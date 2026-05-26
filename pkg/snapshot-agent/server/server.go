@@ -10,6 +10,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
 // Server implements the SnapshotAgentService gRPC server.
@@ -25,7 +27,12 @@ func NewServer() *Server {
 // Snapshot implements SnapshotAgentService.Snapshot.
 func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.SnapshotResponse, error) {
 	log.Printf("Snapshot called: JobID=%s, Group=%s", req.GetJobId(), req.GetGroup())
-	return nil, status.Errorf(codes.Unimplemented, "method Snapshot not implemented")
+	pods, err := podutils.GetLocalPods(ctx)
+	podNames := ""
+	for _, pod := range pods {
+		podNames += pod.Name + " "
+	}
+	return &pb.SnapshotResponse{OperationId: podNames}, err
 }
 
 // Restore implements SnapshotAgentService.Restore.
