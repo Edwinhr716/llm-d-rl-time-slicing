@@ -16,10 +16,10 @@ RUN rm -f go.work && \
     go work use ./pkg/snapshot-agent
 
 # Build the snapshot-agent
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /workspace/snapshot-agent ./cmd/snapshot-agent
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /workspace/snapshot-agent ./cmd/snapshot-agent
 
 # --- Runtime stage ---
-FROM gcr.io/distroless/static:nonroot
+FROM gcr.io/distroless/base:nonroot
 
 WORKDIR /
 COPY --from=builder /workspace/snapshot-agent .

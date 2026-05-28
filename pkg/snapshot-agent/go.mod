@@ -3,6 +3,7 @@ module github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent
 go 1.26.2
 
 require (
+	github.com/NVIDIA/go-nvml v0.11.0-0
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	k8s.io/api v0.36.1
