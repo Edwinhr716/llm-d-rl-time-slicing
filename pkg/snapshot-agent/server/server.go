@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"google.golang.org/grpc"
@@ -28,9 +29,19 @@ func NewServer() *Server {
 func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.SnapshotResponse, error) {
 	log.Printf("Snapshot called: JobID=%s, Group=%s", req.GetJobId(), req.GetGroup())
 	pods, err := podutils.GetLocalPods(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pids, err := podutils.GetPodPIDs(ctx, pods[0].Name, pods[0].Namespace)
+	if err != nil {
+		return nil, err
+	}
 	podNames := ""
 	for _, pod := range pods {
 		podNames += pod.Name + " "
+	}
+	for _, pid := range pids {
+		podNames += ":" + strconv.Itoa(pid) + " "
 	}
 	return &pb.SnapshotResponse{OperationId: podNames}, err
 }
