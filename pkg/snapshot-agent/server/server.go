@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strconv"
+	"os"
+	"strings"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"google.golang.org/grpc"
@@ -30,20 +31,32 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 	log.Printf("Snapshot called: JobID=%s, Group=%s", req.GetJobId(), req.GetGroup())
 	pods, err := podutils.GetLocalPods(ctx)
 	if err != nil {
-		return nil, err
+		log.Printf("Error getting local pods: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to get local pods: %v", err)
 	}
-	pids, err := podutils.GetPodPIDs(ctx, pods[0].Name, pods[0].Namespace)
-	if err != nil {
-		return nil, err
+
+	if len(pods) == 0 {
+		log.Printf("No pods found with label %s=%s on node %s", podutils.SnapshotAgentLabel, podutils.SnapshotAgentValue, os.Getenv("NODE_NAME"))
+		return &pb.SnapshotResponse{OperationId: "no-pods-found"}, nil
 	}
-	podNames := ""
+
+	var results []string
 	for _, pod := range pods {
-		podNames += pod.Name + " "
+		log.Printf("Processing pod: %s/%s", pod.Namespace, pod.Name)
+		pids, err := podutils.GetPodPIDs(ctx, pod.Name, pod.Namespace)
+		if err != nil {
+			log.Printf("Error getting PIDs for pod %s: %v", pod.Name, err)
+			continue
+		}
+
+		podInfo := fmt.Sprintf("%s", pod.Name)
+		for _, pid := range pids {
+			podInfo += fmt.Sprintf(":%d", pid)
+		}
+		results = append(results, podInfo)
 	}
-	for _, pid := range pids {
-		podNames += ":" + strconv.Itoa(pid) + " "
-	}
-	return &pb.SnapshotResponse{OperationId: podNames}, err
+
+	return &pb.SnapshotResponse{OperationId: strings.Join(results, " ")}, nil
 }
 
 // Restore implements SnapshotAgentService.Restore.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -14,9 +15,16 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+const (
+	// SnapshotAgentLabel is the label used to identify pods that the snapshot agent should manage.
+	SnapshotAgentLabel = "snapshot-agent"
+	// SnapshotAgentValue is the value of the label for pods to be managed.
+	SnapshotAgentValue = "true"
+)
+
 // GetLocalPods returns a list of pods running on the same node as the current pod.
 // It uses the NODE_NAME environment variable (populated via the Downward API)
-// to filter pods by node.
+// to filter pods by node and the snapshot-agent label to filter by managed pods.
 func GetLocalPods(ctx context.Context) ([]corev1.Pod, error) {
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
@@ -35,10 +43,10 @@ func GetLocalPods(ctx context.Context) ([]corev1.Pod, error) {
 		return nil, fmt.Errorf("failed to create kubernetes clientset: %w", err)
 	}
 
-	// List pods on the current node
+	// List pods on the current node that have the snapshot-agent label
 	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
-		LabelSelector: "snapshot-agent=true",
+		LabelSelector: fmt.Sprintf("%s=%s", SnapshotAgentLabel, SnapshotAgentValue),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pods on node %s: %w", nodeName, err)
@@ -56,10 +64,13 @@ func GetPodPIDs(ctx context.Context, podName, namespace string) ([]int, error) {
 	}
 
 	// 2. Initialize NVML
+	log.Printf("Initializing NVML...")
 	ret := nvml.Init()
 	if ret != nvml.SUCCESS {
+		log.Printf("Failed to initialize NVML: %v", nvml.ErrorString(ret))
 		return nil, fmt.Errorf("failed to initialize NVML: %v", nvml.ErrorString(ret))
 	}
+	log.Printf("NVML initialized successfully")
 	defer nvml.Shutdown()
 
 	// 3. Discover PIDs
