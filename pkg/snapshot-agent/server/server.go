@@ -5,82 +5,141 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"strings"
+	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	sm "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
+	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
 // Server implements the SnapshotAgentService gRPC server.
 type Server struct {
 	pb.UnimplementedSnapshotAgentServiceServer
+	state *sm.StateManager
 }
 
 // NewServer creates a new Server instance.
 func NewServer() *Server {
-	return &Server{}
+	return &Server{
+		state: sm.NewStateManager(),
+	}
 }
 
-// Snapshot implements SnapshotAgentService.Snapshot.
+// Snapshot triggers an asynchronous snapshot of the accelerator context for a job.
 func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.SnapshotResponse, error) {
 	log.Printf("Snapshot called: JobID=%s, Group=%s", req.GetJobId(), req.GetGroup())
-	pods, err := podutils.GetLocalPods(ctx)
-	if err != nil {
-		log.Printf("Error getting local pods: %v", err)
-		return nil, status.Errorf(codes.Internal, "failed to get local pods: %v", err)
-	}
 
-	if len(pods) == 0 {
-		log.Printf("No pods found with label %s=%s on node %s", podutils.SnapshotAgentLabel, podutils.SnapshotAgentValue, os.Getenv("NODE_NAME"))
-		return &pb.SnapshotResponse{OperationId: "no-pods-found"}, nil
-	}
-
-	var results []string
-	for _, pod := range pods {
-		log.Printf("Processing pod: %s/%s", pod.Namespace, pod.Name)
-		pids, err := podutils.GetPodPIDs(ctx, pod.Name, pod.Namespace)
+	opID, err := s.state.StartSnapshot(req.GetJobId(), req.GetGroup(), func() (int64, int64, error) {
+		// TODO: Implement actual backend snapshot logic (e.g. CRIU, GPU context)
+		// For now, we simulate work and use existing pod/pid discovery
+		log.Printf("Background: Starting snapshot for %s", req.GetJobId())
+		pods, err := podutils.GetLocalPods(context.Background(), req.GetJobId())
 		if err != nil {
-			log.Printf("Error getting PIDs for pod %s: %v", pod.Name, err)
-			continue
+			return 0, 0, fmt.Errorf("failed to get local pods: %w", err)
+		}
+		if len(pods) == 0 {
+			return 0, 0, fmt.Errorf("no pods found for job %s", req.GetJobId())
+		}
+		var results []string
+		for _, pod := range pods {
+			log.Printf("Processing pod: %s/%s", pod.Namespace, pod.Name)
+			pids, err := podutils.GetPodPIDs(ctx, pod.Name, pod.Namespace)
+			if err != nil {
+				log.Printf("Error getting PIDs for pod %s: %v", pod.Name, err)
+				continue
+			}	
+			podInfo := fmt.Sprintf("%s", pod.Name)
+			for _, pid := range pids {
+				podInfo += fmt.Sprintf(":%d", pid)
+			}
+			results = append(results, podInfo)
 		}
 
-		podInfo := fmt.Sprintf("%s", pod.Name)
-		for _, pid := range pids {
-			podInfo += fmt.Sprintf(":%d", pid)
-		}
-		results = append(results, podInfo)
+		// Simulate some processing time
+		time.Sleep(2 * time.Second)
+
+		// Dummy values for now
+		return 1024 * 1024, 2048 * 1024, nil
+	})
+
+	if err != nil {
+		return nil, err
 	}
 
-	return &pb.SnapshotResponse{OperationId: strings.Join(results, " ")}, nil
+	return &pb.SnapshotResponse{OperationId: opID}, nil
 }
 
-// Restore implements SnapshotAgentService.Restore.
+// Restore triggers an asynchronous restoration of the accelerator context for a job.
 func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.RestoreResponse, error) {
 	log.Printf("Restore called: JobID=%s, Group=%s", req.GetJobId(), req.GetGroup())
-	return nil, status.Errorf(codes.Unimplemented, "method Restore not implemented")
+
+	opID, err := s.state.StartRestore(req.GetJobId(), req.GetGroup(), func() error {
+		// TODO: Implement actual backend restore logic
+		log.Printf("Background: Starting restore for %s", req.GetJobId())
+
+		// Simulate some processing time
+		time.Sleep(2 * time.Second)
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.RestoreResponse{OperationId: opID}, nil
 }
 
-// GetOperation implements SnapshotAgentService.GetOperation.
+// GetOperation polls the status of a long-running snapshot or restore operation.
 func (s *Server) GetOperation(ctx context.Context, req *pb.GetOperationRequest) (*pb.GetOperationResponse, error) {
 	log.Printf("GetOperation called: OperationID=%s", req.GetOperationId())
-	return nil, status.Errorf(codes.Unimplemented, "method GetOperation not implemented")
+
+	op, ok := s.state.GetOperation(req.GetOperationId())
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "operation %s not found", req.GetOperationId())
+	}
+
+	elapsed := time.Since(op.StartedAt).Milliseconds()
+	if !op.FinishedAt.IsZero() {
+		elapsed = op.FinishedAt.Sub(op.StartedAt).Milliseconds()
+	}
+
+	resp := &pb.GetOperationResponse{
+		Status:    op.Status,
+		ElapsedMs: elapsed,
+	}
+
+	if op.Status == pb.OperationStatus_OPERATION_STATUS_COMPLETE {
+		storageBytes := op.StorageBytes
+		deviceBytes := op.SnapshotDeviceBytes
+		resp.StorageBytes = &storageBytes
+		resp.SnapshotDeviceBytes = &deviceBytes
+	}
+
+	if op.Status == pb.OperationStatus_OPERATION_STATUS_FAILED {
+		errStr := op.Error
+		resp.Error = &errStr
+	}
+
+	return resp, nil
 }
 
-// Status implements SnapshotAgentService.Status.
+// Status returns the current state of jobs and accelerators on the node.
 func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
 	log.Printf("Status called")
-	return nil, status.Errorf(codes.Unimplemented, "method Status not implemented")
+	return &pb.StatusResponse{
+		JobStatuses: s.state.GetJobStatus(),
+		// TODO: Implement accelerator status discovery
+		AcceleratorStatuses: nil,
+	}, nil
 }
 
-// Health implements SnapshotAgentService.Health.
+// Health returns the health status of the agent.
 func (s *Server) Health(ctx context.Context, req *pb.HealthRequest) (*pb.HealthResponse, error) {
 	log.Printf("Health called")
-	return nil, status.Errorf(codes.Unimplemented, "method Health not implemented")
+	return &pb.HealthResponse{Healthy: true}, nil
 }
 
 // StartServer starts the gRPC server on the specified port.

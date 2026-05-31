@@ -20,12 +20,13 @@ const (
 	SnapshotAgentLabel = "snapshot-agent"
 	// SnapshotAgentValue is the value of the label for pods to be managed.
 	SnapshotAgentValue = "true"
+	JobIdLabel         = "timeslice.io/job-id"
 )
 
 // GetLocalPods returns a list of pods running on the same node as the current pod.
 // It uses the NODE_NAME environment variable (populated via the Downward API)
 // to filter pods by node and the snapshot-agent label to filter by managed pods.
-func GetLocalPods(ctx context.Context) ([]corev1.Pod, error) {
+func GetLocalPods(ctx context.Context, jobId string) ([]corev1.Pod, error) {
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
 		return nil, fmt.Errorf("NODE_NAME environment variable not set")
@@ -46,7 +47,7 @@ func GetLocalPods(ctx context.Context) ([]corev1.Pod, error) {
 	// List pods on the current node that have the snapshot-agent label
 	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
-		LabelSelector: fmt.Sprintf("%s=%s", SnapshotAgentLabel, SnapshotAgentValue),
+		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", SnapshotAgentLabel, SnapshotAgentValue, JobIdLabel, jobId),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pods on node %s: %w", nodeName, err)
