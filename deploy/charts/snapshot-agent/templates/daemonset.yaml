@@ -26,6 +26,8 @@ spec:
       hostPID: true
       containers:
         - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
@@ -37,7 +39,7 @@ spec:
               value: {{ .Values.port | quote }}
             {{- if .Values.nvidia.driver.enabled }}
             - name: LD_LIBRARY_PATH
-              value: {{ .Values.nvidia.driver.mountPath }}/lib64
+              value: {{ join ":" .Values.nvidia.driver.libraryPaths }}
             {{- end }}
             - name: NVIDIA_VISIBLE_DEVICES
               value: "all"
