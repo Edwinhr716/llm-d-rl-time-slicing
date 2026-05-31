@@ -26,6 +26,17 @@ affinity: {}
 
 port: 9001
 
+nvidia:
+  driver:
+    enabled: true
+    hostPath: /home/kubernetes/bin/nvidia
+    # Path inside the container where the driver will be mounted
+    mountPath: /usr/local/nvidia
+  devices:
+    enabled: true
+    hostPath: /dev
+    mountPath: /dev
+
 rbac:
   create: true
 

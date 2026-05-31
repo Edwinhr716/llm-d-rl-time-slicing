@@ -35,12 +35,45 @@ spec:
                   fieldPath: spec.nodeName
             - name: AGENT_PORT
               value: {{ .Values.port | quote }}
+            {{- if .Values.nvidia.driver.enabled }}
+            - name: LD_LIBRARY_PATH
+              value: {{ .Values.nvidia.driver.mountPath }}/lib64
+            {{- end }}
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
           ports:
             - name: grpc
               containerPort: {{ .Values.port }}
               protocol: TCP
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if or .Values.nvidia.driver.enabled .Values.nvidia.devices.enabled }}
+          volumeMounts:
+            {{- if .Values.nvidia.driver.enabled }}
+            - name: nvidia-driver
+              mountPath: {{ .Values.nvidia.driver.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.nvidia.devices.enabled }}
+            - name: nvidia-devices
+              mountPath: {{ .Values.nvidia.devices.mountPath }}
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.nvidia.driver.enabled .Values.nvidia.devices.enabled }}
+      volumes:
+        {{- if .Values.nvidia.driver.enabled }}
+        - name: nvidia-driver
+          hostPath:
+            path: {{ .Values.nvidia.driver.hostPath }}
+        {{- end }}
+        {{- if .Values.nvidia.devices.enabled }}
+        - name: nvidia-devices
+          hostPath:
+            path: {{ .Values.nvidia.devices.hostPath }}
+        {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
