@@ -8,8 +8,8 @@ import (
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
 	sm "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
-	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -18,52 +18,37 @@ import (
 // Server implements the SnapshotAgentService gRPC server.
 type Server struct {
 	pb.UnimplementedSnapshotAgentServiceServer
-	state *sm.StateManager
+	state          *sm.StateManager
+	backends       map[string]backends.Backend
+	defaultBackend string
 }
 
 // NewServer creates a new Server instance.
-func NewServer() *Server {
+func NewServer(backends map[string]backends.Backend, defaultBackend string) *Server {
 	return &Server{
-		state: sm.NewStateManager(),
+		state:          sm.NewStateManager(),
+		backends:       backends,
+		defaultBackend: defaultBackend,
 	}
 }
 
 // Snapshot triggers an asynchronous snapshot of the accelerator context for a job.
 func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.SnapshotResponse, error) {
-	log.Printf("Snapshot called: JobID=%s, Group=%s", req.GetJobId(), req.GetGroup())
+	log.Printf("Snapshot called: JobID=%s, Group=%s, Backend=%s", req.GetJobId(), req.GetGroup(), req.GetBackend())
+
+	backendName := req.GetBackend()
+	if backendName == "" {
+		backendName = s.defaultBackend
+	}
+
+	backend, ok := s.backends[backendName]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "backend %s not found", backendName)
+	}
 
 	opID, err := s.state.StartSnapshot(req.GetJobId(), req.GetGroup(), func() (int64, int64, error) {
-		// TODO: Implement actual backend snapshot logic (e.g. CRIU, GPU context)
-		// For now, we simulate work and use existing pod/pid discovery
-		log.Printf("Background: Starting snapshot for %s", req.GetJobId())
-		pods, err := podutils.GetLocalPods(context.Background(), req.GetJobId())
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to get local pods: %w", err)
-		}
-		if len(pods) == 0 {
-			return 0, 0, fmt.Errorf("no pods found for job %s", req.GetJobId())
-		}
-		var results []string
-		for _, pod := range pods {
-			log.Printf("Processing pod: %s/%s", pod.Namespace, pod.Name)
-			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
-			if err != nil {
-				log.Printf("Error getting PIDs for pod %s: %v", pod.Name, err)
-				continue
-			}	
-			podInfo := fmt.Sprintf("%s", pod.Name)
-			for _, pid := range pids {
-				podInfo += fmt.Sprintf(":%d", pid)
-			}
-			results = append(results, podInfo)
-		}
-		log.Printf("Snapshot results: %v", results)
-
-		// Simulate some processing time
-		time.Sleep(2 * time.Second)
-
-		// Dummy values for now
-		return 1024 * 1024, 2048 * 1024, nil
+		log.Printf("Background: Starting snapshot for %s using backend %s", req.GetJobId(), backendName)
+		return backend.Snapshot(context.Background(), req.GetJobId(), req.GetGroup())
 	})
 
 	if err != nil {
@@ -75,15 +60,21 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 
 // Restore triggers an asynchronous restoration of the accelerator context for a job.
 func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.RestoreResponse, error) {
-	log.Printf("Restore called: JobID=%s, Group=%s", req.GetJobId(), req.GetGroup())
+	log.Printf("Restore called: JobID=%s, Group=%s, Backend=%s", req.GetJobId(), req.GetGroup(), req.GetBackend())
+
+	backendName := req.GetBackend()
+	if backendName == "" {
+		backendName = s.defaultBackend
+	}
+
+	backend, ok := s.backends[backendName]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "backend %s not found", backendName)
+	}
 
 	opID, err := s.state.StartRestore(req.GetJobId(), req.GetGroup(), func() error {
-		// TODO: Implement actual backend restore logic
-		log.Printf("Background: Starting restore for %s", req.GetJobId())
-
-		// Simulate some processing time
-		time.Sleep(2 * time.Second)
-		return nil
+		log.Printf("Background: Starting restore for %s using backend %s", req.GetJobId(), backendName)
+		return backend.Restore(context.Background(), req.GetJobId(), req.GetGroup())
 	})
 
 	if err != nil {
@@ -144,14 +135,14 @@ func (s *Server) Health(ctx context.Context, req *pb.HealthRequest) (*pb.HealthR
 }
 
 // StartServer starts the gRPC server on the specified port.
-func StartServer(port int) error {
+func StartServer(port int, backends map[string]backends.Backend, defaultBackend string) error {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
 
 	s := grpc.NewServer()
-	pb.RegisterSnapshotAgentServiceServer(s, NewServer())
+	pb.RegisterSnapshotAgentServiceServer(s, NewServer(backends, defaultBackend))
 
 	log.Printf("Starting gRPC server on port %d...", port)
 	if err := s.Serve(lis); err != nil {

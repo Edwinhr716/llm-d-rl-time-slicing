@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -21,7 +22,13 @@ var lis *bufconn.Listener
 func initGRPCServer() {
 	lis = bufconn.Listen(bufSize)
 	s := grpc.NewServer()
-	pb.RegisterSnapshotAgentServiceServer(s, NewServer())
+	
+	noopBackend := backends.NewNoopBackend()
+	backendsMap := map[string]backends.Backend{
+		"noop": noopBackend,
+	}
+	
+	pb.RegisterSnapshotAgentServiceServer(s, NewServer(backendsMap, "noop"))
 	go func() {
 		if err := s.Serve(lis); err != nil {
 			log.Fatalf("Server exited with error: %v", err)
@@ -49,6 +56,26 @@ func TestServer_Snapshot(t *testing.T) {
 	})
 	if err != nil {
 		t.Errorf("Expected success, got error: %v", err)
+	}
+}
+
+func TestServer_Snapshot_InvalidBackend(t *testing.T) {
+	initGRPCServer()
+	ctx := context.Background()
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewSnapshotAgentServiceClient(conn)
+
+	_, err = client.Snapshot(ctx, &pb.SnapshotRequest{
+		JobId:   "test-job",
+		Group:   "test-group",
+		Backend: "invalid-backend",
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("Expected NotFound error, got: %v", err)
 	}
 }
 

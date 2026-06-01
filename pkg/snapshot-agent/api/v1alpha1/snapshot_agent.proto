@@ -25,6 +25,7 @@ service SnapshotAgentService {
 message SnapshotRequest {
   string job_id = 1;
   string group = 2;
+  string backend = 3;
 }
 
 message SnapshotResponse {
@@ -34,6 +35,7 @@ message SnapshotResponse {
 message RestoreRequest {
   string job_id = 1;
   string group = 2;
+  string backend = 3;
 }
 
 message RestoreResponse {

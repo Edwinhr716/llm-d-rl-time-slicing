@@ -18,15 +18,25 @@ import (
 	"flag"
 	"log"
 
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
 )
 
 func main() {
 	port := flag.Int("port", 9001, "The port to listen on")
+	useCriu := flag.Bool("use-criu", false, "Whether to use CRIU for snapshots")
 	flag.Parse()
 
+	cudaBackend := backends.NewCudaCheckpoint(*useCriu)
+	noopBackend := backends.NewNoopBackend()
+
+	registeredBackends := map[string]backends.Backend{
+		"cuda": cudaBackend,
+		"noop": noopBackend,
+	}
+
 	log.Printf("Starting Snapshot Agent on port %d", *port)
-	if err := server.StartServer(*port); err != nil {
+	if err := server.StartServer(*port, registeredBackends, "cuda"); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }

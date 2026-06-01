@@ -29,10 +29,10 @@ func NewCudaCheckpoint(useCriu bool) *CudaCheckpoint {
 }
 
 // Snapshot triggers a snapshot of the accelerator context for a job.
-func (c *CudaCheckpoint) Snapshot(ctx context.Context, jobID, group string) (string, error) {
+func (c *CudaCheckpoint) Snapshot(ctx context.Context, jobID, group string) (int64, int64, error) {
 	// For now, assume jobID is the PID. In a production system, this would be resolved.
 	if jobID == "" {
-		return "", fmt.Errorf("jobID (PID) is required")
+		return 0, 0, fmt.Errorf("jobID (PID) is required")
 	}
 	pid := jobID
 
@@ -44,10 +44,10 @@ func (c *CudaCheckpoint) Snapshot(ctx context.Context, jobID, group string) (str
 	// 1. Lock and Checkpoint CUDA
 	t0 := time.Now()
 	if err := c.runSudoCommand("./bin/x86_64_Linux/cuda-checkpoint", "--action", "lock", "--pid", pid); err != nil {
-		return "", fmt.Errorf("cuda-checkpoint lock failed: %w", err)
+		return 0, 0, fmt.Errorf("cuda-checkpoint lock failed: %w", err)
 	}
 	if err := c.runSudoCommand("./bin/x86_64_Linux/cuda-checkpoint", "--action", "checkpoint", "--pid", pid); err != nil {
-		return "", fmt.Errorf("cuda-checkpoint checkpoint failed: %w", err)
+		return 0, 0, fmt.Errorf("cuda-checkpoint checkpoint failed: %w", err)
 	}
 	log.Printf("[Metric] cuda-checkpoint action took %v", time.Since(t0))
 
@@ -57,7 +57,7 @@ func (c *CudaCheckpoint) Snapshot(ctx context.Context, jobID, group string) (str
 	if c.useCriu {
 		imgDir := filepath.Join("checkpoint", "pid_"+pid)
 		if err := os.MkdirAll(imgDir, 0755); err != nil {
-			return "", fmt.Errorf("failed to create image directory: %w", err)
+			return 0, 0, fmt.Errorf("failed to create image directory: %w", err)
 		}
 
 		// Cleanup shared memory semaphores
@@ -71,19 +71,18 @@ func (c *CudaCheckpoint) Snapshot(ctx context.Context, jobID, group string) (str
 		err := c.runSudoCommand("criu", "dump", "--shell-job", "--tcp-established", "--file-locks", "--link-remap", "--ext-unix-sk", "--external", "vdso32", "--leave-running", "--images-dir", imgDir, "--tree", pid)
 		if err != nil {
 			log.Printf("CRIU dump failed for PID %s: %v", pid, err)
-			return "", fmt.Errorf("criu dump failed: %w", err)
+			return 0, 0, fmt.Errorf("criu dump failed: %w", err)
 		}
 		log.Printf("[Metric] dump took %v for PID %s", time.Since(t0Dump), pid)
 	}
 
-	operationID := fmt.Sprintf("snap-%s-%d", pid, time.Now().Unix())
-	return operationID, nil
+	return 1024 * 1024, 2048 * 1024, nil
 }
 
 // Restore triggers a restoration of the accelerator context for a job.
-func (c *CudaCheckpoint) Restore(ctx context.Context, jobID, group string) (string, error) {
+func (c *CudaCheckpoint) Restore(ctx context.Context, jobID, group string) error {
 	if jobID == "" {
-		return "", fmt.Errorf("jobID (PID) is required")
+		return fmt.Errorf("jobID (PID) is required")
 	}
 	pid := jobID
 
@@ -98,21 +97,20 @@ func (c *CudaCheckpoint) Restore(ctx context.Context, jobID, group string) (stri
 		err := c.runSudoCommand("criu", "restore", "--shell-job", "--tcp-established", "--restore-detached", "--file-locks", "--link-remap", "--ext-unix-sk", "--external", "vdso32", "--images-dir", imgDir)
 		if err != nil {
 			log.Printf("CRIU restore failed for PID %s: %v", pid, err)
-			return "", fmt.Errorf("criu restore failed: %w", err)
+			return fmt.Errorf("criu restore failed: %w", err)
 		}
 		delete(c.dumpedPids, pid)
 		log.Printf("[Metric] restore took %v for PID %s", time.Since(t0Restore), pid)
 	} else if c.yieldedPids[pid] {
 		t0 := time.Now()
 		if err := c.runSudoCommand("./bin/x86_64_Linux/cuda-checkpoint", "--toggle", "--pid", pid); err != nil {
-			return "", fmt.Errorf("cuda-checkpoint toggle failed: %w", err)
+			return fmt.Errorf("cuda-checkpoint toggle failed: %w", err)
 		}
 		delete(c.yieldedPids, pid)
 		log.Printf("[Metric] cuda-checkpoint toggle took %v for PID %s", time.Since(t0), pid)
 	}
 
-	operationID := fmt.Sprintf("rest-%s-%d", pid, time.Now().Unix())
-	return operationID, nil
+	return nil
 }
 
 func (c *CudaCheckpoint) runSudoCommand(name string, args ...string) error {
