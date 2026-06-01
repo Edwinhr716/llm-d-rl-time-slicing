@@ -47,8 +47,8 @@ func TestServer_Snapshot(t *testing.T) {
 		JobId: "test-job",
 		Group: "test-group",
 	})
-	if status.Code(err) != codes.Unimplemented {
-		t.Errorf("Expected Unimplemented error, got: %v", err)
+	if err != nil {
+		t.Errorf("Expected success, got error: %v", err)
 	}
 }
 
@@ -66,8 +66,8 @@ func TestServer_Restore(t *testing.T) {
 		JobId: "test-job",
 		Group: "test-group",
 	})
-	if status.Code(err) != codes.Unimplemented {
-		t.Errorf("Expected Unimplemented error, got: %v", err)
+	if err != nil {
+		t.Errorf("Expected success, got error: %v", err)
 	}
 }
 
@@ -84,8 +84,8 @@ func TestServer_GetOperation(t *testing.T) {
 	_, err = client.GetOperation(ctx, &pb.GetOperationRequest{
 		OperationId: "test-op",
 	})
-	if status.Code(err) != codes.Unimplemented {
-		t.Errorf("Expected Unimplemented error, got: %v", err)
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("Expected NotFound error, got: %v", err)
 	}
 }
 
@@ -100,8 +100,8 @@ func TestServer_Status(t *testing.T) {
 	client := pb.NewSnapshotAgentServiceClient(conn)
 
 	_, err = client.Status(ctx, &pb.StatusRequest{})
-	if status.Code(err) != codes.Unimplemented {
-		t.Errorf("Expected Unimplemented error, got: %v", err)
+	if err != nil {
+		t.Errorf("Expected success, got error: %v", err)
 	}
 }
 
@@ -116,7 +116,7 @@ func TestServer_Health(t *testing.T) {
 	client := pb.NewSnapshotAgentServiceClient(conn)
 
 	_, err = client.Health(ctx, &pb.HealthRequest{})
-	if status.Code(err) != codes.Unimplemented {
-		t.Errorf("Expected Unimplemented error, got: %v", err)
+	if err != nil {
+		t.Errorf("Expected success, got error: %v", err)
 	}
 }

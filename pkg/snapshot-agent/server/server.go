@@ -46,7 +46,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 		var results []string
 		for _, pod := range pods {
 			log.Printf("Processing pod: %s/%s", pod.Namespace, pod.Name)
-			pids, err := podutils.GetPodPIDs(ctx, pod.Name, pod.Namespace)
+			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
 			if err != nil {
 				log.Printf("Error getting PIDs for pod %s: %v", pod.Name, err)
 				continue
@@ -57,6 +57,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 			}
 			results = append(results, podInfo)
 		}
+		log.Printf("Snapshot results: %v", results)
 
 		// Simulate some processing time
 		time.Sleep(2 * time.Second)
