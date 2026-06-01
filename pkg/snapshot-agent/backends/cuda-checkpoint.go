@@ -29,17 +29,12 @@ func NewCudaCheckpoint(useCriu bool) *CudaCheckpoint {
 }
 
 // Snapshot triggers a snapshot of the accelerator context for a job.
-func (c *CudaCheckpoint) Snapshot(ctx context.Context, jobID, group string) (int64, int64, error) {
-	// For now, assume jobID is the PID. In a production system, this would be resolved.
-	if jobID == "" {
-		return 0, 0, fmt.Errorf("jobID (PID) is required")
-	}
-	pid := jobID
+func (c *CudaCheckpoint) Snapshot(ctx context.Context, pid string) (int64, int64, error) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	log.Printf("Snapshotting PID %s (Group: %s)", pid, group)
+	log.Printf("Snapshotting PID %s", pid)
 
 	// 1. Lock and Checkpoint CUDA
 	t0 := time.Now()

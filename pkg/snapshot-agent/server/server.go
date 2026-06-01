@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
 	sm "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
+	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -48,7 +50,29 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 
 	opID, err := s.state.StartSnapshot(req.GetJobId(), req.GetGroup(), func() (int64, int64, error) {
 		log.Printf("Background: Starting snapshot for %s using backend %s", req.GetJobId(), backendName)
-		return backend.Snapshot(context.Background(), req.GetJobId(), req.GetGroup())
+		pods, err := podutils.GetLocalPods(context.Background(), req.GetJobId())
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to get local pods: %v", err)
+		}
+		var storageBytes int64
+		var deviceBytes int64
+
+		if len(pods) == 0 {
+			return 0, 0, fmt.Errorf("no pods found for job %s", req.GetJobId())
+		}
+		for _, pod := range pods {
+			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
+			if err != nil {
+				return 0, 0, fmt.Errorf("failed to get pod PIDs: %v", err)
+			}
+			for _, pid := range pids {
+				storageBytes, deviceBytes, err = backend.Snapshot(context.Background(), strconv.Itoa(pid))
+				if err != nil {
+					return 0, 0, fmt.Errorf("failed to snapshot pod %s: %v", pod.Name, err)
+				}
+			}
+		}
+		return storageBytes, deviceBytes, nil
 	})
 
 	if err != nil {
