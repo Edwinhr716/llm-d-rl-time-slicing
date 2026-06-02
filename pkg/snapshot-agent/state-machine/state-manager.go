@@ -23,6 +23,7 @@ type Job struct {
 	ID    string
 	Group string
 	State pb.JobState
+	PIDs  []int
 	mu    sync.Mutex
 }
 
@@ -217,4 +218,41 @@ func (sm *StateManager) GetJobStatus() []*pb.JobStatus {
 		job.mu.Unlock()
 	}
 	return statuses
+}
+
+// UpdateJobPIDs updates the PIDs associated with a job.
+func (sm *StateManager) UpdateJobPIDs(jobID string, pids []int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	job, ok := sm.jobs[jobID]
+	if !ok {
+		return
+	}
+
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	job.PIDs = pids
+}
+
+// GetJobPIDs returns the PIDs associated with a job.
+func (sm *StateManager) GetJobPIDs(jobID string) ([]int, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	job, ok := sm.jobs[jobID]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "job %s not found", jobID)
+	}
+
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	if len(job.PIDs) == 0 {
+		return nil, status.Errorf(codes.NotFound, "no PIDs found for job %s", jobID)
+	}
+
+	// Return a copy to avoid race conditions
+	pids := make([]int, len(job.PIDs))
+	copy(pids, job.PIDs)
+	return pids, nil
 }

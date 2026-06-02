@@ -60,12 +60,14 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 		if len(pods) == 0 {
 			return 0, 0, fmt.Errorf("no pods found for job %s", req.GetJobId())
 		}
+		var allPIDs []int
 		for _, pod := range pods {
 			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
 			log.Printf("Pod %s has PIDs: %v", pod.Name, pids)
 			if err != nil {
 				return 0, 0, fmt.Errorf("failed to get pod PIDs: %v", err)
 			}
+			allPIDs = append(allPIDs, pids...)
 			for _, pid := range pids {
 				storageBytes, deviceBytes, err = backend.Snapshot(context.Background(), strconv.Itoa(pid))
 				if err != nil {
@@ -73,8 +75,10 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 				}
 			}
 		}
+		s.state.UpdateJobPIDs(req.GetJobId(), allPIDs)
 		return storageBytes, deviceBytes, nil
-	})
+		})
+
 
 	if err != nil {
 		return nil, err
@@ -99,19 +103,15 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 
 	opID, err := s.state.StartRestore(req.GetJobId(), req.GetGroup(), func() error {
 		log.Printf("Background: Starting restore for %s using backend %s", req.GetJobId(), backendName)
-		pods, err := podutils.GetLocalPods(context.Background(), req.GetJobId())
+
+		pids, err := s.state.GetJobPIDs(req.GetJobId())
 		if err != nil {
-			return fmt.Errorf("failed to get local pods: %v", err)
+			return fmt.Errorf("failed to get PIDs for job %s: %v", req.GetJobId(), err)
 		}
-		for _, pod := range pods {
-			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
-			if err != nil {
-				return fmt.Errorf("failed to get pod PIDs: %v", err)
-			}
-			for _, pid := range pids {
-				if err := backend.Restore(context.Background(), strconv.Itoa(pid)); err != nil {
-					return fmt.Errorf("failed to restore pod %s: %v", pod.Name, err)
-				}
+
+		for _, pid := range pids {
+			if err := backend.Restore(context.Background(), strconv.Itoa(pid)); err != nil {
+				return fmt.Errorf("failed to restore PID %d: %v", pid, err)
 			}
 		}
 		return nil

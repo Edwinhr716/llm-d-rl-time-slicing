@@ -41,6 +41,17 @@ func TestStateManager_Transitions(t *testing.T) {
 		t.Errorf("Expected state SAVED, got %v", job.State)
 	}
 
+	// Test PID storage
+	pids := []int{123, 456}
+	sm.UpdateJobPIDs(jobID, pids)
+	retrievedPIDs, err := sm.GetJobPIDs(jobID)
+	if err != nil {
+		t.Fatalf("GetJobPIDs failed: %v", err)
+	}
+	if len(retrievedPIDs) != 2 || retrievedPIDs[0] != 123 || retrievedPIDs[1] != 456 {
+		t.Errorf("Retrieved PIDs do not match. Expected %v, got %v", pids, retrievedPIDs)
+	}
+
 	op, ok := sm.GetOperation(opID)
 	if !ok || op.Status != pb.OperationStatus_OPERATION_STATUS_COMPLETE {
 		t.Errorf("Expected operation COMPLETE, got %v", op.Status)

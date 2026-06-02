@@ -115,7 +115,7 @@ func (c *CudaCheckpoint) getCudaCheckpointPath() string {
 		return path
 	}
 	// Fallback to the relative path used in development
-	return "./bin/x86_64_Linux/cuda-checkpoint"
+	return "/usr/local/bin/cuda-checkpoint"
 }
 
 func (c *CudaCheckpoint) runSudoCommand(name string, args ...string) error {
