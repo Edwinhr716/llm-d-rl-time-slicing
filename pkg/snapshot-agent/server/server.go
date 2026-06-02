@@ -61,6 +61,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 			return 0, 0, fmt.Errorf("no pods found for job %s", req.GetJobId())
 		}
 		var allPIDs []int
+		log.Printf("Pods found for job %s: %v", req.GetJobId(), pods)
 		for _, pod := range pods {
 			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
 			log.Printf("Pod %s has PIDs: %v", pod.Name, pids)
@@ -76,6 +77,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 			}
 		}
 		s.state.UpdateJobPIDs(req.GetJobId(), allPIDs)
+		log.Printf("PIDs for job %s: %v", req.GetJobId(), allPIDs)
 		return storageBytes, deviceBytes, nil
 		})
 
