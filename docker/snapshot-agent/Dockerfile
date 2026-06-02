@@ -23,6 +23,8 @@ FROM gcr.io/distroless/base
 
 WORKDIR /
 COPY --from=builder /workspace/snapshot-agent .
+# Copy pre-built binaries (like cuda-checkpoint) from the bin directory
+COPY --from=builder /workspace/bin ./bin
 
 
 ENTRYPOINT ["/snapshot-agent"]

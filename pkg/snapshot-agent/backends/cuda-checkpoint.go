@@ -38,10 +38,11 @@ func (c *CudaCheckpoint) Snapshot(ctx context.Context, pid string) (int64, int64
 
 	// 1. Lock and Checkpoint CUDA
 	t0 := time.Now()
-	if err := c.runSudoCommand("./bin/x86_64_Linux/cuda-checkpoint", "--action", "lock", "--pid", pid); err != nil {
+	binaryPath := c.getCudaCheckpointPath()
+	if err := c.runSudoCommand(binaryPath, "--action", "lock", "--pid", pid); err != nil {
 		return 0, 0, fmt.Errorf("cuda-checkpoint lock failed: %w", err)
 	}
-	if err := c.runSudoCommand("./bin/x86_64_Linux/cuda-checkpoint", "--action", "checkpoint", "--pid", pid); err != nil {
+	if err := c.runSudoCommand(binaryPath, "--action", "checkpoint", "--pid", pid); err != nil {
 		return 0, 0, fmt.Errorf("cuda-checkpoint checkpoint failed: %w", err)
 	}
 	log.Printf("[Metric] cuda-checkpoint action took %v", time.Since(t0))
@@ -75,16 +76,15 @@ func (c *CudaCheckpoint) Snapshot(ctx context.Context, pid string) (int64, int64
 }
 
 // Restore triggers a restoration of the accelerator context for a job.
-func (c *CudaCheckpoint) Restore(ctx context.Context, jobID, group string) error {
-	if jobID == "" {
+func (c *CudaCheckpoint) Restore(ctx context.Context, pid string) error {
+	if pid == "" {
 		return fmt.Errorf("jobID (PID) is required")
 	}
-	pid := jobID
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	log.Printf("Restoring PID %s (Group: %s)", pid, group)
+	log.Printf("Restoring PID %s", pid)
 
 	if c.dumpedPids[pid] {
 		imgDir := filepath.Join("checkpoint", "pid_"+pid)
@@ -98,7 +98,8 @@ func (c *CudaCheckpoint) Restore(ctx context.Context, jobID, group string) error
 		log.Printf("[Metric] restore took %v for PID %s", time.Since(t0Restore), pid)
 	} else if c.yieldedPids[pid] {
 		t0 := time.Now()
-		if err := c.runSudoCommand("./bin/x86_64_Linux/cuda-checkpoint", "--toggle", "--pid", pid); err != nil {
+		binaryPath := c.getCudaCheckpointPath()
+		if err := c.runSudoCommand(binaryPath, "--toggle", "--pid", pid); err != nil {
 			return fmt.Errorf("cuda-checkpoint toggle failed: %w", err)
 		}
 		delete(c.yieldedPids, pid)
@@ -108,8 +109,26 @@ func (c *CudaCheckpoint) Restore(ctx context.Context, jobID, group string) error
 	return nil
 }
 
+func (c *CudaCheckpoint) getCudaCheckpointPath() string {
+	// First check if it's in the PATH
+	if path, err := exec.LookPath("cuda-checkpoint"); err == nil {
+		return path
+	}
+	// Fallback to the relative path used in development
+	return "./bin/x86_64_Linux/cuda-checkpoint"
+}
+
 func (c *CudaCheckpoint) runSudoCommand(name string, args ...string) error {
-	cmd := exec.Command("sudo", append([]string{name}, args...)...)
+	// Check if 'sudo' exists in PATH
+	_, err := exec.LookPath("sudo")
+	var cmd *exec.Cmd
+	if err != nil {
+		log.Printf("'sudo' not found in PATH, attempting to run command directly: %s %v", name, args)
+		cmd = exec.Command(name, args...)
+	} else {
+		cmd = exec.Command("sudo", append([]string{name}, args...)...)
+	}
+
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("command failed: %v, output: %s", err, string(out))
 	}

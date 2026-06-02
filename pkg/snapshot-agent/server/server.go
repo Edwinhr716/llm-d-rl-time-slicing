@@ -62,6 +62,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 		}
 		for _, pod := range pods {
 			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
+			log.Printf("Pod %s has PIDs: %v", pod.Name, pids)
 			if err != nil {
 				return 0, 0, fmt.Errorf("failed to get pod PIDs: %v", err)
 			}
@@ -98,7 +99,22 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 
 	opID, err := s.state.StartRestore(req.GetJobId(), req.GetGroup(), func() error {
 		log.Printf("Background: Starting restore for %s using backend %s", req.GetJobId(), backendName)
-		return backend.Restore(context.Background(), req.GetJobId(), req.GetGroup())
+		pods, err := podutils.GetLocalPods(context.Background(), req.GetJobId())
+		if err != nil {
+			return fmt.Errorf("failed to get local pods: %v", err)
+		}
+		for _, pod := range pods {
+			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
+			if err != nil {
+				return fmt.Errorf("failed to get pod PIDs: %v", err)
+			}
+			for _, pid := range pids {
+				if err := backend.Restore(context.Background(), strconv.Itoa(pid)); err != nil {
+					return fmt.Errorf("failed to restore pod %s: %v", pod.Name, err)
+				}
+			}
+		}
+		return nil
 	})
 
 	if err != nil {

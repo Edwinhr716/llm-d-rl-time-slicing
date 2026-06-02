@@ -9,5 +9,5 @@ type Backend interface {
 	Snapshot(ctx context.Context, pid string) (int64, int64, error)
 
 	// Restore triggers a restoration of the accelerator context for a job.
-	Restore(ctx context.Context, jobID, group string) error
+	Restore(ctx context.Context, pid string) error
 }
