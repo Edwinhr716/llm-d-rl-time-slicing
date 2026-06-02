@@ -83,6 +83,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 
 
 	if err != nil {
+		log.Printf("Failed to start snapshot for job %s: %v", req.GetJobId(), err)
 		return nil, err
 	}
 
