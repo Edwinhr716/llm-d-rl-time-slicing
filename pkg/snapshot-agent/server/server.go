@@ -113,6 +113,7 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 		}
 
 		for _, pid := range pids {
+			log.Printf("Restoring PID %d using backend %s", pid, backendName)
 			if err := backend.Restore(context.Background(), strconv.Itoa(pid)); err != nil {
 				return fmt.Errorf("failed to restore PID %d: %v", pid, err)
 			}
