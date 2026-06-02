@@ -30,15 +30,21 @@ func TestStateManager_Transitions(t *testing.T) {
 	}
 
 	// Verify transitioning state
-	if job.State != pb.JobState_JOB_STATE_TRANSITIONING {
-		t.Errorf("Expected state TRANSITIONING, got %v", job.State)
+	job.mu.Lock()
+	currentState := job.State
+	job.mu.Unlock()
+	if currentState != pb.JobState_JOB_STATE_TRANSITIONING {
+		t.Errorf("Expected state TRANSITIONING, got %v", currentState)
 	}
 
 	// Wait for background op
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
-	if job.State != pb.JobState_JOB_STATE_SAVED {
-		t.Errorf("Expected state SAVED, got %v", job.State)
+	job.mu.Lock()
+	currentState = job.State
+	job.mu.Unlock()
+	if currentState != pb.JobState_JOB_STATE_SAVED {
+		t.Errorf("Expected state SAVED, got %v", currentState)
 	}
 
 	// Test PID storage
@@ -90,9 +96,12 @@ func TestStateManager_Transitions(t *testing.T) {
 		t.Fatalf("StartRestore failed: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	if job.State != pb.JobState_JOB_STATE_RUNNING {
-		t.Errorf("Expected state RUNNING, got %v", job.State)
+	time.Sleep(200 * time.Millisecond)
+	job.mu.Lock()
+	currentState = job.State
+	job.mu.Unlock()
+	if currentState != pb.JobState_JOB_STATE_RUNNING {
+		t.Errorf("Expected state RUNNING, got %v", currentState)
 	}
 
 	// 5. Redundancy Optimization
@@ -116,8 +125,11 @@ func TestStateManager_Transitions(t *testing.T) {
 		t.Fatalf("StartRestore failed: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	if job.State != pb.JobState_JOB_STATE_FAULTED {
-		t.Errorf("Expected state FAULTED after error, got %v", job.State)
+	time.Sleep(200 * time.Millisecond)
+	job.mu.Lock()
+	currentState = job.State
+	job.mu.Unlock()
+	if currentState != pb.JobState_JOB_STATE_FAULTED {
+		t.Errorf("Expected state FAULTED after error, got %v", currentState)
 	}
 }

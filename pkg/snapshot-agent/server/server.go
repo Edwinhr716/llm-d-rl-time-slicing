@@ -54,13 +54,13 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to get local pods: %v", err)
 		}
-		var storageBytes int64
-		var deviceBytes int64
 
 		if len(pods) == 0 {
 			return 0, 0, fmt.Errorf("no pods found for job %s", req.GetJobId())
 		}
+
 		var allPIDs []int
+		var allPIDStrings []string
 		log.Printf("Pods found for job %s: %v", req.GetJobId(), pods)
 		for _, pod := range pods {
 			pids, err := podutils.GetPodPIDs(context.Background(), pod.Name, pod.Namespace)
@@ -70,16 +70,23 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 			}
 			allPIDs = append(allPIDs, pids...)
 			for _, pid := range pids {
-				storageBytes, deviceBytes, err = backend.Snapshot(context.Background(), strconv.Itoa(pid))
-				if err != nil {
-					return 0, 0, fmt.Errorf("failed to snapshot pod %s: %v", pod.Name, err)
-				}
+				allPIDStrings = append(allPIDStrings, strconv.Itoa(pid))
 			}
 		}
+
+		if len(allPIDStrings) == 0 {
+			return 0, 0, fmt.Errorf("no GPU PIDs found for job %s", req.GetJobId())
+		}
+
+		storageBytes, deviceBytes, err := backend.Snapshot(context.Background(), allPIDStrings)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to snapshot job %s: %v", req.GetJobId(), err)
+		}
+
 		s.state.UpdateJobPIDs(req.GetJobId(), allPIDs)
 		log.Printf("PIDs for job %s: %v", req.GetJobId(), allPIDs)
 		return storageBytes, deviceBytes, nil
-		})
+	})
 
 
 	if err != nil {
@@ -112,11 +119,14 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 			return fmt.Errorf("failed to get PIDs for job %s: %v", req.GetJobId(), err)
 		}
 
+		var pidStrings []string
 		for _, pid := range pids {
-			log.Printf("Restoring PID %d using backend %s", pid, backendName)
-			if err := backend.Restore(context.Background(), strconv.Itoa(pid)); err != nil {
-				return fmt.Errorf("failed to restore PID %d: %v", pid, err)
-			}
+			pidStrings = append(pidStrings, strconv.Itoa(pid))
+		}
+
+		log.Printf("Restoring PIDs %v using backend %s", pidStrings, backendName)
+		if err := backend.Restore(context.Background(), pidStrings); err != nil {
+			return fmt.Errorf("failed to restore job %s: %v", req.GetJobId(), err)
 		}
 		return nil
 	})
