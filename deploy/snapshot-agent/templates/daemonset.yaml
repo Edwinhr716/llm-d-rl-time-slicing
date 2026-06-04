@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "snapshot-agent.fullname" . }}
+  labels:
+    {{- include "snapshot-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "snapshot-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "snapshot-agent.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "snapshot-agent.serviceAccountName" . }}
+      hostNetwork: true
+      hostPID: true
+      initContainers:
+        - name: install-cuda-checkpoint
+          image: alpine:latest
+          command: ["sh", "-c", "apk add --no-cache wget && wget -qO /opt/bin/cuda-checkpoint https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/main/bin/x86_64_Linux/cuda-checkpoint && chmod +x /opt/bin/cuda-checkpoint && echo 'cuda-checkpoint installed'"]
+          volumeMounts:
+            - name: bin-dir
+              mountPath: /opt/bin
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: AGENT_PORT
+              value: {{ .Values.port | quote }}
+            {{- if .Values.nvidia.driver.enabled }}
+            - name: LD_LIBRARY_PATH
+              value: {{ join ":" .Values.nvidia.driver.libraryPaths }}
+            {{- end }}
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.port }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: bin-dir
+              mountPath: /opt/bin
+            {{- if .Values.nvidia.driver.enabled }}
+            - name: nvidia-driver
+              mountPath: {{ .Values.nvidia.driver.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.nvidia.devices.enabled }}
+            - name: nvidia-devices
+              mountPath: {{ .Values.nvidia.devices.mountPath }}
+            {{- end }}
+      volumes:
+        - name: bin-dir
+          emptyDir: {}
+        {{- if .Values.nvidia.driver.enabled }}
+        - name: nvidia-driver
+          hostPath:
+            path: {{ .Values.nvidia.driver.hostPath }}
+        {{- end }}
+        {{- if .Values.nvidia.devices.enabled }}
+        - name: nvidia-devices
+          hostPath:
+            path: {{ .Values.nvidia.devices.hostPath }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
