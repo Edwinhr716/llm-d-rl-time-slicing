@@ -1,6 +1,6 @@
 module github.com/llm-d-incubation/llm-d-rl-time-slicing
 
-go 1.26.2
+go 1.25
 
 require (
 	github.com/NVIDIA/go-nvml v0.13.0-1
