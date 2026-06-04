@@ -30,8 +30,8 @@ func (s *MemLockStore) Lock(ctx context.Context, groupID, jobID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	current, ok := s.locks[groupID]
-	if ok && current != "" && current != jobID {
+	current := s.locks[groupID]
+	if current != "" && current != jobID {
 		return ErrAlreadyLocked
 	}
 	s.locks[groupID] = jobID
@@ -43,8 +43,8 @@ func (s *MemLockStore) Unlock(ctx context.Context, groupID, jobID string) error 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	current, ok := s.locks[groupID]
-	if !ok || current == "" {
+	current := s.locks[groupID]
+	if current == "" {
 		return nil
 	}
 	if current != jobID {

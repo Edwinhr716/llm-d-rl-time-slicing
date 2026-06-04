@@ -31,31 +31,34 @@ func NewConfigMapLockStore(client kubernetes.Interface) *ConfigMapLockStore {
 }
 
 func (s *ConfigMapLockStore) getOrCreateConfigMap(ctx context.Context) (*corev1.ConfigMap, error) {
-	cm, err := s.client.CoreV1().ConfigMaps(Namespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
-	if err == nil {
-		return cm, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("failed to get configmap: %w", err)
-	}
+	var cm *corev1.ConfigMap
 
-	// Create it
-	cm = &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ConfigMapName,
-			Namespace: Namespace,
-		},
-		Data: make(map[string]string),
+	err := retry.OnError(retry.DefaultRetry, apierrors.IsAlreadyExists, func() error {
+		var getErr error
+		cm, getErr = s.client.CoreV1().ConfigMaps(Namespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+		if getErr == nil {
+			return nil
+		}
+		if !apierrors.IsNotFound(getErr) {
+			return getErr
+		}
+
+		// Create it
+		newCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ConfigMapName,
+				Namespace: Namespace,
+			},
+			Data: make(map[string]string),
+		}
+		var createErr error
+		cm, createErr = s.client.CoreV1().ConfigMaps(Namespace).Create(ctx, newCM, metav1.CreateOptions{})
+		return createErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get or create configmap after %d attempts: %w", retry.DefaultRetry.Steps, err)
 	}
-	created, err := s.client.CoreV1().ConfigMaps(Namespace).Create(ctx, cm, metav1.CreateOptions{})
-	if err == nil {
-		return created, nil
-	}
-	// If it was created concurrently, try to get it again
-	if apierrors.IsAlreadyExists(err) {
-		return s.client.CoreV1().ConfigMaps(Namespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
-	}
-	return nil, fmt.Errorf("failed to create configmap: %w", err)
+	return cm, nil
 }
 
 // GetLock returns the job_id currently holding the lock for the group.

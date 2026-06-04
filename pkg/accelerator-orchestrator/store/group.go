@@ -13,7 +13,7 @@ type Group struct {
 	mu    sync.RWMutex
 	id    string
 	nodes []string
-	// activeJob is the job_id holding the lock, empty if none.
+	// lockingJob is the job_id holding the lock, empty if none.
 	lockingJob string
 	// activeJob is the job_id whose context is active, empty if none.
 	// The primary situation where the active job is not locking is the
@@ -27,12 +27,13 @@ type Group struct {
 }
 
 // NewGroup creates a new Group with default values.
-func NewGroup(id string) *Group {
+func NewGroup(id string, lockStore LockStore) *Group {
 	return &Group{
 		id:             id,
 		state:          pb.GroupStatus_STATE_UNSPECIFIED,
 		stateTimestamp: time.Now(),
 		queue:          NewWaitingJobQueue(),
+		lockStore:      lockStore,
 	}
 }
 

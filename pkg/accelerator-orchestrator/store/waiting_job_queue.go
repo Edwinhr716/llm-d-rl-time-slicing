@@ -1,6 +1,7 @@
 package store
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
@@ -14,14 +15,14 @@ type WaitingJob struct {
 // WaitingJobQueue is a thread-safe FIFO queue for WaitingJobs that prevents duplicates.
 type WaitingJobQueue struct {
 	mu    sync.RWMutex
-	jobs  []WaitingJob
-	exist map[string]struct{}
+	jobs  list.List
+	exist map[string]*list.Element
 }
 
 // NewWaitingJobQueue creates a new WaitingJobQueue.
 func NewWaitingJobQueue() *WaitingJobQueue {
 	return &WaitingJobQueue{
-		exist: make(map[string]struct{}),
+		exist: make(map[string]*list.Element),
 	}
 }
 
@@ -35,11 +36,11 @@ func (q *WaitingJobQueue) Enqueue(jobID string) bool {
 		return false
 	}
 
-	q.exist[jobID] = struct{}{}
-	q.jobs = append(q.jobs, WaitingJob{
+	elem := q.jobs.PushBack(WaitingJob{
 		JobID:       jobID,
 		QueuedSince: time.Now(),
 	})
+	q.exist[jobID] = elem
 	return true
 }
 
@@ -49,12 +50,16 @@ func (q *WaitingJobQueue) Dequeue() (string, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if len(q.jobs) == 0 {
+	front := q.jobs.Front()
+	if front == nil {
 		return "", false
 	}
 
-	job := q.jobs[0]
-	q.jobs = q.jobs[1:]
+	_ = q.jobs.Remove(front)
+	job, ok := front.Value.(WaitingJob)
+	if !ok {
+		panic("invalid type in queue")
+	}
 	delete(q.exist, job.JobID)
 	return job.JobID, true
 }
@@ -63,7 +68,7 @@ func (q *WaitingJobQueue) Dequeue() (string, bool) {
 func (q *WaitingJobQueue) Len() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return len(q.jobs)
+	return q.jobs.Len()
 }
 
 // Exists checks if a job is currently in the queue.
@@ -79,28 +84,13 @@ func (q *WaitingJobQueue) List() []WaitingJob {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 
-	if len(q.jobs) == 0 {
-		return nil
-	}
-	res := make([]WaitingJob, len(q.jobs))
-	copy(res, q.jobs)
-	return res
-}
-
-// Reset clears the queue and re-initializes it with the provided jobs, preserving their order.
-// It automatically filters out any duplicates in the input slice (keeping the first occurrence).
-func (q *WaitingJobQueue) Reset(jobs []WaitingJob) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	q.jobs = nil
-	q.exist = make(map[string]struct{})
-
-	for _, j := range jobs {
-		if _, ok := q.exist[j.JobID]; ok {
-			continue // skip duplicates in input
+	res := make([]WaitingJob, 0, q.jobs.Len())
+	for e := q.jobs.Front(); e != nil; e = e.Next() {
+		job, ok := e.Value.(WaitingJob)
+		if !ok {
+			panic("invalid type in queue")
 		}
-		q.exist[j.JobID] = struct{}{}
-		q.jobs = append(q.jobs, j)
+		res = append(res, job)
 	}
+	return res
 }

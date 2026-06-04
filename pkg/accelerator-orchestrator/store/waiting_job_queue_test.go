@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/accelerator-orchestrator/store"
 )
@@ -73,85 +72,6 @@ func TestWaitingJobQueue_BasicAndDuplicates(t *testing.T) {
 					got := queue.Len()
 					if got != step.wantInt {
 						t.Fatalf("step %d: Len() = %d, want %d", i, got, step.wantInt)
-					}
-				}
-			}
-		})
-	}
-}
-
-func TestWaitingJobQueue_Reset(t *testing.T) {
-	tests := []struct {
-		name        string
-		initial     []string
-		resetInput  []store.WaitingJob
-		expectedIDs []string
-	}{
-		{
-			name:        "reset empty queue to empty",
-			initial:     nil,
-			resetInput:  nil,
-			expectedIDs: nil,
-		},
-		{
-			name:    "reset empty queue with populated values",
-			initial: nil,
-			resetInput: []store.WaitingJob{
-				{JobID: "job-1", QueuedSince: time.Now()},
-				{JobID: "job-2", QueuedSince: time.Now()},
-			},
-			expectedIDs: []string{"job-1", "job-2"},
-		},
-		{
-			name:    "reset and deduplicate",
-			initial: []string{"old-job"},
-			resetInput: []store.WaitingJob{
-				{JobID: "job-1", QueuedSince: time.Now()},
-				{JobID: "job-2", QueuedSince: time.Now()},
-				{JobID: "job-1", QueuedSince: time.Now().Add(time.Second)}, // duplicate
-			},
-			expectedIDs: []string{"job-1", "job-2"},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			queue := store.NewWaitingJobQueue()
-			for _, id := range tc.initial {
-				_ = queue.Enqueue(id)
-			}
-
-			queue.Reset(tc.resetInput)
-
-			if queue.Len() != len(tc.expectedIDs) {
-				t.Fatalf("after Reset, Len() = %d, want %d", queue.Len(), len(tc.expectedIDs))
-			}
-
-			// Check order and existence
-			list := queue.List()
-			if len(list) != len(tc.expectedIDs) {
-				t.Fatalf("after Reset, List() returned %d items, want %d", len(list), len(tc.expectedIDs))
-			}
-
-			for i, got := range list {
-				if got.JobID != tc.expectedIDs[i] {
-					t.Errorf("at index %d, got job ID %q, want %q", i, got.JobID, tc.expectedIDs[i])
-				}
-			}
-
-			// Ensure old jobs are removed
-			for _, old := range tc.initial {
-				if queue.Exists(old) {
-					// Unless it was explicitly part of reset
-					stillExpected := false
-					for _, exp := range tc.expectedIDs {
-						if exp == old {
-							stillExpected = true
-							break
-						}
-					}
-					if !stillExpected {
-						t.Errorf("old job %q still exists in queue after Reset", old)
 					}
 				}
 			}

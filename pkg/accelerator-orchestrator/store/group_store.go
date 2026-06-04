@@ -13,6 +13,8 @@ var (
 	ErrAlreadyLocked = errors.New("group is already locked")
 	// ErrNotLockHolder is returned when trying to unlock a group locked by another job.
 	ErrNotLockHolder = errors.New("group is locked by another job")
+	// ErrAlreadyExists is returned when trying to add a resource that already exists.
+	ErrAlreadyExists = errors.New("resource already exists")
 )
 
 // LockStore defines the interface for persisting lock state.
@@ -56,6 +58,23 @@ func (s *GroupStore) Get(ctx context.Context, id string) (*Group, error) {
 	return g, nil
 }
 
+// GetOrCreate returns the group with the given ID. If it does not exist, it creates
+// a new group, adds it to the store, and returns it.
+// Returns the group, a boolean indicating if a new group was created, and any error.
+func (s *GroupStore) GetOrCreate(ctx context.Context, id string) (*Group, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	g, ok := s.groups[id]
+	if ok {
+		return g, false, nil
+	}
+
+	g = NewGroup(id, s.lockStore)
+	s.groups[id] = g
+	return g, true, nil
+}
+
 // List returns all known groups.
 func (s *GroupStore) List(ctx context.Context) ([]*Group, error) {
 	s.mu.RLock()
@@ -66,19 +85,6 @@ func (s *GroupStore) List(ctx context.Context) ([]*Group, error) {
 		list = append(list, g)
 	}
 	return list, nil
-}
-
-func (s *GroupStore) Put(ctx context.Context, group *Group) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	g, ok := s.groups[group.ID()]
-	if ok {
-		group.queue = g.queue
-	}
-	group.lockStore = s.lockStore
-	s.groups[group.ID()] = group
-	return nil
 }
 
 // Delete removes the group.

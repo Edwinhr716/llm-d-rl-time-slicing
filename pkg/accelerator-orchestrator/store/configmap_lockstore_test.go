@@ -3,12 +3,17 @@ package store_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/accelerator-orchestrator/store"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestConfigMapLockStore_LockAndUnlock(t *testing.T) {
@@ -154,6 +159,253 @@ func TestConfigMapLockStore_GetLockScenarios(t *testing.T) {
 			}
 			if got != tc.expected {
 				t.Errorf("GetLock() = %q, want %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestConfigMapLockStore_Lock_RetryOnConflict(t *testing.T) {
+	ctx := context.Background()
+	groupID := "group-1"
+	jobID := "job-a"
+
+	tests := []struct {
+		name          string
+		conflictCount int
+		shouldSucceed bool
+	}{
+		{
+			name:          "succeeds after 2 conflicts",
+			conflictCount: 2,
+			shouldSucceed: true,
+		},
+		{
+			name:          "fails after too many conflicts (6 conflicts)",
+			conflictCount: 6,
+			shouldSucceed: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewSimpleClientset()
+			lockStore := store.NewConfigMapLockStore(client)
+
+			// Pre-create the configmap so Lock doesn't have to create it (keeps reactor simpler)
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      store.ConfigMapName,
+					Namespace: store.Namespace,
+				},
+				Data: make(map[string]string),
+			}
+			_, err := client.CoreV1().ConfigMaps(store.Namespace).Create(ctx, cm, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("failed to pre-create ConfigMap: %v", err)
+			}
+
+			attempts := 0
+			client.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				attempts++
+				if attempts <= tc.conflictCount {
+					return true, nil, apierrors.NewConflict(
+						schema.GroupResource{Resource: "configmaps"},
+						store.ConfigMapName,
+						errors.New("simulated conflict"),
+					)
+				}
+				return false, nil, nil // Let the fake client handle it normally
+			})
+
+			err = lockStore.Lock(ctx, groupID, jobID)
+			if tc.shouldSucceed {
+				verifyLockSuccess(t, ctx, lockStore, groupID, jobID, err)
+			} else {
+				verifyConflict(t, "Lock()", err)
+			}
+		})
+	}
+}
+
+func TestConfigMapLockStore_Unlock_RetryOnConflict(t *testing.T) {
+	ctx := context.Background()
+	groupID := "group-1"
+	jobID := "job-a"
+
+	tests := []struct {
+		name          string
+		conflictCount int
+		shouldSucceed bool
+	}{
+		{
+			name:          "succeeds after 2 conflicts",
+			conflictCount: 2,
+			shouldSucceed: true,
+		},
+		{
+			name:          "fails after too many conflicts (6 conflicts)",
+			conflictCount: 6,
+			shouldSucceed: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewSimpleClientset()
+			lockStore := store.NewConfigMapLockStore(client)
+
+			// Pre-create the configmap with lock
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      store.ConfigMapName,
+					Namespace: store.Namespace,
+				},
+				Data: map[string]string{
+					groupID: jobID,
+				},
+			}
+			_, err := client.CoreV1().ConfigMaps(store.Namespace).Create(ctx, cm, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("failed to pre-create ConfigMap: %v", err)
+			}
+
+			attempts := 0
+			client.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				attempts++
+				if attempts <= tc.conflictCount {
+					return true, nil, apierrors.NewConflict(
+						schema.GroupResource{Resource: "configmaps"},
+						store.ConfigMapName,
+						errors.New("simulated conflict"),
+					)
+				}
+				return false, nil, nil
+			})
+
+			err = lockStore.Unlock(ctx, groupID, jobID)
+			if tc.shouldSucceed {
+				verifyUnlockSuccess(t, ctx, lockStore, groupID, err)
+			} else {
+				verifyConflict(t, "Unlock()", err)
+			}
+		})
+	}
+}
+
+func verifyLockSuccess(t *testing.T, ctx context.Context, lockStore *store.ConfigMapLockStore, groupID, jobID string, err error) {
+	t.Helper()
+	if err != nil {
+		t.Errorf("Lock() failed: %v, want success", err)
+	}
+	got, err := lockStore.GetLock(ctx, groupID)
+	if err != nil {
+		t.Fatalf("GetLock() failed: %v", err)
+	}
+	if got != jobID {
+		t.Errorf("GetLock() = %q, want %q", got, jobID)
+	}
+}
+
+func verifyUnlockSuccess(t *testing.T, ctx context.Context, lockStore *store.ConfigMapLockStore, groupID string, err error) {
+	t.Helper()
+	if err != nil {
+		t.Errorf("Unlock() failed: %v, want success", err)
+	}
+	got, err := lockStore.GetLock(ctx, groupID)
+	if err != nil {
+		t.Fatalf("GetLock() failed: %v", err)
+	}
+	if got != "" {
+		t.Errorf("GetLock() = %q, want empty (unlocked)", got)
+	}
+}
+
+func verifyConflict(t *testing.T, op string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Errorf("%s succeeded, want failure due to conflict", op)
+	}
+	if !apierrors.IsConflict(err) {
+		t.Errorf("%s error = %v, want Conflict error", op, err)
+	}
+}
+
+func TestConfigMapLockStore_Lock_GetOrCreateRetry(t *testing.T) {
+	ctx := context.Background()
+	groupID := "group-1"
+	jobID := "job-a"
+
+	tests := []struct {
+		name               string
+		setupReactor       func(client *fake.Clientset)
+		shouldSucceed      bool
+		expectedErrMessage string
+	}{
+		{
+			name: "success on first try",
+			setupReactor: func(client *fake.Clientset) {
+				// No special reactor needed, fake client handles it
+			},
+			shouldSucceed: true,
+		},
+		{
+			name: "succeeds after 1 retry (concurrent create)",
+			setupReactor: func(client *fake.Clientset) {
+				attempts := 0
+				client.PrependReactor("create", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+					attempts++
+					if attempts == 1 {
+						// Simulate concurrent creation by adding it to tracker
+						createAction, ok := action.(k8stesting.CreateAction)
+						if !ok {
+							return true, nil, errors.New("expected CreateAction")
+						}
+						obj := createAction.GetObject()
+						if err := client.Tracker().Add(obj); err != nil {
+							return true, nil, err
+						}
+						return true, nil, apierrors.NewAlreadyExists(
+							schema.GroupResource{Resource: "configmaps"},
+							store.ConfigMapName,
+						)
+					}
+					return false, nil, nil
+				})
+			},
+			shouldSucceed: true,
+		},
+		{
+			name: "fails after too many attempts",
+			setupReactor: func(client *fake.Clientset) {
+				// Always fail Create with AlreadyExists, but never add to tracker
+				// So Get will always return NotFound
+				client.PrependReactor("create", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewAlreadyExists(
+						schema.GroupResource{Resource: "configmaps"},
+						store.ConfigMapName,
+					)
+				})
+			},
+			shouldSucceed:      false,
+			expectedErrMessage: "failed to get or create configmap after 5 attempts",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewSimpleClientset()
+			tc.setupReactor(client)
+			lockStore := store.NewConfigMapLockStore(client)
+
+			err := lockStore.Lock(ctx, groupID, jobID)
+			if tc.shouldSucceed {
+				verifyLockSuccess(t, ctx, lockStore, groupID, jobID, err)
+			} else {
+				if err == nil {
+					t.Errorf("Lock() succeeded, want failure")
+				} else if !strings.Contains(err.Error(), tc.expectedErrMessage) {
+					t.Errorf("Lock() error = %v, want error containing %q", err, tc.expectedErrMessage)
+				}
 			}
 		})
 	}

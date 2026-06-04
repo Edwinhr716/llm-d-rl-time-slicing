@@ -40,7 +40,7 @@ func TestGroup_GettersAndSetters(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			group := store.NewGroup(tc.groupID)
+			group := store.NewGroup(tc.groupID, nil)
 			group.SetNodes(tc.nodes)
 
 			if group.ID() != tc.groupID {
@@ -126,12 +126,10 @@ func TestGroup_LockAndUnlock(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			group := store.NewGroup("group-1")
-
-			// Associate it with the lockStore via Put in GroupStore
 			groupStore := store.NewGroupStore(tc.lockStore)
-			if err := groupStore.Put(ctx, group); err != nil {
-				t.Fatalf("failed to put group: %v", err)
+			group, _, err := groupStore.GetOrCreate(ctx, "group-1")
+			if err != nil {
+				t.Fatalf("failed to get or create group: %v", err)
 			}
 
 			for i, s := range tc.steps {

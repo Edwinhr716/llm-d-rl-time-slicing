@@ -47,9 +47,7 @@ func TestGroupStore_Get(t *testing.T) {
 			ctx := context.Background()
 			groupStore := store.NewGroupStore(store.NewMemLockStore())
 			for _, g := range tc.initial {
-				if err := groupStore.Put(ctx, g); err != nil {
-					t.Fatalf("failed to put initial group: %v", err)
-				}
+				addGroupToStore(t, ctx, groupStore, g)
 			}
 
 			got, err := groupStore.Get(ctx, tc.groupID)
@@ -60,71 +58,6 @@ func TestGroupStore_Get(t *testing.T) {
 				if got.ID() != tc.wantGroup.ID() {
 					t.Errorf("Get() got group ID %q, want %q", got.ID(), tc.wantGroup.ID())
 				}
-			}
-		})
-	}
-}
-
-func TestGroupStore_Put(t *testing.T) {
-	tests := []struct {
-		name        string
-		initial     []*store.Group
-		putGroup    *store.Group
-		expectedLen int
-	}{
-		{
-			name:        "put into empty store",
-			initial:     nil,
-			putGroup:    newTestGroup("group-1", nil),
-			expectedLen: 1,
-		},
-		{
-			name: "overwrite existing group",
-			initial: []*store.Group{
-				newTestGroup("group-1", []string{"node-a"}),
-			},
-			putGroup:    newTestGroup("group-1", []string{"node-b"}),
-			expectedLen: 1,
-		},
-		{
-			name: "put another group",
-			initial: []*store.Group{
-				newTestGroup("group-1", nil),
-			},
-			putGroup:    newTestGroup("group-2", nil),
-			expectedLen: 2,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			groupStore := store.NewGroupStore(store.NewMemLockStore())
-			for _, g := range tc.initial {
-				if err := groupStore.Put(ctx, g); err != nil {
-					t.Fatalf("failed to put initial group: %v", err)
-				}
-			}
-
-			err := groupStore.Put(ctx, tc.putGroup)
-			if err != nil {
-				t.Fatalf("Put() returned error: %v", err)
-			}
-
-			list, err := groupStore.List(ctx)
-			if err != nil {
-				t.Fatalf("List() returned error: %v", err)
-			}
-			if len(list) != tc.expectedLen {
-				t.Errorf("expected store size %d, got %d", tc.expectedLen, len(list))
-			}
-
-			got, err := groupStore.Get(ctx, tc.putGroup.ID())
-			if err != nil {
-				t.Fatalf("failed to retrieve put group: %v", err)
-			}
-			if got.ID() != tc.putGroup.ID() {
-				t.Errorf("retrieved group ID does not match put group ID")
 			}
 		})
 	}
@@ -163,9 +96,7 @@ func TestGroupStore_List(t *testing.T) {
 			ctx := context.Background()
 			groupStore := store.NewGroupStore(store.NewMemLockStore())
 			for _, g := range tc.initial {
-				if err := groupStore.Put(ctx, g); err != nil {
-					t.Fatalf("failed to put initial group: %v", err)
-				}
+				addGroupToStore(t, ctx, groupStore, g)
 			}
 
 			list, err := groupStore.List(ctx)
@@ -221,9 +152,7 @@ func TestGroupStore_Delete(t *testing.T) {
 			ctx := context.Background()
 			groupStore := store.NewGroupStore(store.NewMemLockStore())
 			for _, g := range tc.initial {
-				if err := groupStore.Put(ctx, g); err != nil {
-					t.Fatalf("failed to put initial group: %v", err)
-				}
+				addGroupToStore(t, ctx, groupStore, g)
 			}
 
 			err := groupStore.Delete(ctx, tc.deleteID)
@@ -269,9 +198,91 @@ func TestGroupStateEnum(t *testing.T) {
 }
 
 func newTestGroup(id string, nodes []string) *store.Group {
-	g := store.NewGroup(id)
+	g := store.NewGroup(id, nil)
 	if nodes != nil {
 		g.SetNodes(nodes)
 	}
 	return g
+}
+
+func TestGroupStore_GetOrCreate(t *testing.T) {
+	tests := []struct {
+		name        string
+		initial     []*store.Group
+		groupID     string
+		wantCreated bool
+		expectedLen int
+	}{
+		{
+			name:        "group does not exist",
+			initial:     nil,
+			groupID:     "group-1",
+			wantCreated: true,
+			expectedLen: 1,
+		},
+		{
+			name: "group already exists",
+			initial: []*store.Group{
+				newTestGroup("group-1", nil),
+			},
+			groupID:     "group-1",
+			wantCreated: false,
+			expectedLen: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			groupStore := store.NewGroupStore(store.NewMemLockStore())
+			for _, g := range tc.initial {
+				addGroupToStore(t, ctx, groupStore, g)
+			}
+
+			got, created, err := groupStore.GetOrCreate(ctx, tc.groupID)
+			if err != nil {
+				t.Fatalf("GetOrCreate() returned error: %v", err)
+			}
+
+			if created != tc.wantCreated {
+				t.Errorf("GetOrCreate() created = %t, want %t", created, tc.wantCreated)
+			}
+
+			if got.ID() != tc.groupID {
+				t.Errorf("GetOrCreate() returned group with ID %q, want %q", got.ID(), tc.groupID)
+			}
+
+			list, err := groupStore.List(ctx)
+			if err != nil {
+				t.Fatalf("List() returned error: %v", err)
+			}
+			if len(list) != tc.expectedLen {
+				t.Errorf("expected store size %d, got %d", tc.expectedLen, len(list))
+			}
+
+			// Verify it is in the store
+			stored, err := groupStore.Get(ctx, tc.groupID)
+			if err != nil {
+				t.Fatalf("failed to retrieve group from store: %v", err)
+			}
+			if stored != got {
+				t.Errorf("retrieved group does not match returned group pointer")
+			}
+		})
+	}
+}
+
+func addGroupToStore(t *testing.T, ctx context.Context, s *store.GroupStore, g *store.Group) {
+	t.Helper()
+	got, created, err := s.GetOrCreate(ctx, g.ID())
+	if err != nil {
+		t.Fatalf("failed to add group to store: %v", err)
+	}
+	if !created {
+		t.Fatalf("failed to add initial group: group %q already exists", g.ID())
+	}
+	nodes := g.Nodes()
+	if len(nodes) > 0 {
+		got.SetNodes(nodes)
+	}
 }
