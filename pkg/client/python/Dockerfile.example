@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies, including git for pip install git+https
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies, including the timeslice library from GitHub
+RUN pip install --no-cache-dir \
+    requests==2.32.3 \
+    vllm \
+    "git+https://github.com/Edwinhr716/llm-d-rl-time-slicing.git@cuda-checkpoint#subdirectory=pkg/client/python"
+
+# Copy the example script
+COPY pkg/client/python/examples/timeslice_sampler.py .
+
+# Create a non-privileged user
+RUN useradd -m sampler && chown -R sampler:sampler /app
+USER sampler
+
+# Set entrypoint
+ENTRYPOINT ["python", "timeslice_sampler.py"]
