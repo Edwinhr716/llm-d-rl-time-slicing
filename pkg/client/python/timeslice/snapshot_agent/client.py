@@ -6,6 +6,7 @@ from . import snapshot_agent_pb2, snapshot_agent_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
+
 class SnapshotAgentClient:
     """Client for SnapshotAgentService."""
 
@@ -40,7 +41,9 @@ class SnapshotAgentClient:
             SnapshotResponse or None on error.
         """
         try:
-            request = snapshot_agent_pb2.SnapshotRequest(job_id=job_id, group=group, backend=backend)
+            request = snapshot_agent_pb2.SnapshotRequest(
+                job_id=job_id, group=group, backend=backend
+            )
             logger.info(f"Calling Snapshot with job_id={job_id}, group={group}...")
             response = self.stub.Snapshot(request)
             logger.info(f"Snapshot Response: operation_id={response.operation_id}")
@@ -63,7 +66,9 @@ class SnapshotAgentClient:
             request = snapshot_agent_pb2.GetOperationRequest(operation_id=operation_id)
             logger.info(f"Calling GetOperation with operation_id={operation_id}...")
             response = self.stub.GetOperation(request)
-            logger.info(f"GetOperation Response: status={response.status}, elapsed={response.elapsed_ms}ms")
+            logger.info(
+                f"GetOperation Response: status={response.status}, elapsed={response.elapsed_ms}ms"
+            )
             if response.error:
                 logger.error(f"Operation error: {response.error}")
             return response
@@ -84,7 +89,9 @@ class SnapshotAgentClient:
             RestoreResponse or None on error.
         """
         try:
-            request = snapshot_agent_pb2.RestoreRequest(job_id=job_id, group=group, backend=backend)
+            request = snapshot_agent_pb2.RestoreRequest(
+                job_id=job_id, group=group, backend=backend
+            )
             logger.info(f"Calling Restore with job_id={job_id}, group={group}...")
             response = self.stub.Restore(request)
             logger.info(f"Restore Response: operation_id={response.operation_id}")
