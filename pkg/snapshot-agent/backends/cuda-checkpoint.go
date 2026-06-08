@@ -30,21 +30,10 @@ func (c *CudaCheckpoint) Snapshot(ctx context.Context, pids []string) error {
 
 	// 1. Lock and Checkpoint CUDA
 	t0 := time.Now()
-	binaryPath := c.getCudaCheckpointPath()
-
-	pidArgs := make([]string, 0, 2*len(pids))
-	for _, pid := range pids {
-		pidArgs = append(pidArgs, "--pid", pid)
-	}
-
-	if err := c.runSudoCommand(ctx, binaryPath, append([]string{"--action", "lock"}, pidArgs...)...); err != nil {
-		return fmt.Errorf("cuda-checkpoint lock failed: %w", err)
-	}
-	if err := c.runSudoCommand(ctx, binaryPath, append([]string{"--action", "checkpoint"}, pidArgs...)...); err != nil {
+	if err := c.checkpointPIDs(ctx, pids); err != nil {
 		return fmt.Errorf("cuda-checkpoint checkpoint failed: %w", err)
 	}
 	logger.Info("cuda-checkpoint action took", "duration", time.Since(t0))
-
 	return nil
 }
 
@@ -60,13 +49,7 @@ func (c *CudaCheckpoint) Restore(ctx context.Context, pids []string) error {
 
 	logger.Info("Restoring PIDs", "pids", pids)
 	t0 := time.Now()
-	binaryPath := c.getCudaCheckpointPath()
-	pidArgs := make([]string, 0, 2*len(pids))
-	for _, pid := range pids {
-		pidArgs = append(pidArgs, "--pid", pid)
-	}
-
-	if err := c.runSudoCommand(ctx, binaryPath, append([]string{"--toggle"}, pidArgs...)...); err != nil {
+	if err := c.restorePIDs(ctx, pids); err != nil {
 		return fmt.Errorf("cuda-checkpoint toggle failed: %w", err)
 	}
 	logger.Info("cuda-checkpoint toggle took", "duration", time.Since(t0), "pids", pids)
@@ -87,6 +70,33 @@ func (c *CudaCheckpoint) runSudoCommand(ctx context.Context, name string, args .
 	cmd := exec.CommandContext(ctx, name, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("command failed: %w, output: %s", err, string(out))
+	}
+	return nil
+}
+
+func (c *CudaCheckpoint) checkpointPIDs(ctx context.Context, pids []string) error {
+	binaryPath := c.getCudaCheckpointPath()
+	pidArgs := make([]string, 0, 2*len(pids))
+	for _, pid := range pids {
+		pidArgs = append(pidArgs, "--pid", pid)
+	}
+	if err := c.runSudoCommand(ctx, binaryPath, append([]string{"--action", "lock"}, pidArgs...)...); err != nil {
+		return fmt.Errorf("cuda-checkpoint lock failed: %w", err)
+	}
+	if err := c.runSudoCommand(ctx, binaryPath, append([]string{"--action", "checkpoint"}, pidArgs...)...); err != nil {
+		return fmt.Errorf("cuda-checkpoint checkpoint failed: %w", err)
+	}
+	return nil
+}
+
+func (c *CudaCheckpoint) restorePIDs(ctx context.Context, pids []string) error {
+	binaryPath := c.getCudaCheckpointPath()
+	pidArgs := make([]string, 0, 2*len(pids))
+	for _, pid := range pids {
+		pidArgs = append(pidArgs, "--pid", pid)
+	}
+	if err := c.runSudoCommand(ctx, binaryPath, append([]string{"--toggle"}, pidArgs...)...); err != nil {
+		return fmt.Errorf("cuda-checkpoint toggle failed: %w", err)
 	}
 	return nil
 }
