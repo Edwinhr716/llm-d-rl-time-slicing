@@ -1,4 +1,4 @@
-package server
+package server_test
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -22,13 +23,13 @@ var lis *bufconn.Listener
 func initGRPCServer() {
 	lis = bufconn.Listen(bufSize)
 	s := grpc.NewServer()
-	
+
 	noopBackend := backends.NewNoopBackend()
 	backendsMap := map[string]backends.Backend{
 		"noop": noopBackend,
 	}
-	
-	pb.RegisterSnapshotAgentServiceServer(s, NewServer(backendsMap, "noop"))
+
+	pb.RegisterSnapshotAgentServiceServer(s, server.NewServer(backendsMap, "noop"))
 	go func() {
 		if err := s.Serve(lis); err != nil {
 			log.Fatalf("Server exited with error: %v", err)
@@ -43,7 +44,9 @@ func bufDialer(context.Context, string) (net.Conn, error) {
 func TestServer_Snapshot(t *testing.T) {
 	initGRPCServer()
 	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(bufDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -62,7 +65,9 @@ func TestServer_Snapshot(t *testing.T) {
 func TestServer_Snapshot_InvalidBackend(t *testing.T) {
 	initGRPCServer()
 	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(bufDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -82,7 +87,9 @@ func TestServer_Snapshot_InvalidBackend(t *testing.T) {
 func TestServer_Restore(t *testing.T) {
 	initGRPCServer()
 	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(bufDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -101,7 +108,9 @@ func TestServer_Restore(t *testing.T) {
 func TestServer_GetOperation(t *testing.T) {
 	initGRPCServer()
 	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(bufDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -119,7 +128,9 @@ func TestServer_GetOperation(t *testing.T) {
 func TestServer_Status(t *testing.T) {
 	initGRPCServer()
 	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(bufDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -135,7 +146,9 @@ func TestServer_Status(t *testing.T) {
 func TestServer_Health(t *testing.T) {
 	initGRPCServer()
 	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(bufDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}

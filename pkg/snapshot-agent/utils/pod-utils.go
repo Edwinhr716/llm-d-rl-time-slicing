@@ -20,13 +20,13 @@ const (
 	SnapshotAgentLabel = "snapshot-agent"
 	// SnapshotAgentValue is the value of the label for pods to be managed.
 	SnapshotAgentValue = "true"
-	JobIdLabel         = "timeslice.io/job-id"
+	JobIDLabel         = "timeslice.io/job-id"
 )
 
 // GetLocalPods returns a list of pods running on the same node as the current pod.
 // It uses the NODE_NAME environment variable (populated via the Downward API)
 // to filter pods by node and the snapshot-agent label to filter by managed pods.
-func GetLocalPods(ctx context.Context, jobId string) ([]corev1.Pod, error) {
+func GetLocalPods(ctx context.Context, jobID string) ([]corev1.Pod, error) {
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
 		return nil, fmt.Errorf("NODE_NAME environment variable not set")
@@ -47,7 +47,7 @@ func GetLocalPods(ctx context.Context, jobId string) ([]corev1.Pod, error) {
 	// List pods on the current node that have the snapshot-agent label
 	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
-		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", SnapshotAgentLabel, SnapshotAgentValue, JobIdLabel, jobId),
+		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", SnapshotAgentLabel, SnapshotAgentValue, JobIDLabel, jobID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pods on node %s: %w", nodeName, err)
@@ -72,7 +72,11 @@ func GetPodPIDs(ctx context.Context, podName, namespace string) ([]int, error) {
 		return nil, fmt.Errorf("failed to initialize NVML: %v", nvml.ErrorString(ret))
 	}
 	log.Printf("NVML initialized successfully")
-	defer nvml.Shutdown()
+	defer func() {
+		if ret := nvml.Shutdown(); ret != nvml.SUCCESS {
+			log.Printf("Failed to shutdown NVML: %v", nvml.ErrorString(ret))
+		}
+	}()
 
 	// 3. Discover PIDs
 	count, ret := nvml.DeviceGetCount()
@@ -157,7 +161,7 @@ func isPIDInPodCgroup(pid int, podUID string) (bool, error) {
 	return isPIDInPodCgroupInternal(fmt.Sprintf("/proc/%d/cgroup", pid), podUID)
 }
 
-func isPIDInPodCgroupInternal(cgroupPath string, podUID string) (bool, error) {
+func isPIDInPodCgroupInternal(cgroupPath, podUID string) (bool, error) {
 	f, err := os.Open(cgroupPath)
 	if err != nil {
 		return false, err

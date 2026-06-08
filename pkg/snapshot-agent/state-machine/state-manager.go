@@ -208,7 +208,7 @@ func (sm *StateManager) GetJobStatus() []*pb.JobStatus {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	var statuses []*pb.JobStatus
+	statuses := make([]*pb.JobStatus, 0, len(sm.jobs))
 	for id, job := range sm.jobs {
 		job.mu.Lock()
 		statuses = append(statuses, &pb.JobStatus{
