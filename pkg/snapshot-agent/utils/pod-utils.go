@@ -68,8 +68,8 @@ func GetPodPIDs(ctx context.Context, podName, namespace string) ([]int, error) {
 	log.Printf("Initializing NVML...")
 	ret := nvml.Init()
 	if ret != nvml.SUCCESS {
-		log.Printf("Failed to initialize NVML: %v", nvml.ErrorString(ret))
-		return nil, fmt.Errorf("failed to initialize NVML: %v", nvml.ErrorString(ret))
+		log.Printf("Failed to initialize NVML: %v", ret)
+		return nil, fmt.Errorf("failed to initialize NVML: %v", ret)
 	}
 	log.Printf("NVML initialized successfully")
 	defer nvml.Shutdown()
@@ -77,7 +77,7 @@ func GetPodPIDs(ctx context.Context, podName, namespace string) ([]int, error) {
 	// 3. Discover PIDs
 	count, ret := nvml.DeviceGetCount()
 	if ret != nvml.SUCCESS {
-		return nil, fmt.Errorf("failed to get device count: %v", nvml.ErrorString(ret))
+		return nil, fmt.Errorf("failed to get device count: %v", ret)
 	}
 
 	var pids []int

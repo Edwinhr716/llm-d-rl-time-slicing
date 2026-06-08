@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 )
 
 // CudaCheckpoint implements the Backend interface using cuda-checkpoint and optionally CRIU.
@@ -35,12 +35,77 @@ func (c *CudaCheckpoint) Discover(ctx context.Context) error {
 	}
 
 	// 2. Discover GPUs using NVML
-	_, err = utils.DiscoverGPUs()
+	_, err = c.discoverGPUs()
 	if err != nil {
 		return fmt.Errorf("GPU discovery failed: %w", err)
 	}
 
 	return nil
+}
+
+func (c *CudaCheckpoint) discoverGPUs() (int, error) {
+	log.Printf("Initializing NVML...")
+	ret := nvml.Init()
+	if ret != nvml.SUCCESS {
+		return 0, fmt.Errorf("failed to initialize NVML: %v", ret)
+	}
+	log.Printf("NVML initialized successfully")
+	defer nvml.Shutdown()
+
+	count, ret := nvml.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		return 0, fmt.Errorf("failed to get device count: %v", ret)
+	}
+
+	if count == 0 {
+		return 0, fmt.Errorf("no GPUs found on the system")
+	}
+
+	return count, nil
+}
+
+// GetAcceleratorStatuses returns the status of accelerators managed by this backend.
+func (c *CudaCheckpoint) GetAcceleratorStatuses(ctx context.Context) ([]GPUStatus, error) {
+	log.Printf("Initializing NVML for status discovery...")
+	ret := nvml.Init()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("failed to initialize NVML: %v", ret)
+	}
+	defer nvml.Shutdown()
+
+	count, ret := nvml.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("failed to get device count: %v", ret)
+	}
+
+	var statuses []GPUStatus
+	for i := 0; i < count; i++ {
+		device, ret := nvml.DeviceGetHandleByIndex(i)
+		if ret != nvml.SUCCESS {
+			log.Printf("Failed to get handle for device %d: %v", i, ret)
+			continue
+		}
+
+		uuid, ret := device.GetUUID()
+		if ret != nvml.SUCCESS {
+			log.Printf("Failed to get UUID for device %d: %v", i, ret)
+			uuid = fmt.Sprintf("gpu-%d", i)
+		}
+
+		memory, ret := device.GetMemoryInfo()
+		if ret != nvml.SUCCESS {
+			log.Printf("Failed to get memory info for device %d: %v", i, ret)
+			continue
+		}
+
+		statuses = append(statuses, GPUStatus{
+			ID:               uuid,
+			MemoryUsedBytes:  memory.Used,
+			MemoryTotalBytes: memory.Total,
+		})
+	}
+
+	return statuses, nil
 }
 
 // Snapshot triggers a snapshot of the accelerator context for a job.

@@ -175,10 +175,27 @@ func (s *Server) GetOperation(ctx context.Context, req *pb.GetOperationRequest) 
 // Status returns the current state of jobs and accelerators on the node.
 func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
 	log.Printf("Status called")
+
+	var acceleratorStatuses []*pb.AcceleratorStatus
+	backend, ok := s.backends[s.defaultBackend]
+	if ok {
+		gpuStatuses, err := backend.GetAcceleratorStatuses(ctx)
+		if err != nil {
+			log.Printf("Failed to get accelerator statuses from backend %s: %v", s.defaultBackend, err)
+		} else {
+			for _, gs := range gpuStatuses {
+				acceleratorStatuses = append(acceleratorStatuses, &pb.AcceleratorStatus{
+					Id:               gs.ID,
+					MemoryUsedBytes:  int64(gs.MemoryUsedBytes),
+					MemoryTotalBytes: int64(gs.MemoryTotalBytes),
+				})
+			}
+		}
+	}
+
 	return &pb.StatusResponse{
-		JobStatuses: s.state.GetJobStatus(),
-		// TODO: Implement accelerator status discovery
-		AcceleratorStatuses: nil,
+		JobStatuses:         s.state.GetJobStatus(),
+		AcceleratorStatuses: acceleratorStatuses,
 	}, nil
 }
 

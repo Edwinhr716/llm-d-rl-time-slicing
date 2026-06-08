@@ -35,3 +35,9 @@ func (b *NoopBackend) Discover(ctx context.Context) error {
 	log.Printf("NoopBackend: Discover called")
 	return nil
 }
+
+// GetAcceleratorStatuses simulates getting accelerator statuses.
+func (b *NoopBackend) GetAcceleratorStatuses(ctx context.Context) ([]GPUStatus, error) {
+	log.Printf("NoopBackend: GetAcceleratorStatuses called")
+	return nil, nil
+}
