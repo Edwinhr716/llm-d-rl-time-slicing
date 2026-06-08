@@ -4,19 +4,43 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
 // CudaCheckpoint implements the Backend interface using cuda-checkpoint and optionally CRIU.
 type CudaCheckpoint struct {
-	mu          sync.Mutex
+	mu sync.Mutex
 }
 
 // NewCudaCheckpoint creates a new CudaCheckpoint backend.
 func NewCudaCheckpoint() *CudaCheckpoint {
 	return &CudaCheckpoint{}
+}
+
+// Discover checks if the backend is available and discovers available GPUs.
+func (c *CudaCheckpoint) Discover(ctx context.Context) error {
+	// 1. Check if cuda-checkpoint is executable
+	path := c.getCudaCheckpointPath()
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("cuda-checkpoint binary not found at %s: %w", path, err)
+	}
+	if info.Mode()&0111 == 0 {
+		return fmt.Errorf("cuda-checkpoint binary at %s is not executable", path)
+	}
+
+	// 2. Discover GPUs using NVML
+	_, err = utils.DiscoverGPUs()
+	if err != nil {
+		return fmt.Errorf("GPU discovery failed: %w", err)
+	}
+
+	return nil
 }
 
 // Snapshot triggers a snapshot of the accelerator context for a job.

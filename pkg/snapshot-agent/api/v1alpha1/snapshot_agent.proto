@@ -91,7 +91,9 @@ message StatusResponse {
   repeated AcceleratorStatus accelerator_statuses = 2;
 }
 
-message HealthRequest {}
+message HealthRequest {
+  string backend = 1;
+}
 
 message HealthResponse {
   bool healthy = 1;

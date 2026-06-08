@@ -142,8 +142,27 @@ func TestServer_Health(t *testing.T) {
 	defer conn.Close()
 	client := pb.NewSnapshotAgentServiceClient(conn)
 
-	_, err = client.Health(ctx, &pb.HealthRequest{})
+	// Test default backend (noop)
+	resp, err := client.Health(ctx, &pb.HealthRequest{})
 	if err != nil {
-		t.Errorf("Expected success, got error: %v", err)
+		t.Errorf("Expected success for default backend, got error: %v", err)
+	}
+	if !resp.Healthy {
+		t.Errorf("Expected Healthy=true, got false")
+	}
+
+	// Test explicit noop backend
+	resp, err = client.Health(ctx, &pb.HealthRequest{Backend: "noop"})
+	if err != nil {
+		t.Errorf("Expected success for noop backend, got error: %v", err)
+	}
+	if !resp.Healthy {
+		t.Errorf("Expected Healthy=true, got false")
+	}
+
+	// Test invalid backend
+	_, err = client.Health(ctx, &pb.HealthRequest{Backend: "invalid-backend"})
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("Expected NotFound error for invalid backend, got: %v", err)
 	}
 }
