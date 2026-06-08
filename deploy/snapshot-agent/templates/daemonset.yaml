@@ -79,11 +79,13 @@ spec:
         - name: nvidia-driver
           hostPath:
             path: {{ .Values.nvidia.driver.hostPath }}
+            type: Directory
         {{- end }}
         {{- if .Values.nvidia.devices.enabled }}
         - name: nvidia-devices
           hostPath:
             path: {{ .Values.nvidia.devices.hostPath }}
+            type: Directory
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
