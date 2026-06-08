@@ -1,0 +1,56 @@
+# Default values for snapshot-agent.
+image:
+  repository: ghcr.io/llm-d/snapshot-agent
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+podAnnotations: {}
+
+resources: {}
+#  limits:
+#    cpu: 500m
+#    memory: 1Gi
+#  requests:
+#    cpu: 100m
+#    memory: 256Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+port: 9001
+
+securityContext:
+  privileged: true
+
+nvidia:
+  driver:
+    enabled: true
+    hostPath: /home/kubernetes/bin/nvidia
+    # Path inside the container where the driver will be mounted
+    mountPath: /usr/local/nvidia
+    # List of library search paths inside the container
+    libraryPaths:
+      - /usr/local/nvidia/lib64
+  devices:
+    enabled: true
+    hostPath: /dev
+    mountPath: /dev
+
+rbac:
+  create: true
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
