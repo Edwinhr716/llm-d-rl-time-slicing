@@ -1,0 +1,14 @@
+# Default values for llm-d-rl-time-slicing parent chart.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Override values for the acceleratororchestrator subchart
+acceleratororchestrator:
+  enabled: true
+  # You can add specific overrides here, for example:
+  # replicaCount: 2
+
+# Override values for the snapshot-agent subchart
+snapshot-agent:
+  enabled: true
+  # You can add specific overrides here

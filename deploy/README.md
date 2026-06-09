@@ -1,94 +1,84 @@
-# Deploying Accelerator Orchestrator
+# Timeslice Parent Helm Chart
 
-This directory contains the Helm chart for deploying the Accelerator Orchestrator in a Kubernetes cluster.
+This is the parent Helm chart that coordinates the deployment of both the **Accelerator Orchestrator** and the **Snapshot Agent**.
+
+## Directory Structure
+
+*   `Chart.yaml`: Defines the parent chart and its dependencies.
+*   `values.yaml`: Allows overriding configuration for both subcharts.
+*   `acceleratororchestrator/`: Subchart for the Accelerator Orchestrator.
+*   `snapshot-agent/`: Subchart for the Snapshot Agent DaemonSet.
 
 ## Prerequisites
 
-*   A Kubernetes cluster.
-*   `kubectl` configured to connect to your cluster.
-*   `helm` (v3+) installed.
+*   Helm v3 installed.
+*   Access to a Kubernetes cluster.
 
-## Deployment with Helm
+## Usage
 
-> [!IMPORTANT]
-> The Accelerator Orchestrator is hardcoded to manage its locks (stored as a ConfigMap) in the `timeslice-system` namespace. Consequently, the Helm chart creates namespace-scoped RBAC resources (`Role` and `RoleBinding`) specifically in the `timeslice-system` namespace.
->
-> It is highly recommended to deploy the orchestrator itself into the `timeslice-system` namespace.
+### 1. Initialize/Update Dependencies
 
-To deploy the orchestrator using the local Helm chart:
-
-1.  **Install the chart**:
-    From the `deploy` directory, install the chart into the `timeslice-system` namespace (creating it if it doesn't exist):
-    ```bash
-    helm install acceleratororchestrator ./acceleratororchestrator \
-      --namespace timeslice-system \
-      --create-namespace
-    ```
-    This will deploy the orchestrator and set up the required RBAC permissions:
-    *   Creating a `ServiceAccount` for the orchestrator in the release namespace.
-    *   Creating a `ClusterRole` and `ClusterRoleBinding` granting the service account cluster-wide read-only permissions (`get`, `list`, `watch`) for `pods` and `nodes`.
-    *   Creating a `Role` and `RoleBinding` **specifically in the `timeslice-system` namespace** granting the service account read-write permissions (`get`, `list`, `watch`, `create`, `update`, `patch`, `delete`) for `configmaps` in that namespace.
-    *   Configuring the orchestrator pod to use this `ServiceAccount`.
-
-2.  **Verify the deployment**:
-    ```bash
-    kubectl get pods -n timeslice-system -l app.kubernetes.io/name=acceleratororchestrator
-    ```
-
-3.  **Uninstall the chart**:
-    ```bash
-    helm uninstall acceleratororchestrator --namespace timeslice-system
-    ```
-
-## Development Workflow: Custom Images
-
-During development, you will need to build your own container image containing your changes and push it to a custom registry (e.g., Google Container Registry, Artifact Registry, Docker Hub, or a local registry like Kind/Minikube).
-
-### 1. Build and Push the Image
-
-We use the provided `Makefile` targets to build and push the container image. The Makefile uses `docker buildx` under the hood to build multi-arch images (amd64/arm64) and push them to your registry.
-
-1.  Define your custom registry and version (tag) by setting them as environment variables:
-    ```bash
-    export REGISTRY=your-custom-registry.com/your-project
-    export VERSION=dev-$(git rev-parse --short HEAD)
-    ```
-2.  Run the following make target from the repository root to build and push the image:
-    ```bash
-    make image-push-orchestrator
-    ```
-    This will build the image using `docker/acceleratororchestrator/Dockerfile` and push it to `your-custom-registry.com/your-project/acceleratororchestrator:dev-<hash>`.
-
-### 2. Deploy with your Custom Image
-
-Once your image is pushed, you can instruct Helm to use it.
-
-#### Option A: Via Command Line Flags (Recommended for Development)
-
-This avoids modifying files in your git tree:
+Because this chart uses local subcharts as dependencies, you must build the dependencies before deploying. Run the following command from this directory (`deploy/`):
 
 ```bash
-helm install acceleratororchestrator ./acceleratororchestrator \
-  --namespace timeslice-system \
-  --create-namespace \
-  --set image.repository=your-custom-registry.com/your-project/acceleratororchestrator \
-  --set image.tag=dev
+helm dependency update .
 ```
 
-#### Option B: Via `values.yaml`
+This will look at the `dependencies` section in `Chart.yaml`, package the local subcharts, and place them in a `charts/` directory (which should be ignored or will be created dynamically).
 
-Edit `deploy/acceleratororchestrator/values.yaml` directly:
+### 2. Configuration
+
+You can configure the subcharts by modifying the parent `values.yaml` file. Values for each subchart must be nested under the subchart's name.
+
+Example `values.yaml`:
 
 ```yaml
-image:
-  repository: your-custom-registry.com/your-project/acceleratororchestrator
-  pullPolicy: IfNotPresent
-  tag: "dev"
+acceleratororchestrator:
+  replicaCount: 2
+  image:
+    tag: latest
+
+snapshot-agent:
+  image:
+    tag: latest
 ```
 
-And then run:
+### 3. Installation
+
+The chart automatically creates the `timeslice-system` namespace, and **all** deployed resources (orchestrator, agent, RBAC, etc.) are forced into this namespace regardless of where the Helm release is installed.
+
+To install the chart:
+
 ```bash
-helm install acceleratororchestrator ./acceleratororchestrator \
-  --namespace timeslice-system \
-  --create-namespace
+helm install timeslice .
 ```
+
+This will install the Helm release metadata in your current default namespace, but all Kubernetes resources will be deployed to `timeslice-system`.
+
+If you prefer to have the Helm release metadata also reside in the `timeslice-system` namespace, you must use the `--create-namespace` flag (or ensure the namespace exists beforehand):
+
+```bash
+helm install timeslice . -n timeslice-system --create-namespace
+```
+
+To install with custom values:
+
+```bash
+helm install timeslice . -f my-values.yaml
+```
+
+### 4. Uninstallation
+
+To uninstall/delete the `timeslice` deployment:
+
+If you installed it without specifying a namespace (default):
+```bash
+helm uninstall timeslice
+```
+
+If you installed it into the `timeslice-system` namespace:
+```bash
+helm uninstall timeslice -n timeslice-system
+```
+
+Uninstalling the release will automatically delete the `timeslice-system` namespace and all resources within it.

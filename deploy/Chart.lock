@@ -1,0 +1,9 @@
+dependencies:
+- name: acceleratororchestrator
+  repository: file://./acceleratororchestrator
+  version: 0.1.0
+- name: snapshot-agent
+  repository: file://./snapshot-agent
+  version: 0.1.0
+digest: sha256:f725b8766f3d4ff07a24396ebcc78db951e0dcedf06c00111cc6d6c602734541
+generated: "2026-06-09T20:48:07.00895014Z"

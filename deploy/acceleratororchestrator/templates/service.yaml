@@ -2,6 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "acceleratororchestrator.fullname" . }}
+  namespace: timeslice-system
   labels:
     {{- include "acceleratororchestrator.labels" . | nindent 4 }}
 spec:

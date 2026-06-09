@@ -12,5 +12,5 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ include "acceleratororchestrator.serviceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
+    namespace: timeslice-system
 {{- end }}

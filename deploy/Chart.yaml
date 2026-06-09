@@ -1,0 +1,13 @@
+apiVersion: v2
+name: timeslice
+description: Parent Helm chart to deploy both Accelerator Orchestrator and Snapshot Agent
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: acceleratororchestrator
+    version: 0.1.0
+    repository: "file://./acceleratororchestrator"
+  - name: snapshot-agent
+    version: 0.1.0
+    repository: "file://./snapshot-agent"

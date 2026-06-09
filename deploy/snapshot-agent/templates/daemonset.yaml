@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: {{ include "snapshot-agent.fullname" . }}
+  namespace: timeslice-system
   labels:
     {{- include "snapshot-agent.labels" . | nindent 4 }}
 spec:

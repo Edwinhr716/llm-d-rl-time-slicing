@@ -12,5 +12,5 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ include "snapshot-agent.serviceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
+    namespace: timeslice-system
 {{- end }}
