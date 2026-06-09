@@ -20,11 +20,12 @@ const (
 
 // Job represents a per-workload state.
 type Job struct {
-	ID    string
-	Group string
-	State pb.JobState
-	PIDs  []int
-	mu    sync.Mutex
+	ID      string
+	Group   string
+	State   pb.JobState
+	PIDs    []int
+	Backend string
+	mu      sync.Mutex
 }
 
 // Operation represents a long-running snapshot or restore task.
@@ -71,13 +72,16 @@ func (sm *StateManager) getOrCreateJob(jobID, group string) *Job {
 }
 
 // StartSnapshot initiates a snapshot operation if the job state allows it.
-func (sm *StateManager) StartSnapshot(jobID, group string, worker func() (error)) (string, error) {
+func (sm *StateManager) StartSnapshot(jobID, group, backend string, worker func() (error)) (string, error) {
 	sm.mu.Lock()
 	job := sm.getOrCreateJob(jobID, group)
 	sm.mu.Unlock()
 
 	job.mu.Lock()
 	defer job.mu.Unlock()
+
+	// Update backend
+	job.Backend = backend
 
 	// 1. Concurrency Guard
 	if job.State == pb.JobState_JOB_STATE_TRANSITIONING {
@@ -131,13 +135,16 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() (error)
 }
 
 // StartRestore initiates a restore operation if the job state allows it.
-func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (string, error) {
+func (sm *StateManager) StartRestore(jobID, group, backend string, worker func() error) (string, error) {
 	sm.mu.Lock()
 	job := sm.getOrCreateJob(jobID, group)
 	sm.mu.Unlock()
 
 	job.mu.Lock()
 	defer job.mu.Unlock()
+
+	// Update backend
+	job.Backend = backend
 
 	// 1. Redundancy Optimization
 	if job.State == pb.JobState_JOB_STATE_RUNNING {
@@ -218,6 +225,27 @@ func (sm *StateManager) GetJobStatus() []*pb.JobStatus {
 		job.mu.Unlock()
 	}
 	return statuses
+}
+
+// GetJobBackends returns a list of unique backends currently used by jobs.
+func (sm *StateManager) GetJobBackends() []string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	backendMap := make(map[string]bool)
+	for _, job := range sm.jobs {
+		job.mu.Lock()
+		if job.Backend != "" {
+			backendMap[job.Backend] = true
+		}
+		job.mu.Unlock()
+	}
+
+	var backends []string
+	for b := range backendMap {
+		backends = append(backends, b)
+	}
+	return backends
 }
 
 // UpdateJobPIDs updates the PIDs associated with a job.

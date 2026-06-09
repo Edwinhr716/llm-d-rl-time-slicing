@@ -48,7 +48,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 		return nil, status.Errorf(codes.NotFound, "backend %s not found", backendName)
 	}
 
-	opID, err := s.state.StartSnapshot(req.GetJobId(), req.GetGroup(), func() (error) {
+	opID, err := s.state.StartSnapshot(req.GetJobId(), req.GetGroup(), backendName, func() (error) {
 		log.Printf("Background: Starting snapshot for %s using backend %s", req.GetJobId(), backendName)
 		pods, err := podutils.GetLocalPods(context.Background(), req.GetJobId())
 		if err != nil {
@@ -111,7 +111,7 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 		return nil, status.Errorf(codes.NotFound, "backend %s not found", backendName)
 	}
 
-	opID, err := s.state.StartRestore(req.GetJobId(), req.GetGroup(), func() error {
+	opID, err := s.state.StartRestore(req.GetJobId(), req.GetGroup(), backendName, func() error {
 		log.Printf("Background: Starting restore for %s using backend %s", req.GetJobId(), backendName)
 
 		pids, err := s.state.GetJobPIDs(req.GetJobId())
@@ -177,18 +177,30 @@ func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusR
 	log.Printf("Status called")
 
 	var acceleratorStatuses []*pb.AcceleratorStatus
-	backend, ok := s.backends[s.defaultBackend]
-	if ok {
+	backendNames := s.state.GetJobBackends()
+	if len(backendNames) == 0 {
+		backendNames = []string{s.defaultBackend}
+	}
+
+	seenAccelerators := make(map[string]bool)
+	for _, name := range backendNames {
+		backend, ok := s.backends[name]
+		if !ok {
+			continue
+		}
 		gpuStatuses, err := backend.GetAcceleratorStatuses(ctx)
 		if err != nil {
-			log.Printf("Failed to get accelerator statuses from backend %s: %v", s.defaultBackend, err)
-		} else {
-			for _, gs := range gpuStatuses {
+			log.Printf("Failed to get accelerator statuses from backend %s: %v", name, err)
+			continue
+		}
+		for _, gs := range gpuStatuses {
+			if !seenAccelerators[gs.ID] {
 				acceleratorStatuses = append(acceleratorStatuses, &pb.AcceleratorStatus{
 					Id:               gs.ID,
 					MemoryUsedBytes:  int64(gs.MemoryUsedBytes),
 					MemoryTotalBytes: int64(gs.MemoryTotalBytes),
 				})
+				seenAccelerators[gs.ID] = true
 			}
 		}
 	}

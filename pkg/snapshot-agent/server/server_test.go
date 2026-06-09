@@ -126,10 +126,16 @@ func TestServer_Status(t *testing.T) {
 	defer conn.Close()
 	client := pb.NewSnapshotAgentServiceClient(conn)
 
-	_, err = client.Status(ctx, &pb.StatusRequest{})
+	resp, err := client.Status(ctx, &pb.StatusRequest{})
 	if err != nil {
 		t.Errorf("Expected success, got error: %v", err)
 	}
+	if resp == nil {
+		t.Fatal("Expected response, got nil")
+	}
+	// Note: AcceleratorStatuses might be empty in test environments without GPUs
+	log.Printf("Status returned %d job statuses and %d accelerator statuses", 
+		len(resp.JobStatuses), len(resp.AcceleratorStatuses))
 }
 
 func TestServer_Health(t *testing.T) {
