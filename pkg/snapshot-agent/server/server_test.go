@@ -117,9 +117,33 @@ func TestServer_Status(t *testing.T) {
 	defer conn.Close()
 	client := pb.NewSnapshotAgentServiceClient(conn)
 
-	_, err = client.Status(ctx, &pb.StatusRequest{})
+	jobID := "test-job-status"
+	_, err = client.Snapshot(ctx, &pb.SnapshotRequest{
+		JobId:   jobID,
+		Group:   "test-group",
+		Backend: pb.Backend_BACKEND_UNSPECIFIED,
+	})
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+
+	resp, err := client.Status(ctx, &pb.StatusRequest{})
 	if err != nil {
 		t.Errorf("Expected success, got error: %v", err)
+	}
+
+	found := false
+	for _, js := range resp.JobStatuses {
+		if js.JobId == jobID {
+			found = true
+			if js.State != pb.JobState_JOB_STATE_TRANSITIONING && js.State != pb.JobState_JOB_STATE_FAULTED && js.State != pb.JobState_JOB_STATE_SAVED {
+				t.Errorf("Unexpected job state: %v", js.State)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Job %s not found in status response", jobID)
 	}
 }
 
