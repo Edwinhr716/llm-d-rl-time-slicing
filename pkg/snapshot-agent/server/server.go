@@ -188,7 +188,7 @@ func (s *Server) Health(ctx context.Context, req *pb.HealthRequest) (*pb.HealthR
 	}
 
 	if err := backend.Health(ctx); err != nil {
-		return nil, status.Errorf(codes.Internal, "health check failed: %v", err)
+		return &pb.HealthResponse{Healthy: false}, status.Errorf(codes.Internal, "health check failed: %v", err)
 	}
 
 	return &pb.HealthResponse{Healthy: true}, nil
