@@ -101,3 +101,42 @@ class SnapshotAgentClient:
         except Exception as e:
             logger.error(f"Unexpected error in Restore: {e}")
         return None
+
+    def status(self):
+        """
+        Calls the Status endpoint of the SnapshotAgentService.
+        Returns:
+            StatusResponse or None on error.
+        """
+        try:
+            request = snapshot_agent_pb2.StatusRequest()
+            logger.info("Calling Status...")
+            response = self.stub.Status(request)
+            logger.info(
+                f"Status Response: {len(response.job_statuses)} jobs, "
+                f"{len(response.accelerator_statuses)} accelerators"
+            )
+            return response
+        except grpc.RpcError as e:
+            logger.error(f"gRPC error calling Status: {e.code()} - {e.details()}")
+        except Exception as e:
+            logger.error(f"Unexpected error in Status: {e}")
+        return None
+
+    def health(self):
+        """
+        Calls the Health endpoint of the SnapshotAgentService.
+        Returns:
+            HealthResponse or None on error.
+        """
+        try:
+            request = snapshot_agent_pb2.HealthRequest()
+            logger.info("Calling Health...")
+            response = self.stub.Health(request)
+            logger.info(f"Health Response: healthy={response.healthy}")
+            return response
+        except grpc.RpcError as e:
+            logger.error(f"gRPC error calling Health: {e.code()} - {e.details()}")
+        except Exception as e:
+            logger.error(f"Unexpected error in Health: {e}")
+        return None
