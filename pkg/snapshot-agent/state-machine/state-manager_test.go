@@ -1,4 +1,4 @@
-package statemachine
+package statemachine_test
 
 import (
 	"errors"
@@ -6,32 +6,33 @@ import (
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	statemachine "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 func TestNewStateManager(t *testing.T) {
-	sm := NewStateManager()
+	sm := statemachine.NewStateManager()
 	if sm == nil {
 		t.Fatal("NewStateManager returned nil")
 	}
-	if sm.jobs == nil {
+	if sm.InternalJobs() == nil {
 		t.Error("sm.jobs map not initialized")
 	}
-	if sm.operations == nil {
+	if sm.InternalOperations() == nil {
 		t.Error("sm.operations map not initialized")
 	}
 }
 
 func TestGetOrCreateJob(t *testing.T) {
-	sm := NewStateManager()
+	sm := statemachine.NewStateManager()
 	jobID := "test-job"
 	group := "test-group"
 	groupTwo := "test-group-2"
 
-	sm.mu.Lock()
-	job1 := sm.getOrCreateJob(jobID, group)
-	sm.mu.Unlock()
+	sm.InternalMu().Lock()
+	job1 := sm.InternalGetOrCreateJob(jobID, group)
+	sm.InternalMu().Unlock()
 
 	if job1 == nil {
 		t.Fatal("getOrCreateJob returned nil")
@@ -40,9 +41,9 @@ func TestGetOrCreateJob(t *testing.T) {
 		t.Errorf("Unexpected job fields: %+v", job1)
 	}
 
-	sm.mu.Lock()
-	job2 := sm.getOrCreateJob(jobID, groupTwo) // Group should not be updated if already exists
-	sm.mu.Unlock()
+	sm.InternalMu().Lock()
+	job2 := sm.InternalGetOrCreateJob(jobID, groupTwo) // Group should not be updated if already exists
+	sm.InternalMu().Unlock()
 
 	if job2 != job1 {
 		t.Error("getOrCreateJob returned a different instance for existing jobID")
@@ -88,14 +89,14 @@ func TestStartSnapshot(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sm := NewStateManager()
+			sm := statemachine.NewStateManager()
 			jobID := "job-1"
 			group := "group-1"
 
-			sm.mu.Lock()
-			job := sm.getOrCreateJob(jobID, group)
+			sm.InternalMu().Lock()
+			job := sm.InternalGetOrCreateJob(jobID, group)
 			job.State = tc.initialState
-			sm.mu.Unlock()
+			sm.InternalMu().Unlock()
 
 			worker := func() error {
 				return tc.workerErr
@@ -183,14 +184,14 @@ func TestStartRestore(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sm := NewStateManager()
+			sm := statemachine.NewStateManager()
 			jobID := "job-1"
 			group := "group-1"
 
-			sm.mu.Lock()
-			job := sm.getOrCreateJob(jobID, group)
+			sm.InternalMu().Lock()
+			job := sm.InternalGetOrCreateJob(jobID, group)
 			job.State = tc.initialState
-			sm.mu.Unlock()
+			sm.InternalMu().Unlock()
 
 			worker := func() error {
 				return tc.workerErr
@@ -240,16 +241,16 @@ func TestStartRestore(t *testing.T) {
 }
 
 func TestGetJobStatus(t *testing.T) {
-	sm := NewStateManager()
+	sm := statemachine.NewStateManager()
 
 	if len(sm.GetJobStatus()) != 0 {
 		t.Error("Expected 0 jobs")
 	}
 
-	sm.mu.Lock()
-	sm.getOrCreateJob("job1", "group1").State = pb.JobState_JOB_STATE_RUNNING
-	sm.getOrCreateJob("job2", "group1").State = pb.JobState_JOB_STATE_SAVED
-	sm.mu.Unlock()
+	sm.InternalMu().Lock()
+	sm.InternalGetOrCreateJob("job1", "group1").State = pb.JobState_JOB_STATE_RUNNING
+	sm.InternalGetOrCreateJob("job2", "group1").State = pb.JobState_JOB_STATE_SAVED
+	sm.InternalMu().Unlock()
 
 	statuses := sm.GetJobStatus()
 	if len(statuses) != 2 {
@@ -261,7 +262,7 @@ func TestGetJobStatus(t *testing.T) {
 }
 
 func TestJobPIDs(t *testing.T) {
-	sm := NewStateManager()
+	sm := statemachine.NewStateManager()
 	jobID := "job1"
 	pids := []int{100, 200, 300}
 
@@ -271,9 +272,9 @@ func TestJobPIDs(t *testing.T) {
 		t.Errorf("Expected NotFound for non-existent job, got %v", err)
 	}
 
-	sm.mu.Lock()
-	sm.getOrCreateJob(jobID, "group1")
-	sm.mu.Unlock()
+	sm.InternalMu().Lock()
+	sm.InternalGetOrCreateJob(jobID, "group1")
+	sm.InternalMu().Unlock()
 
 	sm.UpdateJobPIDs(jobID, pids)
 	gotPids, err := sm.GetJobPIDs(jobID)
@@ -291,7 +292,10 @@ func TestJobPIDs(t *testing.T) {
 	}
 
 	gotPids[0] = 999
-	gotPids2, _ := sm.GetJobPIDs(jobID)
+	gotPids2, err := sm.GetJobPIDs(jobID)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 	if gotPids2[0] == 999 {
 		t.Error("GetJobPIDs returned a pointer to internal slice, not a copy")
 	}
@@ -304,14 +308,14 @@ func TestJobPIDs(t *testing.T) {
 }
 
 func TestConcurrencyControl(t *testing.T) {
-	sm := NewStateManager()
+	sm := statemachine.NewStateManager()
 	jobID := "concurrent-job"
 	group := "group-1"
 
 	// 1. Start a "slow" worker that blocks until we tell it to finish
 	blockWorker := make(chan struct{})
 	workerStarted := make(chan struct{})
-	
+
 	slowWorker := func() error {
 		close(workerStarted)
 		<-blockWorker
@@ -367,7 +371,7 @@ func TestConcurrencyControl(t *testing.T) {
 }
 
 func TestGetOperation(t *testing.T) {
-	sm := NewStateManager()
+	sm := statemachine.NewStateManager()
 	opID := "op-1"
 
 	_, ok := sm.GetOperation(opID)
@@ -375,10 +379,10 @@ func TestGetOperation(t *testing.T) {
 		t.Error("Expected ok=false for non-existent operation")
 	}
 
-	op := &Operation{ID: opID, Status: pb.OperationStatus_OPERATION_STATUS_PENDING}
-	sm.mu.Lock()
-	sm.operations[opID] = op
-	sm.mu.Unlock()
+	op := &statemachine.Operation{ID: opID, Status: pb.OperationStatus_OPERATION_STATUS_PENDING}
+	sm.InternalMu().Lock()
+	sm.InternalOperations()[opID] = op
+	sm.InternalMu().Unlock()
 
 	gotOp, ok := sm.GetOperation(opID)
 	if !ok {
@@ -389,10 +393,10 @@ func TestGetOperation(t *testing.T) {
 	}
 }
 
-func waitForOperation(t *testing.T, sm *StateManager, opID string) *Operation {
+func waitForOperation(t *testing.T, sm *statemachine.StateManager, opID string) *statemachine.Operation {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	var op *Operation
+	var op *statemachine.Operation
 	var ok bool
 	for time.Now().Before(deadline) {
 		op, ok = sm.GetOperation(opID)
@@ -412,7 +416,7 @@ func waitForOperation(t *testing.T, sm *StateManager, opID string) *Operation {
 	return op
 }
 
-func checkJobState(t *testing.T, sm *StateManager, jobID string, expectedState pb.JobState) {
+func checkJobState(t *testing.T, sm *statemachine.StateManager, jobID string, expectedState pb.JobState) {
 	t.Helper()
 	statuses := sm.GetJobStatus()
 	for _, s := range statuses {
@@ -426,7 +430,7 @@ func checkJobState(t *testing.T, sm *StateManager, jobID string, expectedState p
 	t.Errorf("Job %s status not found", jobID)
 }
 
-func checkOperationStatus(t *testing.T, op *Operation, expected pb.OperationStatus, expectedErr string) {
+func checkOperationStatus(t *testing.T, op *statemachine.Operation, expected pb.OperationStatus, expectedErr string) {
 	t.Helper()
 	if op.Status != expected {
 		t.Errorf("Operation %s: expected status %v, got %v", op.ID, expected, op.Status)
