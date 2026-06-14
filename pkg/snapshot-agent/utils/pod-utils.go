@@ -24,7 +24,7 @@ const (
 )
 
 var (
-	// For mocking in tests
+	// For mocking in tests.
 	GetK8sClient = func() (kubernetes.Interface, error) {
 		config, err := rest.InClusterConfig()
 		if err != nil {
@@ -33,9 +33,9 @@ var (
 		return kubernetes.NewForConfig(config)
 	}
 
-	NvmlInit           = nvml.Init
-	NvmlShutdown       = nvml.Shutdown
-	NvmlDeviceGetCount = nvml.DeviceGetCount
+	NvmlInit                   = nvml.Init
+	NvmlShutdown               = nvml.Shutdown
+	NvmlDeviceGetCount         = nvml.DeviceGetCount
 	NvmlDeviceGetHandleByIndex = func(index int) (DeviceInterface, nvml.Return) {
 		return nvml.DeviceGetHandleByIndex(index)
 	}

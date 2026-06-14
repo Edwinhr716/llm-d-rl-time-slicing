@@ -50,12 +50,12 @@ func TestGetPodPIDs(t *testing.T) {
 	utils.NvmlShutdown = func() nvml.Return { return nvml.SUCCESS }
 
 	tests := []struct {
-		name          string
-		podName       string
-		namespace     string
-		setupMocks    func()
-		expectedPIDs  []int
-		expectError   bool
+		name         string
+		podName      string
+		namespace    string
+		setupMocks   func()
+		expectedPIDs []int
+		expectError  bool
 	}{
 		{
 			name:      "Success",
@@ -276,7 +276,7 @@ func TestIsPIDInPodCgroupInternal(t *testing.T) {
 			cgroupPath := tt.filePath
 			if cgroupPath == "" {
 				cgroupPath = filepath.Join(tempDir, "cgroup-"+tt.name)
-				err := os.WriteFile(cgroupPath, []byte(tt.cgroupLog), 0644)
+				err := os.WriteFile(cgroupPath, []byte(tt.cgroupLog), 0o600)
 				if err != nil {
 					t.Fatalf("Failed to write cgroup file: %v", err)
 				}
