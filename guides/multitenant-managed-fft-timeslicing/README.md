@@ -24,10 +24,7 @@ By using the Snapshot Agent, you can implement time-slicing without modifying th
 The Snapshot Agent must be deployed as a DaemonSet to ensure it is available on every node.
 
 ### Using Helm
-```bash
-cd ../../deploy/
-helm install snapshot-agent ./snapshot-agent
-```
+Follow the instrcutions in [helm-snapshot-agent.md](../../deploy/snapshot-agent/README.md) to deploy the Snapshot Agent.
 
 ### Key Configuration (`values.yaml`)
 - `port`: The gRPC port (default: `9001`).
@@ -66,9 +63,15 @@ env:
 The `timeslice.SnapshotAgentClient` library provides a high-level Python API for interacting with the Snapshot Agent.
 
 ### Installation
+From the local repository:
 ```bash
 cd ../../pkg/client/python
 pip install .
+```
+
+Or install from the remote repository:
+```bash
+pip install "git+https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git#subdirectory=pkg/client/python"
 ```
 
 ### Choosing a Backend
@@ -99,7 +102,7 @@ with SnapshotAgentClient(endpoint) as client:
     print("Snapshotting...")
     result = client.snapshot_and_wait(job_id, group)
     if result.status == "OPERATION_STATUS_COMPLETE":
-        print(f"Snapshot success! Used {result.storage_bytes} bytes")
+        print(f"Snapshot success! Completed in {result.elapsed_ms} ms")
 
     # ... wait for your turn (orchestrated externally) ...
 
@@ -107,7 +110,7 @@ with SnapshotAgentClient(endpoint) as client:
     print("Restoring...")
     result = client.restore_and_wait(job_id, group)
     if result.status == "OPERATION_STATUS_COMPLETE":
-        print("Restore success!")
+        print("Restore success! Completed in {result.elapsed_ms} ms")
 ```
 
 ### Advanced Usage
