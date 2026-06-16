@@ -235,8 +235,7 @@ func TestGetLocalPods(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "pod1",
 						Labels: map[string]string{
-							snapshotutils.SnapshotAgentLabel: snapshotutils.SnapshotAgentValue,
-							snapshotutils.JobIDLabel:         jobID,
+							snapshotutils.JobIDLabel: jobID,
 						},
 					},
 					Spec: corev1.PodSpec{NodeName: nodeName},
