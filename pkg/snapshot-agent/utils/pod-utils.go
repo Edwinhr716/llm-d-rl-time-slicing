@@ -16,10 +16,6 @@ import (
 )
 
 const (
-	// SnapshotAgentLabel is the label used to identify pods that the snapshot agent should manage.
-	SnapshotAgentLabel string = "snapshot-agent"
-	// SnapshotAgentValue is the value of the label for pods to be managed.
-	SnapshotAgentValue string = "true"
 	// JobIDLabel is the label used to identify the job ID.
 	JobIDLabel string = "timeslice.io/job-id"
 )
