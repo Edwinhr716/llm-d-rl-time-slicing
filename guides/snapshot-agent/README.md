@@ -1,6 +1,11 @@
-# GPU Time-Slicing for Multi-Tenant Managed RL Services
+# Snapshot Agent
 
-This guide is for developers building a managed RL service who want to enable multiple tenants to share GPU nodes by time-slicing their RL workloads. This applies to any GPU-bound RL component — trainer, sampler, or both, each running as a separate pod. The service is responsible for deciding when to preempt a running job and when to resume it. The Snapshot Agent provides the GPU checkpoint/restore primitive the service calls at those boundaries. From the tenant's perspective, their RL job simply pauses and resumes transparently
+The Snapshot Agent provides GPU checkpoint/restore primitives to enable efficient resource sharing for GPU-bound workloads. By allowing processes to save and reload their entire GPU state, it enables scenarios where multiple high-memory workloads can share the same physical GPU hardware.
+
+## Use Cases
+
+1.  **Multi-tenant GPU Time-slicing:** Enable multiple tenants to share GPU nodes by time-slicing their workloads (e.g., RL trainers and samplers). The Snapshot Agent provides the primitives to preempt and resume these jobs transparently.
+2.  **Multi-model vLLM Server Proxy:** Serve multiple models (e.g., same family such as Gemma4 or Qwen3) on the same GPU by taking turns for inference requests. A proxy can snapshot the GPU state of one model and restore another to handle incoming requests for different models without requiring them to fit in GPU memory simultaneously.
 
 ## Overview
 
@@ -9,12 +14,12 @@ The Snapshot Agent is a gRPC service that runs as a DaemonSet on each GPU node. 
 - **Restore:** Reload a previously saved state to the GPU.
 - **Status:** Monitor the current state of jobs and accelerators.
 
-By using the Snapshot Agent, you can implement time-slicing without modifying the core LLM engine code, simply by wrapping your execution loop with the `timeslice.SnapshotAgentClient` client library.
+By using the Snapshot Agent, you can implement context switching without modifying the core engine code, simply by wrapping your execution loop with the `timeslice.SnapshotAgentClient` client library.
 
 ## Architecture
 
 1.  **Snapshot Agent (DaemonSet):** Runs on every node with GPUs. It has privileged access to the GPU devices and host paths required for snapshotting.
-2.  **Tenant's RL Workload:**: A sampler or trainer running on a pod.
+2.  **Workload:** A GPU-bound process (e.g., a sampler, trainer, or vLLM instance) running in a pod.
 3.  **Snapshot Agent Client:** A Python library used by the application pod to communicate with the local Snapshot Agent via gRPC (port 9001).
 
 ---
@@ -24,7 +29,7 @@ By using the Snapshot Agent, you can implement time-slicing without modifying th
 The Snapshot Agent must be deployed as a DaemonSet to ensure it is available on every node.
 
 ### Using Helm
-Follow the instrcutions in [helm-snapshot-agent.md](../../deploy/snapshot-agent/README.md) to deploy the Snapshot Agent.
+Follow the instructions in [helm-snapshot-agent.md](../../deploy/snapshot-agent/README.md) to deploy the Snapshot Agent.
 
 ### Key Configuration (`values.yaml`)
 - `port`: The gRPC port (default: `9001`).
@@ -35,9 +40,9 @@ See [helm-snapshot-agent.md](../../deploy/snapshot-agent/README.md) for more det
 
 ---
 
-## 2. Integrating with Tenant's RL Workload
+## 2. Integrating with Workloads
 
-To enable a pod for time-slicing, you need to add specific labels and environment variables to your Deployment.
+To enable a pod for snapshotting, you need to add specific labels and environment variables to your Deployment.
 
 ### Required Labels
 The Snapshot Agent identifies pods that should be managed via labels:
@@ -77,40 +82,40 @@ pip install "git+https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git#s
 ### Choosing a Backend
 The `backend` parameter controls how GPU state is checkpointed. It is an optional argument in the following `SnapshotAgentClient` methods:
 
-*   `snapshot(job_id, group, backend=...)`
-*   `restore(job_id, group, backend=...)`
-*   `snapshot_and_wait(job_id, group, backend=...)`
-*   `restore_and_wait(job_id, group, backend=...)`
+*   `snapshot(job_id, backend=...)`
+*   `restore(job_id, backend=...)`
+*   `snapshot_and_wait(job_id, backend=...)`
+*   `restore_and_wait(job_id, backend=...)`
 
 Available backends:
-*   **BACKEND_CUDA (default):** Full process-level GPU checkpoint via `cuda-checkpoint`. Suitable for any GPU-bound RL component (trainer, sampler) running full model weights.
+*   **BACKEND_CUDA (default):** Full process-level GPU checkpoint via `cuda-checkpoint`. Suitable for any GPU-bound component (trainer, sampler, LLM engine) running full model weights.
 *   Additional backends for lighter-weight workloads (e.g. LoRA adapters) are planned for a future release.
 
 ### Basic Workflow
-The most common usage is to trigger a snapshot at the end of a "slice" and a restore at the beginning of the next one.
+The most common usage is to trigger a snapshot at the end of a "slice" or request batch and a restore at the beginning of the next one.
 
 ```python
+import os
 from timeslice.snapshot_agent import SnapshotAgentClient
 
 # AGENT_ENDPOINT is typically $(NODE_IP):9001
 endpoint = os.getenv("AGENT_ENDPOINT", "localhost:9001")
 job_id = "test-job"
-group = "default"
 
 with SnapshotAgentClient(endpoint) as client:
     # 1. Trigger Snapshot and wait for completion
     print("Snapshotting...")
-    result = client.snapshot_and_wait(job_id, group)
+    result = client.snapshot_and_wait(job_id)
     if result.status == "OPERATION_STATUS_COMPLETE":
         print(f"Snapshot success! Completed in {result.elapsed_ms} ms")
 
-    # ... wait for your turn (orchestrated externally) ...
+    # ... wait for your turn or next request (orchestrated externally) ...
 
     # 2. Trigger Restore and wait for completion
     print("Restoring...")
-    result = client.restore_and_wait(job_id, group)
+    result = client.restore_and_wait(job_id)
     if result.status == "OPERATION_STATUS_COMPLETE":
-        print("Restore success! Completed in {result.elapsed_ms} ms")
+        print(f"Restore success! Completed in {result.elapsed_ms} ms")
 ```
 
 ### Advanced Usage
@@ -118,7 +123,7 @@ For more granular control, you can use asynchronous methods and poll for status 
 
 ```python
 # Start snapshot
-response = client.snapshot(job_id, group)
+response = client.snapshot(job_id)
 op_id = response.operation_id
 
 # Do other work...
@@ -145,7 +150,7 @@ For debugging, you can use `grpcurl`:
 # Get node IP first
 NODE_IP=$(kubectl get pod <agent-pod> -o jsonpath='{.status.hostIP}')
 
-grpcurl -plaintext -d '{"job_id": "test-job", "group": "default"}' \
+grpcurl -plaintext -d '{"job_id": "test-job"}' \
   $NODE_IP:9001 snapshot_agent.v1alpha1.SnapshotAgentService/Snapshot
 ```
 
