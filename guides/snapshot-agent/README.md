@@ -88,7 +88,7 @@ The `backend` parameter controls how GPU state is checkpointed. It is an optiona
 *   `restore_and_wait(job_id, backend=...)`
 
 Available backends:
-*   **BACKEND_CUDA (default):** Full process-level GPU checkpoint via `cuda-checkpoint`. Suitable for any GPU-bound component (trainer, sampler, LLM engine) running full model weights.
+*   **BACKEND_CUDA (default):** Full process-level GPU checkpoint via `cuda-checkpoint`. It offloads the complete accelerator state (VRAM) to host memory. Suitable for any GPU-bound component (trainer, sampler, LLM engine) running full model weights.
 *   Additional backends for lighter-weight workloads (e.g. LoRA adapters) are planned for a future release.
 
 ### Basic Workflow
