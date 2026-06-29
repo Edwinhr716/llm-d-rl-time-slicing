@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,10 +42,11 @@ import (
 const bufSize = 1024 * 1024
 
 var (
-	lis        *bufconn.Listener
-	testServer *server.Server
-	fakeClient *fakek8s.Clientset
-	mockedPIDs map[string][]int
+	lis          *bufconn.Listener
+	testServer   *server.Server
+	fakeClient   *fakek8s.Clientset
+	mockedPIDs   map[string][]int
+	mockedPIDsMu sync.RWMutex
 )
 
 type FailingBackend struct {
@@ -89,12 +91,15 @@ func initGRPCServer() {
 
 	mockedPIDs = make(map[string][]int)
 	utils.GetPodPIDs = func(ctx context.Context, podName, namespace string) ([]int, error) {
+		mockedPIDsMu.RLock()
+		defer mockedPIDsMu.RUnlock()
 		if pids, ok := mockedPIDs[podName]; ok {
 			return pids, nil
 		}
 		return nil, nil
 	}
 }
+
 
 func bufDialer(context.Context, string) (net.Conn, error) {
 	return lis.Dial()
@@ -131,9 +136,12 @@ func prepareSavedJob(
 ) {
 	t.Helper()
 	createFakePod(ctx, t, jobID, podName)
+	mockedPIDsMu.Lock()
 	mockedPIDs[podName] = pids
+	mockedPIDsMu.Unlock()
 
 	testServer.InternalState().RegisterJob(jobID, group)
+
 	if err := testServer.InternalState().TransitionToRunning(jobID, pids); err != nil {
 		t.Fatalf("Failed to transition job to RUNNING: %v", err)
 	}
@@ -206,9 +214,12 @@ func TestServer_Snapshot(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			createFakePod(ctx, t, tc.jobID, tc.podName)
+			mockedPIDsMu.Lock()
 			mockedPIDs[tc.podName] = tc.pids
+			mockedPIDsMu.Unlock()
 
 			testServer.InternalState().RegisterJob(tc.jobID, tc.group)
+
 			if err := testServer.InternalState().TransitionToRunning(tc.jobID, tc.pids); err != nil {
 				t.Fatalf("Failed to transition job to RUNNING: %v", err)
 			}
