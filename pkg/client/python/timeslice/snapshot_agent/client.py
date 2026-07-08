@@ -38,14 +38,14 @@ class SnapshotAgentInterface(ABC):
 
     @abstractmethod
     def snapshot(
-        self, job_id: str, group: str = "", backend: Union[str, int] = 0
+        self, job_id: str, group: str = "", backend: Union[str, int] = 0, memory_addresses: Optional[list[str]] = None
     ) -> SnapshotResponse:
         """Triggers an asynchronous snapshot."""
         pass
 
     @abstractmethod
     def restore(
-        self, job_id: str, group: str = "", backend: Union[str, int] = 0
+        self, job_id: str, group: str = "", backend: Union[str, int] = 0, memory_addresses: Optional[list[str]] = None
     ) -> RestoreResponse:
         """Triggers an asynchronous restoration."""
         pass
@@ -130,7 +130,7 @@ class SnapshotAgentClient(SnapshotAgentInterface):
                 return snapshot_agent_pb2.BACKEND_UNSPECIFIED
 
     def snapshot(
-        self, job_id: str, group: str = "", backend: Union[str, int] = 0
+        self, job_id: str, group: str = "", backend: Union[str, int] = 0, memory_addresses: Optional[list[str]] = None
     ) -> SnapshotResponse:
         """
         Triggers an asynchronous snapshot.
@@ -138,6 +138,7 @@ class SnapshotAgentClient(SnapshotAgentInterface):
             job_id: ID of the job to snapshot.
             group: Group for the snapshot.
             backend: Backend to use (e.g., 'CUDA' or snapshot_agent_pb2.BACKEND_CUDA).
+            memory_addresses: Optional list of memory addresses to snapshot.
         Returns:
             SnapshotResponse containing the operation_id.
         Raises:
@@ -148,6 +149,8 @@ class SnapshotAgentClient(SnapshotAgentInterface):
             request = snapshot_agent_pb2.SnapshotRequest(
                 job_id=job_id, group=group, backend=backend_enum
             )
+            if memory_addresses:
+                request.memory_addresses.extend(memory_addresses)
             logger.info(
                 f"Calling Snapshot with job_id={job_id}, group={group}, backend={backend_enum}..."
             )
@@ -160,7 +163,7 @@ class SnapshotAgentClient(SnapshotAgentInterface):
             raise SnapshotAgentError(f"Unexpected error: {e}") from e
 
     def restore(
-        self, job_id: str, group: str = "", backend: Union[str, int] = 0
+        self, job_id: str, group: str = "", backend: Union[str, int] = 0, memory_addresses: Optional[list[str]] = None
     ) -> RestoreResponse:
         """
         Triggers an asynchronous restoration.
@@ -168,6 +171,7 @@ class SnapshotAgentClient(SnapshotAgentInterface):
             job_id: ID of the job to restore.
             group: Group for the restoration.
             backend: Backend to use.
+            memory_addresses: Optional list of memory addresses to restore.
         Returns:
             RestoreResponse containing the operation_id.
         Raises:
@@ -178,6 +182,8 @@ class SnapshotAgentClient(SnapshotAgentInterface):
             request = snapshot_agent_pb2.RestoreRequest(
                 job_id=job_id, group=group, backend=backend_enum
             )
+            if memory_addresses:
+                request.memory_addresses.extend(memory_addresses)
             logger.info(
                 f"Calling Restore with job_id={job_id}, group={group}, backend={backend_enum}..."
             )
@@ -303,10 +309,11 @@ class SnapshotAgentClient(SnapshotAgentInterface):
         job_id: str,
         group: str = "",
         backend: Union[str, int] = 0,
+        memory_addresses: Optional[list[str]] = None,
         poll_interval_sec: float = 1.0,
     ) -> GetOperationResponse:
         """Calls snapshot and waits for completion."""
-        response = self.snapshot(job_id, group, backend)
+        response = self.snapshot(job_id, group, backend, memory_addresses=memory_addresses)
         return self.wait_for_operation(response.operation_id, poll_interval_sec)
 
     def restore_and_wait(
@@ -314,8 +321,9 @@ class SnapshotAgentClient(SnapshotAgentInterface):
         job_id: str,
         group: str = "",
         backend: Union[str, int] = 0,
+        memory_addresses: Optional[list[str]] = None,
         poll_interval_sec: float = 1.0,
     ) -> GetOperationResponse:
         """Calls restore and waits for completion."""
-        response = self.restore(job_id, group, backend)
+        response = self.restore(job_id, group, backend, memory_addresses=memory_addresses)
         return self.wait_for_operation(response.operation_id, poll_interval_sec)

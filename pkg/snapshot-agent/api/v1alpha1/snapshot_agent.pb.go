@@ -24,9 +24,10 @@ const (
 type Backend int32
 
 const (
-	Backend_BACKEND_UNSPECIFIED Backend = 0
-	Backend_BACKEND_CUDA        Backend = 1
-	Backend_BACKEND_GPU_GCR     Backend = 2
+	Backend_BACKEND_UNSPECIFIED             Backend = 0
+	Backend_BACKEND_CUDA                    Backend = 1
+	Backend_BACKEND_GPU_GCR                 Backend = 2
+	Backend_BACKEND_GPU_CR_MEMORY_ADDRESSES Backend = 3
 )
 
 // Enum value maps for Backend.
@@ -35,11 +36,13 @@ var (
 		0: "BACKEND_UNSPECIFIED",
 		1: "BACKEND_CUDA",
 		2: "BACKEND_GPU_GCR",
+		3: "BACKEND_GPU_CR_MEMORY_ADDRESSES",
 	}
 	Backend_value = map[string]int32{
-		"BACKEND_UNSPECIFIED": 0,
-		"BACKEND_CUDA":        1,
-		"BACKEND_GPU_GCR":     2,
+		"BACKEND_UNSPECIFIED":             0,
+		"BACKEND_CUDA":                    1,
+		"BACKEND_GPU_GCR":                 2,
+		"BACKEND_GPU_CR_MEMORY_ADDRESSES": 3,
 	}
 )
 
@@ -186,10 +189,11 @@ type SnapshotRequest struct {
 	// job_id should be unique within that group.
 	JobId string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	// group is an optional identifier for a set of related jobs.
-	Group         string  `protobuf:"bytes,2,opt,name=group,proto3" json:"group,omitempty"`
-	Backend       Backend `protobuf:"varint,3,opt,name=backend,proto3,enum=snapshot_agent.v1alpha1.Backend" json:"backend,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Group           string   `protobuf:"bytes,2,opt,name=group,proto3" json:"group,omitempty"`
+	Backend         Backend  `protobuf:"varint,3,opt,name=backend,proto3,enum=snapshot_agent.v1alpha1.Backend" json:"backend,omitempty"`
+	MemoryAddresses []string `protobuf:"bytes,4,rep,name=memory_addresses,json=memoryAddresses,proto3" json:"memory_addresses,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SnapshotRequest) Reset() {
@@ -243,6 +247,13 @@ func (x *SnapshotRequest) GetBackend() Backend {
 	return Backend_BACKEND_UNSPECIFIED
 }
 
+func (x *SnapshotRequest) GetMemoryAddresses() []string {
+	if x != nil {
+		return x.MemoryAddresses
+	}
+	return nil
+}
+
 type SnapshotResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	OperationId   string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
@@ -293,10 +304,11 @@ type RestoreRequest struct {
 	// job_id should be unique within that group.
 	JobId string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	// group is an optional identifier for a set of related jobs.
-	Group         string  `protobuf:"bytes,2,opt,name=group,proto3" json:"group,omitempty"`
-	Backend       Backend `protobuf:"varint,3,opt,name=backend,proto3,enum=snapshot_agent.v1alpha1.Backend" json:"backend,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Group           string   `protobuf:"bytes,2,opt,name=group,proto3" json:"group,omitempty"`
+	Backend         Backend  `protobuf:"varint,3,opt,name=backend,proto3,enum=snapshot_agent.v1alpha1.Backend" json:"backend,omitempty"`
+	MemoryAddresses []string `protobuf:"bytes,4,rep,name=memory_addresses,json=memoryAddresses,proto3" json:"memory_addresses,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RestoreRequest) Reset() {
@@ -348,6 +360,13 @@ func (x *RestoreRequest) GetBackend() Backend {
 		return x.Backend
 	}
 	return Backend_BACKEND_UNSPECIFIED
+}
+
+func (x *RestoreRequest) GetMemoryAddresses() []string {
+	if x != nil {
+		return x.MemoryAddresses
+	}
+	return nil
 }
 
 type RestoreResponse struct {
@@ -721,17 +740,19 @@ var File_snapshot_agent_proto protoreflect.FileDescriptor
 
 const file_snapshot_agent_proto_rawDesc = "" +
 	"\n" +
-	"\x14snapshot_agent.proto\x12\x17snapshot_agent.v1alpha1\"z\n" +
+	"\x14snapshot_agent.proto\x12\x17snapshot_agent.v1alpha1\"\xa5\x01\n" +
 	"\x0fSnapshotRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
 	"\x05group\x18\x02 \x01(\tR\x05group\x12:\n" +
-	"\abackend\x18\x03 \x01(\x0e2 .snapshot_agent.v1alpha1.BackendR\abackend\"5\n" +
+	"\abackend\x18\x03 \x01(\x0e2 .snapshot_agent.v1alpha1.BackendR\abackend\x12)\n" +
+	"\x10memory_addresses\x18\x04 \x03(\tR\x0fmemoryAddresses\"5\n" +
 	"\x10SnapshotResponse\x12!\n" +
-	"\foperation_id\x18\x01 \x01(\tR\voperationId\"y\n" +
+	"\foperation_id\x18\x01 \x01(\tR\voperationId\"\xa4\x01\n" +
 	"\x0eRestoreRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
 	"\x05group\x18\x02 \x01(\tR\x05group\x12:\n" +
-	"\abackend\x18\x03 \x01(\x0e2 .snapshot_agent.v1alpha1.BackendR\abackend\"4\n" +
+	"\abackend\x18\x03 \x01(\x0e2 .snapshot_agent.v1alpha1.BackendR\abackend\x12)\n" +
+	"\x10memory_addresses\x18\x04 \x03(\tR\x0fmemoryAddresses\"4\n" +
 	"\x0fRestoreResponse\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\"8\n" +
 	"\x13GetOperationRequest\x12!\n" +
@@ -756,11 +777,12 @@ const file_snapshot_agent_proto_rawDesc = "" +
 	"\x12memory_total_bytes\x18\x03 \x01(\x03R\x10memoryTotalBytes\"\xb6\x01\n" +
 	"\x0eStatusResponse\x12E\n" +
 	"\fjob_statuses\x18\x01 \x03(\v2\".snapshot_agent.v1alpha1.JobStatusR\vjobStatuses\x12]\n" +
-	"\x14accelerator_statuses\x18\x02 \x03(\v2*.snapshot_agent.v1alpha1.AcceleratorStatusR\x13acceleratorStatuses*I\n" +
+	"\x14accelerator_statuses\x18\x02 \x03(\v2*.snapshot_agent.v1alpha1.AcceleratorStatusR\x13acceleratorStatuses*n\n" +
 	"\aBackend\x12\x17\n" +
 	"\x13BACKEND_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fBACKEND_CUDA\x10\x01\x12\x13\n" +
-	"\x0fBACKEND_GPU_GCR\x10\x02*\x8d\x01\n" +
+	"\x0fBACKEND_GPU_GCR\x10\x02\x12#\n" +
+	"\x1fBACKEND_GPU_CR_MEMORY_ADDRESSES\x10\x03*\x8d\x01\n" +
 	"\x0fOperationStatus\x12 \n" +
 	"\x1cOPERATION_STATUS_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18OPERATION_STATUS_PENDING\x10\x01\x12\x1d\n" +

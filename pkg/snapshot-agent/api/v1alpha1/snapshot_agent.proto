@@ -23,6 +23,7 @@ enum Backend {
   BACKEND_UNSPECIFIED = 0;
   BACKEND_CUDA = 1;
   BACKEND_GPU_GCR = 2;
+  BACKEND_GPU_CR_MEMORY_ADDRESSES = 3;
 }
 
 message SnapshotRequest {
@@ -32,6 +33,7 @@ message SnapshotRequest {
   // group is an optional identifier for a set of related jobs.
   string group = 2;
   Backend backend = 3;
+  repeated string memory_addresses = 4;
 }
 
 message SnapshotResponse {
@@ -45,6 +47,7 @@ message RestoreRequest {
   // group is an optional identifier for a set of related jobs.
   string group = 2;
   Backend backend = 3;
+  repeated string memory_addresses = 4;
 }
 
 message RestoreResponse {

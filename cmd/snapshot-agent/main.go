@@ -39,7 +39,8 @@ func main() {
 	registeredBackends := map[backends.BackendType]backends.Backend{
 		backends.BackendCuda:   backends.NewCudaCheckpoint(),
 		backends.BackendNoop:   backends.NewNoopBackend(),
-		backends.BackendGpuGcr: backends.NewGpuCr(),
+		backends.BackendGpuGcr:               backends.NewGpuCr(),
+		backends.BackendGpuCrMemoryAddresses: backends.NewGpuCrMemoryAddresses(),
 	}
 
 	// Ensure /mnt/huge-ckpt is writable by everyone (required for GPU-CR workload)

@@ -12,6 +12,8 @@ const (
 	BackendNoop BackendType = "noop"
 	// BackendGpuGcr is the GPU-GCR-based checkpointing backend.
 	BackendGpuGcr BackendType = "gpu_gcr"
+	// BackendGpuCrMemoryAddresses is the GPU-CR-based checkpointing backend using memory addresses.
+	BackendGpuCrMemoryAddresses BackendType = "gpu-cr-memory-addresses"
 )
 
 // Backend defines the interface for checkpoint and restore operations.

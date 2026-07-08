@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
@@ -43,6 +44,8 @@ func (s *Server) getBackendType(backend pb.Backend) backends.BackendType {
 		return backends.BackendCuda
 	case pb.Backend_BACKEND_GPU_GCR:
 		return backends.BackendGpuGcr
+	case pb.Backend_BACKEND_GPU_CR_MEMORY_ADDRESSES:
+		return backends.BackendGpuCrMemoryAddresses
 	default:
 		return s.defaultBackend
 	}
@@ -74,31 +77,43 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 			}
 		}()
 
-		pods, err := podutils.GetLocalPods(bgCtx, req.GetJobId())
-		if err != nil {
-			return fmt.Errorf("failed to get local pods: %w", err)
+		var targets []string
+		var pids []int
+		if backendType == backends.BackendGpuCrMemoryAddresses {
+			targets = req.GetMemoryAddresses()
+			pids = extractPIDs(targets)
+			if len(targets) == 0 {
+				return fmt.Errorf("no memory addresses provided for job %s", req.GetJobId())
+			}
+		} else {
+			pods, err := podutils.GetLocalPods(bgCtx, req.GetJobId())
+			if err != nil {
+				return fmt.Errorf("failed to get local pods: %w", err)
+			}
+
+			if len(pods) == 0 {
+				return fmt.Errorf("no pods found for job %s", req.GetJobId())
+			}
+
+			var allPIDStrings []string
+			pids, allPIDStrings, err = getPIDsFromPods(bgCtx, pods)
+			if err != nil {
+				return fmt.Errorf("failed to get PIDs from pods: %w", err)
+			}
+
+			if len(allPIDStrings) == 0 {
+				return fmt.Errorf("no GPU PIDs found for job %s", req.GetJobId())
+			}
+			targets = allPIDStrings
 		}
 
-		if len(pods) == 0 {
-			return fmt.Errorf("no pods found for job %s", req.GetJobId())
-		}
-
-		allPIDs, allPIDStrings, err := getPIDsFromPods(bgCtx, pods)
-		if err != nil {
-			return fmt.Errorf("failed to get PIDs from pods: %w", err)
-		}
-
-		if len(allPIDStrings) == 0 {
-			return fmt.Errorf("no GPU PIDs found for job %s", req.GetJobId())
-		}
-
-		err = backend.Snapshot(bgCtx, allPIDStrings)
+		err = backend.Snapshot(bgCtx, targets)
 		if err != nil {
 			return fmt.Errorf("failed to snapshot job %s: %w", req.GetJobId(), err)
 		}
 
-		s.state.UpdateJobPIDs(req.GetJobId(), allPIDs)
-		slog.InfoContext(bgCtx, "PIDs for job", "pids", allPIDs)
+		s.state.UpdateJobPIDs(req.GetJobId(), pids)
+		slog.InfoContext(bgCtx, "PIDs for job", "pids", pids)
 		return nil
 	})
 	if err != nil {
@@ -135,18 +150,25 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 			}
 		}()
 
-		pids, err := s.state.GetJobPIDs(req.GetJobId())
-		if err != nil {
-			return fmt.Errorf("failed to get PIDs for job %s: %w", req.GetJobId(), err)
+		var targets []string
+		if backendType == backends.BackendGpuCrMemoryAddresses {
+			targets = req.GetMemoryAddresses()
+			if len(targets) == 0 {
+				return fmt.Errorf("no memory addresses provided for job %s", req.GetJobId())
+			}
+		} else {
+			pids, err := s.state.GetJobPIDs(req.GetJobId())
+			if err != nil {
+				return fmt.Errorf("failed to get PIDs for job %s: %w", req.GetJobId(), err)
+			}
+
+			for _, pid := range pids {
+				targets = append(targets, strconv.Itoa(pid))
+			}
 		}
 
-		var pidStrings []string
-		for _, pid := range pids {
-			pidStrings = append(pidStrings, strconv.Itoa(pid))
-		}
-
-		slog.InfoContext(bgCtx, "Restoring PIDs", "pids", pidStrings, "backend", backendType)
-		if err := backend.Restore(bgCtx, pidStrings); err != nil {
+		slog.InfoContext(bgCtx, "Restoring", "targets", targets, "backend", backendType)
+		if err := backend.Restore(bgCtx, targets); err != nil {
 			return fmt.Errorf("failed to restore job %s: %w", req.GetJobId(), err)
 		}
 		return nil
@@ -289,4 +311,21 @@ func getPIDsFromPods(ctx context.Context, pods []v1.Pod) ([]int, []string, error
 		}
 	}
 	return allPIDs, allPIDStrings, nil
+}
+
+func extractPIDs(targets []string) []int {
+	pidMap := make(map[int]bool)
+	for _, t := range targets {
+		parts := strings.SplitN(t, ":", 2)
+		if len(parts) == 2 {
+			if pid, err := strconv.Atoi(parts[0]); err == nil {
+				pidMap[pid] = true
+			}
+		}
+	}
+	var pids []int
+	for pid := range pidMap {
+		pids = append(pids, pid)
+	}
+	return pids
 }
