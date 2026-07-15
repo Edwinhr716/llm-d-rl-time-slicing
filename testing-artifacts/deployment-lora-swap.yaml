@@ -1,28 +1,30 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: validator-deployment
+  name: lora-swap-deployment
   labels:
-    app: validator
+    app: lora-swap
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: validator
+      app: lora-swap
   template:
     metadata:
       labels:
-        app: validator
+        app: lora-swap
         snapshot-agent: "true"
-        timeslice.io/job-id: "test-job"
+        timeslice.io/job-id: "lora-test-5"
     spec:
       hostIPC: true
       hostPID: true
       containers:
-      - name: validator
-        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/snapshot-client:test-fix-11 # Replace with your actual image tag
+      - name: lora-swap
+        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/lora-swap-client:latest # Replace with your actual image tag
         command: ["python3"]
-        args: ["validate_selective_cr.py"]
+        args: ["test_lora_swap.py"]
+        securityContext:
+          runAsUser: 0
         imagePullPolicy: Always
         env:
         - name: NODE_IP
@@ -32,9 +34,9 @@ spec:
         - name: AGENT_ENDPOINT
           value: "$(NODE_IP):9001"
         - name: JOB_ID
-          value: "test-job"
+          value: "lora-test-5"
         - name: GROUP
-          value: "test-group"
+          value: "lora-group"
         - name: GPU_VENDOR
           value: "NVIDIA"
         - name: GPUCR_NUM_THREADS
@@ -43,8 +45,12 @@ spec:
           value: "60"
         - name: GPUCR_STAGING_MB
           value: "1024"
+        - name: VLLM_ALLOW_INSECURE_SERIALIZATION
+          value: "1"
         - name: LD_PRELOAD
           value: "/usr/local/lib/vGPU-NVIDIA.so"
+        - name: VLLM_ENABLE_V1_MULTIPROCESSING
+          value: "0"
         - name: LD_LIBRARY_PATH
           value: "/usr/local/cuda/lib64"
         - name: PYTORCH_NO_CUDA_MEMORY_CACHING
@@ -65,8 +71,8 @@ spec:
           path: /var/tmp/huge-ckpt
           type: DirectoryOrCreate
       resourceClaims:
-      - name: gpus-for-pod # This is the internal name used by the container
-        resourceClaimName: shared-two-gpus-claim # References the standalone claim
+      - name: gpus-for-pod
+        resourceClaimName: shared-two-gpus-claim
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"

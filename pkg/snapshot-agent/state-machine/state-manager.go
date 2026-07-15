@@ -124,6 +124,7 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 			op.Status = pb.OperationStatus_OPERATION_STATUS_COMPLETE
 			op.StorageBytes = 1024
 			job.State = pb.JobState_JOB_STATE_SAVED
+			job.Group = group
 		}
 	}()
 
@@ -140,7 +141,7 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 	defer job.mu.Unlock()
 
 	// 1. Redundancy Optimization
-	if job.State == pb.JobState_JOB_STATE_RUNNING {
+	if job.State == pb.JobState_JOB_STATE_RUNNING && job.Group == group {
 		return "already-running", nil
 	}
 
@@ -188,6 +189,7 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 		} else {
 			op.Status = pb.OperationStatus_OPERATION_STATUS_COMPLETE
 			job.State = pb.JobState_JOB_STATE_RUNNING
+			job.Group = group
 			op.SnapshotDeviceBytes = 1024
 		}
 	}()

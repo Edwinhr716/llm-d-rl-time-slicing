@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temp-debug-root
+spec:
+  nodeName: gke-dra-testing-rl-l4-nodepool-0f7d021b-s96q
+  hostPID: true
+  hostIPC: true
+  containers:
+  - name: debug
+    image: alpine
+    command: ["sleep", "3600"]
+    securityContext:
+      privileged: true
