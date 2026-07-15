@@ -1,0 +1,45 @@
+# --- Build stage for GPU-CR ---
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS gpu-cr-builder
+RUN apt-get update && apt-get install -y git cmake build-essential
+RUN git clone -b memory-allocation https://github.com/Edwinhr716/GPU-CR.git /tmp/GPU-CR && \
+    cd /tmp/GPU-CR && \
+    sed -i 's/#define CR_CKPT_SIGNAL     SIGUSR1/#define CR_CKPT_SIGNAL     (SIGRTMAX - 8)/' src/common.h && \
+    sed -i 's/#define CR_RESTORE_SIGNAL  SIGUSR2/#define CR_RESTORE_SIGNAL  (SIGRTMAX - 7)/' src/common.h && \
+    sed -i 's/int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/int fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
+    sed -i 's/fprintf(stderr, "\[HOOK\] cudaMalloc called! size=%zu\\n", size);/fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu\\n", size);\n    if (size == 0) { *devPtr = nullptr; return cudaSuccess; }/' src/GPUs/NVIDIA/nv.cpp && \
+    mkdir build && \
+    cd build && \
+    cmake -DGPU_VENDOR=NVIDIA .. && \
+    make -j$(nproc)
+
+FROM vllm/vllm-openai:v0.22.0
+
+WORKDIR /app
+
+USER root
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    build-essential \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy vGPU-NVIDIA.so from builder
+COPY --from=gpu-cr-builder /tmp/GPU-CR/build/vGPU-NVIDIA.so /usr/local/lib/
+
+# Install the timeslice client directly into the system python (which is venv-managed in vllm image)
+RUN pip install --no-cache-dir --upgrade protobuf grpcio grpcio-tools && \
+    pip install --no-cache-dir \
+    "git+https://github.com/Edwinhr716/llm-d-rl-time-slicing.git@gcr-backend-memory-allocation#subdirectory=pkg/client/python"
+
+# --- VERIFICATION STEP ---
+RUN python3 -c "import timeslice; print('Successfully imported timeslice')"
+
+# Copy the validation script
+COPY validate_selective_cr.py .
+
+# Create a non-privileged user
+RUN useradd -m validator && chown -R validator:validator /app
+USER validator
+
+ENTRYPOINT ["python3", "validate_selective_cr.py"]
