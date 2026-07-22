@@ -1,28 +1,28 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: lora-swap-deployment
+  name: lora-swap-max1-deployment
   labels:
-    app: lora-swap
+    app: lora-swap-max1
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: lora-swap
+      app: lora-swap-max1
   template:
     metadata:
       labels:
-        app: lora-swap
+        app: lora-swap-max1
         snapshot-agent: "true"
-        timeslice.io/job-id: "lora-test-5"
+        timeslice.io/job-id: "lora-test-max1"
     spec:
       hostIPC: true
-      hostPID: true
+      hostPID: true  # Required for GPU-CR IPC matching
       containers:
       - name: lora-swap
-        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/lora-swap-client:latest # Replace with your actual image tag
+        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/lora-swap-client-max1:latest # Replace with your actual image tag
         command: ["python3"]
-        args: ["test_lora_swap.py"]
+        args: ["test_lora_swap_max1.py"]
         securityContext:
           runAsUser: 0
         imagePullPolicy: Always
@@ -34,7 +34,7 @@ spec:
         - name: AGENT_ENDPOINT
           value: "$(NODE_IP):9001"
         - name: JOB_ID
-          value: "lora-test-5"
+          value: "lora-test-max1"
         - name: GROUP
           value: "lora-group"
         - name: GPU_VENDOR

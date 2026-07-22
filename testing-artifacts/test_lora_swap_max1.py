@@ -128,15 +128,15 @@ def get_lora_addresses_from_worker(model, slot_index):
     return targets
 
 def main():
-    # 1. Initialize vLLM
+    # 1. Initialize vLLM with max_loras=1
     model_name = "facebook/opt-125m"
-    print(f"Initializing vLLM with model {model_name}...")
+    print(f"Initializing vLLM with model {model_name} (max_loras=1)...")
    
     # We must set enforce_eager=True and disable_custom_all_reduce=True for CR
     llm = LLM(
         model=model_name,
         enable_lora=True,
-        max_loras=2,
+        max_loras=1, # Crucial for testing single-slot swapping
         max_lora_rank=16,
         enforce_eager=True,
         disable_custom_all_reduce=True,
@@ -164,9 +164,12 @@ def main():
         print(f"Failed to connect to Snapshot Agent: {e}")
         sys.exit(1)
         
-    job_id = os.getenv("JOB_ID", "lora-test")
+    job_id = os.getenv("JOB_ID", "lora-test-max1")
     group = os.getenv("GROUP", "lora-group")
     backend = snapshot_agent_pb2.BACKEND_GPU_CR_MEMORY_ADDRESSES
+    
+    # Since max_loras=1, we only use Slot 0
+    slot_index = 0
     
     # 2. Load LoRA A and run inference (loads into Slot 0)
     print("\n--- Loading LoRA A ---")
@@ -178,28 +181,10 @@ def main():
     print(f"LoRA A Initial Output: {repr(output_A_initial)}")
     
     # Find Slot 0 addresses
-    slot_A_index = 0
-    targets_A = llm.llm_engine.apply_model(lambda m: get_lora_addresses_from_worker(m, slot_A_index))[0]
-    print(f"LoRA A (Slot {slot_A_index}) targets: {len(targets_A)} regions found.")
+    targets_A = llm.llm_engine.apply_model(lambda m: get_lora_addresses_from_worker(m, slot_index))[0]
+    print(f"LoRA A (Slot {slot_index}) targets: {len(targets_A)} regions found.")
     
-    # 3. Load LoRA B and run inference (loads into Slot 1)
-    print("\n--- Loading LoRA B ---")
-    lora_request_B = LoRARequest("lora_B", 2, lora_dir_B)
-    outputs = llm.generate(["Who are you?"], sampling_params, lora_request=lora_request_B)
-    output_B_initial = outputs[0].outputs[0].text
-    print(f"LoRA B Initial Output: {repr(output_B_initial)}")
-    
-    # Find Slot 1 addresses
-    slot_B_index = 1
-    targets_B = llm.llm_engine.apply_model(lambda m: get_lora_addresses_from_worker(m, slot_B_index))[0]
-    print(f"LoRA B (Slot {slot_B_index}) targets: {len(targets_B)} regions found.")
-    
-    # Verify outputs are different
-    if output_A_initial == output_B_initial:
-        print("WARNING: Outputs are identical! LoRA weights might not have had enough effect, or model is not using them.")
-    else:
-        print("SUCCESS: Initial outputs are different.")
-        
+    # 3. Snapshot LoRA A (Slot 0)
     print("\n--- Snapshotting LoRA A (Slot 0) ---")
     try:
         resp = client.snapshot_and_wait(job_id=job_id, group=group + "-A", backend=backend, memory_addresses=targets_A)
@@ -208,15 +193,26 @@ def main():
         print(f"Snapshot A failed: {e}")
         sys.exit(1)
         
-    print("\n--- Restoring LoRA A (to remap memory for B) ---")
-    try:
-        resp = client.restore_and_wait(job_id=job_id, group=group + "-A", backend=backend, memory_addresses=targets_A)
-        print("Restore A response:", resp.status)
-    except Exception as e:
-        print(f"Restore A failed: {e}")
-        sys.exit(1)
+    # 4. Load LoRA B and run inference (overwrites Slot 0)
+    print("\n--- Loading LoRA B ---")
+    lora_request_B = LoRARequest("lora_B", 2, lora_dir_B)
+    outputs = llm.generate(["Who are you?"], sampling_params, lora_request=lora_request_B)
+    output_B_initial = outputs[0].outputs[0].text
+    print(f"LoRA B Initial Output: {repr(output_B_initial)}")
+    
+    # Find Slot 0 addresses again (should be same as targets_A)
+    targets_B = llm.llm_engine.apply_model(lambda m: get_lora_addresses_from_worker(m, slot_index))[0]
+    print(f"LoRA B (Slot {slot_index}) targets: {len(targets_B)} regions found.")
+    
+    # Verify targets are identical (proving they share the slot)
+    if targets_A != targets_B:
+        print("WARNING: Targets for A and B are different! Slot addresses are not static?")
+        # We will use targets_B for B's snapshot just in case, but they should be the same.
+    else:
+        print("SUCCESS: Slot addresses for A and B are identical.")
 
-    print("\n--- Snapshotting LoRA B (Slot 1) ---")
+    # 5. Snapshot LoRA B (Slot 0)
+    print("\n--- Snapshotting LoRA B (Slot 0) ---")
     try:
         resp = client.snapshot_and_wait(job_id=job_id, group=group + "-B", backend=backend, memory_addresses=targets_B)
         print("Snapshot B response:", resp.status)
@@ -224,7 +220,9 @@ def main():
         print(f"Snapshot B failed: {e}")
         sys.exit(1)
         
-    # 5. Restore A and test
+    # 6. Restore A and test (Hijack Test)
+    # vLLM thinks B is active in Slot 0. We restore A's weights into Slot 0.
+    # If we request B, we should get A's output.
     print("\n--- Restoring LoRA A (Slot 0) ---")
     try:
         resp = client.restore_and_wait(job_id=job_id, group=group + "-A", backend=backend, memory_addresses=targets_A)
@@ -233,18 +231,18 @@ def main():
         print(f"Restore A failed: {e}")
         sys.exit(1)
         
-    print("Running query for LoRA A...")
-    outputs = llm.generate(["Who are you?"], sampling_params, lora_request=lora_request_A)
-    output_A_restored = outputs[0].outputs[0].text
-    print(f"LoRA A Restored Output: {repr(output_A_restored)}")
+    print("Running query requesting LoRA B (expecting LoRA A output)...")
+    outputs = llm.generate(["Who are you?"], sampling_params, lora_request=lora_request_B)
+    output_after_restore_A = outputs[0].outputs[0].text
+    print(f"Output (requested B): {repr(output_after_restore_A)}")
     
-    if output_A_restored == output_A_initial:
-        print("SUCCESS: LoRA A restored correctly!")
+    if output_after_restore_A == output_A_initial:
+        print("SUCCESS: LoRA A restored correctly (hijacked LoRA B request)!")
     else:
-        print(f"FAILURE: LoRA A restored output mismatch! Expected {repr(output_A_initial)}, got {repr(output_A_restored)}")
+        print(f"FAILURE: LoRA A restored output mismatch! Expected A's output {repr(output_A_initial)}, got {repr(output_after_restore_A)}")
         
-    # 6. Restore B and test
-    print("\n--- Restoring LoRA B (Slot 1) ---")
+    # 7. Restore B and test
+    print("\n--- Restoring LoRA B (Slot 0) ---")
     try:
         resp = client.restore_and_wait(job_id=job_id, group=group + "-B", backend=backend, memory_addresses=targets_B)
         print("Restore B response:", resp.status)
@@ -252,17 +250,27 @@ def main():
         print(f"Restore B failed: {e}")
         sys.exit(1)
         
-    print("Running query for LoRA B...")
+    print("Running query requesting LoRA B (expecting LoRA B output)...")
     outputs = llm.generate(["Who are you?"], sampling_params, lora_request=lora_request_B)
-    output_B_restored = outputs[0].outputs[0].text
-    print(f"LoRA B Restored Output: {repr(output_B_restored)}")
+    output_after_restore_B = outputs[0].outputs[0].text
+    print(f"Output (requested B): {repr(output_after_restore_B)}")
     
-    if output_B_restored == output_B_initial:
+    if output_after_restore_B == output_B_initial:
         print("SUCCESS: LoRA B restored correctly!")
     else:
-        print(f"FAILURE: LoRA B restored output mismatch! Expected {repr(output_B_initial)}, got {repr(output_B_restored)}")
+        print(f"FAILURE: LoRA B restored output mismatch! Expected B's output {repr(output_B_initial)}, got {repr(output_after_restore_B)}")
         
-    print("\nLoRA Swap Test Completed.")
+    # 8. Test what happens if we request A (should trigger vLLM reload and still work, but slower)
+    print("\n--- Requesting LoRA A (triggers vLLM reload) ---")
+    outputs = llm.generate(["Who are you?"], sampling_params, lora_request=lora_request_A)
+    output_A_reloaded = outputs[0].outputs[0].text
+    print(f"Output (requested A): {repr(output_A_reloaded)}")
+    if output_A_reloaded == output_A_initial:
+         print("SUCCESS: LoRA A reloaded and worked correctly.")
+    else:
+         print("FAILURE: LoRA A reload failed.")
+
+    print("\nLoRA Swap Max 1 Test Completed.")
 
 if __name__ == "__main__":
     main()

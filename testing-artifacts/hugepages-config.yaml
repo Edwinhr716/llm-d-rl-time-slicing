@@ -1,0 +1,4 @@
+linuxConfig:
+  hugepageConfig:
+    hugepage_size2m: 30720
+    hugepage_size1g: 0
