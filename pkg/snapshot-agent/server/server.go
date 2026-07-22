@@ -107,7 +107,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 			targets = allPIDStrings
 		}
 
-		err = backend.Snapshot(bgCtx, targets)
+		err = backend.Snapshot(bgCtx, req.GetGroup(), targets)
 		if err != nil {
 			return fmt.Errorf("failed to snapshot job %s: %w", req.GetJobId(), err)
 		}
@@ -168,7 +168,7 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 		}
 
 		slog.InfoContext(bgCtx, "Restoring", "targets", targets, "backend", backendType)
-		if err := backend.Restore(bgCtx, targets); err != nil {
+		if err := backend.Restore(bgCtx, req.GetGroup(), targets); err != nil {
 			return fmt.Errorf("failed to restore job %s: %w", req.GetJobId(), err)
 		}
 		return nil

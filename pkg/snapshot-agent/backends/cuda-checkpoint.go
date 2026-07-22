@@ -51,15 +51,15 @@ func NewCudaCheckpoint() *CudaCheckpoint {
 }
 
 // Snapshot triggers a snapshot of the accelerator context for a job.
-func (c *CudaCheckpoint) Snapshot(ctx context.Context, pids []string) error {
+func (c *CudaCheckpoint) Snapshot(ctx context.Context, groupID string, targets []string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	slog.InfoContext(ctx, "Snapshotting PIDs", "pids", pids)
+	slog.InfoContext(ctx, "Snapshotting targets", "groupID", groupID, "targets", targets)
 
 	// 1. Lock and Checkpoint CUDA
 	t0 := time.Now()
-	if err := c.checkpointPIDs(ctx, pids); err != nil {
+	if err := c.checkpointPIDs(ctx, targets); err != nil {
 		return fmt.Errorf("cuda-checkpoint checkpoint failed: %w", err)
 	}
 	slog.InfoContext(ctx, "cuda-checkpoint action took", "duration", time.Since(t0))
@@ -67,20 +67,20 @@ func (c *CudaCheckpoint) Snapshot(ctx context.Context, pids []string) error {
 }
 
 // Restore triggers a restoration of the accelerator context for a job.
-func (c *CudaCheckpoint) Restore(ctx context.Context, pids []string) error {
-	if len(pids) == 0 {
-		return fmt.Errorf("at least one PID is required")
+func (c *CudaCheckpoint) Restore(ctx context.Context, groupID string, targets []string) error {
+	if len(targets) == 0 {
+		return fmt.Errorf("at least one target is required")
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	slog.InfoContext(ctx, "Restoring PIDs", "pids", pids)
+	slog.InfoContext(ctx, "Restoring targets", "groupID", groupID, "targets", targets)
 	t0 := time.Now()
-	if err := c.restorePIDs(ctx, pids); err != nil {
+	if err := c.restorePIDs(ctx, targets); err != nil {
 		return fmt.Errorf("cuda-checkpoint toggle failed: %w", err)
 	}
-	slog.InfoContext(ctx, "cuda-checkpoint toggle took", "duration", time.Since(t0), "pids", pids)
+	slog.InfoContext(ctx, "cuda-checkpoint toggle took", "duration", time.Since(t0), "targets", targets)
 	return nil
 }
 

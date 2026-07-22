@@ -193,6 +193,14 @@ def main():
         print(f"Snapshot A failed: {e}")
         sys.exit(1)
         
+    print("\n--- Restoring LoRA A (to remap memory for B) ---")
+    try:
+        resp = client.restore_and_wait(job_id=job_id, group=group + "-A", backend=backend, memory_addresses=targets_A)
+        print("Restore A response:", resp.status)
+    except Exception as e:
+        print(f"Restore A failed: {e}")
+        sys.exit(1)
+        
     # 4. Load LoRA B and run inference (overwrites Slot 0)
     print("\n--- Loading LoRA B ---")
     lora_request_B = LoRARequest("lora_B", 2, lora_dir_B)

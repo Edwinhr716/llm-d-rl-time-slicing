@@ -27,16 +27,16 @@ func NewGpuCr() *GpuCr {
 }
 
 // Snapshot triggers a snapshot of the accelerator context for a job.
-func (g *GpuCr) Snapshot(ctx context.Context, pids []string) error {
+func (g *GpuCr) Snapshot(ctx context.Context, groupID string, targets []string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	slog.InfoContext(ctx, "Snapshotting PIDs using GPU-CR", "pids", pids)
+	slog.InfoContext(ctx, "Snapshotting targets using GPU-CR", "groupID", groupID, "targets", targets)
 
 	t0 := time.Now()
-	for _, pid := range pids {
-		if err := g.checkpointPID(ctx, pid); err != nil {
-			return fmt.Errorf("cr_client checkpoint failed for PID %s: %w", pid, err)
+	for _, target := range targets {
+		if err := g.checkpointPID(ctx, target); err != nil {
+			return fmt.Errorf("cr_client checkpoint failed for PID %s: %w", target, err)
 		}
 	}
 	slog.InfoContext(ctx, "GPU-CR checkpoint took", "duration", time.Since(t0))
@@ -44,22 +44,22 @@ func (g *GpuCr) Snapshot(ctx context.Context, pids []string) error {
 }
 
 // Restore triggers a restoration of the accelerator context for a job.
-func (g *GpuCr) Restore(ctx context.Context, pids []string) error {
-	if len(pids) == 0 {
-		return fmt.Errorf("at least one PID is required")
+func (g *GpuCr) Restore(ctx context.Context, groupID string, targets []string) error {
+	if len(targets) == 0 {
+		return fmt.Errorf("at least one target is required")
 	}
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	slog.InfoContext(ctx, "Restoring PIDs using GPU-CR", "pids", pids)
+	slog.InfoContext(ctx, "Restoring targets using GPU-CR", "groupID", groupID, "targets", targets)
 	t0 := time.Now()
-	for _, pid := range pids {
-		if err := g.restorePID(ctx, pid); err != nil {
-			return fmt.Errorf("cr_client restore failed for PID %s: %w", pid, err)
+	for _, target := range targets {
+		if err := g.restorePID(ctx, target); err != nil {
+			return fmt.Errorf("cr_client restore failed for PID %s: %w", target, err)
 		}
 	}
-	slog.InfoContext(ctx, "GPU-CR restore took", "duration", time.Since(t0), "pids", pids)
+	slog.InfoContext(ctx, "GPU-CR restore took", "duration", time.Since(t0), "targets", targets)
 	return nil
 }
 

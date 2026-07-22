@@ -15,16 +15,16 @@ func NewNoopBackend() *NoopBackend {
 }
 
 // Snapshot simulates a snapshot operation.
-func (b *NoopBackend) Snapshot(ctx context.Context, pids []string) error {
-	slog.InfoContext(ctx, "NoopBackend: Snapshot called", "pids", pids)
+func (b *NoopBackend) Snapshot(ctx context.Context, groupID string, targets []string) error {
+	slog.InfoContext(ctx, "NoopBackend: Snapshot called", "groupID", groupID, "targets", targets)
 	// Simulate some work
 	time.Sleep(500 * time.Millisecond)
 	return nil
 }
 
 // Restore simulates a restore operation.
-func (b *NoopBackend) Restore(ctx context.Context, pids []string) error {
-	slog.InfoContext(ctx, "NoopBackend: Restore called", "pids", pids)
+func (b *NoopBackend) Restore(ctx context.Context, groupID string, targets []string) error {
+	slog.InfoContext(ctx, "NoopBackend: Restore called", "groupID", groupID, "targets", targets)
 	// Simulate some work
 	time.Sleep(500 * time.Millisecond)
 	return nil

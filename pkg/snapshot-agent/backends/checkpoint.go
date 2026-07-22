@@ -20,10 +20,10 @@ const (
 type Backend interface {
 	// Snapshot triggers a snapshot of the accelerator context for a job.
 	// Returns storageBytes, deviceBytes, and error.
-	Snapshot(ctx context.Context, pids []string) error
+	Snapshot(ctx context.Context, groupID string, targets []string) error
 
 	// Restore triggers a restoration of the accelerator context for a job.
-	Restore(ctx context.Context, pids []string) error
+	Restore(ctx context.Context, groupID string, targets []string) error
 
 	// HealthCheck checks if the backend is healthy by initializing the backend
 	// and the discovery provider.
