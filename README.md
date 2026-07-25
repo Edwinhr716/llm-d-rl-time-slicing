@@ -20,6 +20,12 @@
 
 For the full design rationale and preliminary benchmark results, see the [Platform-Native Time-Slicing proposal](https://github.com/llm-d/llm-d/blob/main/docs/proposals/rl-time-slicing-platform.md).
 
+## See Time-Slicing in Action
+
+![Time-slicing replay](docs/diagrams/verl-sync-rl-timeslice-replay.gif)
+
+&#9654; **[Open the interactive replay](https://llm-d-incubation.github.io/llm-d-rl-time-slicing/diagrams/verl-sync-rl-timeslice-replay.html)** — play recorded runs, inspect every lock handoff and snapshot/restore, and select between runs as more are added.
+
 ## Architecture
 
 ![Architecture](https://github.com/llm-d-incubation/llm-d-rl-time-slicing/blob/main/docs/diagrams/time-slicing-architecture-diagram.png?raw=true)
