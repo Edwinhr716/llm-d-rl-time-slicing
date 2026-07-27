@@ -5,7 +5,7 @@ import warnings
 
 from timeslice.snapshot_agent import snapshot_agent_pb2 as timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2
 
-GRPC_GENERATED_VERSION = '1.82.1'
+GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -101,6 +101,10 @@ class SnapshotAgentServiceServicer:
         (no HTTP server) use this instead of AppEndpointConfig. The first message
         from the workload must be a RegisterWorkload; subsequent messages are
         CommandResults acknowledging AgentCommands.
+
+        Registration is node-scoped: the workload registers with the agent on
+        its own node, and Snapshot/Restore requests carrying an AppChannelConfig
+        must be sent to that same agent.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
