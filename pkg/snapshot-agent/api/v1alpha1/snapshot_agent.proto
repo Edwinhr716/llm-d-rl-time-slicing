@@ -50,6 +50,12 @@ message CudaBackendConfig {
   ProcessTarget explicit_target = 1;
 }
 
+// Configuration for the Direct Memory (process-level) backend.
+message DirectMemoryBackendConfig {
+  // The target processes to checkpoint/restore.
+  ProcessTarget explicit_target = 1;
+}
+
 // App identifies the HTTP API dialect of an application-aware workload.
 // It grows only when a new HTTP dialect ships; workloads reached through a
 // registered workload channel never need an entry here.
@@ -114,6 +120,7 @@ message BackendConfig {
     CudaBackendConfig cuda = 1;
     AppEndpointConfig app_endpoint = 2;
     AppChannelConfig app_channel = 3;
+    DirectMemoryBackendConfig direct_memory = 4;
   }
 }
 
