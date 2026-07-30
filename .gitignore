@@ -3,7 +3,9 @@
 *.dll
 *.so
 *.dylib
-bin/
+bin/*
+!bin/cr_client
+!bin/vGPU-NVIDIA.so
 
 # Test
 *.test
