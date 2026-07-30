@@ -26,7 +26,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
-	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/accelerator-orchestrator/api/v1alpha1"
+	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/tests/integration/orchestrator/scenarios"
 )
 
@@ -39,7 +39,7 @@ var orchestratorTestCmd = &cobra.Command{
 	Use:   "orchestrator",
 	Short: "Run E2E scenario tests against the cluster",
 	Long: `Runs the E2E scenario tests (Single RL Job and Queued RL Jobs) ` +
-		`against the active Kubernetes cluster and the deployed Accelerator Orchestrator.`,
+		`against the active Kubernetes cluster and the deployed TimeSlice Orchestrator.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -126,7 +126,7 @@ var orchestratorTestCmd = &cobra.Command{
 			return fmt.Errorf("failed to create orchestrator client: %w", err)
 		}
 		defer conn.Close()
-		client := pb.NewAcceleratorOrchestratorServiceClient(conn)
+		client := pb.NewTimeSliceOrchestratorServiceClient(conn)
 
 		// Ping the orchestrator with a quick call to ensure it's reachable
 		pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -135,7 +135,7 @@ var orchestratorTestCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("failed to connect to orchestrator at %s: %w "+
 				"(make sure to port-forward if necessary: "+
-				"kubectl port-forward svc/timeslice-acceleratororchestrator 50051:50051 -n timeslice-system)",
+				"kubectl port-forward svc/timeslice-timesliceorchestrator 50051:50051 -n timeslice-system)",
 				orchestratorAddr, err)
 		}
 		fmt.Printf("Connected successfully.\n\n")

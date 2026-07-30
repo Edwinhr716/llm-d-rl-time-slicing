@@ -2,8 +2,8 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
-# Override values for the acceleratororchestrator subchart
-acceleratororchestrator:
+# Override values for the timesliceorchestrator subchart
+timesliceorchestrator:
   enabled: true
   # You can add specific overrides here, for example:
   # replicaCount: 2

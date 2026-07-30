@@ -29,7 +29,7 @@ import (
 var inspectCmd = &cobra.Command{
 	Use:   "inspect",
 	Short: "Inspect orchestrator and snapshot-agent deployment status",
-	Long: `Checks the Kubernetes cluster to ensure both the accelerator-orchestrator deployment ` +
+	Long: `Checks the Kubernetes cluster to ensure both the timeslice-orchestrator deployment ` +
 		`and snapshot-agent daemonset are deployed and running, and returns their image versions.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -92,23 +92,23 @@ func verifyCluster(ctx context.Context, clientset *kubernetes.Clientset) bool {
 		}
 	}
 
-	// 1. Verify Accelerator Orchestrator Deployment
+	// 1. Verify TimeSlice Orchestrator Deployment
 	var orchPassed bool
 	var orchDetails []string
 	deployments, err := clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "app.kubernetes.io/name=acceleratororchestrator",
+		LabelSelector: "app.kubernetes.io/name=timesliceorchestrator",
 	})
 
 	var orchDep *appsv1.Deployment
 	if err == nil && len(deployments.Items) > 0 {
 		orchDep = &deployments.Items[0]
 	} else if err == nil {
-		// Fallback: search by name containing "acceleratororchestrator"
+		// Fallback: search by name containing "timesliceorchestrator"
 		allDeps, err := clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
 		if err == nil {
 			for i := range allDeps.Items {
 				d := &allDeps.Items[i]
-				if strings.Contains(d.Name, "acceleratororchestrator") {
+				if strings.Contains(d.Name, "timesliceorchestrator") {
 					orchDep = d
 					break
 				}
@@ -147,7 +147,7 @@ func verifyCluster(ctx context.Context, clientset *kubernetes.Clientset) bool {
 			}
 		}
 	}
-	printResult("Accelerator Orchestrator Deployment", orchPassed, orchDetails)
+	printResult("TimeSlice Orchestrator Deployment", orchPassed, orchDetails)
 	fmt.Println()
 
 	// 2. Verify Snapshot Agent DaemonSet

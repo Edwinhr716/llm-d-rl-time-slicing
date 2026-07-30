@@ -9,7 +9,7 @@ COPY . .
 # Recreate go.work to ensure clean multi-module build
 RUN rm -f go.work && \
     go work init . && \
-    go work use ./pkg/accelerator-orchestrator && \
+    go work use ./pkg/timeslice-orchestrator && \
     go work use ./pkg/snapshot-agent
 
 # Build the snapshot-agent

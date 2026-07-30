@@ -1,6 +1,6 @@
 # Timeslice Parent Helm Chart
 
-This is the parent Helm chart that coordinates the deployment of both the **Accelerator Orchestrator** and the **Snapshot Agent**.
+This is the parent Helm chart that coordinates the deployment of both the **TimeSlice Orchestrator** and the **Snapshot Agent**.
 
 Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` by CI: `latest` on every merge to main; versioned tags via a manual workflow run.
 
@@ -8,7 +8,7 @@ Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*
 
 *   `Chart.yaml`: Defines the parent chart and its dependencies.
 *   `values.yaml`: Allows overriding configuration for both subcharts.
-*   `acceleratororchestrator/`: Subchart for the Accelerator Orchestrator.
+*   `timesliceorchestrator/`: Subchart for the TimeSlice Orchestrator.
 *   `snapshot-agent/`: Subchart for the Snapshot Agent DaemonSet.
 
 ## Prerequisites
@@ -38,7 +38,7 @@ DRA is required for timeslicing. This helm file includes the **NVIDIA DRA Driver
 Example `values.yaml`:
 
 ```yaml
-acceleratororchestrator:
+timesliceorchestrator:
   replicaCount: 2
   image:
     tag: latest
@@ -103,9 +103,9 @@ If you are developing and validating using a custom registry, you can combine th
 Create a development-specific values file (e.g., `values-dev.yaml`) containing your registry overrides:
 ```yaml
 # values-dev.yaml
-acceleratororchestrator:
+timesliceorchestrator:
   image:
-    repository: your-custom-registry.com/your-project/acceleratororchestrator
+    repository: your-custom-registry.com/your-project/timesliceorchestrator
 snapshot-agent:
   image:
     repository: your-custom-registry.com/your-project/snapshot-agent
@@ -121,7 +121,7 @@ Alternatively, you can pass the registry overrides via `--set` flags alongside t
 ```bash
 helm upgrade --install timeslice . \
   -f values-gke.yaml \
-  --set acceleratororchestrator.image.repository=your-custom-registry.com/your-project/acceleratororchestrator \
+  --set timesliceorchestrator.image.repository=your-custom-registry.com/your-project/timesliceorchestrator \
   --set snapshot-agent.image.repository=your-custom-registry.com/your-project/snapshot-agent
 ```
 

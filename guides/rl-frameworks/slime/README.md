@@ -94,7 +94,7 @@ kubectl apply -f sync/resource-claims.yaml
 
 ## 2. Deploying the Time-Slicing Platform
 
-We deploy the core platform components—**Accelerator Orchestrator**, **Snapshot Agent** (DaemonSet), and the **NVIDIA DRA Driver**—using the parent Helm chart.
+We deploy the core platform components—**TimeSlice Orchestrator**, **Snapshot Agent** (DaemonSet), and the **NVIDIA DRA Driver**—using the parent Helm chart.
 
 ### Step 1: Update Helm Chart Dependencies
 From the root of your `llm-d-rl-time-slicing` workspace, navigate to the `deploy` directory and fetch the required subcharts:
@@ -106,7 +106,7 @@ helm dependency update .
 ### Step 2: Configure `values.yaml`
 Review or modify the parent `values.yaml` file to match your cluster environment:
 ```yaml
-acceleratororchestrator:
+timesliceorchestrator:
   replicaCount: 2
   image:
     tag: latest
@@ -148,7 +148,7 @@ Verify that the orchestrator and agents are running and healthy:
 
 To participate in cooperative time-slicing, the Slime training loop driver requests and yields access to the GPU resource pools at its natural phase boundaries.
 
-Because worker processes (SGLang engines and Megatron-LM trainer actors) run as background servers, **only the main RL loop driver script (`train.py`)** needs to communicate with the Accelerator Orchestrator via `OrchestratorClient`.
+Because worker processes (SGLang engines and Megatron-LM trainer actors) run as background servers, **only the main RL loop driver script (`train.py`)** needs to communicate with the TimeSlice Orchestrator via `OrchestratorClient`.
 
 ### Step 1: Add Time-Slicing Command-Line Arguments
 Add time-slicing configuration options to `slime/utils/arguments.py`:
@@ -163,26 +163,26 @@ parser.add_argument(
 parser.add_argument(
     "--timeslice-orchestrator-addr",
     type=str,
-    default="timeslice-acceleratororchestrator.timeslice-system.svc.cluster.local:50051",
-    help="Address of the Accelerator Orchestrator gRPC service.",
+    default="timeslice-timesliceorchestrator.timeslice-system.svc.cluster.local:50051",
+    help="Address of the TimeSlice Orchestrator gRPC service.",
 )
 parser.add_argument(
     "--timeslice-job-id",
     type=str,
     default=None,
-    help="Unique job identifier for the Accelerator Orchestrator.",
+    help="Unique job identifier for the TimeSlice Orchestrator.",
 )
 parser.add_argument(
     "--timeslice-sampler-group",
     type=str,
     default="group-slime-sampler",
-    help="Accelerator Orchestrator time-slice group for rollout samplers.",
+    help="TimeSlice Orchestrator time-slice group for rollout samplers.",
 )
 parser.add_argument(
     "--timeslice-trainer-group",
     type=str,
     default="group-slime-trainer",
-    help="Accelerator Orchestrator time-slice group for trainer actors.",
+    help="TimeSlice Orchestrator time-slice group for trainer actors.",
 )
 ```
 
@@ -199,7 +199,7 @@ def train(args):
     job_id = getattr(args, "timeslice_job_id", None) or os.getenv("TIMESLICE_JOB_ID", "slime-job-default")
 
     if getattr(args, "enable_timeslice", False):
-        addr = getattr(args, "timeslice_orchestrator_addr", "timeslice-acceleratororchestrator.timeslice-system.svc.cluster.local:50051")
+        addr = getattr(args, "timeslice_orchestrator_addr", "timeslice-timesliceorchestrator.timeslice-system.svc.cluster.local:50051")
         sampler_client = OrchestratorClient(target=addr, job_id=job_id, group_id=getattr(args, "timeslice_sampler_group", "group-slime-sampler"))
         trainer_client = OrchestratorClient(target=addr, job_id=job_id, group_id=getattr(args, "timeslice_trainer_group", "group-slime-trainer"))
 
@@ -353,7 +353,7 @@ Ensure they have unique `TIMESLICE_JOB_ID` environment variables.
 ### Step 2: Port-Forward the Orchestrator
 To monitor the orchestrator state from your local machine, port-forward the gRPC service:
 ```bash
-kubectl port-forward svc/timeslice-acceleratororchestrator 50051:50051 -n timeslice-system
+kubectl port-forward svc/timeslice-timesliceorchestrator 50051:50051 -n timeslice-system
 ```
 
 ### Step 3: Observe Time-Slicing via the CLI
@@ -377,7 +377,7 @@ You can inspect the platform logs to verify that the Snapshot Agent is actively 
 
 1. **Orchestrator Logs (Scheduling Decisions)**:
    ```bash
-   kubectl logs -n timeslice-system -l app.kubernetes.io/name=acceleratororchestrator --tail=100 -f
+   kubectl logs -n timeslice-system -l app.kubernetes.io/name=timesliceorchestrator --tail=100 -f
    ```
    Look for lines indicating lock transfers:
    ```text

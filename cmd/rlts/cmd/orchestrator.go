@@ -23,13 +23,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/accelerator-orchestrator/api/v1alpha1"
+	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 )
 
 var orchestratorCmd = &cobra.Command{
 	Use:   "orchestrator",
-	Short: "Interact with the Accelerator Orchestrator",
-	Long:  `Manage and query the Accelerator Orchestrator.`,
+	Short: "Interact with the TimeSlice Orchestrator",
+	Long:  `Manage and query the TimeSlice Orchestrator.`,
 }
 
 func init() {
@@ -40,12 +40,12 @@ func init() {
 	orchestratorCmd.AddCommand(yieldCmd)
 }
 
-func getClient() (pb.AcceleratorOrchestratorServiceClient, *grpc.ClientConn, error) {
+func getClient() (pb.TimeSliceOrchestratorServiceClient, *grpc.ClientConn, error) {
 	conn, err := grpc.NewClient(orchestratorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, nil, fmt.Errorf("did not connect: %w", err)
 	}
-	return pb.NewAcceleratorOrchestratorServiceClient(conn), conn, nil
+	return pb.NewTimeSliceOrchestratorServiceClient(conn), conn, nil
 }
 
 var listGroupsCmd = &cobra.Command{

@@ -27,7 +27,7 @@ class TestTimeSliceOrchestratorClient(unittest.TestCase):
             "timeslice.orchestrator.client.grpc.insecure_channel"
         )
         self.mock_stub_patcher = patch(
-            "timeslice.orchestrator.client.pb2_grpc.AcceleratorOrchestratorServiceStub"
+            "timeslice.orchestrator.client.pb2_grpc.TimeSliceOrchestratorServiceStub"
         )
 
         self.mock_insecure_channel = self.mock_channel_patcher.start()

@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/accelerator-orchestrator/api/v1alpha1"
+	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	resourcev1 "k8s.io/api/resource/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,7 +32,7 @@ import (
 func RunSingleRLJobScenario(
 	ctx context.Context,
 	clientset kubernetes.Interface,
-	client pb.AcceleratorOrchestratorServiceClient,
+	client pb.TimeSliceOrchestratorServiceClient,
 	logger Logger,
 	samplerTemplateKey string,
 	trainerTemplateKey string,
@@ -104,7 +104,7 @@ func RunSingleRLJobScenario(
 func RunQueuedRLJobsScenario(
 	ctx context.Context,
 	clientset kubernetes.Interface,
-	client pb.AcceleratorOrchestratorServiceClient,
+	client pb.TimeSliceOrchestratorServiceClient,
 	logger Logger,
 	samplerTemplateKey string,
 	trainerTemplateKey string,

@@ -3,8 +3,8 @@ PROJECT_NAME ?= llm-d-rl-time-slicing
 # Matches where CI publishes (ghcr.io/<owner>/<repo>/<component>); override
 # REGISTRY for dev pushes to your own registry.
 REGISTRY ?= ghcr.io/llm-d-incubation
-ORCHESTRATOR_IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)/acceleratororchestrator
-ORCHESTRATOR_DOCKERFILE ?= docker/acceleratororchestrator/Dockerfile
+ORCHESTRATOR_IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)/timesliceorchestrator
+ORCHESTRATOR_DOCKERFILE ?= docker/timesliceorchestrator/Dockerfile
 SNAPSHOT_AGENT_IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)/snapshot-agent
 SNAPSHOT_AGENT_DOCKERFILE ?= docker/snapshot-agent/Dockerfile
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -96,7 +96,7 @@ pre-commit: ## Run pre-commit hooks on all files
 ##@ Container
 
 .PHONY: image-build-orchestrator
-image-build-orchestrator: ## Build acceleratororchestrator container image (local only)
+image-build-orchestrator: ## Build timesliceorchestrator container image (local only)
 	docker buildx build \
 		--platform $(PLATFORMS) \
 		--tag $(ORCHESTRATOR_IMAGE):$(VERSION) \
@@ -105,7 +105,7 @@ image-build-orchestrator: ## Build acceleratororchestrator container image (loca
 		.
 
 .PHONY: image-push-orchestrator
-image-push-orchestrator: ## Build and push acceleratororchestrator container image
+image-push-orchestrator: ## Build and push timesliceorchestrator container image
 	docker buildx build \
 		--platform $(PLATFORMS) \
 		--push \

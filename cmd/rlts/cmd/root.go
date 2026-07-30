@@ -23,7 +23,7 @@ var orchestratorAddr string
 var rootCmd = &cobra.Command{
 	Use:   "rlts",
 	Short: "rlts is a CLI for interacting with LLM-D RL Time Slicing",
-	Long:  `A command line interface to interact with the LLM-D RL Time Slicing components, including the Accelerator Orchestrator.`,
+	Long:  `A command line interface to interact with the LLM-D RL Time Slicing components, including the TimeSlice Orchestrator.`,
 }
 
 func Execute() error {
@@ -32,5 +32,5 @@ func Execute() error {
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&orchestratorAddr, "addr", "localhost:50051",
-		"address of the accelerator orchestrator gRPC server")
+		"address of the TimeSlice Orchestrator gRPC server")
 }

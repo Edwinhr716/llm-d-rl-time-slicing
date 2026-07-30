@@ -21,7 +21,7 @@ DEFAULT_SERVICE_CONFIG = json.dumps(
         "methodConfig": [
             {
                 "name": [
-                    {"service": "timeslice.orchestrator.AcceleratorOrchestratorService"}
+                    {"service": "timeslice.orchestrator.TimeSliceOrchestratorService"}
                 ],
                 "retryPolicy": {
                     "maxAttempts": 5,
@@ -46,7 +46,7 @@ DEFAULT_CHANNEL_OPTIONS: List[Tuple[str, Any]] = [
 
 
 class TimeSliceOrchestratorClient:
-    """Convenient UX wrapper client for the Accelerator Orchestrator Service."""
+    """Convenient UX wrapper client for the TimeSlice Orchestrator Service."""
 
     def __init__(
         self,
@@ -72,7 +72,7 @@ class TimeSliceOrchestratorClient:
 
         # Initialize insecure channel. (Can be extended to secure if needed in future)
         self._channel = grpc.insecure_channel(target, options=channel_options)
-        self._stub = pb2_grpc.AcceleratorOrchestratorServiceStub(self._channel)
+        self._stub = pb2_grpc.TimeSliceOrchestratorServiceStub(self._channel)
 
     def __enter__(self):
         return self

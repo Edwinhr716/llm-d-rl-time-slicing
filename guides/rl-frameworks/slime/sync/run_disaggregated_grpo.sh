@@ -88,7 +88,7 @@ SGLANG_ARGS=(
 )
 TIMESLICE_ARGS=(
     --enable-timeslice
-    --timeslice-orchestrator-addr "timeslice-acceleratororchestrator.timeslice-system.svc.cluster.local:50051"
+    --timeslice-orchestrator-addr "timeslice-timesliceorchestrator.timeslice-system.svc.cluster.local:50051"
     --timeslice-sampler-group "samplers"
     --timeslice-trainer-group "trainers"
     --timeslice-job-id "${JOB_NAME:-slime-job-$RANDOM}"

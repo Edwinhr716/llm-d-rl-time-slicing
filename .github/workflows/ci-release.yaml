@@ -26,8 +26,8 @@ jobs:
           # as a unit, and the snapshot-agent is x86_64-only today (cuda-checkpoint
           # binary + CGO build). Revisit both together when an aarch64
           # cuda-checkpoint is available.
-          - component: acceleratororchestrator
-            dockerfile: docker/acceleratororchestrator/Dockerfile
+          - component: timesliceorchestrator
+            dockerfile: docker/timesliceorchestrator/Dockerfile
             platforms: linux/amd64
           - component: snapshot-agent
             dockerfile: docker/snapshot-agent/Dockerfile

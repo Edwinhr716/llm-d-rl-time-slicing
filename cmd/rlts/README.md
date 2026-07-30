@@ -1,6 +1,6 @@
 # rlts CLI
 
-`rlts` is a command-line interface for interacting with the LLM-D RL Time Slicing components, primarily the Accelerator Orchestrator.
+`rlts` is a command-line interface for interacting with the LLM-D RL Time Slicing components, primarily the TimeSlice Orchestrator.
 
 ## Building the CLI
 
@@ -14,12 +14,12 @@ This will create the `rlts` binary in the `bin` directory.
 
 ## Connecting to a Deployed Orchestrator
 
-If the Accelerator Orchestrator is deployed inside a Kubernetes cluster, you need to establish a connection to it. The easiest way to do this from your local machine is using `kubectl port-forward`.
+If the TimeSlice Orchestrator is deployed inside a Kubernetes cluster, you need to establish a connection to it. The easiest way to do this from your local machine is using `kubectl port-forward`.
 
-Assuming the orchestrator is deployed as a service named `acceleratororchestrator` in the default namespace:
+Assuming the orchestrator is deployed as a service named `timesliceorchestrator` in the default namespace:
 
 ```bash
-kubectl port-forward svc/acceleratororchestrator 50051:50051
+kubectl port-forward svc/timesliceorchestrator 50051:50051
 ```
 
 This forwards traffic from your local port `50051` to the orchestrator service in the cluster. Keep this command running in a separate terminal.
@@ -34,14 +34,14 @@ rlts [command] [--addr <address>]
 
 ### Global Flags
 
-*   `--addr string`: Address of the accelerator orchestrator gRPC server (default "localhost:50051")
+*   `--addr string`: Address of the TimeSlice Orchestrator gRPC server (default "localhost:50051")
 *   `-h`, `--help`: Help for `rlts`
 
 ---
 
 ## Orchestrator Commands
 
-All commands for interacting with the Accelerator Orchestrator are nested under `rlts orchestrator`.
+All commands for interacting with the TimeSlice Orchestrator are nested under `rlts orchestrator`.
 
 ### List Active Groups
 

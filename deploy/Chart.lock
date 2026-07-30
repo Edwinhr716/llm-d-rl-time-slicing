@@ -1,6 +1,6 @@
 dependencies:
-- name: acceleratororchestrator
-  repository: file://./acceleratororchestrator
+- name: timesliceorchestrator
+  repository: file://./timesliceorchestrator
   version: 0.1.0
 - name: snapshot-agent
   repository: file://./snapshot-agent
@@ -8,5 +8,5 @@ dependencies:
 - name: nvidia-dra-driver-gpu
   repository: https://helm.ngc.nvidia.com/nvidia
   version: 25.8.0
-digest: sha256:9abcd401622d435e29700f949f8b4954a8892c6b8631f5d0e52bae316389be05
-generated: "2026-06-23T23:21:35.295516503Z"
+digest: sha256:214a3d207f4c37e369123c235b02ce9cb5ea27619ac5ac01bdc1c187e205d0c2
+generated: "2026-07-29T21:14:17.56060342-07:00"

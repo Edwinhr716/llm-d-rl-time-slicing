@@ -7,7 +7,7 @@ These changes are categorized by their implementation purpose below:
 ---
 
 ### 1. Time-Slicing Lock Coordination & Deadlock Prevention
-* **Purpose:** Integrates the gRPC-based Accelerator Orchestrator client into Slime's main training loop to coordinate GPU residency and prevent cross-cluster circular wait deadlocks.
+* **Purpose:** Integrates the gRPC-based TimeSlice Orchestrator client into Slime's main training loop to coordinate GPU residency and prevent cross-cluster circular wait deadlocks.
 * **Key Files:** [`train.py`](https://github.com/jessicaochen/slime/blob/timeslice/train.py), [`slime/utils/arguments.py`](https://github.com/jessicaochen/slime/blob/timeslice/slime/utils/arguments.py).
 * **Implementation Details:**
   * **CLI Flag Registration:** Added orchestrator configuration flags (`--enable-timeslice`, `--timeslice-orchestrator-addr`, `--timeslice-job-id`, `--timeslice-sampler-group`, `--timeslice-trainer-group`) to `arguments.py`.

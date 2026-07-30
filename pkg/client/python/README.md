@@ -18,7 +18,7 @@ pip install .[dev]
 This SDK provides two clients:
 
 1.  **Snapshot Agent Client**: Used to trigger manual snapshots and restores on local nodes. See usage below.
-2.  **Accelerator Orchestrator Client**: Used to coordinate shared GPU access between jobs in a time-slice group. Detailed documentation and examples can be found in the [Orchestrator README](timeslice/orchestrator/README.md).
+2.  **TimeSlice Orchestrator Client**: Used to coordinate shared GPU access between jobs in a time-slice group. Detailed documentation and examples can be found in the [Orchestrator README](timeslice/orchestrator/README.md).
 
 ---
 
@@ -55,4 +55,4 @@ python3 -m grpc_tools.protoc \
     timeslice/snapshot_agent/snapshot_agent.proto
 ```
 
-To generate stubs for the Accelerator Orchestrator, see the [Orchestrator README](timeslice/orchestrator/README.md#development).
+To generate stubs for the TimeSlice Orchestrator, see the [Orchestrator README](timeslice/orchestrator/README.md#development).

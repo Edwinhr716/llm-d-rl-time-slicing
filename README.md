@@ -5,7 +5,7 @@
 # Time-Slicing for Reinforcement Learning Workloads
   > **Current Project Status:**
   > * **Snapshot Agent:** Available, with pluggable snapshot backends — see the [user guide](./guides/snapshot-agent/).
-  > * **Accelerator Orchestrator:** Available — see the [user guide](./guides/accelerator-orchestrator/).
+  > * **TimeSlice Orchestrator:** Available — see the [user guide](./guides/timeslice-orchestrator/).
 ## The Problem: Accelerator Underutilization
   Reinforcement learning (RL) workloads spend a significant fraction of their lifecycle idle—waiting on reward evaluation, generation stragglers, or synchronization steps. Across large-scale fleets, this leaves expensive accelerator hardware **underutilized 45–66% of the time**, even though the underlying RL math doesn't require it.
   
@@ -38,17 +38,17 @@ For the full design rationale and preliminary benchmark results, see the [Platfo
 This architecture consists of the following foundational components:
 
 - **Snapshot Agent**: A node-local daemon, deployed as a Kubernetes DaemonSet, that performs the actual checkpoint/restore of accelerator state for a job. It supports a pluggable backend model, with backends specific to the underlying accelerator and checkpoint mechanism.
-- **Accelerator Orchestrator**: A central coordinator that manages exclusive accelerator access across co-located jobs. It persists lock state for crash recovery and exposes a gRPC API (`Acquire`/`Yield`) that frameworks invoke at natural phase boundaries.
-- **`timeslice` client**: A lightweight library used by training and inference services to interact seamlessly with the Snapshot Agent and Accelerator Orchestrator without needing to manage raw gRPC calls directly.
+- **TimeSlice Orchestrator**: A central coordinator that manages exclusive accelerator access across co-located jobs. It persists lock state for crash recovery and exposes a gRPC API (`Acquire`/`Yield`) that frameworks invoke at natural phase boundaries.
+- **`timeslice` client**: A lightweight library used by training and inference services to interact seamlessly with the Snapshot Agent and TimeSlice Orchestrator without needing to manage raw gRPC calls directly.
 
 ## Modes of Operation
 
-**Cooperative Accelerator Time-Slicing** — the Accelerator Orchestrator coordinates multiple jobs sharing a cluster of accelerator nodes, granting and reclaiming hardware access at each job's natural yield points:
+**Cooperative Accelerator Time-Slicing** — the TimeSlice Orchestrator coordinates multiple jobs sharing a cluster of accelerator nodes, granting and reclaiming hardware access at each job's natural yield points:
 
 ```python
 from timeslice import TimeSliceOrchestratorClient
 
-client = TimeSliceOrchestratorClient(target="timeslice-acceleratororchestrator.timeslice-system:50051",
+client = TimeSliceOrchestratorClient(target="timeslice-timesliceorchestrator.timeslice-system:50051",
                                      job_id="my-job", group_id="trainer-group")
 
 @client.on_accelerators()

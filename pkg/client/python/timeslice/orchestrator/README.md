@@ -1,4 +1,4 @@
-# Accelerator Orchestrator Python Client
+# TimeSlice Orchestrator Python Client
 
 The `TimeSliceOrchestratorClient` coordinates access to shared accelerators (GPUs/TPUs) among multiple jobs in a time-slice group. It ensures that only one job has exclusive access to the accelerator at any given time, driving the snapshot/restore cycle automatically behind the scenes.
 
@@ -182,14 +182,14 @@ if __name__ == "__main__":
 
 ## Development
 
-To regenerate gRPC stubs for the Accelerator Orchestrator:
+To regenerate gRPC stubs for the TimeSlice Orchestrator:
 
 ```bash
 # Run from pkg/client/python directory
 python3 -m grpc_tools.protoc \
-    -Itimeslice/orchestrator/_generated=../../accelerator-orchestrator/api/v1alpha1 \
+    -Itimeslice/orchestrator/_generated=../../timeslice-orchestrator/api/v1alpha1 \
     --python_out=. \
     --grpc_python_out=. \
-    timeslice/orchestrator/_generated/accelerator_orchestrator.proto
+    timeslice/orchestrator/_generated/timeslice_orchestrator.proto
 ```
 
