@@ -195,7 +195,10 @@ func TestDirectMemoryHealthCheck(t *testing.T) {
 
 func TestDirectMemoryConfigHelpers(t *testing.T) {
 	pids := []string{"100", "200"}
-	cfg := backends.BuildDirectMemoryConfig(pids)
+	cfg, err := backends.BuildDirectMemoryConfig(pids)
+	if err != nil {
+		t.Fatalf("BuildDirectMemoryConfig() unexpected error: %v", err)
+	}
 	extracted := backends.ExtractDirectMemoryPIDStrings(cfg)
 	if !reflect.DeepEqual(extracted, pids) {
 		t.Errorf("ExtractDirectMemoryPIDStrings() = %v, want %v", extracted, pids)
@@ -203,5 +206,10 @@ func TestDirectMemoryConfigHelpers(t *testing.T) {
 
 	if len(backends.ExtractDirectMemoryPIDStrings(nil)) != 0 {
 		t.Errorf("Expected nil when extracting from nil config")
+	}
+
+	_, err = backends.BuildDirectMemoryConfig([]string{"100", "not-a-pid"})
+	if err == nil {
+		t.Errorf("BuildDirectMemoryConfig() expected error for invalid PID string, got nil")
 	}
 }
