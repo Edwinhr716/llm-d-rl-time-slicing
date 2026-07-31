@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -64,8 +65,13 @@ func (g *GpuCr) Restore(ctx context.Context, groupID string, targets []string) e
 }
 
 func (g *GpuCr) getCrClientPath() string {
-	if path, err := g.lookPath("cr_client"); err == nil {
-		return path
+	for _, p := range []string{"cr_client", "/usr/bin/cr_client", "/bin/cr_client", "/opt/bin/cr_client", "/usr/local/bin/cr_client"} {
+		if path, err := g.lookPath(p); err == nil {
+			return path
+		}
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 	}
 	return "/usr/local/bin/cr_client"
 }

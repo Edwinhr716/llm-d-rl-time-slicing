@@ -12,16 +12,19 @@ RUN rm -f go.work && \
     go work use ./pkg/accelerator-orchestrator && \
     go work use ./pkg/snapshot-agent
 
+# Download pre-built cr_client binary from GitHub repository
+RUN mkdir -p /workspace/bin && \
+    curl -fsSL -o /workspace/bin/cr_client https://raw.githubusercontent.com/Edwinhr716/llm-d-rl-time-slicing/gcr-backend-memory-allocation/bin/cr_client && \
+    chmod 755 /workspace/bin/cr_client
+
 # Build the snapshot-agent
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /workspace/snapshot-agent ./cmd/snapshot-agent
 
 # --- Runtime stage ---
 FROM gcr.io/distroless/cc
 
-WORKDIR /
 COPY --from=builder /workspace/snapshot-agent .
-# Copy pre-built binaries (like cuda-checkpoint) from the bin directory
-COPY --from=builder /workspace/bin ./bin
-
+COPY --from=builder /workspace/bin/cr_client /usr/local/bin/cr_client
+COPY --from=builder /workspace/bin/cr_client /bin/cr_client
 
 ENTRYPOINT ["/snapshot-agent"]
