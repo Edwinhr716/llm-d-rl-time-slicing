@@ -162,10 +162,14 @@ func (s *Server) buildSnapshotFn(
 					return pidErr
 				}
 				var reqConfig *pb.BackendConfig
+				var cfgErr error
 				if backendType == backends.BackendDirectMemory {
-					reqConfig = backends.BuildDirectMemoryConfig(allPIDStrings)
+					reqConfig, cfgErr = backends.BuildDirectMemoryConfig(allPIDStrings)
 				} else {
 					reqConfig = backends.BuildCudaConfig(allPIDStrings)
+				}
+				if cfgErr != nil {
+					return fmt.Errorf("failed to build backend config for job %s: %w", jobID, cfgErr)
 				}
 				req := backends.Request{JobID: jobID, Config: reqConfig}
 				if err := backend.Snapshot(bgCtx, req); err != nil {
@@ -241,10 +245,14 @@ func (s *Server) buildRestoreFn(
 				}
 				slog.InfoContext(bgCtx, "Restoring PIDs", "pids", pidStrings, "backend", backendType)
 				var reqConfig *pb.BackendConfig
+				var cfgErr error
 				if backendType == backends.BackendDirectMemory {
-					reqConfig = backends.BuildDirectMemoryConfig(pidStrings)
+					reqConfig, cfgErr = backends.BuildDirectMemoryConfig(pidStrings)
 				} else {
 					reqConfig = backends.BuildCudaConfig(pidStrings)
+				}
+				if cfgErr != nil {
+					return fmt.Errorf("failed to build backend config for job %s: %w", jobID, cfgErr)
 				}
 				return backend.Restore(bgCtx, backends.Request{JobID: jobID, Config: reqConfig})
 			}, nil

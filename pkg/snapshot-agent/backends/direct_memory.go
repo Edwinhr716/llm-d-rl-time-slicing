@@ -148,12 +148,14 @@ func ExtractDirectMemoryPIDStrings(config *pb.BackendConfig) []string {
 }
 
 // BuildDirectMemoryConfig wraps PID strings into a DirectMemory BackendConfig.
-func BuildDirectMemoryConfig(pidStrings []string) *pb.BackendConfig {
+func BuildDirectMemoryConfig(pidStrings []string) (*pb.BackendConfig, error) {
 	pids := make([]int32, 0, len(pidStrings))
 	for _, s := range pidStrings {
-		if pid, err := strconv.ParseInt(s, 10, 32); err == nil {
-			pids = append(pids, int32(pid))
+		pid, err := strconv.ParseInt(s, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid PID string %q: %w", s, err)
 		}
+		pids = append(pids, int32(pid))
 	}
 	return &pb.BackendConfig{
 		Backend: &pb.BackendConfig_DirectMemory{
@@ -161,5 +163,5 @@ func BuildDirectMemoryConfig(pidStrings []string) *pb.BackendConfig {
 				ExplicitTarget: &pb.ProcessTarget{Pids: pids},
 			},
 		},
-	}
+	}, nil
 }
