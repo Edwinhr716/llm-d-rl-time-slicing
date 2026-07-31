@@ -25,6 +25,9 @@ spec:
       serviceAccountName: {{ include "snapshot-agent.serviceAccountName" . }}
       hostNetwork: true
       hostPID: true
+      {{- if .Values.directMemory.enabled }}
+      hostIPC: true
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -66,6 +69,10 @@ spec:
             - name: nvidia-devices
               mountPath: {{ .Values.nvidia.devices.mountPath }}
             {{- end }}
+            {{- if .Values.directMemory.enabled }}
+            - name: direct-memory-staging
+              mountPath: {{ .Values.directMemory.stagingMountPath }}
+            {{- end }}
       volumes:
         {{- if .Values.nvidia.driver.enabled }}
         - name: nvidia-driver
@@ -78,6 +85,12 @@ spec:
           hostPath:
             path: {{ .Values.nvidia.devices.hostPath }}
             type: Directory
+        {{- end }}
+        {{- if .Values.directMemory.enabled }}
+        - name: direct-memory-staging
+          hostPath:
+            path: {{ .Values.directMemory.stagingHostPath }}
+            type: DirectoryOrCreate
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

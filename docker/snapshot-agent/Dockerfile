@@ -20,12 +20,17 @@ RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /workspace/snapshot-ag
 ADD https://github.com/NVIDIA/cuda-checkpoint/raw/00d5cce84c628088d6caa203fc4af40c1538b6f7/bin/x86_64_Linux/cuda-checkpoint /workspace/bin/cuda-checkpoint
 RUN chmod +x /workspace/bin/cuda-checkpoint
 
+# Download pre-built cr_client binary from GPU-CR GitHub release
+RUN mkdir -p /workspace/bin && \
+    curl -fsSL -o /workspace/bin/cr_client https://github.com/Edwinhr716/GPU-CR/releases/download/v0.1.0/cr_client && \
+    chmod 755 /workspace/bin/cr_client
+
 # --- Runtime stage ---
-FROM gcr.io/distroless/base
+FROM gcr.io/distroless/cc
 
 WORKDIR /
 COPY --from=builder /workspace/snapshot-agent .
-# Copy bundled binaries (cuda-checkpoint) from the builder's bin directory
+# Copy bundled binaries (cuda-checkpoint, cr_client) from the builder's bin directory
 COPY --from=builder /workspace/bin ./bin
 
 

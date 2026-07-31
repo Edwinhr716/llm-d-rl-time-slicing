@@ -47,6 +47,12 @@ nvidia:
     hostPath: /dev
     mountPath: /dev
 
+directMemory:
+  enabled: false
+  # Path on the host for hugepages/VRAM staging
+  stagingHostPath: /var/tmp/huge-ckpt
+  stagingMountPath: /mnt/huge-ckpt
+
 rbac:
   create: true
 
