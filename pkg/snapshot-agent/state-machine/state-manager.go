@@ -1,6 +1,7 @@
 package statemachine
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -84,9 +85,12 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 2. Fault Protection
+	// 2. Fault Recovery: a failed operation marks the job FAULTED, but the
+	// fault is typically transient (dead workload PID, timed-out cr_client).
+	// Let a fresh snapshot attempt reset the job rather than requiring an
+	// agent redeploy.
 	if job.State == pb.JobState_JOB_STATE_FAULTED {
-		return "", status.Errorf(codes.FailedPrecondition, "job %s is in FAULTED state", jobID)
+		slog.Warn("Job is FAULTED; allowing new snapshot to reset it", "jobID", jobID)
 	}
 
 	opID := uuid.New().String()
@@ -150,9 +154,10 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 3. Fault Protection
+	// 3. Fault Recovery: see StartSnapshot — allow a fresh restore to reset
+	// a FAULTED job instead of wedging until agent redeploy.
 	if job.State == pb.JobState_JOB_STATE_FAULTED {
-		return "", status.Errorf(codes.FailedPrecondition, "job %s is in FAULTED state", jobID)
+		slog.Warn("Job is FAULTED; allowing new restore to reset it", "jobID", jobID)
 	}
 
 	opID := uuid.New().String()

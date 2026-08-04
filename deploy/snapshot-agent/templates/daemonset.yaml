@@ -27,6 +27,21 @@ spec:
       hostPID: true
       hostIPC: true
       initContainers:
+        # Mount hugetlbfs at the shared checkpoint path on the HOST. GPU-CR
+        # relies on the filesystem itself being hugetlbfs (it does not pass
+        # MAP_HUGETLB); without this mount every dump silently degrades to
+        # boot-disk page cache and the node's hugepage pool goes unused.
+        - name: mount-hugetlbfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p /var/tmp/huge-ckpt; grep -q " /var/tmp/huge-ckpt hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize=2M,mode=0777 nodev /var/tmp/huge-ckpt; chmod 0777 /var/tmp/huge-ckpt' && \
+              echo "hugetlbfs mounted at /var/tmp/huge-ckpt"
         - name: install-cuda-checkpoint
           image: alpine:latest
           command: ["sh", "-c", "apk add --no-cache wget && wget -qO /opt/bin/cuda-checkpoint https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/main/bin/x86_64_Linux/cuda-checkpoint && chmod +x /opt/bin/cuda-checkpoint && echo 'cuda-checkpoint installed'"]
@@ -56,6 +71,10 @@ spec:
               value: "all"
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: "compute,utility"
+            # Snapshot group copies must live on disk: hugetlbfs has no
+            # write(2) support and copies there would pin hugepages forever.
+            - name: SNAPSHOT_DIR
+              value: /var/snapshots
           ports:
             - name: grpc
               containerPort: {{ .Values.port }}
@@ -76,6 +95,11 @@ spec:
             {{- end }}
             - name: huge-ckpt
               mountPath: /mnt/huge-ckpt
+              # Pick up the hugetlbfs mount made by the init container even
+              # though the hostPath was prepared before it ran.
+              mountPropagation: HostToContainer
+            - name: gcr-snapshots
+              mountPath: /var/snapshots
       volumes:
         - name: bin-dir
           emptyDir: {}
@@ -94,6 +118,10 @@ spec:
         - name: huge-ckpt
           hostPath:
             path: /var/tmp/huge-ckpt
+            type: DirectoryOrCreate
+        - name: gcr-snapshots
+          hostPath:
+            path: /var/tmp/gcr-snapshots
             type: DirectoryOrCreate
       {{- with .Values.nodeSelector }}
       nodeSelector:

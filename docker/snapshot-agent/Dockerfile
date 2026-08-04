@@ -6,11 +6,8 @@ WORKDIR /workspace
 # Copy the entire project to resolve internal dependencies
 COPY . .
 
-# Recreate go.work to ensure clean multi-module build
-RUN rm -f go.work && \
-    go work init . && \
-    go work use ./pkg/accelerator-orchestrator && \
-    go work use ./pkg/snapshot-agent
+# Drop any local go.work; the root go.mod resolves all packages
+RUN rm -f go.work
 
 # Download pre-built cr_client binary from GitHub repository
 RUN mkdir -p /workspace/bin && \

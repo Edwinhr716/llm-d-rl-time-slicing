@@ -2,12 +2,15 @@ package backends
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -66,7 +69,7 @@ func (g *GpuCrMemoryAddresses) Snapshot(ctx context.Context, groupID string, tar
 	if ctlDir == "" {
 		ctlDir = "/mnt/huge-ckpt"
 	}
-	snapshotsDir := filepath.Join(ctlDir, "snapshots")
+	snapshotsDir := snapshotStoreDir(ctlDir)
 	targetDir := filepath.Join(snapshotsDir, filepath.Clean(groupID))
 
 	// Ensure targetDir is still under snapshotsDir (prevent path traversal)
@@ -81,21 +84,28 @@ func (g *GpuCrMemoryAddresses) Snapshot(ctx context.Context, groupID string, tar
 			return fmt.Errorf("failed to resolve PID %s to ID: %w", pid, err)
 		}
 
-		// Copy data file
+		// Copy data file. Limit the copy to the dump's allocated extent
+		// (shared_mem_fs.current_offset) so we don't scan the full 25GB
+		// buffer, which on hugetlbfs is a zero-fill read of the whole pool.
 		srcData := filepath.Join(ctlDir, id)
 		dstData := filepath.Join(targetDir, id)
 		slog.InfoContext(ctx, "Copying checkpoint file", "src", srcData, "dst", dstData)
-		if err := copyFile(srcData, dstData); err != nil {
+		if err := copyFile(srcData, dstData, dumpDataLimit(srcData)); err != nil {
 			return fmt.Errorf("failed to copy checkpoint file from %s to %s: %w", srcData, dstData, err)
 		}
 
-		// Copy host file
-		srcHost := filepath.Join(ctlDir, fmt.Sprintf("%s-host", id))
-		dstHost := filepath.Join(targetDir, fmt.Sprintf("%s-host", id))
-		if _, err := os.Stat(srcHost); err == nil {
-			slog.InfoContext(ctx, "Copying host file", "src", srcHost, "dst", dstHost)
-			if err := copyFile(srcHost, dstHost); err != nil {
-				return fmt.Errorf("failed to copy host file from %s to %s: %w", srcHost, dstHost, err)
+		// Copy host file. The -host file is the DMA staging double-buffer —
+		// transient scratch, ~2GB of mostly-stale bytes; copying it both ways
+		// dominated swap latency in Phase 1 measurements. Skipped unless
+		// GPU_CR_COPY_HOST_FILE=1.
+		if copyHostFileEnabled() {
+			srcHost := filepath.Join(ctlDir, fmt.Sprintf("%s-host", id))
+			dstHost := filepath.Join(targetDir, fmt.Sprintf("%s-host", id))
+			if _, err := os.Stat(srcHost); err == nil {
+				slog.InfoContext(ctx, "Copying host file", "src", srcHost, "dst", dstHost)
+				if err := copyFile(srcHost, dstHost, 0); err != nil {
+					return fmt.Errorf("failed to copy host file from %s to %s: %w", srcHost, dstHost, err)
+				}
 			}
 		}
 	}
@@ -120,7 +130,7 @@ func (g *GpuCrMemoryAddresses) Restore(ctx context.Context, groupID string, targ
 	if ctlDir == "" {
 		ctlDir = "/mnt/huge-ckpt"
 	}
-	snapshotsDir := filepath.Join(ctlDir, "snapshots")
+	snapshotsDir := snapshotStoreDir(ctlDir)
 	targetDir := filepath.Join(snapshotsDir, filepath.Clean(groupID))
 
 	// Ensure targetDir is still under snapshotsDir (prevent path traversal)
@@ -129,7 +139,11 @@ func (g *GpuCrMemoryAddresses) Restore(ctx context.Context, groupID string, targ
 		return fmt.Errorf("invalid group ID (path traversal attempt): %s", groupID)
 	}
 
-	// 1. Copy files back from snapshot directory (overwriting active slot)
+	// 1. Copy files back from snapshot directory (overwriting active slot).
+	// When ctlDir is a hugetlbfs mount, write(2) is not supported and
+	// truncating would rip pages out of the workload's live mapping, so we
+	// write through a shared mmap of the existing buffer file instead.
+	hugetlb := isHugetlbfs(ctlDir)
 	t0 := time.Now()
 	for pid := range grouped {
 		id, err := g.resolvePidToId(pid)
@@ -140,18 +154,20 @@ func (g *GpuCrMemoryAddresses) Restore(ctx context.Context, groupID string, targ
 		// Restore data file
 		srcData := filepath.Join(targetDir, id)
 		dstData := filepath.Join(ctlDir, id)
-		slog.InfoContext(ctx, "Restoring checkpoint file", "src", srcData, "dst", dstData)
-		if err := copyFile(srcData, dstData); err != nil {
+		slog.InfoContext(ctx, "Restoring checkpoint file", "src", srcData, "dst", dstData, "hugetlbfs", hugetlb)
+		if err := restoreCopy(srcData, dstData, hugetlb); err != nil {
 			return fmt.Errorf("failed to restore checkpoint file from %s to %s: %w", srcData, dstData, err)
 		}
 
-		// Restore host file
-		srcHost := filepath.Join(targetDir, fmt.Sprintf("%s-host", id))
-		dstHost := filepath.Join(ctlDir, fmt.Sprintf("%s-host", id))
-		if _, err := os.Stat(srcHost); err == nil {
-			slog.InfoContext(ctx, "Restoring host file", "src", srcHost, "dst", dstHost)
-			if err := copyFile(srcHost, dstHost); err != nil {
-				return fmt.Errorf("failed to restore host file from %s to %s: %w", srcHost, dstHost, err)
+		// Restore host file (skipped by default; see Snapshot).
+		if copyHostFileEnabled() {
+			srcHost := filepath.Join(targetDir, fmt.Sprintf("%s-host", id))
+			dstHost := filepath.Join(ctlDir, fmt.Sprintf("%s-host", id))
+			if _, err := os.Stat(srcHost); err == nil {
+				slog.InfoContext(ctx, "Restoring host file", "src", srcHost, "dst", dstHost, "hugetlbfs", hugetlb)
+				if err := restoreCopy(srcHost, dstHost, hugetlb); err != nil {
+					return fmt.Errorf("failed to restore host file from %s to %s: %w", srcHost, dstHost, err)
+				}
 			}
 		}
 	}
@@ -176,13 +192,125 @@ func (g *GpuCrMemoryAddresses) resolvePidToId(pid string) (string, error) {
 	}
 	mapPath := filepath.Join(ctlDir, fmt.Sprintf("pid_map_%s", pid))
 	data, err := os.ReadFile(mapPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read pid map file %s: %w", mapPath, err)
+	if err == nil {
+		// Strip NULs as well as whitespace: an mmap-written map file is
+		// hugepage-sized with a zero-padded tail.
+		id := strings.TrimSpace(strings.TrimRight(string(data), "\x00"))
+		if isAllDigits(id) {
+			return id, nil
+		}
 	}
-	return strings.TrimSpace(string(data)), nil
+
+	// Fallback: the preloader writes pid_map via buffered stdio, which
+	// silently produces an empty file on hugetlbfs. The dump buffer mapping
+	// is visible in /proc/<pid>/maps and its basename IS the id.
+	id, ferr := idFromProcMaps(pid)
+	if ferr != nil {
+		return "", fmt.Errorf("pid map file %s unusable (%v) and /proc fallback failed: %w", mapPath, err, ferr)
+	}
+	slog.Info("Resolved GPU-CR id from /proc/<pid>/maps fallback", "pid", pid, "id", id)
+	return id, nil
 }
 
-func copyFile(src, dst string) error {
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// idFromProcMaps scans /proc/<pid>/maps for the GPU-CR dump buffer mapping
+// (a file named huge-ckpt/<id>, all digits) and returns the id.
+func idFromProcMaps(pid string) (string, error) {
+	data, err := os.ReadFile(filepath.Join("/proc", pid, "maps"))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		idx := strings.IndexByte(line, '/')
+		if idx < 0 {
+			continue
+		}
+		path := line[idx:]
+		if !strings.Contains(path, "huge-ckpt/") {
+			continue
+		}
+		base := filepath.Base(path)
+		if isAllDigits(base) {
+			return base, nil
+		}
+	}
+	return "", fmt.Errorf("no huge-ckpt/<id> mapping found in /proc/%s/maps", pid)
+}
+
+// snapshotStoreDir returns where snapshot group copies are kept. Defaults to
+// <ctlDir>/snapshots for backwards compatibility, but should be pointed at a
+// disk-backed path via SNAPSHOT_DIR when ctlDir is hugetlbfs (write(2) is not
+// supported there, and copies would permanently consume hugepages).
+func snapshotStoreDir(ctlDir string) string {
+	if d := os.Getenv("SNAPSHOT_DIR"); d != "" {
+		return d
+	}
+	return filepath.Join(ctlDir, "snapshots")
+}
+
+func copyHostFileEnabled() bool {
+	return os.Getenv("GPU_CR_COPY_HOST_FILE") == "1"
+}
+
+const hugetlbfsMagic = 0x958458f6
+
+func isHugetlbfs(path string) bool {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return false
+	}
+	return uint64(st.Type) == hugetlbfsMagic
+}
+
+// dumpDataLimit reads the shared_mem_fs header of a GPU-CR dump file and
+// returns current_offset — the end of allocated data — so copies can skip the
+// untouched tail of the buffer. Falls back to 0 (copy everything) if the
+// header is unreadable or implausible.
+func dumpDataLimit(path string) int64 {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return 0
+	}
+
+	var hdr [16]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return 0
+	}
+	currentOffset := int64(binary.LittleEndian.Uint64(hdr[8:16]))
+	if currentOffset < 16 || currentOffset > st.Size() {
+		return 0
+	}
+	return currentOffset
+}
+
+// restoreCopy copies a saved snapshot file back over the live dump buffer.
+func restoreCopy(src, dst string, hugetlb bool) error {
+	if hugetlb {
+		return copyIntoHugetlbfs(src, dst)
+	}
+	return copyFile(src, dst, 0)
+}
+
+// copyFile copies src to dst (regular filesystem), sparse-aware. If limit > 0
+// only the first limit bytes are copied; dst is still sized to match src.
+func copyFile(src, dst string, limit int64) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -194,6 +322,9 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	srcSize := srcStat.Size()
+	if limit <= 0 || limit > srcSize {
+		limit = srcSize
+	}
 
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
@@ -211,14 +342,18 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	const bufSize = 64 * 1024 // 64KB block size
+	const bufSize = 4 * 1024 * 1024 // 4MB blocks: hugetlbfs zero-fill reads dominate copy time
 	buf := make([]byte, bufSize)
 
 	var writeOffset int64 = 0
 	var currentOffset int64 = 0
 
-	for {
-		n, err := srcFile.Read(buf)
+	for currentOffset < limit {
+		want := int64(bufSize)
+		if remaining := limit - currentOffset; remaining < want {
+			want = remaining
+		}
+		n, err := srcFile.Read(buf[:want])
 		if n > 0 {
 			if isAllZeros(buf[:n]) {
 				currentOffset += int64(n)
@@ -249,6 +384,127 @@ func copyFile(src, dst string) error {
 	return dstFile.Sync()
 }
 
+// copyIntoHugetlbfs writes the data extents of src into the existing dump
+// buffer file dst on hugetlbfs via a shared mmap (hugetlbfs has no write(2),
+// and truncating would invalidate the workload's live mapping). Only src's
+// data extents are touched, so hugepage faults stay bounded by the snapshot's
+// real size. Regions that are holes in src keep whatever bytes the buffer
+// currently holds; GPU-CR readers only consult extents recorded in the dump
+// header, so stale tail bytes are ignored.
+func copyIntoHugetlbfs(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	srcStat, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+	srcSize := srcStat.Size()
+
+	dstFile, err := os.OpenFile(dst, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("live dump buffer must already exist on hugetlbfs: %w", err)
+	}
+	defer dstFile.Close()
+
+	dstStat, err := dstFile.Stat()
+	if err != nil {
+		return err
+	}
+	dstSize := dstStat.Size()
+	if dstSize == 0 {
+		return fmt.Errorf("dump buffer %s has zero size", dst)
+	}
+
+	m, err := syscall.Mmap(int(dstFile.Fd()), 0, int(dstSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return fmt.Errorf("mmap of hugetlbfs dump buffer %s failed: %w", dst, err)
+	}
+	defer syscall.Munmap(m)
+
+	const (
+		seekData = 3 // SEEK_DATA
+		seekHole = 4 // SEEK_HOLE
+	)
+	buf := make([]byte, 64*1024)
+
+	copyRange := func(start, end int64) error {
+		if end > dstSize {
+			end = dstSize
+		}
+		for off := start; off < end; {
+			want := int64(len(buf))
+			if remaining := end - off; remaining < want {
+				want = remaining
+			}
+			n, err := srcFile.ReadAt(buf[:want], off)
+			if n > 0 {
+				copy(m[off:off+int64(n)], buf[:n])
+				off += int64(n)
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Walk src's data extents with SEEK_DATA/SEEK_HOLE; fall back to a full
+	// zero-skipping scan if the filesystem doesn't support it.
+	var off int64
+	for off < srcSize {
+		dataStart, err := srcFile.Seek(off, seekData)
+		if err != nil {
+			if off == 0 {
+				return copyRangeFullScan(srcFile, srcSize, dstSize, m, buf)
+			}
+			break // ENXIO: no more data extents
+		}
+		holeStart, err := srcFile.Seek(dataStart, seekHole)
+		if err != nil {
+			holeStart = srcSize
+		}
+		if err := copyRange(dataStart, holeStart); err != nil {
+			return err
+		}
+		off = holeStart
+	}
+	return nil
+}
+
+func copyRangeFullScan(srcFile *os.File, srcSize, dstSize int64, m []byte, buf []byte) error {
+	end := srcSize
+	if end > dstSize {
+		end = dstSize
+	}
+	for off := int64(0); off < end; {
+		want := int64(len(buf))
+		if remaining := end - off; remaining < want {
+			want = remaining
+		}
+		n, err := srcFile.ReadAt(buf[:want], off)
+		if n > 0 {
+			if !isAllZeros(buf[:n]) {
+				copy(m[off:off+int64(n)], buf[:n])
+			}
+			off += int64(n)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func isAllZeros(buf []byte) bool {
 	for _, b := range buf {
 		if b != 0 {
@@ -258,18 +514,34 @@ func isAllZeros(buf []byte) bool {
 	return true
 }
 
+// opTimeout bounds a single cr_client invocation. Without it, a workload
+// dying mid-operation leaves cr_client polling the shared-memory control file
+// forever and the job wedged in TRANSITIONING (observed in Phase 0).
+func opTimeout() time.Duration {
+	if v := os.Getenv("GPU_CR_OP_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 120 * time.Second
+}
+
 func (g *GpuCrMemoryAddresses) checkpointMemoryAddresses(ctx context.Context, pid string, spec string) error {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout())
+	defer cancel()
 	binaryPath := g.getCrClientPath()
 	if err := g.runCommand(ctx, binaryPath, "-c", "-p", pid, "-s", spec); err != nil {
-		return err
+		return fmt.Errorf("cr_client checkpoint (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
 }
 
 func (g *GpuCrMemoryAddresses) restoreMemoryAddresses(ctx context.Context, pid string, spec string) error {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout())
+	defer cancel()
 	binaryPath := g.getCrClientPath()
 	if err := g.runCommand(ctx, binaryPath, "-r", "-p", pid, "-s", spec); err != nil {
-		return err
+		return fmt.Errorf("cr_client restore (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
 }

@@ -19,6 +19,7 @@ import (
 	"flag"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
@@ -51,6 +52,14 @@ func main() {
 			slog.InfoContext(ctx, "Successfully set /mnt/huge-ckpt permissions to 0777")
 		}
 	}
+
+	// Sweep stale GPU-CR artifacts: on hugetlbfs each leaked dump pair pins
+	// ~27Gi of hugepage reservations, so leaks exhaust the pool in 2 runs.
+	ctlDir := os.Getenv("EXPORT_FILE_PATH")
+	if ctlDir == "" {
+		ctlDir = "/mnt/huge-ckpt"
+	}
+	backends.StartGC(ctx, ctlDir, 10*time.Minute)
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent", "port", *port)
 	if err := server.StartServer(ctx, *port, registeredBackends, backends.BackendCuda); err != nil {

@@ -1,14 +1,14 @@
-apiVersion: apps/v1
-kind: Deployment
+# Single-shot variant of deployment-lora-swap-max1.yaml: no restart loop, so
+# a failure can't re-enter the snapshot agent against poisoned job state and
+# the failing container's logs survive for debugging.
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: lora-swap-max1-deployment
+  name: lora-swap-max1-job
   labels:
     app: lora-swap-max1
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: lora-swap-max1
+  backoffLimit: 0
   template:
     metadata:
       labels:
@@ -16,11 +16,12 @@ spec:
         snapshot-agent: "true"
         timeslice.io/job-id: "lora-test-max1"
     spec:
+      restartPolicy: Never
       hostIPC: true
       hostPID: true  # Required for GPU-CR IPC matching
       containers:
       - name: lora-swap
-        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/lora-swap-client-max1:latest # Replace with your actual image tag
+        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/lora-swap-client-max1:latest
         command: ["python3"]
         args: ["test_lora_swap_max1.py"]
         securityContext:

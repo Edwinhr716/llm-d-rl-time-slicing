@@ -10,13 +10,15 @@ fullnameOverride: ""
 
 podAnnotations: {}
 
-resources: {}
-#  limits:
-#    cpu: 500m
-#    memory: 1Gi
-#  requests:
-#    cpu: 100m
-#    memory: 256Mi
+# hugepages-2Mi covers hugetlb cgroup charges when the agent faults pages
+# while mmap-writing restores into the shared hugetlbfs dump buffers.
+resources:
+  requests:
+    hugepages-2Mi: "2Gi"
+    memory: "512Mi"
+  limits:
+    hugepages-2Mi: "2Gi"
+    memory: "512Mi"
 
 nodeSelector: {}
 
