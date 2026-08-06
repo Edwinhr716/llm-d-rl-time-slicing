@@ -384,13 +384,18 @@ func copyFile(src, dst string, limit int64) error {
 	return dstFile.Sync()
 }
 
-// copyIntoHugetlbfs writes the data extents of src into the existing dump
-// buffer file dst on hugetlbfs via a shared mmap (hugetlbfs has no write(2),
-// and truncating would invalidate the workload's live mapping). Only src's
-// data extents are touched, so hugepage faults stay bounded by the snapshot's
-// real size. Regions that are holes in src keep whatever bytes the buffer
-// currently holds; GPU-CR readers only consult extents recorded in the dump
-// header, so stale tail bytes are ignored.
+// copyIntoHugetlbfs writes src back into the existing dump buffer file dst
+// on hugetlbfs via a shared mmap (hugetlbfs has no write(2), and truncating
+// would invalidate the workload's live mapping).
+//
+// HOLE-FAITHFUL BY CONTRACT: every byte of the dump extent is authoritative
+// checkpoint payload, INCLUDING zeros — first-step optimizer moments are
+// exactly zero by construction, and skipping them left a co-resident
+// checkpoint's bytes beneath sparse holes (the 2026-08-04 silent-corruption
+// incident; see GPU-CR GEP-0003). We therefore copy the full extent
+// [0, current_offset) unconditionally: pread reads file holes as zeros, so
+// zeros land in the buffer exactly like data. Hugepage faults stay bounded
+// by the dump extent, not the buffer size.
 func copyIntoHugetlbfs(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -403,6 +408,11 @@ func copyIntoHugetlbfs(src, dst string) error {
 		return err
 	}
 	srcSize := srcStat.Size()
+
+	limit := dumpDataLimit(src)
+	if limit <= 0 || limit > srcSize {
+		limit = srcSize
+	}
 
 	dstFile, err := os.OpenFile(dst, os.O_RDWR, 0)
 	if err != nil {
@@ -418,6 +428,9 @@ func copyIntoHugetlbfs(src, dst string) error {
 	if dstSize == 0 {
 		return fmt.Errorf("dump buffer %s has zero size", dst)
 	}
+	if limit > dstSize {
+		limit = dstSize
+	}
 
 	m, err := syscall.Mmap(int(dstFile.Fd()), 0, int(dstSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
@@ -425,74 +438,15 @@ func copyIntoHugetlbfs(src, dst string) error {
 	}
 	defer syscall.Munmap(m)
 
-	const (
-		seekData = 3 // SEEK_DATA
-		seekHole = 4 // SEEK_HOLE
-	)
-	buf := make([]byte, 64*1024)
-
-	copyRange := func(start, end int64) error {
-		if end > dstSize {
-			end = dstSize
-		}
-		for off := start; off < end; {
-			want := int64(len(buf))
-			if remaining := end - off; remaining < want {
-				want = remaining
-			}
-			n, err := srcFile.ReadAt(buf[:want], off)
-			if n > 0 {
-				copy(m[off:off+int64(n)], buf[:n])
-				off += int64(n)
-			}
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	// Walk src's data extents with SEEK_DATA/SEEK_HOLE; fall back to a full
-	// zero-skipping scan if the filesystem doesn't support it.
-	var off int64
-	for off < srcSize {
-		dataStart, err := srcFile.Seek(off, seekData)
-		if err != nil {
-			if off == 0 {
-				return copyRangeFullScan(srcFile, srcSize, dstSize, m, buf)
-			}
-			break // ENXIO: no more data extents
-		}
-		holeStart, err := srcFile.Seek(dataStart, seekHole)
-		if err != nil {
-			holeStart = srcSize
-		}
-		if err := copyRange(dataStart, holeStart); err != nil {
-			return err
-		}
-		off = holeStart
-	}
-	return nil
-}
-
-func copyRangeFullScan(srcFile *os.File, srcSize, dstSize int64, m []byte, buf []byte) error {
-	end := srcSize
-	if end > dstSize {
-		end = dstSize
-	}
-	for off := int64(0); off < end; {
+	buf := make([]byte, 4*1024*1024)
+	for off := int64(0); off < limit; {
 		want := int64(len(buf))
-		if remaining := end - off; remaining < want {
+		if remaining := limit - off; remaining < want {
 			want = remaining
 		}
 		n, err := srcFile.ReadAt(buf[:want], off)
 		if n > 0 {
-			if !isAllZeros(buf[:n]) {
-				copy(m[off:off+int64(n)], buf[:n])
-			}
+			copy(m[off:off+int64(n)], buf[:n])
 			off += int64(n)
 		}
 		if err == io.EOF {

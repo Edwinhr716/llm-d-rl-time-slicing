@@ -5,10 +5,10 @@ steps:
   - -f
   - docker/snapshot-agent/Dockerfile
   - -t
-  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:hugetlbfs-v5
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:hugetlbfs-v6
   - .
 images:
-- asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:hugetlbfs-v5
+- asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:hugetlbfs-v6
 options:
   machineType: E2_HIGHCPU_8
 timeout: 1800s
