@@ -9,10 +9,10 @@ COPY . .
 # Drop any local go.work; the root go.mod resolves all packages
 RUN rm -f go.work
 
-# Download pre-built cr_client binary from GitHub repository
-RUN mkdir -p /workspace/bin && \
-    curl -fsSL -o /workspace/bin/cr_client https://raw.githubusercontent.com/Edwinhr716/llm-d-rl-time-slicing/gcr-backend-memory-allocation/bin/cr_client && \
-    chmod 755 /workspace/bin/cr_client
+# The GPU-CR cr_client CLI is taken from the checkout's bin/ directory.
+# To use a specific GPU-CR version, replace bin/cr_client before building
+# (see docs/gke-memory-address-demo.md for building it from a GPU-CR release).
+RUN chmod 755 /workspace/bin/cr_client
 
 # Build the snapshot-agent
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /workspace/snapshot-agent ./cmd/snapshot-agent
