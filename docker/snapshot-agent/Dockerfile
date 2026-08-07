@@ -11,7 +11,7 @@ RUN rm -f go.work
 
 # The GPU-CR cr_client CLI is taken from the checkout's bin/ directory.
 # To use a specific GPU-CR version, replace bin/cr_client before building
-# (see docs/gke-memory-address-demo.md for building it from a GPU-CR release).
+# (see docs/gke-memory-address-integration.md for building it from a GPU-CR release).
 RUN chmod 755 /workspace/bin/cr_client
 
 # Build the snapshot-agent

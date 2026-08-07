@@ -1,38 +1,40 @@
-# Running the Memory-Address LoRA Swap Demo on GKE
+# GKE User Guide: Memory-Address Snapshots with the Snapshot Agent
 
-This guide walks through running the multi-tenant LoRA swap demo end to end on
-GKE: the Snapshot Agent (backend `BACKEND_GPU_CR_MEMORY_ADDRESSES`) snapshots
-and restores individual GPU memory regions of live processes, so many LoRA
-tenants can share one GPU — on both the trainer and the sampler side of an RL
-loop.
+This guide walks through integrating the Snapshot Agent's memory-address
+backend (`BACKEND_GPU_CR_MEMORY_ADDRESSES`) with your own GPU workloads on
+GKE. The backend snapshots and restores individual GPU memory regions of a
+live process — the process keeps running, the bytes come back bit-for-bit at
+the same addresses, and the physical VRAM behind parked regions is freed in
+between. Typical uses: parking inactive tenants' adapter + optimizer state in
+a multi-tenant trainer, and swapping adapters through a fixed slot in an
+inference server.
 
-Repositories involved:
+What you need from where:
 
-| Repo / branch | Provides |
+| Source | Provides |
 |---|---|
 | [`GPU-CR`](https://github.com/Edwinhr716/GPU-CR) **release v0.3.0** | `vGPU-NVIDIA.so` (workload preload) + `cr_client` (agent CLI) |
-| `llm-d-rl-time-slicing` @ `gcr-backend-memory-allocation` (this repo) | Snapshot Agent + Python client |
-| [`open-rl`](https://github.com/Edwinhr716/open-rl) @ `timeslice-lora-swap` | Demo workloads (trainer, vLLM sampler, gateway, driver) + manifests |
+| `llm-d-rl-time-slicing` @ `gcr-backend-memory-allocation` (this repo) | Snapshot Agent, example manifests, Python client |
 
 ## 1. Prerequisites
 
 - `gcloud`, `kubectl`, `docker`, `git`.
 - A GCP project with GKE enabled and an Artifact Registry repo you can push to
   (`gcloud auth configure-docker <REGION>-docker.pkg.dev`).
-- GKE **Standard** (not Autopilot — the demo needs hostPath, hostPID,
+- GKE **Standard** (not Autopilot — the agent needs hostPath, hostPID,
   privileged pods, and node system config).
 
 Set these once; the rest of the guide uses them:
 
 ```shell
 export PROJECT=<your-project>  REGION=us-central1  ZONE=us-central1-a
-export CLUSTER=timeslice-demo
+export CLUSTER=<your-cluster>
 export REGISTRY=<REGION>-docker.pkg.dev/$PROJECT/<your-repo>
 ```
 
 ## 2. Create the cluster
 
-A small CPU pool is enough for redis, the gateway, and the demo driver:
+Any Standard cluster works; a small CPU pool covers non-GPU components:
 
 ```shell
 gcloud container clusters create $CLUSTER \
@@ -43,9 +45,14 @@ gcloud container clusters get-credentials $CLUSTER --location=$REGION
 
 ## 3. Create the GPU node pool (with hugepages)
 
-GPU-CR stages snapshots in 2Mi hugepages. With the 8GiB staging buffer built
-in step 4, each GPU process reserves ~10Gi of hugepages at startup, so a 24Gi
-pool comfortably fits the two GPU workloads (trainer + sampler):
+GPU-CR stages snapshots in 2Mi hugepages, and its staging buffer is sized at
+**build time**. The standard build uses a 25GiB buffer — sized for
+whole-model checkpoints — which makes every GPU process reserve ~27Gi of
+hugepages at startup and forces a 60Gi+ carve-out per node. Region snapshots
+of adapter-scale state need far less, so this guide builds the library with
+an **8GiB buffer** (step 4): each process then reserves ~10Gi (8Gi buffer +
+2×1Gi staging areas), a 24Gi pool fits two GPU workloads per node, and the
+~38Gi difference stays available to your workloads as regular RAM.
 
 ```shell
 cat > hugepages-config.yaml <<'EOF'
@@ -54,9 +61,9 @@ linuxConfig:
     hugepage_size2m: 12288   # 24Gi of 2Mi pages
 EOF
 
-# g2-standard-24 requires exactly 2x L4. 300GB disk: the vLLM image is ~20GB
-# unpacked; smaller disks hit DiskPressure.
-gcloud container node-pools create rl-hugepages-l4 \
+# g2-standard-24 requires exactly 2x L4. Size the disk for your images
+# (large inference images can hit DiskPressure on small disks).
+gcloud container node-pools create <your-gpu-pool> \
   --project=$PROJECT --cluster=$CLUSTER --location=$REGION --node-locations=$ZONE \
   --machine-type=g2-standard-24 \
   --accelerator=type=nvidia-l4,count=2,gpu-driver-version=latest \
@@ -64,14 +71,18 @@ gcloud container node-pools create rl-hugepages-l4 \
   --system-config-from-file=hugepages-config.yaml
 ```
 
+If you keep the standard 25GiB build instead, scale the pool accordingly
+(~30Gi of hugepages per concurrent GPU-CR process).
+
 ## 4. Build the GPU-CR binaries from release v0.3.0
 
 Build both binaries from the
 [v0.3.0 release](https://github.com/Edwinhr716/GPU-CR/releases/tag/v0.3.0)
 source using the release's own `Dockerfile.build`. It applies the two
-deployment patches the demo needs (checkpoint signals remapped to
+deployment patches this integration needs (checkpoint signals remapped to
 SIGRTMAX-8/-7 so they don't collide with the workload's own signal use, and a
-world-writable control file) and lets you right-size the staging buffer:
+world-writable control file) and takes the staging-buffer size as a build
+argument:
 
 ```shell
 git clone --branch v0.3.0 --depth 1 https://github.com/Edwinhr716/GPU-CR
@@ -88,10 +99,10 @@ docker rm gpu-cr-tmp && cd ..
 > deployment patches) — don't mix them with the patched builds; the two
 > binaries must always come from the same build so their signal numbers match.
 
-## 5. Build and push the two images
+## 5. Build and push the Snapshot Agent image
 
-**Snapshot Agent** (this repo, branch `gcr-backend-memory-allocation`) — bakes
-in your `cr_client`:
+From this repo (branch `gcr-backend-memory-allocation`), with your
+`cr_client` dropped into `bin/`:
 
 ```shell
 cd llm-d-rl-time-slicing
@@ -100,42 +111,55 @@ docker build -f docker/snapshot-agent/Dockerfile -t $REGISTRY/snapshot-agent:v0.
 docker push $REGISTRY/snapshot-agent:v0.3.0
 ```
 
-**Demo workload image** (open-rl, branch `timeslice-lora-swap`) — one image
-serves the sampler, trainer, gateway, and driver, and bakes in your
-`vGPU-NVIDIA.so`. Point the `.so` line in `src/server/Dockerfile.timeslice`
-at your build:
-
-```shell
-cd open-rl
-cp ../gpu-cr-bin/vGPU-NVIDIA.so .
-# In src/server/Dockerfile.timeslice, replace the ADD line for vGPU-NVIDIA.so with:
-#   COPY vGPU-NVIDIA.so /usr/local/lib/vGPU-NVIDIA.so
-docker build -f src/server/Dockerfile.timeslice -t $REGISTRY/timeslice-demo:v0.3.0 .
-docker push $REGISTRY/timeslice-demo:v0.3.0
-```
-
 ## 6. Deploy the Snapshot Agent
 
-The manifest lives in open-rl at `k8s/deploy/timeslice-demo/snapshot-agent.yaml`.
-Edit its image to `$REGISTRY/snapshot-agent:v0.3.0` and its `nodeSelector` to
-your pool, then:
+An example DaemonSet is included at
+`deploy/examples/snapshot-agent-memory-addresses.yaml`. Fill in the two
+placeholders (agent image, GPU pool selector), then:
 
 ```shell
 kubectl create namespace timeslice-system
-kubectl apply -f k8s/deploy/timeslice-demo/snapshot-agent.yaml
+# ServiceAccount + RBAC come from the helm chart in deploy/snapshot-agent;
+# the example DaemonSet replaces the chart's daemonset template.
+kubectl apply -f deploy/examples/snapshot-agent-memory-addresses.yaml
 ```
 
-The manifest already encodes the load-bearing details: an init container that
-mounts hugetlbfs at `/var/tmp/huge-ckpt` on the host (GPU-CR needs a real
-hugetlbfs mount), `mountPropagation: HostToContainer`, a tmpfs-backed
-`SNAPSHOT_DIR` for the per-tenant snapshot copies, and a memory limit sized
-for parked tenants (tmpfs writes are charged to the agent's cgroup).
+The manifest encodes the load-bearing details:
 
-## 7. Integrate your workloads
+- An init container that **mounts hugetlbfs at `/var/tmp/huge-ckpt` on the
+  host** — GPU-CR requires the filesystem itself to be hugetlbfs; without it,
+  dumps silently degrade to boot-disk page cache and the hugepage pool goes
+  unused.
+- `mountPropagation: HostToContainer` so the agent sees that mount.
+- `SNAPSHOT_DIR` on tmpfs, not hugetlbfs (hugetlbfs has no `write(2)`; tmpfs
+  keeps snapshot copies at RAM speed).
+- An agent memory limit sized for parked snapshots — tmpfs writes are charged
+  to the **agent's** cgroup, roughly the size of each parked group.
 
-This is what any workload — training or inference — needs to be swappable.
+## 7. Integrate your workload
 
-### 7.1 Pod spec (both kinds of workload)
+### 7.1 Your workload image
+
+Add two things to your existing Dockerfile: the preload library built in
+step 4, and the Python client for the agent's gRPC API.
+
+```dockerfile
+# --- Snapshot Agent integration ---
+# GPU-CR preload library (from the v0.3.0 release build, step 4).
+# Place vGPU-NVIDIA.so in the build context first.
+COPY vGPU-NVIDIA.so /usr/local/lib/vGPU-NVIDIA.so
+RUN chmod 755 /usr/local/lib/vGPU-NVIDIA.so
+
+# Snapshot Agent Python client.
+RUN pip install --no-cache-dir \
+    "git+https://github.com/Edwinhr716/llm-d-rl-time-slicing.git@gcr-backend-memory-allocation#subdirectory=pkg/client/python"
+```
+
+Nothing activates inside the image itself: the library only engages when the
+pod sets `LD_PRELOAD`, so the same image runs unchanged with the integration
+disabled.
+
+### 7.2 Pod spec
 
 ```yaml
 metadata:
@@ -145,10 +169,11 @@ metadata:
 spec:
   hostIPC: true                      # GPU-CR control channel
   hostPID: true                      # agent signals the workload PID
-  nodeSelector: {cloud.google.com/gke-nodepool: rl-hugepages-l4}
+  # Schedule onto the hugepages GPU pool created in step 3:
+  nodeSelector: {cloud.google.com/gke-nodepool: <your-gpu-pool>}
   containers:
   - name: workload
-    image: <your image with vGPU-NVIDIA.so baked in>
+    image: <your image from 7.1>
     securityContext: {runAsUser: 0}
     env:
     - name: NODE_IP
@@ -173,34 +198,31 @@ vLLM workloads additionally need
 `{name: VLLM_ENABLE_V1_MULTIPROCESSING, value: "0"}` (addresses must live in
 the process the agent targets).
 
-### 7.2 Calling the agent from Python
-
-Install the client (already baked into the demo image):
-
-```shell
-pip install "git+https://github.com/Edwinhr716/llm-d-rl-time-slicing.git@gcr-backend-memory-allocation#subdirectory=pkg/client/python"
-```
+### 7.3 Calling the agent from Python
 
 Regions are strings of the form `"<pid>:<hex address>:<bytes>"`, taken from
-live tensors. Snapshots are grouped per tenant with `group=`.
-
-### 7.3 Training workload example
-
-Park an inactive tenant (adapter weights + AdamW state → VRAM freed) and
-revive it when its next batch arrives. Full implementation:
-`src/training/timeslice_tenant.py` in open-rl.
+live tensors. Snapshots are grouped per tenant/session with `group=`.
 
 ```python
-import os, torch
+import os
 from timeslice.snapshot_agent.client import SnapshotAgentClient
 
 client = SnapshotAgentClient(endpoint=os.environ["AGENT_ENDPOINT"])
 JOB_ID, BACKEND = os.environ["JOB_ID"], "BACKEND_GPU_CR_MEMORY_ADDRESSES"
+```
+
+### 7.4 Training workload example
+
+Park an inactive tenant (adapter weights + optimizer state → VRAM freed) and
+revive it when its next batch arrives:
+
+```python
+import torch
 
 def regions_for(params, optimizer):
     """Adapter weights + AdamW moments -> 'pid:hexaddr:size' strings."""
     pid, tensors = os.getpid(), []
-    for p in params:                                  # trainable LoRA params
+    for p in params:                                  # trainable adapter params
         tensors.append(p.data)
         state = optimizer.state.get(p, {})
         for key in ("exp_avg", "exp_avg_sq"):         # only exists AFTER the
@@ -230,13 +252,13 @@ Rules that keep this correct:
 - **Restore incoming before snapshotting outgoing** at every switch.
 - Re-collect regions after any model reload — addresses change.
 
-### 7.4 Sampling / inference workload example
+### 7.5 Sampling / inference workload example
 
 vLLM with a single LoRA slot (`max_loras=1`): the slot's stacked buffers have
 stable device addresses, so switching adapters = snapshot the resident
 adapter's slot bytes, restore the incoming adapter's bytes into the same
-slot. No reload from storage. Full implementation: `src/server/timeslice_lora.py`
-and `src/server/timeslice_vllm_sampler.py` in open-rl.
+slot. No reload from storage. (A complete standalone version of this test
+lives in this repo at `testing-artifacts/test_lora_swap_max1.py`.)
 
 ```python
 def slot_regions(model):
@@ -268,44 +290,33 @@ def switch_adapter(resident, incoming):
 The incoming adapter must have been loaded (and snapshotted) through the slot
 once before — after that, it never touches storage again.
 
-## 8. Deploy and run the demo
+## 8. Operations
 
-The prewired manifests in open-rl `k8s/deploy/timeslice-demo/` apply exactly
-the integration above. Edit the images to `$REGISTRY/timeslice-demo:v0.3.0`,
-then:
-
-```shell
-kubectl apply -f k8s/deploy/timeslice-demo/stack.yaml     # redis, gateway, sampler, trainer
-kubectl get pods -n openrl-demo -w                        # wait for Ready
-kubectl apply -f k8s/deploy/timeslice-demo/driver-job.yaml
-kubectl logs -f job/timeslice-demo-driver -n openrl-demo | grep '\[driver\]'
-```
-
-The driver alternates two tenants through full RL rounds
-(forward_backward → optim_step → save weights → sample) and ends with
-determinism tripwires; look for `PASSED` at the end.
-
-**Before every re-run**, clear stale GPU-CR dump files — they pin their full
-hugepage reservations even after the process dies:
+**Clean slate between workload restarts.** GPU-CR dump files pin their full
+hugepage reservations even after the owning process dies (reservations attach
+to the file inode). Before restarting GPU workloads:
 
 ```shell
-kubectl scale deploy/timeslice-sampler deploy/trainer-worker -n openrl-demo --replicas=0
-sleep 25
-# In a privileged pod (or node shell) on the GPU node:
-#   rm -rf /var/tmp/huge-ckpt/* /dev/shm/gcr-snapshots/* /var/tmp/open-rl/*
+# Scale your GPU workloads to zero, then in a privileged pod (or node
+# shell) on the GPU node:
+#   rm -rf /var/tmp/huge-ckpt/* /dev/shm/gcr-snapshots/*
 #   grep HugePages_Free /proc/meminfo   # must equal HugePages_Total
-kubectl scale deploy/timeslice-sampler deploy/trainer-worker -n openrl-demo --replicas=1
+# then scale the workloads back up.
 ```
 
-## 9. Verify it's working
+The agent also garbage-collects stale dump files and snapshots for dead PIDs
+automatically, on a delay.
+
+**Verify it's working:**
 
 - **Swaps are real**: `kubectl logs -n timeslice-system -l app.kubernetes.io/name=snapshot-agent | grep took`
-  shows per-operation timings; the trainer's metrics
-  (`/mnt/open-rl/metrics/trainer.jsonl`) record `vram_freed_mb` per swap-out.
+  shows per-operation timings, and `torch.cuda.mem_get_info()` before/after a
+  snapshot shows the freed VRAM.
 - **Hugepages are used**: on the GPU node, `grep Huge /proc/meminfo` —
   `HugePages_Free` must drop below `HugePages_Total` while workloads run.
-- **Correctness**: the driver's tripwires verify the same tenant restored
-  twice samples identically and different tenants sample differently.
+- **Correctness**: restore a group and compare tensors against copies saved
+  before the snapshot (`torch.equal`), or check that deterministic
+  (temperature-0) outputs are identical before and after a park/revive cycle.
 
 ## Troubleshooting
 
@@ -315,4 +326,4 @@ kubectl scale deploy/timeslice-sampler deploy/trainer-worker -n openrl-demo --re
 | Agent reports job `FAULTED` | A cr_client op hit a dead PID; the agent auto-recovers after its op timeout. Re-check pod health, then retry. |
 | `libcuda.so.1` not found in workload | `LD_LIBRARY_PATH` must include `/usr/local/nvidia/lib64`. |
 | Snapshots "work" but `HugePages_Free` never moves | hugetlbfs isn't actually mounted on the host — check the agent's init container ran on that node. |
-| Xid 31 / illegal memory access on the sampler | Restore must immediately follow snapshot on the same regions (the demo code handles this); also verify `CUDA_LAUNCH_BLOCKING=1`. |
+| Xid 31 / illegal memory access | A snapshot was left un-restored on regions the workload then touched — always pair snapshot with a restore of the same regions (see the slot-swap pattern); also verify `CUDA_LAUNCH_BLOCKING=1`. |
