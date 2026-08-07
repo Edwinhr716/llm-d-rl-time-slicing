@@ -167,8 +167,9 @@ metadata:
     snapshot-agent: "true"           # agent discovers pods by this label
     timeslice.io/job-id: "my-job"    # must match the JOB_ID env below
 spec:
-  hostIPC: true                      # GPU-CR control channel
-  hostPID: true                      # agent signals the workload PID
+  hostPID: true                      # required: the workload self-reports its PID
+                                     # in region strings, and the agent signals it
+                                     # in the host PID namespace
   # Schedule onto the hugepages GPU pool created in step 3:
   nodeSelector: {cloud.google.com/gke-nodepool: <your-gpu-pool>}
   containers:
