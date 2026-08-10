@@ -1,0 +1,117 @@
+# Appendix C - hugetlbfs probe pods.
+# hp-consumer: T5 scheduling-gate pod (track a, WITH hugepages request).
+# hp-probe-with-request: T6 variant B (track b, WITH hugepages request).
+# hp-probe-no-request: T6 variant A (track b, NO hugepages request).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hp-consumer
+  namespace: taskc-hpboot
+spec:
+  nodeSelector:
+    cloud.google.com/gke-nodepool: hpboot-l4-c
+    hp-test/track: a
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: python:3.12-slim
+      command:
+        - python3
+        - -c
+        - |
+          import mmap, os
+          fd = os.open('/mnt/huge/probe-%d' % os.getpid(), os.O_CREAT | os.O_RDWR)
+          size = 1 << 30
+          os.ftruncate(fd, size)
+          m = mmap.mmap(fd, size)
+          for off in range(0, size, 2 << 20):
+              m[off] = 1
+          print('wrote OK')
+      volumeMounts:
+        - {name: huge, mountPath: /mnt/huge, mountPropagation: HostToContainer}
+      resources:
+        requests: {hugepages-2Mi: 2Gi, memory: 1Gi, cpu: 100m}
+        limits:   {hugepages-2Mi: 2Gi, memory: 1Gi}
+  volumes:
+    - name: huge
+      hostPath: {path: /var/tmp/huge-ckpt, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hp-probe-with-request
+  namespace: taskc-hpboot
+spec:
+  nodeSelector:
+    cloud.google.com/gke-nodepool: hpboot-l4-c
+    hp-test/track: b
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: python:3.12-slim
+      command:
+        - python3
+        - -c
+        - |
+          import mmap, os
+          fd = os.open('/mnt/huge/probe-%d' % os.getpid(), os.O_CREAT | os.O_RDWR)
+          size = 1 << 30
+          os.ftruncate(fd, size)
+          m = mmap.mmap(fd, size)
+          for off in range(0, size, 2 << 20):
+              m[off] = 1
+          print('wrote OK')
+      volumeMounts:
+        - {name: huge, mountPath: /mnt/huge, mountPropagation: HostToContainer}
+      resources:
+        requests: {hugepages-2Mi: 2Gi, memory: 1Gi, cpu: 100m}
+        limits:   {hugepages-2Mi: 2Gi, memory: 1Gi}
+  volumes:
+    - name: huge
+      hostPath: {path: /var/tmp/huge-ckpt, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hp-probe-no-request
+  namespace: taskc-hpboot
+spec:
+  nodeSelector:
+    cloud.google.com/gke-nodepool: hpboot-l4-c
+    hp-test/track: b
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: python:3.12-slim
+      command:
+        - python3
+        - -c
+        - |
+          import mmap, os
+          fd = os.open('/mnt/huge/probe-%d' % os.getpid(), os.O_CREAT | os.O_RDWR)
+          size = 1 << 30
+          os.ftruncate(fd, size)
+          m = mmap.mmap(fd, size)
+          for off in range(0, size, 2 << 20):
+              m[off] = 1
+          print('wrote OK')
+      volumeMounts:
+        - {name: huge, mountPath: /mnt/huge, mountPropagation: HostToContainer}
+      resources:
+        requests: {memory: 1Gi, cpu: 100m}
+        limits:   {memory: 1Gi}
+  volumes:
+    - name: huge
+      hostPath: {path: /var/tmp/huge-ckpt, type: DirectoryOrCreate}

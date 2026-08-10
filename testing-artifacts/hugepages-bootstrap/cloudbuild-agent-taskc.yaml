@@ -1,0 +1,20 @@
+# Cloud Build config for the taskc-tagged snapshot-agent image (T7).
+# Usage (from repo root):
+#   gcloud builds submit --config testing-artifacts/hugepages-bootstrap/cloudbuild-agent-taskc.yaml \
+#     --substitutions=_TAG=taskc-<shortsha> .
+steps:
+- name: gcr.io/cloud-builders/docker
+  args:
+  - build
+  - -f
+  - docker/snapshot-agent/Dockerfile
+  - -t
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:${_TAG}
+  - .
+substitutions:
+  _TAG: taskc-dev
+images:
+- asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:${_TAG}
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 1800s

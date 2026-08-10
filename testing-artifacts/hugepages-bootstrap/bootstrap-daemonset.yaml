@@ -1,0 +1,81 @@
+# Appendix B - DRAFT hugepages-bootstrap DaemonSet (the artifact under test).
+# Track B: pinned to hp-test/track=b on pool hpboot-l4-c.
+# For T7 the nodeSelector is switched to the GPU pool label + nvidia.com/gpu toleration.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: timeslice-hugepages-bootstrap
+value: 900000000
+description: Hugepage-pool bootstrap; must run before GPU workloads.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hugepages-bootstrap
+  namespace: taskc-hpboot
+  labels: {app: hugepages-bootstrap}
+spec:
+  selector:
+    matchLabels: {app: hugepages-bootstrap}
+  template:
+    metadata:
+      labels: {app: hugepages-bootstrap}
+    spec:
+      priorityClassName: timeslice-hugepages-bootstrap
+      hostPID: true
+      nodeSelector:
+        cloud.google.com/gke-nodepool: hpboot-l4-c
+        hp-test/track: b
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      initContainers:
+        - name: provision-hugepages
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          env:
+            # 12288 x 2Mi = 24Gi, sized for two GPU-CR processes built with
+            # SHM_SIZE_GB=8. Raise for the stock 25GiB build.
+            - name: HUGEPAGES_2M
+              value: "12288"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              apk add --no-cache util-linux >/dev/null
+              target=$HUGEPAGES_2M
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              # Pool already at size => kubelet saw it at its last start:
+              # either boot-time node config, or a previous run of this
+              # script, which only restarts kubelet AFTER a full allocation.
+              if [ "$current" -ge "$target" ]; then
+                echo "hugepage pool already provisioned ($current/$target pages), nothing to do"
+                exit 0
+              fi
+              echo "reserving $target 2Mi hugepages (currently $current)"
+              nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -lt "$target" ]; then
+                echo "short by $((target - current)) pages; compacting and retrying"
+                nsenter -t 1 -m -- sh -c 'echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+                nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+                current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              fi
+              if [ "$current" -lt "$target" ]; then
+                # Fail WITHOUT restarting kubelet: an undersized pool must
+                # surface here, not as workload SIGBUS later.
+                echo "ERROR: only $current of $target pages allocated (memory fragmented or exhausted)"
+                exit 1
+              fi
+              echo "pool ready; restarting kubelet so the node reports hugepages-2Mi (running pods unaffected)"
+              nsenter -t 1 -m -- systemctl restart kubelet
+      containers:
+        - name: pause
+          image: alpine:latest
+          command: ["sleep", "infinity"]
+          resources:
+            requests: {cpu: 5m, memory: 16Mi}
+            limits: {memory: 32Mi}
