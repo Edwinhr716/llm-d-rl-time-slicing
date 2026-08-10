@@ -121,6 +121,63 @@ helm install snapshot-agent ./snapshot-agent \
   --set tolerations[0].effect=NoSchedule
 ```
 
+## GPU-CR Memory-Regions Backend (`memoryRegions.*`)
+
+The `memory-regions` backend (selective checkpoint/restore of explicit device
+memory ranges via GPU-CR's `cr_client`) needs node-level machinery that the
+CUDA/app backends do not. It is gated behind the `memoryRegions` values block
+and **disabled by default** — with `memoryRegions.enabled=false` the rendered
+chart is identical to a plain CUDA/app deployment.
+
+```bash
+helm install snapshot-agent ./snapshot-agent \
+  --namespace timeslice-system \
+  --create-namespace \
+  --set memoryRegions.enabled=true
+```
+
+Enabling it adds, all lifted from the validated GPU-CR prototype deployment:
+
+*   `hostIPC: true` — GPU-CR's shared-memory control channel between the
+    agent's `cr_client` and the workload's preloader.
+*   A privileged `mount-hugetlbfs` init container that `nsenter`s the host
+    mount namespace and idempotently mounts hugetlbfs at
+    `memoryRegions.hostCtlPath` (default `/var/tmp/huge-ckpt`,
+    `pagesize=2M,mode=0777`). GPU-CR only gets hugepage backing if the
+    checkpoint dir is a real hugetlbfs mount; without it every dump silently
+    degrades to boot-disk page cache. Set `memoryRegions.hugetlbfs.mount=false`
+    if the host mounts it by other means.
+*   Env for the agent: `EXPORT_FILE_PATH` (= `memoryRegions.ctlDir`),
+    `SNAPSHOT_DIR` (= `memoryRegions.snapshotDir`), `GPU_CR_OP_TIMEOUT_SEC`,
+    and `GPU_CR_COPY_HOST_FILE=1` when `memoryRegions.copyHostFile=true`.
+    Setting `EXPORT_FILE_PATH` also switches on the agent's GPU-CR artifact
+    GC and the 0777 chmod of the checkpoint dir at startup.
+*   Volumes: the `huge-ckpt` hostPath at `ctlDir` (with
+    `mountPropagation: HostToContainer` so the init container's mount is
+    visible) and the disk-backed `gcr-snapshots` hostPath at `snapshotDir`
+    (snapshot copies must NOT live on hugetlbfs: no `write(2)` support, and
+    copies there would pin hugepages forever).
+*   `hugepages-2Mi` requests/limits (`memoryRegions.hugepagesResource`,
+    default `2Gi`) merged into the agent's resources, plus a memory request
+    (required by Kubernetes alongside hugepages). This is hugetlb cgroup
+    headroom for mmap-write restores into live dump buffers.
+
+Node prerequisites:
+
+*   The node must pre-allocate hugepages (`vm.nr_hugepages`). Size the pool
+    for your workloads: a GPU-CR dump + staging pair pins **~27 Gi per
+    workload** on 2 Mi pages (25 Gi dump buffer + 2×1 Gi staging), reserved
+    at `mmap` time.
+*   Workload pods need the GPU-CR preloader (`LD_PRELOAD=vGPU-NVIDIA.so`),
+    `hostPID`, `hostIPC`, the `huge-ckpt` hostPath mounted at
+    `/mnt/huge-ckpt` with `mountPropagation: HostToContainer`, and matching
+    `hugepages-2Mi` resources.
+
+There is no `cr_client` install step: the binary ships inside the agent image
+at `/usr/local/bin/cr_client`, so the agent and `cr_client` versions always
+roll together. `grpc.health.v1.Health/Check` with `service: "memory-regions"`
+reports `NOT_SERVING` if the binary is missing.
+
 ## Development Workflow: Custom Images
 
 During development, you will need to build your own container image containing your changes and push it to a custom registry.

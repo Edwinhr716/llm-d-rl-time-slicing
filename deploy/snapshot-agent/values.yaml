@@ -50,6 +50,28 @@ nvidia:
     hostPath: /dev
     mountPath: /dev
 
+# GPU-CR memory-regions backend machinery. Default disabled: the chart is
+# identical to a CUDA/app-backend deployment unless this is turned on.
+memoryRegions:
+  enabled: false
+  # Shared checkpoint/control dir (EXPORT_FILE_PATH inside the agent).
+  ctlDir: /mnt/huge-ckpt
+  # Host path backing ctlDir; also the hugetlbfs mountpoint.
+  hostCtlPath: /var/tmp/huge-ckpt
+  hugetlbfs:
+    mount: true # run the nsenter init container
+    pagesize: 2M
+  # hugetlb cgroup headroom for mmap-write restores into live dump buffers.
+  # Rendered as hugepages-<pagesize>i requests/limits (k8s requires a memory
+  # request alongside hugepages; one is added if resources doesn't set one).
+  hugepagesResource: 2Gi
+  # Disk-backed snapshot store: hugetlbfs has no write(2), and copies there
+  # would pin hugepages forever.
+  snapshotDir: /var/snapshots
+  snapshotsHostPath: /var/lib/snapshot-agent/snapshots
+  copyHostFile: false # GPU_CR_COPY_HOST_FILE
+  opTimeoutSec: 120 # GPU_CR_OP_TIMEOUT_SEC
+
 # Kubernetes-style feature gates (map of Name: bool), rendered into the
 # agent's FEATURE_GATES env var. Experimental capabilities are off by
 # default; requests selecting a gated backend fail with FAILED_PRECONDITION
