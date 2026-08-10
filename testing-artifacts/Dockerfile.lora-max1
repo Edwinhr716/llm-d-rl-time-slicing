@@ -1,0 +1,29 @@
+# Workload image for the memory-regions LoRA swap validation.
+# Build from the REPO ROOT so the local Python client and preloader ship in
+# the image (no dependence on a GitHub branch):
+#   docker build -f testing-artifacts/Dockerfile.lora-max1 .
+FROM vllm/vllm-openai:v0.22.0
+
+WORKDIR /app
+
+USER root
+
+# GPU-CR preloader, pinned from the checkout (LD_PRELOAD in the pod spec).
+COPY bin/vGPU-NVIDIA.so /usr/local/lib/vGPU-NVIDIA.so
+RUN chmod 755 /usr/local/lib/vGPU-NVIDIA.so
+
+# Install the timeslice client from the local source tree (must match the
+# agent's proto: the memory-regions API has no wire-compat with the old
+# memory_addresses field 4).
+COPY pkg/client/python /opt/timeslice-client
+RUN pip install --no-cache-dir --upgrade protobuf grpcio && \
+    pip install --no-cache-dir /opt/timeslice-client
+
+# Copy the test scripts
+COPY testing-artifacts/test_lora_swap_max1.py testing-artifacts/test_lora_swap.py testing-artifacts/validate_selective_cr.py ./
+
+# Create a non-privileged user
+RUN useradd -m validator && chown -R validator:validator /app
+USER validator
+
+ENTRYPOINT ["python3", "test_lora_swap_max1.py"]

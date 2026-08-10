@@ -1,0 +1,11 @@
+# Upload the full working tree to Cloud Build, including bin/ (cr_client,
+# vGPU-NVIDIA.so are baked into images). Without this file gcloud would
+# synthesize an ignore list from .gitignore and drop bin/.
+.git
+.gcloudignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+coverage.out
+coverage.html

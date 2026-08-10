@@ -115,12 +115,38 @@ message AppChannelConfig {
   repeated string tags = 2;
 }
 
+// MemoryRegion identifies one device-memory range owned by a process.
+message MemoryRegion {
+  // PID of the process that owns the region.
+  int32 pid = 1;
+  // Device virtual address of the start of the region.
+  uint64 address = 2;
+  // Length of the region in bytes.
+  uint64 size_bytes = 3;
+}
+
+// Configuration for the memory-regions backend: selective checkpoint and
+// restore of specific device memory ranges of a running process (GPU-CR
+// cr_client with a `-s addr:size,...` spec). Regions are required on both
+// Snapshot and Restore; the agent performs no discovery for this backend.
+message MemoryRegionsBackendConfig {
+  repeated MemoryRegion regions = 1;
+  // snapshot_name names the snapshot slot the regions are saved to
+  // (Snapshot) or loaded from (Restore). Distinct names let multiple
+  // snapshots of the same process coexist and be swapped on demand.
+  // If empty, the request's job_id is used. Note this is deliberately NOT
+  // the request's `group`: group identifies a set of related jobs for the
+  // orchestrator and does not name agent-side storage.
+  string snapshot_name = 2;
+}
+
 message BackendConfig {
   oneof backend {
     CudaBackendConfig cuda = 1;
     AppEndpointConfig app_endpoint = 2;
     AppChannelConfig app_channel = 3;
     DirectMemoryBackendConfig direct_memory = 4;
+    MemoryRegionsBackendConfig memory_regions = 5;
   }
 }
 

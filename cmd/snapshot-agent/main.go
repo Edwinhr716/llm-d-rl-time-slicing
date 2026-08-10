@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
@@ -63,10 +64,30 @@ func main() {
 	// server's WorkloadChannel RPC handler.
 	channelRegistry := backends.NewChannelRegistry()
 	registeredBackends := map[backends.BackendType]backends.Backend{
-		backends.BackendCuda:        backends.NewCudaCheckpoint(),
-		backends.BackendNoop:        backends.NewNoopBackend(),
-		backends.BackendAppEndpoint: backends.NewAppEndpointBackend(),
-		backends.BackendAppChannel:  backends.NewAppChannelBackend(channelRegistry),
+		backends.BackendCuda:          backends.NewCudaCheckpoint(),
+		backends.BackendNoop:          backends.NewNoopBackend(),
+		backends.BackendAppEndpoint:   backends.NewAppEndpointBackend(),
+		backends.BackendAppChannel:    backends.NewAppChannelBackend(channelRegistry),
+		backends.BackendMemoryRegions: backends.NewMemoryRegions(),
+	}
+
+	// GPU-CR (memory-regions backend) housekeeping runs only when the shared
+	// checkpoint dir is configured (the Helm chart sets EXPORT_FILE_PATH iff
+	// memoryRegions.enabled), keeping CUDA/app-only deployments untouched.
+	if ctlDir := os.Getenv("EXPORT_FILE_PATH"); ctlDir != "" {
+		// The dir must be writable by the (unprivileged) GPU-CR workloads
+		// that mmap their dump buffers in it.
+		if _, err := os.Stat(ctlDir); err == nil {
+			if err := os.Chmod(ctlDir, 0o777); err != nil {
+				slog.WarnContext(ctx, "Failed to chmod GPU-CR checkpoint dir to 0777", "dir", ctlDir, "error", err)
+			} else {
+				slog.InfoContext(ctx, "Set GPU-CR checkpoint dir permissions to 0777", "dir", ctlDir)
+			}
+		}
+		// Sweep stale GPU-CR artifacts: on hugetlbfs each leaked dump pair
+		// pins ~27Gi of hugepage reservations, so leaks exhaust the pool in
+		// two runs.
+		backends.StartGC(ctx, ctlDir, 10*time.Minute)
 	}
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent", "port", listenPort, "deploymentMode", depMode)
