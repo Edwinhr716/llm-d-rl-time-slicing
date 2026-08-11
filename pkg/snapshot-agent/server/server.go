@@ -96,7 +96,8 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 		return nil, fnErr
 	}
 
-	opID, err := s.state.StartSnapshotSlot(req.GetJobId(), req.GetGroup(), memoryRegionsSlot(config, req.GetJobId()), snapshotFn)
+	slot := memoryRegionsSlot(config, req.GetJobId())
+	opID, err := s.state.StartSnapshotSlot(req.GetJobId(), req.GetGroup(), slot, snapshotFn)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start snapshot", "error", err)
 		return nil, err
@@ -342,7 +343,8 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 		return nil, fnErr
 	}
 
-	opID, err := s.state.StartRestoreSlot(req.GetJobId(), req.GetGroup(), memoryRegionsSlot(restoreConfig, req.GetJobId()), restoreFn)
+	slot := memoryRegionsSlot(restoreConfig, req.GetJobId())
+	opID, err := s.state.StartRestoreSlot(req.GetJobId(), req.GetGroup(), slot, restoreFn)
 	if err != nil {
 		return nil, err
 	}

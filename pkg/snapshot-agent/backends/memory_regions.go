@@ -3,9 +3,11 @@ package backends
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -162,7 +164,7 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 
 	t1 := time.Now()
 	for _, pid := range regionPIDs(cfg) {
-		id, err := g.resolvePidToId(strconv.Itoa(int(pid)))
+		id, err := g.resolvePidToID(strconv.Itoa(int(pid)))
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
@@ -236,7 +238,7 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 	hugetlb := isHugetlbfs(ctlDir)
 	t0 := time.Now()
 	for _, pid := range regionPIDs(cfg) {
-		id, err := g.resolvePidToId(strconv.Itoa(int(pid)))
+		id, err := g.resolvePidToID(strconv.Itoa(int(pid)))
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
@@ -287,7 +289,14 @@ func (g *MemoryRegions) HealthCheck(ctx context.Context) error {
 }
 
 func (g *MemoryRegions) getCrClientPath() string {
-	for _, p := range []string{"cr_client", "/usr/bin/cr_client", "/bin/cr_client", "/opt/bin/cr_client", "/usr/local/bin/cr_client"} {
+	candidates := []string{
+		"cr_client",
+		"/usr/bin/cr_client",
+		"/bin/cr_client",
+		"/opt/bin/cr_client",
+		"/usr/local/bin/cr_client",
+	}
+	for _, p := range candidates {
 		if path, err := g.lookPath(p); err == nil {
 			return path
 		}
@@ -325,8 +334,8 @@ func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec stri
 	return nil
 }
 
-// resolvePidToId maps a workload PID to its GPU-CR dump-buffer id.
-func (g *MemoryRegions) resolvePidToId(pid string) (string, error) {
+// resolvePidToID maps a workload PID to its GPU-CR dump-buffer id.
+func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
 	ctlDir := exportDir()
 	mapPath := filepath.Join(ctlDir, fmt.Sprintf("pid_map_%s", pid))
 	data, err := os.ReadFile(mapPath)
@@ -344,7 +353,11 @@ func (g *MemoryRegions) resolvePidToId(pid string) (string, error) {
 	// is visible in /proc/<pid>/maps and its basename IS the id.
 	id, ferr := idFromProcMaps(g.procRoot, pid)
 	if ferr != nil {
-		return "", fmt.Errorf("pid map file %s unusable (%v) and /proc fallback failed: %w", mapPath, err, ferr)
+		readProblem := "contents are not a numeric id"
+		if err != nil {
+			readProblem = err.Error()
+		}
+		return "", fmt.Errorf("pid map file %s unusable (%s) and /proc fallback failed: %w", mapPath, readProblem, ferr)
 	}
 	slog.Info("Resolved GPU-CR id from /proc/<pid>/maps fallback", "pid", pid, "id", id)
 	return id, nil
@@ -408,7 +421,7 @@ func isHugetlbfs(path string) bool {
 	if err := syscall.Statfs(path, &st); err != nil {
 		return false
 	}
-	return uint64(st.Type) == hugetlbfsMagic
+	return st.Type == hugetlbfsMagic
 }
 
 // dumpDataLimit reads the shared_mem_fs header of a GPU-CR dump file and
@@ -431,7 +444,11 @@ func dumpDataLimit(path string) int64 {
 	if _, err := io.ReadFull(f, hdr[:]); err != nil {
 		return 0
 	}
-	currentOffset := int64(binary.LittleEndian.Uint64(hdr[8:16]))
+	raw := binary.LittleEndian.Uint64(hdr[8:16])
+	if raw > math.MaxInt64 {
+		return 0
+	}
+	currentOffset := int64(raw)
 	if currentOffset < 16 || currentOffset > st.Size() {
 		return 0
 	}
@@ -491,31 +508,26 @@ func copyFile(src, dst string, limit int64) error {
 		if remaining := limit - currentOffset; remaining < want {
 			want = remaining
 		}
-		n, err := srcFile.Read(buf[:want])
-		if n > 0 {
-			if isAllZeros(buf[:n]) {
-				currentOffset += int64(n)
-			} else {
-				if currentOffset != writeOffset {
-					_, err = dstFile.Seek(currentOffset, io.SeekStart)
-					if err != nil {
-						return err
-					}
-					writeOffset = currentOffset
-				}
-				nw, err := dstFile.Write(buf[:n])
-				if err != nil {
+		n, readErr := srcFile.Read(buf[:want])
+		if n > 0 && !isAllZeros(buf[:n]) {
+			if currentOffset != writeOffset {
+				if _, err := dstFile.Seek(currentOffset, io.SeekStart); err != nil {
 					return err
 				}
-				writeOffset += int64(nw)
-				currentOffset += int64(n)
+				writeOffset = currentOffset
 			}
+			nw, err := dstFile.Write(buf[:n])
+			if err != nil {
+				return err
+			}
+			writeOffset += int64(nw)
 		}
-		if err == io.EOF {
+		currentOffset += int64(n)
+		if errors.Is(readErr, io.EOF) {
 			break
 		}
-		if err != nil {
-			return err
+		if readErr != nil {
+			return readErr
 		}
 	}
 
@@ -575,7 +587,9 @@ func copyIntoHugetlbfs(src, dst string) error {
 		return fmt.Errorf("mmap of hugetlbfs dump buffer %s failed: %w", dst, err)
 	}
 	defer func() {
-		_ = syscall.Munmap(m)
+		if merr := syscall.Munmap(m); merr != nil {
+			slog.Warn("munmap of dump buffer failed", "dst", dst, "error", merr)
+		}
 	}()
 
 	buf := make([]byte, 4*1024*1024)
@@ -584,16 +598,16 @@ func copyIntoHugetlbfs(src, dst string) error {
 		if remaining := limit - off; remaining < want {
 			want = remaining
 		}
-		n, err := srcFile.ReadAt(buf[:want], off)
+		n, readErr := srcFile.ReadAt(buf[:want], off)
 		if n > 0 {
 			copy(m[off:off+int64(n)], buf[:n])
 			off += int64(n)
 		}
-		if err == io.EOF {
+		if errors.Is(readErr, io.EOF) {
 			break
 		}
-		if err != nil {
-			return err
+		if readErr != nil {
+			return readErr
 		}
 	}
 	return nil

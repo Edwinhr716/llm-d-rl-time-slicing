@@ -49,13 +49,14 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 	t.Setenv("SNAPSHOT_DIR", snapDir)
 
 	// The workload's preloader would write the pid map; simulate it.
-	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o644))
+	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o600))
 
 	// Put the stub cr_client first on PATH under the canonical name.
 	stubDir := t.TempDir()
 	stubSrc, err := os.ReadFile(filepath.Join(root, "tests", "integration", "memory-regions", "stub_cr_client.sh"))
 	assert.NilError(t, err)
-	assert.NilError(t, os.WriteFile(filepath.Join(stubDir, "cr_client"), stubSrc, 0o755))
+	//nolint:gosec // the stub must be executable
+	assert.NilError(t, os.WriteFile(filepath.Join(stubDir, "cr_client"), stubSrc, 0o700))
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	// Standalone-mode auto-transition needs "GPU occupied"; no NVML here.
@@ -74,7 +75,11 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry())
 	pb.RegisterSnapshotAgentServiceServer(s, srv)
 	grpc_health_v1.RegisterHealthServer(s, server.NewHealthServer(backendsMap, backends.BackendNoop))
-	go func() { _ = s.Serve(lis) }()
+	go func() {
+		if err := s.Serve(lis); err != nil {
+			return
+		}
+	}()
 	t.Cleanup(s.GracefulStop)
 
 	endpoint := lis.Addr().String()

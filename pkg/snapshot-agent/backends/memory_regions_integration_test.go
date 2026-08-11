@@ -41,7 +41,7 @@ func (d *fakeDevice) exec(ctx context.Context, name string, args ...string) ([]b
 	dumpPath := filepath.Join(d.ctlDir, d.id)
 	switch args[0] {
 	case "-c":
-		return nil, os.WriteFile(dumpPath, d.memory, 0o644)
+		return nil, os.WriteFile(dumpPath, d.memory, 0o600)
 	case "-r":
 		data, err := os.ReadFile(dumpPath)
 		if err != nil {
@@ -94,7 +94,11 @@ func startAgent(t *testing.T, dev *fakeDevice) pb.SnapshotAgentServiceClient {
 	s := grpc.NewServer()
 	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry())
 	pb.RegisterSnapshotAgentServiceServer(s, srv)
-	go func() { _ = s.Serve(lis) }()
+	go func() {
+		if err := s.Serve(lis); err != nil {
+			return
+		}
+	}()
 	t.Cleanup(s.GracefulStop)
 
 	conn, err := grpc.NewClient("passthrough://bufnet",
@@ -121,12 +125,14 @@ func waitOp(t *testing.T, client pb.SnapshotAgentServiceClient, opID string) *pb
 	return nil
 }
 
-func jobState(t *testing.T, client pb.SnapshotAgentServiceClient, jobID string) pb.JobState {
+const e2eJobID = "job-e2e"
+
+func jobState(t *testing.T, client pb.SnapshotAgentServiceClient) pb.JobState {
 	t.Helper()
 	resp, err := client.Status(context.Background(), &pb.StatusRequest{})
 	assert.NilError(t, err)
 	for _, js := range resp.GetJobStatuses() {
-		if js.GetJobId() == jobID {
+		if js.GetJobId() == e2eJobID {
 			return js.GetState()
 		}
 	}
@@ -144,20 +150,20 @@ func integrationConfig(slot string) *pb.BackendConfig {
 	}
 }
 
-func snapshotSlotAndWait(t *testing.T, client pb.SnapshotAgentServiceClient, jobID, slot string) *pb.GetOperationResponse {
+func snapshotSlotAndWait(t *testing.T, client pb.SnapshotAgentServiceClient, slot string) *pb.GetOperationResponse {
 	t.Helper()
 	resp, err := client.Snapshot(context.Background(), &pb.SnapshotRequest{
-		JobId:         jobID,
+		JobId:         e2eJobID,
 		BackendConfig: integrationConfig(slot),
 	})
 	assert.NilError(t, err)
 	return waitOp(t, client, resp.GetOperationId())
 }
 
-func restoreSlotAndWait(t *testing.T, client pb.SnapshotAgentServiceClient, jobID, slot string) *pb.GetOperationResponse {
+func restoreSlotAndWait(t *testing.T, client pb.SnapshotAgentServiceClient, slot string) *pb.GetOperationResponse {
 	t.Helper()
 	resp, err := client.Restore(context.Background(), &pb.RestoreRequest{
-		JobId:         jobID,
+		JobId:         e2eJobID,
 		BackendConfig: integrationConfig(slot),
 	})
 	assert.NilError(t, err)
@@ -176,58 +182,57 @@ func TestMemoryRegionsEndToEnd(t *testing.T) {
 
 	dev := &fakeDevice{ctlDir: ctlDir, id: "42"}
 	// pid_map written by the (simulated) preloader at workload startup.
-	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o644))
+	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o600))
 
 	client := startAgent(t, dev)
-	const jobID = "job-e2e"
 
 	contentA := bytes.Repeat([]byte{0xA1}, 64)
 	contentB := bytes.Repeat([]byte{0xB2}, 64)
 
 	// Snapshot slot-a: PENDING -> COMPLETE with storage bytes; job SAVED.
 	dev.setMemory(contentA)
-	op := snapshotSlotAndWait(t, client, jobID, "slot-a")
+	op := snapshotSlotAndWait(t, client, "slot-a")
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_COMPLETE, "error: %s", op.GetError())
 	assert.Assert(t, op.GetStorageBytes() > 0)
-	assert.Equal(t, jobState(t, client, jobID), pb.JobState_JOB_STATE_SAVED)
+	assert.Equal(t, jobState(t, client), pb.JobState_JOB_STATE_SAVED)
 
 	// Restore slot-a: job back to RUNNING.
-	op = restoreSlotAndWait(t, client, jobID, "slot-a")
+	op = restoreSlotAndWait(t, client, "slot-a")
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_COMPLETE, "error: %s", op.GetError())
-	assert.Equal(t, jobState(t, client, jobID), pb.JobState_JOB_STATE_RUNNING)
+	assert.Equal(t, jobState(t, client), pb.JobState_JOB_STATE_RUNNING)
 
 	// Snapshot slot-b with different device bytes, then restore slot-a and
 	// verify slot-a's bytes land back in device memory (bitwise).
 	dev.setMemory(contentB)
-	op = snapshotSlotAndWait(t, client, jobID, "slot-b")
+	op = snapshotSlotAndWait(t, client, "slot-b")
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_COMPLETE, "error: %s", op.GetError())
 
-	op = restoreSlotAndWait(t, client, jobID, "slot-a")
+	op = restoreSlotAndWait(t, client, "slot-a")
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_COMPLETE, "error: %s", op.GetError())
 	assert.Assert(t, bytes.Equal(dev.getMemory(), contentA), "slot-a bytes not restored")
 
 	// Live slot swap while RUNNING: restore slot-b, then back to slot-a.
-	op = restoreSlotAndWait(t, client, jobID, "slot-b")
+	op = restoreSlotAndWait(t, client, "slot-b")
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_COMPLETE, "error: %s", op.GetError())
 	assert.Assert(t, bytes.Equal(dev.getMemory(), contentB), "slot-b bytes not restored")
 
-	op = restoreSlotAndWait(t, client, jobID, "slot-a")
+	op = restoreSlotAndWait(t, client, "slot-a")
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_COMPLETE, "error: %s", op.GetError())
 	assert.Assert(t, bytes.Equal(dev.getMemory(), contentA), "slot-a bytes not restored after swap")
 
 	// Backend failure: operation FAILED with the backend's error, then a
 	// fresh restore resets the FAULTED job.
 	dev.setFail(fmt.Errorf("workload died"))
-	op = restoreSlotAndWait(t, client, jobID, "slot-b")
+	op = restoreSlotAndWait(t, client, "slot-b")
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_FAILED)
-	assert.Assert(t, len(op.GetError()) > 0)
-	assert.Equal(t, jobState(t, client, jobID), pb.JobState_JOB_STATE_FAULTED)
+	assert.Assert(t, op.GetError() != "")
+	assert.Equal(t, jobState(t, client), pb.JobState_JOB_STATE_FAULTED)
 
 	dev.setFail(nil)
-	op = restoreSlotAndWait(t, client, jobID, "slot-b")
+	op = restoreSlotAndWait(t, client, "slot-b")
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_COMPLETE, "error: %s", op.GetError())
 	assert.Assert(t, bytes.Equal(dev.getMemory(), contentB))
-	assert.Equal(t, jobState(t, client, jobID), pb.JobState_JOB_STATE_RUNNING)
+	assert.Equal(t, jobState(t, client), pb.JobState_JOB_STATE_RUNNING)
 }
 
 // TestMemoryRegionsInvalidRequests verifies RPC-level rejections.
@@ -252,5 +257,5 @@ func TestMemoryRegionsInvalidRequests(t *testing.T) {
 	assert.NilError(t, err)
 	op := waitOp(t, client, resp.GetOperationId())
 	assert.Equal(t, op.GetStatus(), pb.OperationStatus_OPERATION_STATUS_FAILED)
-	assert.Assert(t, len(op.GetError()) > 0)
+	assert.Assert(t, op.GetError() != "")
 }

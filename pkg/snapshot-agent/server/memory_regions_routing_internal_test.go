@@ -57,6 +57,7 @@ func TestGetSnapshotBackendType(t *testing.T) {
 	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry())
 
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		assert.Equal(t, srv.getSnapshotBackendType(tc.config), tc.want)
 	}
 
@@ -105,6 +106,7 @@ func TestBuildSnapshotFnMemoryRegions(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		spy := &spyBackend{}
 		srv := NewServer(
 			map[backends.BackendType]backends.Backend{backends.BackendMemoryRegions: spy},
@@ -159,6 +161,7 @@ func TestBuildRestoreFnMemoryRegions(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		spy := &spyBackend{}
 		srv := NewServer(
 			map[backends.BackendType]backends.Backend{backends.BackendMemoryRegions: spy},
@@ -200,12 +203,17 @@ func TestMemoryRegionsSlot(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		assert.Equal(t, memoryRegionsSlot(tc.config, "job-1"), tc.want)
 	}
 
 	testCases := []testCase{
 		{name: "nil config", config: nil, want: ""},
-		{name: "non memory-regions config", config: &pb.BackendConfig{Backend: &pb.BackendConfig_Cuda{Cuda: &pb.CudaBackendConfig{}}}, want: ""},
+		{
+			name:   "non memory-regions config",
+			config: &pb.BackendConfig{Backend: &pb.BackendConfig_Cuda{Cuda: &pb.CudaBackendConfig{}}},
+			want:   "",
+		},
 		{name: "explicit snapshot name", config: memoryRegionsTestConfig("slot-a"), want: "slot-a"},
 		{name: "empty snapshot name falls back to job id", config: memoryRegionsTestConfig(""), want: "job-1"},
 	}
