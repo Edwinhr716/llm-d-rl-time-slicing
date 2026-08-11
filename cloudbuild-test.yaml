@@ -55,6 +55,10 @@ steps:
         grep -q "mount-hugetlbfs" /tmp/mr.yaml
         grep -q "hugepages-2Mi" /tmp/mr.yaml
         grep -q "mountPropagation: HostToContainer" /tmp/mr.yaml
+        # snapshot store must default to tmpfs, not boot disk (swap-latency
+        # regression guard), with an OOM-safe agent memory fallback
+        grep -q "/dev/shm/gcr-snapshots" /tmp/mr.yaml
+        ! grep -q "memory: 512Mi" /tmp/mr.yaml
         echo "helm template checks passed"
 options:
   machineType: E2_HIGHCPU_8

@@ -62,10 +62,17 @@ memoryRegions:
   # Rendered as hugepages-<pagesize>i requests/limits (k8s requires a memory
   # request alongside hugepages; one is added if resources doesn't set one).
   hugepagesResource: 2Gi
-  # Disk-backed snapshot store: hugetlbfs has no write(2), and copies there
-  # would pin hugepages forever.
+  # Snapshot store. Must NOT live on hugetlbfs (no write(2); copies there
+  # would pin hugepages forever). Default is node tmpfs: dumps are multi-GB
+  # and copied on every swap, so a disk-backed store dominates swap latency
+  # (measured 2026-08-11: ~12s write / ~8.4s read per ~2GB dump on a GKE
+  # boot disk vs ~2s round-trip on tmpfs, against a 0.3s GPU-CR op).
+  # NOTE: tmpfs writes are charged to the agent's memory cgroup and are not
+  # reclaimable — size resources.limits.memory to hold the largest
+  # concurrent dump set (see the daemonset template fallback), or the agent
+  # is OOMKilled mid-copy, stranding the workload mid-checkpoint.
   snapshotDir: /var/snapshots
-  snapshotsHostPath: /var/lib/snapshot-agent/snapshots
+  snapshotsHostPath: /dev/shm/gcr-snapshots
   copyHostFile: false # GPU_CR_COPY_HOST_FILE
   opTimeoutSec: 120 # GPU_CR_OP_TIMEOUT_SEC
 
