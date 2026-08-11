@@ -43,7 +43,7 @@ func (f *fakeExec) fn(ctx context.Context, name string, args ...string) ([]byte,
 func (f *fakeExec) callArgs() [][]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out [][]string
+	out := make([][]string, 0, len(f.calls))
 	for _, c := range f.calls {
 		out = append(out, c.args)
 	}
@@ -51,22 +51,24 @@ func (f *fakeExec) callArgs() [][]string {
 }
 
 // newTestBackend returns a MemoryRegions backend wired to tempdirs via env.
-func newTestBackend(t *testing.T, fake *fakeExec) (g *MemoryRegions, ctlDir, snapDir string) {
+//
+//nolint:gocritic // The project configuration bans named returns, conflicting with unnamedResult
+func newTestBackend(t *testing.T, fake *fakeExec) (*MemoryRegions, string, string) {
 	t.Helper()
-	ctlDir = t.TempDir()
-	snapDir = t.TempDir()
+	ctlDir := t.TempDir()
+	snapDir := t.TempDir()
 	t.Setenv("EXPORT_FILE_PATH", ctlDir)
 	t.Setenv("SNAPSHOT_DIR", snapDir)
-	g = NewMemoryRegions()
+	g := NewMemoryRegions()
 	g.execCommand = fake.fn
 	g.lookPath = func(string) (string, error) { return "", fmt.Errorf("not found") }
 	return g, ctlDir, snapDir
 }
 
-// writePidMap maps pid -> id in the ctl dir.
-func writePidMap(t *testing.T, ctlDir string, pid int, id string) {
+// writePidMap maps the test PID 123 to dump-buffer id 42 in the ctl dir.
+func writePidMap(t *testing.T, ctlDir string) {
 	t.Helper()
-	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, fmt.Sprintf("pid_map_%d", pid)), []byte(id+"\n"), 0o644))
+	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_123"), []byte("42\n"), 0o600))
 }
 
 func regionsConfig(name string, regions ...*pb.MemoryRegion) *pb.BackendConfig {
@@ -93,6 +95,7 @@ func TestRegionSpecs(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		got, err := regionSpecs(&pb.MemoryRegionsBackendConfig{Regions: tc.regions})
 		if tc.wantErr != "" {
 			assert.ErrorContains(t, err, tc.wantErr)
@@ -175,10 +178,11 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		fake := &fakeExec{err: tc.execErr}
 		g, ctlDir, snapDir := newTestBackend(t, fake)
-		writePidMap(t, ctlDir, 123, "42")
-		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), dumpContent, 0o644))
+		writePidMap(t, ctlDir)
+		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), dumpContent, 0o600))
 
 		err := g.Snapshot(context.Background(), Request{JobID: tc.jobID, Config: tc.config})
 		if tc.wantErr != "" {
@@ -257,7 +261,7 @@ func TestMemoryRegionsSnapshotTimeout(t *testing.T) {
 	fake := &fakeExec{}
 	g, ctlDir, _ := newTestBackend(t, fake)
 	t.Setenv("GPU_CR_OP_TIMEOUT_SEC", "1")
-	writePidMap(t, ctlDir, 123, "42")
+	writePidMap(t, ctlDir)
 
 	// Blocking fake: returns only when the per-op context expires.
 	g.execCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -280,9 +284,9 @@ func TestMemoryRegionsSnapshotHostFileGating(t *testing.T) {
 			if enabled {
 				t.Setenv("GPU_CR_COPY_HOST_FILE", "1")
 			}
-			writePidMap(t, ctlDir, 123, "42")
-			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), []byte("data"), 0o644))
-			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42-host"), []byte("host staging"), 0o644))
+			writePidMap(t, ctlDir)
+			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), []byte("data"), 0o600))
+			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42-host"), []byte("host staging"), 0o600))
 
 			err := g.Snapshot(context.Background(), Request{
 				JobID:  "job-1",
@@ -306,14 +310,14 @@ func TestMemoryRegionsRestore(t *testing.T) {
 	t.Run("copy-back happens before cr_client -r", func(t *testing.T) {
 		fake := &fakeExec{}
 		g, ctlDir, snapDir := newTestBackend(t, fake)
-		writePidMap(t, ctlDir, 123, "42")
+		writePidMap(t, ctlDir)
 
 		// Live dump buffer holds different (dirty) bytes.
 		dirty := bytes.Repeat([]byte{0xAA}, len(snapContent))
-		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), dirty, 0o644))
+		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), dirty, 0o600))
 		// Saved snapshot slot.
 		assert.NilError(t, os.MkdirAll(filepath.Join(snapDir, "slot-a"), 0o755))
-		assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42"), snapContent, 0o644))
+		assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42"), snapContent, 0o600))
 
 		// At cr_client time, the live buffer must already hold the snapshot.
 		var contentAtExec []byte
@@ -336,7 +340,7 @@ func TestMemoryRegionsRestore(t *testing.T) {
 	t.Run("missing snapshot slot is a clear error", func(t *testing.T) {
 		fake := &fakeExec{}
 		g, ctlDir, _ := newTestBackend(t, fake)
-		writePidMap(t, ctlDir, 123, "42")
+		writePidMap(t, ctlDir)
 
 		err := g.Restore(context.Background(), Request{
 			JobID:  "job-1",
@@ -355,11 +359,11 @@ func TestMemoryRegionsRestore(t *testing.T) {
 			} else {
 				t.Setenv("GPU_CR_COPY_HOST_FILE", "")
 			}
-			writePidMap(t, ctlDir, 123, "42")
-			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), []byte("dirty"), 0o644))
+			writePidMap(t, ctlDir)
+			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), []byte("dirty"), 0o600))
 			assert.NilError(t, os.MkdirAll(filepath.Join(snapDir, "slot-a"), 0o755))
-			assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42"), []byte("datax"), 0o644))
-			assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42-host"), []byte("host bytes"), 0o644))
+			assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42"), []byte("datax"), 0o600))
+			assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42-host"), []byte("host bytes"), 0o600))
 
 			err := g.Restore(context.Background(), Request{
 				JobID:  "job-1",
@@ -389,40 +393,42 @@ func TestDumpDataLimit(t *testing.T) {
 		buf := make([]byte, size)
 		binary.LittleEndian.PutUint64(buf[8:16], offset)
 		path := filepath.Join(t.TempDir(), "dump")
-		assert.NilError(t, os.WriteFile(path, buf, 0o644))
+		assert.NilError(t, os.WriteFile(path, buf, 0o600))
 		return path
 	}
 
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		assert.Equal(t, dumpDataLimit(tc.setup(t)), tc.want)
 	}
 
 	testCases := []testCase{
 		{
 			name:  "valid header returns current_offset",
-			setup: func(t *testing.T) string { return makeDump(t, 64, 48) },
+			setup: func(t *testing.T) string { t.Helper(); return makeDump(t, 64, 48) },
 			want:  48,
 		},
 		{
 			name:  "offset beyond file size ignored",
-			setup: func(t *testing.T) string { return makeDump(t, 64, 4096) },
+			setup: func(t *testing.T) string { t.Helper(); return makeDump(t, 64, 4096) },
 			want:  0,
 		},
 		{
 			name:  "offset inside header ignored",
-			setup: func(t *testing.T) string { return makeDump(t, 64, 8) },
+			setup: func(t *testing.T) string { t.Helper(); return makeDump(t, 64, 8) },
 			want:  0,
 		},
 		{
 			name:  "unreadable file returns zero",
-			setup: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing") },
+			setup: func(t *testing.T) string { t.Helper(); return filepath.Join(t.TempDir(), "missing") },
 			want:  0,
 		},
 		{
 			name: "file shorter than header returns zero",
 			setup: func(t *testing.T) string {
+				t.Helper()
 				path := filepath.Join(t.TempDir(), "short")
-				assert.NilError(t, os.WriteFile(path, []byte{1, 2, 3}, 0o644))
+				assert.NilError(t, os.WriteFile(path, []byte{1, 2, 3}, 0o600))
 				return path
 			},
 			want: 0,
@@ -439,7 +445,7 @@ func TestCopyFile(t *testing.T) {
 		dir := t.TempDir()
 		src := filepath.Join(dir, "src")
 		dst := filepath.Join(dir, "dst")
-		assert.NilError(t, os.WriteFile(src, make([]byte, 1024), 0o644))
+		assert.NilError(t, os.WriteFile(src, make([]byte, 1024), 0o600))
 
 		assert.NilError(t, copyFile(src, dst, 0))
 
@@ -454,7 +460,7 @@ func TestCopyFile(t *testing.T) {
 		src := filepath.Join(dir, "src")
 		dst := filepath.Join(dir, "dst")
 		content := []byte(strings.Repeat("payload!", 128))
-		assert.NilError(t, os.WriteFile(src, content, 0o644))
+		assert.NilError(t, os.WriteFile(src, content, 0o600))
 
 		assert.NilError(t, copyFile(src, dst, 0))
 
@@ -468,7 +474,7 @@ func TestCopyFile(t *testing.T) {
 		src := filepath.Join(dir, "src")
 		dst := filepath.Join(dir, "dst")
 		content := bytes.Repeat([]byte{0xFF}, 100)
-		assert.NilError(t, os.WriteFile(src, content, 0o644))
+		assert.NilError(t, os.WriteFile(src, content, 0o600))
 
 		assert.NilError(t, copyFile(src, dst, 10))
 
@@ -483,8 +489,8 @@ func TestCopyFile(t *testing.T) {
 		dir := t.TempDir()
 		src := filepath.Join(dir, "src")
 		dst := filepath.Join(dir, "dst")
-		assert.NilError(t, os.WriteFile(src, []byte("small"), 0o644))
-		assert.NilError(t, os.WriteFile(dst, bytes.Repeat([]byte{0xBB}, 200), 0o644))
+		assert.NilError(t, os.WriteFile(src, []byte("small"), 0o600))
+		assert.NilError(t, os.WriteFile(dst, bytes.Repeat([]byte{0xBB}, 200), 0o600))
 
 		assert.NilError(t, copyFile(src, dst, 0))
 
@@ -497,7 +503,7 @@ func TestCopyFile(t *testing.T) {
 		dir := t.TempDir()
 		src := filepath.Join(dir, "src")
 		dst := filepath.Join(dir, "nested", "deeper", "dst")
-		assert.NilError(t, os.WriteFile(src, []byte("x"), 0o644))
+		assert.NilError(t, os.WriteFile(src, []byte("x"), 0o600))
 		assert.NilError(t, copyFile(src, dst, 0))
 		_, err := os.Stat(dst)
 		assert.NilError(t, err)
@@ -524,10 +530,10 @@ func TestCopyBackHoleFaithful(t *testing.T) {
 	copy(srcBuf[16:32], bytes.Repeat([]byte{0x11}, 16))
 	// srcBuf[32:48] stays zero.
 	copy(srcBuf[48:64], bytes.Repeat([]byte{0x22}, 16))
-	assert.NilError(t, os.WriteFile(src, srcBuf, 0o644))
+	assert.NilError(t, os.WriteFile(src, srcBuf, 0o600))
 
 	// Destination buffer pre-dirtied with a co-resident checkpoint's bytes.
-	assert.NilError(t, os.WriteFile(dst, bytes.Repeat([]byte{0xAA}, size), 0o644))
+	assert.NilError(t, os.WriteFile(dst, bytes.Repeat([]byte{0xAA}, size), 0o600))
 
 	assert.NilError(t, copyIntoHugetlbfs(src, dst))
 
@@ -545,24 +551,24 @@ func TestResolvePidToId(t *testing.T) {
 	t.Run("NUL-padded pid_map parses", func(t *testing.T) {
 		g, ctlDir, _ := newTestBackend(t, &fakeExec{})
 		content := append([]byte("77"), make([]byte, 30)...) // zero-padded tail
-		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_555"), content, 0o644))
+		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_555"), content, 0o600))
 
-		id, err := g.resolvePidToId("555")
+		id, err := g.resolvePidToID("555")
 		assert.NilError(t, err)
 		assert.Equal(t, id, "77")
 	})
 
 	t.Run("empty pid_map falls back to proc maps", func(t *testing.T) {
 		g, ctlDir, _ := newTestBackend(t, &fakeExec{})
-		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_556"), nil, 0o644))
+		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_556"), nil, 0o600))
 
 		procRoot := t.TempDir()
 		g.procRoot = procRoot
 		assert.NilError(t, os.MkdirAll(filepath.Join(procRoot, "556"), 0o755))
 		maps := "7f0000000000-7f0040000000 rw-s 00000000 00:0f 12345 /var/tmp/huge-ckpt/88\n"
-		assert.NilError(t, os.WriteFile(filepath.Join(procRoot, "556", "maps"), []byte(maps), 0o644))
+		assert.NilError(t, os.WriteFile(filepath.Join(procRoot, "556", "maps"), []byte(maps), 0o600))
 
-		id, err := g.resolvePidToId("556")
+		id, err := g.resolvePidToID("556")
 		assert.NilError(t, err)
 		assert.Equal(t, id, "88")
 	})
@@ -571,7 +577,7 @@ func TestResolvePidToId(t *testing.T) {
 		g, _, _ := newTestBackend(t, &fakeExec{})
 		g.procRoot = t.TempDir()
 
-		_, err := g.resolvePidToId("557")
+		_, err := g.resolvePidToID("557")
 		assert.ErrorContains(t, err, "unusable")
 		assert.ErrorContains(t, err, "fallback failed")
 	})
@@ -601,6 +607,7 @@ func TestSlotDir(t *testing.T) {
 
 	store := "/snapshots"
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		_, err := slotDir(store, tc.slot)
 		if tc.wantErr {
 			assert.ErrorContains(t, err, "path traversal")

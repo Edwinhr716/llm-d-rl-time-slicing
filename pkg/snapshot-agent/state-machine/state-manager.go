@@ -190,7 +190,7 @@ func (sm *StateManager) StartRestoreSlot(jobID, group, slot string, worker func(
 	// 3. Fault Recovery (slot-aware backends only)
 	if slot != "" && job.State == pb.JobState_JOB_STATE_FAULTED {
 		slog.Warn("Job is FAULTED; allowing new restore to reset it", "jobID", jobID, "slot", slot)
-	} else if job.State != pb.JobState_JOB_STATE_SAVED && !(slot != "" && job.State == pb.JobState_JOB_STATE_RUNNING) {
+	} else if job.State != pb.JobState_JOB_STATE_SAVED && (slot == "" || job.State != pb.JobState_JOB_STATE_RUNNING) {
 		// 4. State Validation: restores need a SAVED job — or, for
 		// slot-aware backends, a RUNNING job swapping to a different slot.
 		return "", status.Errorf(codes.FailedPrecondition, "cannot restore job %s in state %s (must be SAVED)", jobID, job.State)

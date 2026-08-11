@@ -23,6 +23,7 @@ func TestGCFilePatterns(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
+		t.Helper()
 		assert.Equal(t, dumpFileRe.MatchString(tc.file), tc.dumpMatch, "dumpFileRe")
 		assert.Equal(t, pidFileRe.MatchString(tc.file), tc.pidMatch, "pidFileRe")
 	}
@@ -49,8 +50,9 @@ func TestSweep(t *testing.T) {
 	old := time.Now().Add(-time.Hour)
 
 	writeAged := func(name string, aged bool) {
+		t.Helper()
 		path := filepath.Join(ctl, name)
-		assert.NilError(t, os.WriteFile(path, []byte("x"), 0o644))
+		assert.NilError(t, os.WriteFile(path, []byte("x"), 0o600))
 		if aged {
 			assert.NilError(t, os.Chtimes(path, old, old))
 		}
@@ -74,10 +76,12 @@ func TestSweep(t *testing.T) {
 	sweep(ctl)
 
 	assertGone := func(name string) {
+		t.Helper()
 		_, err := os.Stat(filepath.Join(ctl, name))
 		assert.Assert(t, os.IsNotExist(err), "%s should have been removed", name)
 	}
 	assertKept := func(name string) {
+		t.Helper()
 		_, err := os.Stat(filepath.Join(ctl, name))
 		assert.NilError(t, err, "%s should have been kept", name)
 	}

@@ -76,7 +76,7 @@ func sweep(ctlDir string) {
 			continue
 		}
 		if m := pidFileRe.FindStringSubmatch(name); m != nil {
-			if _, err := os.Stat(filepath.Join("/proc", m[1])); os.IsNotExist(err) {
+			if _, err := os.Stat("/proc/" + m[1]); os.IsNotExist(err) {
 				if os.Remove(filepath.Join(ctlDir, name)) == nil {
 					removed = append(removed, name)
 				}
