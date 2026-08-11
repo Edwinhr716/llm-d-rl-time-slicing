@@ -113,8 +113,14 @@ spec:
             {{- $lim := deepCopy (default (dict) .Values.resources.limits) }}
             {{- $_ := set $req $hpKey .Values.memoryRegions.hugepagesResource }}
             {{- $_ := set $lim $hpKey .Values.memoryRegions.hugepagesResource }}
-            {{- if not (hasKey $req "memory") }}{{- $_ := set $req "memory" "512Mi" }}{{- end }}
-            {{- if not (hasKey $lim "memory") }}{{- $_ := set $lim "memory" "512Mi" }}{{- end }}
+            {{- /* The snapshot store defaults to tmpfs (snapshotsHostPath),
+                   and tmpfs writes are charged unreclaimably to this
+                   container's cgroup: the memory limit must absorb the
+                   largest concurrent dump set or the agent is OOMKilled
+                   mid-copy (observed with 512Mi vs ~2GB dumps). Burstable
+                   by default: modest request, large limit. */}}
+            {{- if not (hasKey $req "memory") }}{{- $_ := set $req "memory" "4Gi" }}{{- end }}
+            {{- if not (hasKey $lim "memory") }}{{- $_ := set $lim "memory" "46Gi" }}{{- end }}
             {{- toYaml (dict "requests" $req "limits" $lim) | nindent 12 }}
             {{- else }}
             {{- toYaml .Values.resources | nindent 12 }}
