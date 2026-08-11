@@ -54,6 +54,25 @@ an **8GiB buffer** (step 4): each process then reserves ~10Gi (8Gi buffer +
 2×1Gi staging areas), a 24Gi pool fits two GPU workloads per node, and the
 ~38Gi difference stays available to your workloads as regular RAM.
 
+There are two ways to provision the pool. They produce identical
+scheduling and cgroup-enforcement behavior; pick one.
+
+**Option A — runtime bootstrap on a vanilla pool (no node system config).**
+If you already have (or prefer) a plain GPU nodepool, skip the
+`hugepages-config.yaml` / `--system-config-from-file` parts below and
+instead apply `deploy/examples/hugepages-bootstrap-daemonset.yaml` (fill in
+the pool selector; size `HUGEPAGES_2M` as above — 12288 for the 8GiB
+build). It allocates the pool at runtime and restarts the kubelet once per
+node boot so the node publishes `hugepages-2Mi`; the restart is invisible
+to running workloads (measured: zero container restarts, no Ready flap, no
+auto-repair). Validation data and residual risks:
+`docs/proposals/hugepages-runtime-bootstrap.md`. Deploy it before heavy
+workloads land on the nodes — allocation is instant on fresh nodes, while
+badly fragmented nodes fail loudly in the bootstrap pod instead of
+degrading workloads.
+
+**Option B — node system config (declarative, node recreation):**
+
 ```shell
 cat > hugepages-config.yaml <<'EOF'
 linuxConfig:
