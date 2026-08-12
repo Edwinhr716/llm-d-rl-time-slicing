@@ -1,6 +1,7 @@
 package statemachine
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -91,8 +92,14 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 2. State Validation: Only allow snapshotting of RUNNING jobs
-	if job.State != pb.JobState_JOB_STATE_RUNNING {
+	// 2. Fault Recovery: a failed operation marks the job FAULTED, but the
+	// fault is typically transient (dead workload PID, timed-out helper
+	// binary). Let a fresh snapshot attempt reset the job rather than
+	// wedging it until an agent redeploy.
+	if job.State == pb.JobState_JOB_STATE_FAULTED {
+		slog.Warn("Job is FAULTED; allowing new snapshot to reset it", "jobID", jobID)
+	} else if job.State != pb.JobState_JOB_STATE_RUNNING {
+		// 3. State Validation: Only allow snapshotting of RUNNING jobs
 		return "", status.Errorf(codes.FailedPrecondition, "cannot snapshot job %s in state %s (must be RUNNING)", jobID, job.State)
 	}
 
@@ -156,8 +163,12 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 3. State Validation: Only allow restoring of SAVED jobs
-	if job.State != pb.JobState_JOB_STATE_SAVED {
+	// 3. Fault Recovery: see StartSnapshot — allow a fresh restore to reset
+	// a FAULTED job instead of wedging it until an agent redeploy.
+	if job.State == pb.JobState_JOB_STATE_FAULTED {
+		slog.Warn("Job is FAULTED; allowing new restore to reset it", "jobID", jobID)
+	} else if job.State != pb.JobState_JOB_STATE_SAVED {
+		// 4. State Validation: Only allow restoring of SAVED jobs
 		return "", status.Errorf(codes.FailedPrecondition, "cannot restore job %s in state %s (must be SAVED)", jobID, job.State)
 	}
 
