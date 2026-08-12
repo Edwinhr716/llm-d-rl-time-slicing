@@ -47,6 +47,18 @@ nvidia:
     hostPath: /dev
     mountPath: /dev
 
+# Kubernetes-style feature gates (map of Name: bool), rendered into the
+# agent's FEATURE_GATES env var. Experimental capabilities are off by
+# default; requests selecting a gated backend fail with FAILED_PRECONDITION
+# until its gate is enabled.
+# Known gates:
+#   DirectMemoryBackend — the experimental direct_memory backend (driven by
+#   GPU-CR). Default: false.
+# Example:
+#   featureGates:
+#     DirectMemoryBackend: true
+featureGates: {}
+
 rbac:
   create: true
 
