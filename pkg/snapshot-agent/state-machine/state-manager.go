@@ -1,6 +1,7 @@
 package statemachine
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -24,7 +25,13 @@ type Job struct {
 	Group string
 	State pb.JobState
 	PIDs  []int
-	mu    sync.Mutex
+	// FaultedOp records which operation type moved the job into FAULTED.
+	// Only that operation type may be retried from FAULTED: retrying the
+	// faulted op is the natural remedy, while the other op could destroy
+	// recovery state (e.g. snapshotting a half-restored process overwrites
+	// the last good dump). Cleared on any successful operation.
+	FaultedOp OpType
+	mu        sync.Mutex
 }
 
 // Operation represents a long-running snapshot or restore task.
@@ -91,8 +98,21 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 2. State Validation: Only allow snapshotting of RUNNING jobs
-	if job.State != pb.JobState_JOB_STATE_RUNNING {
+	// 2. Fault Recovery: a failed snapshot marks the job FAULTED, but the
+	// fault is typically transient (dead workload PID, timed-out helper
+	// binary). Let a fresh snapshot attempt reset the job rather than
+	// wedging it until an agent redeploy. Only the operation type that
+	// faulted may be retried: a job faulted mid-restore may hold
+	// half-restored device state, and snapshotting it would overwrite the
+	// last good dump with garbage.
+	if job.State == pb.JobState_JOB_STATE_FAULTED {
+		if job.FaultedOp != OpTypeSnapshot {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"cannot snapshot job %s in state FAULTED: the failed operation was a %s — retry that instead", jobID, job.FaultedOp)
+		}
+		slog.Warn("Job is FAULTED from a failed snapshot; allowing a new snapshot to reset it", "jobID", jobID)
+	} else if job.State != pb.JobState_JOB_STATE_RUNNING {
+		// 3. State Validation: Only allow snapshotting of RUNNING jobs
 		return "", status.Errorf(codes.FailedPrecondition, "cannot snapshot job %s in state %s (must be RUNNING)", jobID, job.State)
 	}
 
@@ -127,10 +147,12 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 			op.Status = pb.OperationStatus_OPERATION_STATUS_FAILED
 			op.Error = err.Error()
 			job.State = pb.JobState_JOB_STATE_FAULTED
+			job.FaultedOp = OpTypeSnapshot
 		} else {
 			op.Status = pb.OperationStatus_OPERATION_STATUS_COMPLETE
 			op.StorageBytes = 1024
 			job.State = pb.JobState_JOB_STATE_SAVED
+			job.FaultedOp = ""
 		}
 	}()
 
@@ -156,8 +178,18 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 3. State Validation: Only allow restoring of SAVED jobs
-	if job.State != pb.JobState_JOB_STATE_SAVED {
+	// 3. Fault Recovery: see StartSnapshot — allow a fresh restore to reset
+	// a job FAULTED by a failed restore, instead of wedging it until an
+	// agent redeploy. Restore-retry re-reads the same dump, so it never
+	// destroys recovery state.
+	if job.State == pb.JobState_JOB_STATE_FAULTED {
+		if job.FaultedOp != OpTypeRestore {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"cannot restore job %s in state FAULTED: the failed operation was a %s — retry that instead", jobID, job.FaultedOp)
+		}
+		slog.Warn("Job is FAULTED from a failed restore; allowing a new restore to reset it", "jobID", jobID)
+	} else if job.State != pb.JobState_JOB_STATE_SAVED {
+		// 4. State Validation: Only allow restoring of SAVED jobs
 		return "", status.Errorf(codes.FailedPrecondition, "cannot restore job %s in state %s (must be SAVED)", jobID, job.State)
 	}
 
@@ -192,10 +224,12 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 			op.Status = pb.OperationStatus_OPERATION_STATUS_FAILED
 			op.Error = err.Error()
 			job.State = pb.JobState_JOB_STATE_FAULTED
+			job.FaultedOp = OpTypeRestore
 		} else {
 			op.Status = pb.OperationStatus_OPERATION_STATUS_COMPLETE
 			job.State = pb.JobState_JOB_STATE_RUNNING
 			op.SnapshotDeviceBytes = 1024
+			job.FaultedOp = ""
 		}
 	}()
 
