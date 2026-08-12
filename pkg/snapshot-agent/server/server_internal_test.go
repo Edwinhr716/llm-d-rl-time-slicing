@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -775,7 +776,7 @@ func (m *mockDirectMemoryBackend) Restore(ctx context.Context, req backends.Requ
 }
 
 func TestServer_GetSnapshotBackendType_DirectMemory(t *testing.T) {
-	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry())
+	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry(), features.Gates{features.DirectMemoryBackend: true})
 	cfg := &pb.BackendConfig{
 		Backend: &pb.BackendConfig_DirectMemory{
 			DirectMemory: &pb.DirectMemoryBackendConfig{},
@@ -792,7 +793,7 @@ func TestServer_DirectMemory_StandaloneMode(t *testing.T) {
 	backendsMap := map[backends.BackendType]backends.Backend{
 		backends.BackendDirectMemory: mock,
 	}
-	srv := NewServer(backendsMap, backends.BackendDirectMemory, "standalone", backends.NewChannelRegistry())
+	srv := NewServer(backendsMap, backends.BackendDirectMemory, "standalone", backends.NewChannelRegistry(), features.Gates{features.DirectMemoryBackend: true})
 
 	cfg := &pb.BackendConfig{
 		Backend: &pb.BackendConfig_DirectMemory{
@@ -831,7 +832,7 @@ func TestServer_DirectMemory_K8sMode(t *testing.T) {
 	backendsMap := map[backends.BackendType]backends.Backend{
 		backends.BackendDirectMemory: mock,
 	}
-	srv := NewServer(backendsMap, backends.BackendDirectMemory, "k8s", backends.NewChannelRegistry())
+	srv := NewServer(backendsMap, backends.BackendDirectMemory, "k8s", backends.NewChannelRegistry(), features.Gates{features.DirectMemoryBackend: true})
 
 	jobID := "test-job-dm-k8s"
 	podName := "pod-dm-k8s"
