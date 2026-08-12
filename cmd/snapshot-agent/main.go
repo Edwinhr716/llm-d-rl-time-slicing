@@ -23,6 +23,7 @@ import (
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
 )
 
@@ -34,6 +35,8 @@ func main() {
 
 	port := flag.Int("port", 9001, "The port to listen on")
 	deploymentMode := flag.String("deployment-mode", "standalone", "Deployment mode ('standalone' or 'k8s')")
+	featureGatesSpec := flag.String("feature-gates", "",
+		"Comma-separated list of Name=bool pairs selecting experimental features, e.g. 'DirectMemoryBackend=true'")
 	flag.Parse()
 
 	depMode := *deploymentMode
@@ -57,6 +60,19 @@ func main() {
 		slog.Error("Invalid deployment mode, must be 'standalone' or 'k8s'", "mode", depMode)
 		os.Exit(1)
 	}
+
+	// FEATURE_GATES overrides the flag, mirroring DEPLOYMENT_MODE and
+	// AGENT_PORT: the Helm chart configures the agent through env vars.
+	gatesSpec := *featureGatesSpec
+	if envGates := os.Getenv("FEATURE_GATES"); envGates != "" {
+		gatesSpec = envGates
+	}
+	featureGates, err := features.Parse(gatesSpec)
+	if err != nil {
+		slog.Error("Invalid feature gates", "value", gatesSpec, "error", err)
+		os.Exit(1)
+	}
+
 	ctx := context.Background()
 
 	// The channel registry is shared between the app-channel backend and the
@@ -70,8 +86,11 @@ func main() {
 		backends.BackendDirectMemory: backends.NewDirectMemory(),
 	}
 
-	slog.InfoContext(ctx, "Starting Snapshot Agent", "port", listenPort, "deploymentMode", depMode)
-	if err := server.StartServer(ctx, listenPort, registeredBackends, backends.BackendCuda, depMode, channelRegistry); err != nil {
+	slog.InfoContext(ctx, "Starting Snapshot Agent",
+		"port", listenPort, "deploymentMode", depMode, "featureGates", featureGates.String())
+	err = server.StartServer(
+		ctx, listenPort, registeredBackends, backends.BackendCuda, depMode, channelRegistry, featureGates)
+	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)
 	}

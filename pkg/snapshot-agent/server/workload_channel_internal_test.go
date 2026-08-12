@@ -26,7 +26,7 @@ func newChannelTestServer(t *testing.T) (*Server, *backends.ChannelRegistry, pb.
 	backendsMap := map[backends.BackendType]backends.Backend{
 		backends.BackendAppChannel: backends.NewAppChannelBackend(registry),
 	}
-	srv := NewServer(backendsMap, backends.BackendAppChannel, "k8s", registry)
+	srv := NewServer(backendsMap, backends.BackendAppChannel, "k8s", registry, nil)
 	pb.RegisterSnapshotAgentServiceServer(s, srv)
 	go func() {
 		if err := s.Serve(lisChan); err != nil {

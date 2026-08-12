@@ -51,6 +51,12 @@ message CudaBackendConfig {
 }
 
 // Configuration for the Direct Memory (process-level) backend.
+//
+// Experimental: this backend is driven by GPU-CR, which is itself
+// experimental — expect deployment requirements and operational caveats.
+// It is disabled by default: requests selecting it fail with
+// FAILED_PRECONDITION unless the agent runs with
+// --feature-gates=DirectMemoryBackend=true (or the FEATURE_GATES env var).
 message DirectMemoryBackendConfig {
   // The target processes to checkpoint/restore.
   ProcessTarget explicit_target = 1;
@@ -120,6 +126,8 @@ message BackendConfig {
     CudaBackendConfig cuda = 1;
     AppEndpointConfig app_endpoint = 2;
     AppChannelConfig app_channel = 3;
+    // Experimental: disabled by default behind the DirectMemoryBackend
+    // feature gate; see DirectMemoryBackendConfig.
     DirectMemoryBackendConfig direct_memory = 4;
   }
 }

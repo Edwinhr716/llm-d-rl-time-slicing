@@ -11,6 +11,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	sm "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"google.golang.org/grpc"
@@ -28,16 +29,20 @@ type Server struct {
 	defaultBackend  backends.BackendType
 	deploymentMode  string
 	channelRegistry *backends.ChannelRegistry
+	featureGates    features.Gates
 }
 
 // NewServer creates a new Server instance. channelRegistry is shared with
 // the app-channel backend so workloads registered through the
-// WorkloadChannel RPC are reachable by Snapshot/Restore.
+// WorkloadChannel RPC are reachable by Snapshot/Restore. featureGates
+// selects which experimental capabilities are enabled; nil means every
+// gate at its default (experimental capabilities off).
 func NewServer(
 	backendMap map[backends.BackendType]backends.Backend,
 	defaultBackend backends.BackendType,
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
+	featureGates features.Gates,
 ) *Server {
 	return &Server{
 		state:           sm.NewStateManager(),
@@ -45,7 +50,22 @@ func NewServer(
 		defaultBackend:  defaultBackend,
 		deploymentMode:  deploymentMode,
 		channelRegistry: channelRegistry,
+		featureGates:    featureGates,
 	}
+}
+
+// checkFeatureGates rejects configs that select an experimental backend
+// whose feature gate is off. It runs before backend routing so a gated
+// config never silently falls through to another backend.
+func (s *Server) checkFeatureGates(config *pb.BackendConfig) error {
+	if config.GetDirectMemory() != nil && !s.featureGates.Enabled(features.DirectMemoryBackend) {
+		return status.Errorf(codes.FailedPrecondition,
+			"the direct_memory backend is experimental (driven by GPU-CR, which carries deployment "+
+				"requirements and operational caveats) and is disabled by default; restart the agent "+
+				"with --feature-gates=%s=true (or the FEATURE_GATES env var) to enable it",
+			features.DirectMemoryBackend)
+	}
+	return nil
 }
 
 // Snapshot triggers an asynchronous snapshot of the accelerator context for a job.
@@ -53,6 +73,10 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 	ctx = logging.WithServerMethod(ctx, "Snapshot")
 	ctx = logging.WithJobID(ctx, req.GetJobId())
 	ctx = logging.WithGroupID(ctx, req.GetGroup())
+
+	if err := s.checkFeatureGates(req.GetBackendConfig()); err != nil {
+		return nil, err
+	}
 
 	backendType := s.getSnapshotBackendType(req.GetBackendConfig())
 	slog.InfoContext(ctx, "Snapshot called", "backend", backendType)
@@ -97,6 +121,9 @@ func (s *Server) getSnapshotBackendType(config *pb.BackendConfig) backends.Backe
 	if config.GetAppChannel() != nil {
 		return backends.BackendAppChannel
 	}
+	// NOTE: direct_memory is not routed yet and falls through to the
+	// default backend. It is unreachable unless the DirectMemoryBackend
+	// feature gate is enabled (checkFeatureGates runs before routing).
 	return s.defaultBackend
 }
 
@@ -275,6 +302,10 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 	ctx = logging.WithJobID(ctx, req.GetJobId())
 	ctx = logging.WithGroupID(ctx, req.GetGroup())
 
+	if err := s.checkFeatureGates(req.GetBackendConfig()); err != nil {
+		return nil, err
+	}
+
 	backendType := s.getSnapshotBackendType(req.GetBackendConfig())
 	slog.InfoContext(ctx, "Restore called", "backend", backendType)
 
@@ -390,7 +421,8 @@ func (h *HealthServer) Watch(req *grpc_health_v1.HealthCheckRequest, stream grpc
 	return status.Errorf(codes.Unimplemented, "method Watch not implemented")
 }
 
-// StartServer starts the gRPC server on the specified port.
+// StartServer starts the gRPC server on the specified port. featureGates
+// may be nil, which leaves every gate at its default.
 func StartServer(
 	ctx context.Context,
 	port int,
@@ -398,6 +430,7 @@ func StartServer(
 	defaultBackend backends.BackendType,
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
+	featureGates features.Gates,
 ) error {
 	lc := net.ListenConfig{}
 	lis, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
@@ -412,7 +445,7 @@ func StartServer(
 	}
 
 	// 2. Create Server (which creates StateManager internally)
-	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry)
+	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry, featureGates)
 
 	// 3. Start the Watcher internally
 	watcher, err := NewWatcher(k8sClient, srv.state)

@@ -42,6 +42,17 @@ spec:
                   fieldPath: spec.nodeName
             - name: AGENT_PORT
               value: {{ .Values.port | quote }}
+            {{- if .Values.featureGates }}
+            {{- $gates := list }}
+            {{- range $name, $enabled := .Values.featureGates }}
+            {{- if not (kindIs "bool" $enabled) }}
+            {{- fail (printf "featureGates.%s must be true or false, got %q" $name (toString $enabled)) }}
+            {{- end }}
+            {{- $gates = append $gates (printf "%s=%t" $name $enabled) }}
+            {{- end }}
+            - name: FEATURE_GATES
+              value: {{ join "," $gates | quote }}
+            {{- end }}
             {{- if .Values.nvidia.driver.enabled }}
             - name: LD_LIBRARY_PATH
               value: {{ join ":" .Values.nvidia.driver.libraryPaths }}
