@@ -4,6 +4,8 @@
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+# Imported upstream code is not held to local cosmetic lint standards
+extend-exclude = ["third_party/gpu-cr"]
 
 [tool.ruff.lint]
 select = [
