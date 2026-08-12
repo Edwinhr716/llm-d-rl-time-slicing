@@ -25,9 +25,7 @@ def cuda_config(pids: Sequence[int]) -> snapshot_agent_pb2.BackendConfig:
     mode or to override discovery.
     """
     return snapshot_agent_pb2.BackendConfig(
-        cuda=snapshot_agent_pb2.CudaBackendConfig(
-            explicit_target=_process_target(pids)
-        )
+        cuda=snapshot_agent_pb2.CudaBackendConfig(explicit_target=_process_target(pids))
     )
 
 

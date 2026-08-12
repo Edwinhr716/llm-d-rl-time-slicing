@@ -5,10 +5,13 @@ import pytest
 from timeslice.snapshot_agent import cuda_config, direct_memory_config
 
 
-@pytest.mark.parametrize("builder,oneof", [
-    (cuda_config, "cuda"),
-    (direct_memory_config, "direct_memory"),
-])
+@pytest.mark.parametrize(
+    "builder,oneof",
+    [
+        (cuda_config, "cuda"),
+        (direct_memory_config, "direct_memory"),
+    ],
+)
 def test_builds_config_with_pids(builder, oneof):
     cfg = builder([101, 102])
     assert cfg.WhichOneof("backend") == oneof
