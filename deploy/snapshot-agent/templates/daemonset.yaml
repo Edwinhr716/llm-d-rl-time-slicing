@@ -25,6 +25,29 @@ spec:
       serviceAccountName: {{ include "snapshot-agent.serviceAccountName" . }}
       hostNetwork: true
       hostPID: true
+      {{- if .Values.directMemory.enabled }}
+      # GPU-CR uses a host-shared-memory control channel between the agent's
+      # cr_client and the workload's vGPU preloader.
+      hostIPC: true
+      {{- if .Values.directMemory.hugetlbfs.mount }}
+      initContainers:
+        # Mount hugetlbfs at the shared checkpoint path on the HOST. GPU-CR
+        # relies on the filesystem itself being hugetlbfs (it does not pass
+        # MAP_HUGETLB); without this mount dumps land in boot-disk page
+        # cache and the node's hugepage pool goes unused.
+        - name: mount-hugetlbfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.directMemory.hostCtlPath }}; grep -q " {{ .Values.directMemory.hostCtlPath }} hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize={{ .Values.directMemory.hugetlbfs.pagesize }},mode=0777 nodev {{ .Values.directMemory.hostCtlPath }}; chmod 0777 {{ .Values.directMemory.hostCtlPath }}' && \
+              echo "hugetlbfs mounted at {{ .Values.directMemory.hostCtlPath }}"
+      {{- end }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -42,16 +65,32 @@ spec:
                   fieldPath: spec.nodeName
             - name: AGENT_PORT
               value: {{ .Values.port | quote }}
-            {{- if .Values.featureGates }}
-            {{- $gates := list }}
+            {{- /* Feature gates: explicit values from .Values.featureGates,
+                 with directMemory.enabled implying DirectMemoryBackend=true
+                 (deploying the GPU-CR machinery is the opt-in). */}}
+            {{- $gates := dict }}
+            {{- if .Values.directMemory.enabled }}
+            {{- $_ := set $gates "DirectMemoryBackend" true }}
+            {{- end }}
             {{- range $name, $enabled := .Values.featureGates }}
             {{- if not (kindIs "bool" $enabled) }}
             {{- fail (printf "featureGates.%s must be true or false, got %q" $name (toString $enabled)) }}
             {{- end }}
-            {{- $gates = append $gates (printf "%s=%t" $name $enabled) }}
+            {{- $_ := set $gates $name $enabled }}
+            {{- end }}
+            {{- if $gates }}
+            {{- $pairs := list }}
+            {{- range $name, $enabled := $gates }}
+            {{- $pairs = append $pairs (printf "%s=%t" $name $enabled) }}
             {{- end }}
             - name: FEATURE_GATES
-              value: {{ join "," $gates | quote }}
+              value: {{ join "," $pairs | quote }}
+            {{- end }}
+            {{- if .Values.directMemory.enabled }}
+            - name: EXPORT_FILE_PATH
+              value: {{ .Values.directMemory.ctlDir | quote }}
+            - name: GPU_CR_OP_TIMEOUT_SEC
+              value: {{ .Values.directMemory.opTimeoutSec | quote }}
             {{- end }}
             {{- if .Values.nvidia.driver.enabled }}
             - name: LD_LIBRARY_PATH
@@ -66,7 +105,19 @@ spec:
               containerPort: {{ .Values.port }}
               protocol: TCP
           resources:
+            {{- if and .Values.directMemory.enabled .Values.directMemory.hugepagesResource }}
+            {{- /* Merge hugepages headroom into the configured resources
+                   (k8s requires a memory request alongside hugepages). */}}
+            {{- $hpKey := printf "hugepages-%si" .Values.directMemory.hugetlbfs.pagesize }}
+            {{- $req := deepCopy (default (dict) .Values.resources.requests) }}
+            {{- $lim := deepCopy (default (dict) .Values.resources.limits) }}
+            {{- $_ := set $req $hpKey .Values.directMemory.hugepagesResource }}
+            {{- $_ := set $lim $hpKey .Values.directMemory.hugepagesResource }}
+            {{- if not (hasKey $req "memory") }}{{- $_ := set $req "memory" "256Mi" }}{{- end }}
+            {{- toYaml (dict "requests" $req "limits" $lim) | nindent 12 }}
+            {{- else }}
             {{- toYaml .Values.resources | nindent 12 }}
+            {{- end }}
           volumeMounts:
             {{- if .Values.nvidia.driver.enabled }}
             - name: nvidia-driver
@@ -76,6 +127,13 @@ spec:
             {{- if .Values.nvidia.devices.enabled }}
             - name: nvidia-devices
               mountPath: {{ .Values.nvidia.devices.mountPath }}
+            {{- end }}
+            {{- if .Values.directMemory.enabled }}
+            - name: huge-ckpt
+              mountPath: {{ .Values.directMemory.ctlDir }}
+              # Pick up the hugetlbfs mount made by the init container even
+              # though the hostPath was captured before it ran.
+              mountPropagation: HostToContainer
             {{- end }}
       volumes:
         {{- if .Values.nvidia.driver.enabled }}
@@ -89,6 +147,12 @@ spec:
           hostPath:
             path: {{ .Values.nvidia.devices.hostPath }}
             type: Directory
+        {{- end }}
+        {{- if .Values.directMemory.enabled }}
+        - name: huge-ckpt
+          hostPath:
+            path: {{ .Values.directMemory.hostCtlPath }}
+            type: DirectoryOrCreate
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
