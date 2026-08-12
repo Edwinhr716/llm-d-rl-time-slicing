@@ -90,14 +90,30 @@ func (d *DirectMemory) getCrClientPath() string {
 			return p
 		}
 	}
-	return "/opt/bin/cr_client"
+	return "/usr/local/bin/cr_client"
 }
 
 func (d *DirectMemory) runCommand(ctx context.Context, name string, args ...string) error {
+	// A workload that dies mid-operation can leave cr_client blocked on its
+	// shared-memory control channel forever; without a deadline that wedges
+	// the job in TRANSITIONING and holds d.mu across all future requests.
+	ctx, cancel := context.WithTimeout(ctx, opTimeout())
+	defer cancel()
 	if out, err := d.execCommand(ctx, name, args...); err != nil {
 		return fmt.Errorf("command failed: %w, output: %s", err, string(out))
 	}
 	return nil
+}
+
+// opTimeout is the per-cr_client-invocation deadline, configurable via
+// GPU_CR_OP_TIMEOUT_SEC (default 120).
+func opTimeout() time.Duration {
+	if v := os.Getenv("GPU_CR_OP_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 120 * time.Second
 }
 
 func (d *DirectMemory) checkpointPID(ctx context.Context, pid string) error {
