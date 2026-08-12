@@ -57,6 +57,7 @@ func TestStartSnapshot(t *testing.T) {
 	tests := []struct {
 		name          string
 		initialState  pb.JobState
+		faultedOp     statemachine.OpType
 		workerErr     error
 		expectErrCode codes.Code
 		expectOp      bool
@@ -79,8 +80,18 @@ func TestStartSnapshot(t *testing.T) {
 			expectErrCode: codes.Aborted,
 		},
 		{
-			name:          "Fails when FAULTED",
+			name:         "Recovers when FAULTED by a snapshot",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			faultedOp:    statemachine.OpTypeSnapshot,
+			expectOp:     true,
+			finalState:   pb.JobState_JOB_STATE_SAVED,
+		},
+		{
+			// A job faulted mid-restore may hold half-restored device
+			// state; snapshotting it would overwrite the last good dump.
+			name:          "Rejects when FAULTED by a restore",
 			initialState:  pb.JobState_JOB_STATE_FAULTED,
+			faultedOp:     statemachine.OpTypeRestore,
 			expectErrCode: codes.FailedPrecondition,
 		},
 		{
@@ -101,6 +112,7 @@ func TestStartSnapshot(t *testing.T) {
 			sm.InternalMu().Lock()
 			job := sm.InternalGetOrCreateJob(jobID, group)
 			job.State = tc.initialState
+			job.FaultedOp = tc.faultedOp
 			sm.InternalMu().Unlock()
 
 			worker := func() error {
@@ -153,6 +165,7 @@ func TestStartRestore(t *testing.T) {
 	tests := []struct {
 		name          string
 		initialState  pb.JobState
+		faultedOp     statemachine.OpType
 		workerErr     error
 		expectErrCode codes.Code
 		expectOpID    string // special case for "already-running"
@@ -175,8 +188,17 @@ func TestStartRestore(t *testing.T) {
 			expectErrCode: codes.Aborted,
 		},
 		{
-			name:          "Fails when FAULTED",
+			name:         "Recovers when FAULTED by a restore",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			faultedOp:    statemachine.OpTypeRestore,
+			finalState:   pb.JobState_JOB_STATE_RUNNING,
+		},
+		{
+			// A job faulted mid-snapshot has no complete dump to restore
+			// from; the remedy is retrying the snapshot.
+			name:          "Rejects when FAULTED by a snapshot",
 			initialState:  pb.JobState_JOB_STATE_FAULTED,
+			faultedOp:     statemachine.OpTypeSnapshot,
 			expectErrCode: codes.FailedPrecondition,
 		},
 		{
@@ -196,6 +218,7 @@ func TestStartRestore(t *testing.T) {
 			sm.InternalMu().Lock()
 			job := sm.InternalGetOrCreateJob(jobID, group)
 			job.State = tc.initialState
+			job.FaultedOp = tc.faultedOp
 			sm.InternalMu().Unlock()
 
 			worker := func() error {
@@ -631,6 +654,62 @@ func TestConcurrencyControl(t *testing.T) {
 	if op.Status != pb.OperationStatus_OPERATION_STATUS_COMPLETE {
 		t.Errorf("First operation failed: %v", op.Error)
 	}
+}
+
+// TestFaultRetryCycle walks the full same-op-retry lifecycle: a failed
+// snapshot is retryable only as a snapshot, a successful retry clears the
+// fault, a failed restore is retryable only as a restore, and recovery
+// returns the job to a healthy state.
+func TestFaultRetryCycle(t *testing.T) {
+	sm := statemachine.NewStateManager()
+	jobID := "job-cycle"
+	group := "group-1"
+
+	sm.InternalMu().Lock()
+	sm.InternalGetOrCreateJob(jobID, group).State = pb.JobState_JOB_STATE_RUNNING
+	sm.InternalMu().Unlock()
+
+	// 1. Snapshot fails -> FAULTED (by snapshot).
+	opID, err := sm.StartSnapshot(jobID, group, func() error { return errors.New("boom") })
+	if err != nil {
+		t.Fatalf("StartSnapshot: %v", err)
+	}
+	waitForOperation(t, sm, opID)
+	checkJobState(t, sm, jobID, pb.JobState_JOB_STATE_FAULTED)
+
+	// 2. Restore is NOT a valid retry for a snapshot fault.
+	if _, err := sm.StartRestore(jobID, group, func() error { return nil }); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Restore after snapshot fault: expected FailedPrecondition, got %v", err)
+	}
+
+	// 3. Retrying the snapshot succeeds and clears the fault.
+	opID, err = sm.StartSnapshot(jobID, group, func() error { return nil })
+	if err != nil {
+		t.Fatalf("Snapshot retry: %v", err)
+	}
+	waitForOperation(t, sm, opID)
+	checkJobState(t, sm, jobID, pb.JobState_JOB_STATE_SAVED)
+
+	// 4. Restore fails -> FAULTED (by restore); snapshot is NOT a valid
+	// retry (it would overwrite the last good dump with half-restored
+	// state).
+	opID, err = sm.StartRestore(jobID, group, func() error { return errors.New("boom") })
+	if err != nil {
+		t.Fatalf("StartRestore: %v", err)
+	}
+	waitForOperation(t, sm, opID)
+	checkJobState(t, sm, jobID, pb.JobState_JOB_STATE_FAULTED)
+	if _, err := sm.StartSnapshot(jobID, group, func() error { return nil }); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Snapshot after restore fault: expected FailedPrecondition, got %v", err)
+	}
+
+	// 5. Retrying the restore recovers the job.
+	opID, err = sm.StartRestore(jobID, group, func() error { return nil })
+	if err != nil {
+		t.Fatalf("Restore retry: %v", err)
+	}
+	waitForOperation(t, sm, opID)
+	checkJobState(t, sm, jobID, pb.JobState_JOB_STATE_RUNNING)
 }
 
 func TestGetOperation(t *testing.T) {
