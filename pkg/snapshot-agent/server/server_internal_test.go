@@ -776,7 +776,8 @@ func (m *mockDirectMemoryBackend) Restore(ctx context.Context, req backends.Requ
 }
 
 func TestServer_GetSnapshotBackendType_DirectMemory(t *testing.T) {
-	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry(), features.Gates{features.DirectMemoryBackend: true})
+	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry(),
+		features.Gates{features.DirectMemoryBackend: true})
 	cfg := &pb.BackendConfig{
 		Backend: &pb.BackendConfig_DirectMemory{
 			DirectMemory: &pb.DirectMemoryBackendConfig{},
@@ -793,7 +794,8 @@ func TestServer_DirectMemory_StandaloneMode(t *testing.T) {
 	backendsMap := map[backends.BackendType]backends.Backend{
 		backends.BackendDirectMemory: mock,
 	}
-	srv := NewServer(backendsMap, backends.BackendDirectMemory, "standalone", backends.NewChannelRegistry(), features.Gates{features.DirectMemoryBackend: true})
+	srv := NewServer(backendsMap, backends.BackendDirectMemory, "standalone", backends.NewChannelRegistry(),
+		features.Gates{features.DirectMemoryBackend: true})
 
 	cfg := &pb.BackendConfig{
 		Backend: &pb.BackendConfig_DirectMemory{
@@ -832,7 +834,8 @@ func TestServer_DirectMemory_K8sMode(t *testing.T) {
 	backendsMap := map[backends.BackendType]backends.Backend{
 		backends.BackendDirectMemory: mock,
 	}
-	srv := NewServer(backendsMap, backends.BackendDirectMemory, "k8s", backends.NewChannelRegistry(), features.Gates{features.DirectMemoryBackend: true})
+	srv := NewServer(backendsMap, backends.BackendDirectMemory, "k8s", backends.NewChannelRegistry(),
+		features.Gates{features.DirectMemoryBackend: true})
 
 	jobID := "test-job-dm-k8s"
 	podName := "pod-dm-k8s"
