@@ -388,6 +388,12 @@ func (x *CudaBackendConfig) GetExplicitTarget() *ProcessTarget {
 }
 
 // Configuration for the Direct Memory (process-level) backend.
+//
+// Experimental: this backend is driven by GPU-CR, which is itself
+// experimental — expect deployment requirements and operational caveats.
+// It is disabled by default: requests selecting it fail with
+// FAILED_PRECONDITION unless the agent runs with
+// --feature-gates=DirectMemoryBackend=true (or the FEATURE_GATES env var).
 type DirectMemoryBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The target processes to checkpoint/restore.
@@ -673,6 +679,8 @@ type BackendConfig_AppChannel struct {
 }
 
 type BackendConfig_DirectMemory struct {
+	// Experimental: disabled by default behind the DirectMemoryBackend
+	// feature gate; see DirectMemoryBackendConfig.
 	DirectMemory *DirectMemoryBackendConfig `protobuf:"bytes,4,opt,name=direct_memory,json=directMemory,proto3,oneof"`
 }
 
