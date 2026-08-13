@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
@@ -83,6 +84,24 @@ func main() {
 		backends.BackendNoop:        backends.NewNoopBackend(),
 		backends.BackendAppEndpoint: backends.NewAppEndpointBackend(),
 		backends.BackendAppChannel:  backends.NewAppChannelBackend(channelRegistry),
+	}
+
+	// GPU-CR housekeeping runs only when the shared checkpoint dir is
+	// configured (the Helm chart sets EXPORT_FILE_PATH iff a GPU-CR-driven
+	// backend is enabled), keeping CUDA/app-only deployments untouched.
+	if ctlDir := os.Getenv("EXPORT_FILE_PATH"); ctlDir != "" {
+		// The dir must be writable by the (unprivileged) GPU-CR workloads
+		// that mmap their dump buffers in it.
+		if _, err := os.Stat(ctlDir); err == nil {
+			if err := os.Chmod(ctlDir, 0o777); err != nil {
+				slog.WarnContext(ctx, "Failed to chmod GPU-CR checkpoint dir to 0777", "dir", ctlDir, "error", err)
+			} else {
+				slog.InfoContext(ctx, "Set GPU-CR checkpoint dir permissions to 0777", "dir", ctlDir)
+			}
+		}
+		// Sweep stale GPU-CR artifacts: a leaked dump pins its full extent
+		// in shm/hugetlbfs even after the owning process dies.
+		backends.StartGC(ctx, ctlDir, 10*time.Minute)
 	}
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
