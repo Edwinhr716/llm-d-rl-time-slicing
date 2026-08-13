@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
@@ -211,5 +212,31 @@ func TestDirectMemoryConfigHelpers(t *testing.T) {
 	_, err = backends.BuildDirectMemoryConfig([]string{"100", "not-a-pid"})
 	if err == nil {
 		t.Errorf("BuildDirectMemoryConfig() expected error for invalid PID string, got nil")
+	}
+}
+
+func TestDirectMemoryOpTimeout(t *testing.T) {
+	t.Setenv("GPU_CR_OP_TIMEOUT_SEC", "1")
+
+	dm := backends.NewDirectMemory()
+	dm.SetExecCommand(func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		// Simulate cr_client hanging on a dead workload's control channel:
+		// block until the per-operation deadline cancels the context.
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+
+	start := time.Now()
+	err := dm.Snapshot(context.Background(), backends.Request{JobID: "test-job", Config: directMemoryConfig(123)})
+	if err == nil {
+		t.Fatal("Snapshot() expected timeout error, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Snapshot() took %v; the 1s GPU_CR_OP_TIMEOUT_SEC deadline was not applied", elapsed)
+	}
+
+	err = dm.Restore(context.Background(), backends.Request{JobID: "test-job", Config: directMemoryConfig(123)})
+	if err == nil {
+		t.Fatal("Restore() expected timeout error, got nil")
 	}
 }
