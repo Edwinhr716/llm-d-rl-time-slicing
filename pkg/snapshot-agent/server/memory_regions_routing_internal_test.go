@@ -54,7 +54,7 @@ func TestGetSnapshotBackendType(t *testing.T) {
 		want   backends.BackendType
 	}
 
-	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry())
+	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry(), nil)
 
 	run := func(t *testing.T, tc testCase) {
 		t.Helper()
@@ -110,7 +110,7 @@ func TestBuildSnapshotFnMemoryRegions(t *testing.T) {
 		spy := &spyBackend{}
 		srv := NewServer(
 			map[backends.BackendType]backends.Backend{backends.BackendMemoryRegions: spy},
-			backends.BackendCuda, tc.mode, backends.NewChannelRegistry(),
+			backends.BackendCuda, tc.mode, backends.NewChannelRegistry(), nil,
 		)
 		config := memoryRegionsTestConfig("slot-a")
 
@@ -165,7 +165,7 @@ func TestBuildRestoreFnMemoryRegions(t *testing.T) {
 		spy := &spyBackend{}
 		srv := NewServer(
 			map[backends.BackendType]backends.Backend{backends.BackendMemoryRegions: spy},
-			backends.BackendCuda, tc.mode, backends.NewChannelRegistry(),
+			backends.BackendCuda, tc.mode, backends.NewChannelRegistry(), nil,
 		)
 		config := memoryRegionsTestConfig("slot-b")
 
