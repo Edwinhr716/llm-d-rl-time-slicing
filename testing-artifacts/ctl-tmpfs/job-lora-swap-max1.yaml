@@ -1,0 +1,114 @@
+# Pool-pinned copy of ../job-lora-swap-max1.yaml for ctl-tmpfs-l4.
+# Single-shot variant of deployment-lora-swap-max1.yaml: no restart loop, so
+# a failure can't re-enter the snapshot agent against poisoned job state and
+# the failing container's logs survive for debugging.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lora-swap-max1-ctltmpfs
+  labels:
+    app: lora-swap-max1
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: lora-swap-max1
+        snapshot-agent: "true"
+        timeslice.io/job-id: "lora-test-max1"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: ctl-tmpfs-l4
+      hostIPC: true
+      hostPID: true  # Required for GPU-CR IPC matching
+      initContainers:
+      # GEP-0006: wait for the agent's ctl tmpfs before loading vGPU.so —
+      # the readiness advertisement is written at library load, and both
+      # binaries statfs-gate on the dir being tmpfs.
+      - name: wait-ctl-tmpfs
+        image: busybox:stable
+        command:
+          - sh
+          - -c
+          - |
+            until awk '$2=="/mnt/gpu-cr-ctl" && $3=="tmpfs" {f=1} END {exit !f}' /proc/mounts; do
+              echo "waiting for ctl tmpfs at /mnt/gpu-cr-ctl"; sleep 2;
+            done
+            echo "ctl tmpfs present"
+        volumeMounts:
+        - name: gpu-cr-ctl
+          mountPath: /mnt/gpu-cr-ctl
+          mountPropagation: HostToContainer
+      containers:
+      - name: lora-swap
+        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/lora-swap-client-max1:ctl-tmpfs-v1
+        command: ["python3"]
+        args: ["test_lora_swap_max1.py"]
+        securityContext:
+          runAsUser: 0
+        imagePullPolicy: Always
+        env:
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: AGENT_ENDPOINT
+          value: "$(NODE_IP):9001"
+        - name: JOB_ID
+          value: "lora-test-max1"
+        - name: GROUP
+          value: "lora-group"
+        - name: GPU_VENDOR
+          value: "NVIDIA"
+        - name: VLLM_ALLOW_INSECURE_SERIALIZATION
+          value: "1"
+        - name: LD_PRELOAD
+          value: "/usr/local/lib/vGPU-NVIDIA.so"
+        - name: GPU_CR_CTL_PATH
+          value: "/mnt/gpu-cr-ctl"
+        - name: VLLM_ENABLE_V1_MULTIPROCESSING
+          value: "0"
+        - name: LD_LIBRARY_PATH
+          # /usr/local/nvidia/lib64 is where GKE's device plugin injects the
+          # driver (libcuda.so.1); must precede the CUDA toolkit path.
+          value: "/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+        - name: PYTORCH_NO_CUDA_MEMORY_CACHING
+          value: "1"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: CUDA_LAUNCH_BLOCKING
+          value: "1"
+        volumeMounts:
+        - name: huge-ckpt
+          mountPath: /mnt/huge-ckpt
+          mountPropagation: HostToContainer
+        - name: gpu-cr-ctl
+          mountPath: /mnt/gpu-cr-ctl
+          mountPropagation: HostToContainer
+        resources:
+          requests:
+            memory: "4Gi"
+            nvidia.com/gpu: "1"
+            # 8Gi dump buffer + 2x1Gi staging (SHM_SIZE_GB=8 build of
+            # vGPU-NVIDIA.so), reserved at mmap time, + destination-group
+            # dumps (GEP-0001: parked snapshots fault against THIS pod's
+            # cgroup now) + headroom.
+            hugepages-2Mi: "12Gi"
+          limits:
+            memory: "4Gi"
+            nvidia.com/gpu: "1"
+            hugepages-2Mi: "12Gi"
+      volumes:
+      - name: huge-ckpt
+        hostPath:
+          path: /var/tmp/huge-ckpt
+          type: DirectoryOrCreate
+      - name: gpu-cr-ctl
+        hostPath:
+          path: /var/tmp/gpu-cr-ctl
+          type: DirectoryOrCreate
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
