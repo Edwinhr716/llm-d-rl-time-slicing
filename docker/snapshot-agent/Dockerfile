@@ -37,7 +37,9 @@ WORKDIR /
 COPY --from=builder /workspace/snapshot-agent .
 # Copy bundled binaries (cuda-checkpoint) from the builder's bin directory
 COPY --from=builder /workspace/bin-dist ./bin
-# cr_client at the memory-regions backend's default fallback path (also on PATH).
+# cr_client at the GPU-CR backends' default fallback path (also on PATH);
+# taken from the version-locked gpucr image, never built from upstream
+# source, so it always speaks the same control protocol as the deployed .so.
 COPY --from=gpucr /cr_client /usr/local/bin/cr_client
 COPY --from=gpucr /cr_client /bin/cr_client
 

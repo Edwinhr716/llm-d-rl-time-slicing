@@ -79,9 +79,10 @@ func TestStartSnapshot(t *testing.T) {
 			expectErrCode: codes.Aborted,
 		},
 		{
-			name:          "Fails when FAULTED",
-			initialState:  pb.JobState_JOB_STATE_FAULTED,
-			expectErrCode: codes.FailedPrecondition,
+			name:         "Recovers when FAULTED",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			expectOp:     true,
+			finalState:   pb.JobState_JOB_STATE_SAVED,
 		},
 		{
 			name:         "Worker failure leads to FAULTED",
@@ -175,9 +176,9 @@ func TestStartRestore(t *testing.T) {
 			expectErrCode: codes.Aborted,
 		},
 		{
-			name:          "Fails when FAULTED",
-			initialState:  pb.JobState_JOB_STATE_FAULTED,
-			expectErrCode: codes.FailedPrecondition,
+			name:         "Recovers when FAULTED",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			finalState:   pb.JobState_JOB_STATE_RUNNING,
 		},
 		{
 			name:         "Worker failure leads to FAULTED",

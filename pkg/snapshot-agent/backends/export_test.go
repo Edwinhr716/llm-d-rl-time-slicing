@@ -2,6 +2,7 @@ package backends
 
 import (
 	"context"
+	"os"
 	"time"
 )
 
@@ -34,4 +35,16 @@ func (g *MemoryRegions) SetLookPath(f func(string) (string, error)) {
 
 func (g *MemoryRegions) SetProcRoot(dir string) {
 	g.procRoot = dir
+}
+
+func (d *DirectMemory) SetExecCommand(f func(ctx context.Context, name string, args ...string) ([]byte, error)) {
+	d.execCommand = f
+}
+
+func (d *DirectMemory) SetLookPath(f func(string) (string, error)) {
+	d.lookPath = f
+}
+
+func (d *DirectMemory) SetStatFunc(f func(string) (os.FileInfo, error)) {
+	d.statFunc = f
 }

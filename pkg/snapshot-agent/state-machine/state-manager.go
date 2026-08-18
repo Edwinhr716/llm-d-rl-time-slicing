@@ -107,8 +107,11 @@ func (sm *StateManager) StartSnapshotSlot(jobID, group, slot string, worker func
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 2. Fault Recovery (slot-aware backends only)
-	if slot != "" && job.State == pb.JobState_JOB_STATE_FAULTED {
+	// 2. Fault Recovery: a failed operation marks the job FAULTED, but the
+	// fault is typically transient (dead workload PID, timed-out helper
+	// binary). Let a fresh snapshot attempt reset the job rather than
+	// wedging it until an agent redeploy.
+	if job.State == pb.JobState_JOB_STATE_FAULTED {
 		slog.Warn("Job is FAULTED; allowing new snapshot to reset it", "jobID", jobID, "slot", slot)
 	} else if job.State != pb.JobState_JOB_STATE_RUNNING {
 		// 3. State Validation: Only allow snapshotting of RUNNING jobs
@@ -187,8 +190,9 @@ func (sm *StateManager) StartRestoreSlot(jobID, group, slot string, worker func(
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 3. Fault Recovery (slot-aware backends only)
-	if slot != "" && job.State == pb.JobState_JOB_STATE_FAULTED {
+	// 3. Fault Recovery: see StartSnapshot — allow a fresh restore to reset
+	// a FAULTED job instead of wedging it until an agent redeploy.
+	if job.State == pb.JobState_JOB_STATE_FAULTED {
 		slog.Warn("Job is FAULTED; allowing new restore to reset it", "jobID", jobID, "slot", slot)
 	} else if job.State != pb.JobState_JOB_STATE_SAVED && (slot == "" || job.State != pb.JobState_JOB_STATE_RUNNING) {
 		// 4. State Validation: restores need a SAVED job — or, for

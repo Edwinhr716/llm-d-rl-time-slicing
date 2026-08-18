@@ -85,11 +85,12 @@ func main() {
 		backends.BackendAppEndpoint:   backends.NewAppEndpointBackend(),
 		backends.BackendAppChannel:    backends.NewAppChannelBackend(channelRegistry),
 		backends.BackendMemoryRegions: backends.NewMemoryRegions(),
+		backends.BackendDirectMemory:  backends.NewDirectMemory(),
 	}
 
-	// GPU-CR (memory-regions backend) housekeeping runs only when the shared
-	// checkpoint dir is configured (the Helm chart sets EXPORT_FILE_PATH iff
-	// memoryRegions.enabled), keeping CUDA/app-only deployments untouched.
+	// GPU-CR housekeeping runs only when the shared checkpoint dir is
+	// configured (the Helm chart sets EXPORT_FILE_PATH iff memoryRegions or
+	// directMemory is enabled), keeping CUDA/app-only deployments untouched.
 	if ctlDir := os.Getenv("EXPORT_FILE_PATH"); ctlDir != "" {
 		// The dir must be writable by the (unprivileged) GPU-CR workloads
 		// that mmap their dump buffers in it.
