@@ -59,17 +59,20 @@ scheduling and cgroup-enforcement behavior; pick one.
 
 **Option A — runtime bootstrap on a vanilla pool (no node system config).**
 If you already have (or prefer) a plain GPU nodepool, skip the
-`hugepages-config.yaml` / `--system-config-from-file` parts below and
-instead apply `deploy/examples/hugepages-bootstrap-daemonset.yaml` (fill in
-the pool selector; size `HUGEPAGES_2M` as above — 12288 for the 8GiB
-build). It allocates the pool at runtime and restarts the kubelet once per
-node boot so the node publishes `hugepages-2Mi`; the restart is invisible
-to running workloads (measured: zero container restarts, no Ready flap, no
-auto-repair). Validation data and residual risks:
-`docs/proposals/hugepages-runtime-bootstrap.md`. Deploy it before heavy
-workloads land on the nodes — allocation is instant on fresh nodes, while
-badly fragmented nodes fail loudly in the bootstrap pod instead of
-degrading workloads.
+`hugepages-config.yaml` / `--system-config-from-file` parts below: the
+snapshot-agent DaemonSet itself provisions the pool. Its
+`provision-hugepages` initContainer (see
+`deploy/examples/snapshot-agent-memory-addresses.yaml`, sized via
+`HUGEPAGES_2M` — 12288 for the 8GiB build) allocates the pool at runtime
+and restarts the kubelet once per node boot so the node publishes
+`hugepages-2Mi`; the restart is invisible to running workloads (measured:
+zero container restarts, no Ready flap, no auto-repair). This
+consolidation is possible because the agent carries no `hugepages-2Mi`
+request of its own since GPU-CR GEP-0001/GEP-0006 (it would otherwise be
+unschedulable before its own initContainer ran). Validation data and
+residual risks: `docs/proposals/hugepages-runtime-bootstrap.md` (written
+for the earlier standalone bootstrap DaemonSet, whose script this
+initContainer carries unchanged).
 
 **Option B — node system config (declarative, node recreation):**
 

@@ -1,3 +1,8 @@
+# vGPU-NVIDIA.so comes from the GPU-CR build image so it is version-locked
+# with the cr_client the snapshot-agent ships (GEP-0001/0006 v2/v3 protocol).
+ARG GPUCR_IMAGE=asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/time-slicing/gpucr-so:gep0006-6bdce96
+FROM ${GPUCR_IMAGE} AS gpucr
+
 FROM vllm/vllm-openai:v0.22.0
 
 WORKDIR /app
@@ -8,8 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Download pre-built vGPU-NVIDIA.so from GitHub repository
-ADD https://raw.githubusercontent.com/Edwinhr716/llm-d-rl-time-slicing/gcr-backend-memory-allocation/bin/vGPU-NVIDIA.so /usr/local/lib/vGPU-NVIDIA.so
+COPY --from=gpucr /vGPU-NVIDIA.so /usr/local/lib/vGPU-NVIDIA.so
 RUN chmod 755 /usr/local/lib/vGPU-NVIDIA.so
 
 # Install the timeslice client from GitHub

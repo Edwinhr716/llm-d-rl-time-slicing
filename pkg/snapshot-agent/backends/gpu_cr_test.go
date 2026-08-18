@@ -46,7 +46,7 @@ func TestGpuCrSnapshot(t *testing.T) {
 				return nil, tt.execErr
 			})
 
-			err := g.Snapshot(context.Background(), tt.pids)
+			err := g.Snapshot(context.Background(), "test-group", tt.pids)
 			if (err != nil) != tt.expectedErr {
 				t.Errorf("Snapshot() error = %v, expectedErr %v", err, tt.expectedErr)
 			}
@@ -90,7 +90,7 @@ func TestGpuCrRestore(t *testing.T) {
 				return nil, tt.execErr
 			})
 
-			err := g.Restore(context.Background(), tt.pids)
+			err := g.Restore(context.Background(), "test-group", tt.pids)
 			if (err != nil) != tt.expectedErr {
 				t.Errorf("Restore() error = %v, expectedErr %v", err, tt.expectedErr)
 			}

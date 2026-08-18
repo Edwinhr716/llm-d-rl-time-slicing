@@ -18,9 +18,27 @@ spec:
     spec:
       hostIPC: true
       hostPID: true  # Required for GPU-CR IPC matching
+      initContainers:
+      # GEP-0006: wait for the agent's ctl tmpfs before loading vGPU.so —
+      # the readiness advertisement is written at library load, and both
+      # binaries statfs-gate on the dir being tmpfs.
+      - name: wait-ctl-tmpfs
+        image: busybox:stable
+        command:
+          - sh
+          - -c
+          - |
+            until awk '$2=="/mnt/gpu-cr-ctl" && $3=="tmpfs" {f=1} END {exit !f}' /proc/mounts; do
+              echo "waiting for ctl tmpfs at /mnt/gpu-cr-ctl"; sleep 2;
+            done
+            echo "ctl tmpfs present"
+        volumeMounts:
+        - name: gpu-cr-ctl
+          mountPath: /mnt/gpu-cr-ctl
+          mountPropagation: HostToContainer
       containers:
       - name: lora-swap
-        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/lora-swap-client-max1:latest # Replace with your actual image tag
+        image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/snapshot-example/lora-swap-client-max1:ctl-tmpfs-v1 # Replace with your actual image tag
         command: ["python3"]
         args: ["test_lora_swap_max1.py"]
         securityContext:
@@ -43,6 +61,8 @@ spec:
           value: "1"
         - name: LD_PRELOAD
           value: "/usr/local/lib/vGPU-NVIDIA.so"
+        - name: GPU_CR_CTL_PATH
+          value: "/mnt/gpu-cr-ctl"
         - name: VLLM_ENABLE_V1_MULTIPROCESSING
           value: "0"
         - name: LD_LIBRARY_PATH
@@ -59,18 +79,25 @@ spec:
         - name: huge-ckpt
           mountPath: /mnt/huge-ckpt
           mountPropagation: HostToContainer
+        - name: gpu-cr-ctl
+          mountPath: /mnt/gpu-cr-ctl
+          mountPropagation: HostToContainer
         resources:
           requests:
             memory: "4Gi"
             nvidia.com/gpu: "1"
             # 25Gi dump buffer + 2x1Gi staging per CUDA process (compile-time
             # in vGPU-NVIDIA.so), reserved at mmap time + 1Gi headroom.
-            hugepages-2Mi: "28Gi"
+            hugepages-2Mi: "12Gi"
           limits:
             memory: "4Gi"
             nvidia.com/gpu: "1"
-            hugepages-2Mi: "28Gi"
+            hugepages-2Mi: "12Gi"
       volumes:
+      - name: gpu-cr-ctl
+        hostPath:
+          path: /var/tmp/gpu-cr-ctl
+          type: DirectoryOrCreate
       - name: huge-ckpt
         hostPath:
           path: /var/tmp/huge-ckpt

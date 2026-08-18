@@ -23,14 +23,75 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "snapshot-agent.serviceAccountName" . }}
+      {{- if .Values.priorityClass.name }}
+      priorityClassName: {{ .Values.priorityClass.name }}
+      {{- end }}
       hostNetwork: true
       hostPID: true
       hostIPC: true
       initContainers:
-        # Mount hugetlbfs at the shared checkpoint path on the HOST. GPU-CR
-        # relies on the filesystem itself being hugetlbfs (it does not pass
-        # MAP_HUGETLB); without this mount every dump silently degrades to
-        # boot-disk page cache and the node's hugepage pool goes unused.
+        {{- if .Values.gpuCr.bootstrap.enabled }}
+        # Runtime hugepage provisioning for WORKLOAD pods (the agent itself
+        # requests none). Once per node boot: allocate the 2Mi pool, then
+        # restart the kubelet so the node publishes hugepages-2Mi capacity.
+        # On shortfall it exits 1 WITHOUT restarting the kubelet, so an
+        # undersized pool surfaces as this pod CrashLooping, not as workload
+        # SIGBUS. Scheduling deadlock is impossible ONLY because the agent
+        # container has no hugepages request — do not add one.
+        - name: provision-hugepages
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          env:
+            - name: HUGEPAGES_2M
+              value: {{ .Values.gpuCr.bootstrap.pages2Mi | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              apk add --no-cache util-linux >/dev/null
+              target=$HUGEPAGES_2M
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -ge "$target" ]; then
+                echo "hugepage pool already provisioned ($current/$target pages), nothing to do"
+                exit 0
+              fi
+              echo "reserving $target 2Mi hugepages (currently $current)"
+              nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -lt "$target" ]; then
+                echo "short by $((target - current)) pages; compacting and retrying"
+                nsenter -t 1 -m -- sh -c 'echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+                nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+                current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              fi
+              if [ "$current" -lt "$target" ]; then
+                echo "ERROR: only $current of $target pages allocated (memory fragmented or exhausted)"
+                exit 1
+              fi
+              echo "pool ready; restarting kubelet so the node reports hugepages-2Mi (running pods unaffected)"
+              nsenter -t 1 -m -- systemctl restart kubelet
+        {{- end }}
+        # GEP-0006 control-plane tmpfs on the HOST: cr_client and the
+        # workload's vGPU.so communicate through files here instead of
+        # hugetlbfs. Must exist BEFORE workloads start (their .so writes the
+        # readiness advertisement at load time; a disk-backed dir would be
+        # shadowed by this mount — both binaries statfs-gate on tmpfs).
+        - name: mount-ctl-tmpfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.gpuCr.ctl.hostPath }}; grep -q " {{ .Values.gpuCr.ctl.hostPath }} tmpfs" /proc/mounts || mount -t tmpfs -o size={{ .Values.gpuCr.ctl.sizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.gpuCr.ctl.hostPath }}; chmod 0777 {{ .Values.gpuCr.ctl.hostPath }}' && \
+              echo "ctl tmpfs mounted at {{ .Values.gpuCr.ctl.hostPath }}"
+        # hugetlbfs at the shared checkpoint path on the HOST. GPU-CR relies
+        # on the filesystem itself being hugetlbfs; without this mount every
+        # dump silently degrades to boot-disk page cache.
         - name: mount-hugetlbfs
           image: alpine:latest
           securityContext:
@@ -40,14 +101,8 @@ spec:
             - -c
             - |
               apk add --no-cache util-linux >/dev/null && \
-              nsenter -t 1 -m -- sh -c 'mkdir -p /var/tmp/huge-ckpt; grep -q " /var/tmp/huge-ckpt hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize=2M,mode=0777 nodev /var/tmp/huge-ckpt; chmod 0777 /var/tmp/huge-ckpt' && \
-              echo "hugetlbfs mounted at /var/tmp/huge-ckpt"
-        - name: install-cuda-checkpoint
-          image: alpine:latest
-          command: ["sh", "-c", "apk add --no-cache wget && wget -qO /opt/bin/cuda-checkpoint https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/main/bin/x86_64_Linux/cuda-checkpoint && chmod +x /opt/bin/cuda-checkpoint && echo 'cuda-checkpoint installed'"]
-          volumeMounts:
-            - name: bin-dir
-              mountPath: /opt/bin
+              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.gpuCr.dataDir.hostPath }}; grep -q " {{ .Values.gpuCr.dataDir.hostPath }} hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize=2M,mode=0777 nodev {{ .Values.gpuCr.dataDir.hostPath }}; chmod 0777 {{ .Values.gpuCr.dataDir.hostPath }}' && \
+              echo "hugetlbfs mounted at {{ .Values.gpuCr.dataDir.hostPath }}"
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -55,26 +110,30 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+            - name: DEPLOYMENT_MODE
+              value: "k8s"
             - name: PATH
-              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin
-            {{- if .Values.nvidia.driver.enabled }}
-            - name: LD_LIBRARY_PATH
-              value: {{ join ":" .Values.nvidia.driver.libraryPaths }}
-            {{- end }}
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: AGENT_PORT
               value: {{ .Values.port | quote }}
+            {{- if .Values.nvidia.driver.enabled }}
+            - name: LD_LIBRARY_PATH
+              value: {{ join ":" .Values.nvidia.driver.libraryPaths }}
+            {{- end }}
             - name: NVIDIA_VISIBLE_DEVICES
               value: "all"
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: "compute,utility"
-            # Snapshot group copies must live on disk: hugetlbfs has no
-            # write(2) support and copies there would pin hugepages forever.
-            - name: SNAPSHOT_DIR
-              value: /var/snapshots
+            - name: EXPORT_FILE_PATH
+              value: {{ .Values.gpuCr.dataDir.mountPath | quote }}
+            - name: GPU_CR_CTL_PATH
+              value: {{ .Values.gpuCr.ctl.mountPath | quote }}
+            - name: GPU_CR_OP_TIMEOUT_SEC
+              value: {{ .Values.gpuCr.opTimeoutSec | quote }}
           ports:
             - name: grpc
               containerPort: {{ .Values.port }}
@@ -82,8 +141,6 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
-            - name: bin-dir
-              mountPath: /opt/bin
             {{- if .Values.nvidia.driver.enabled }}
             - name: nvidia-driver
               mountPath: {{ .Values.nvidia.driver.mountPath }}
@@ -94,15 +151,14 @@ spec:
               mountPath: {{ .Values.nvidia.devices.mountPath }}
             {{- end }}
             - name: huge-ckpt
-              mountPath: /mnt/huge-ckpt
-              # Pick up the hugetlbfs mount made by the init container even
-              # though the hostPath was prepared before it ran.
+              mountPath: {{ .Values.gpuCr.dataDir.mountPath }}
+              # Pick up the mounts made by the init containers even though
+              # the hostPath was bound before they ran.
               mountPropagation: HostToContainer
-            - name: gcr-snapshots
-              mountPath: /var/snapshots
+            - name: gpu-cr-ctl
+              mountPath: {{ .Values.gpuCr.ctl.mountPath }}
+              mountPropagation: HostToContainer
       volumes:
-        - name: bin-dir
-          emptyDir: {}
         {{- if .Values.nvidia.driver.enabled }}
         - name: nvidia-driver
           hostPath:
@@ -117,11 +173,11 @@ spec:
         {{- end }}
         - name: huge-ckpt
           hostPath:
-            path: /var/tmp/huge-ckpt
+            path: {{ .Values.gpuCr.dataDir.hostPath }}
             type: DirectoryOrCreate
-        - name: gcr-snapshots
+        - name: gpu-cr-ctl
           hostPath:
-            path: /var/tmp/gcr-snapshots
+            path: {{ .Values.gpuCr.ctl.hostPath }}
             type: DirectoryOrCreate
       {{- with .Values.nodeSelector }}
       nodeSelector:

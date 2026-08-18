@@ -10,15 +10,51 @@ fullnameOverride: ""
 
 podAnnotations: {}
 
-# hugepages-2Mi covers hugetlb cgroup charges when the agent faults pages
-# while mmap-writing restores into the shared hugetlbfs dump buffers.
+# NO hugepages request since GPU-CR GEP-0001 + GEP-0006: the agent moves no
+# dump bytes (destination-path checkpoints run inside the workload's
+# preloader) and the cr_client control channel lives on the ctl tmpfs, so
+# no hugetlb page is ever faulted from this pod's cgroup. That zero request
+# is also what lets this DaemonSet schedule on fresh vanilla nodes BEFORE
+# hugepage capacity exists — which is why the hugepage bootstrap can run as
+# an initContainer here instead of a separate DaemonSet.
+# Memory = 512Mi base + the ctl tmpfs cap (worst case, tmpfs pages charge
+# the first-toucher cgroup, which can be this pod via cr_client).
 resources:
   requests:
-    hugepages-2Mi: "2Gi"
-    memory: "512Mi"
+    memory: "576Mi"
   limits:
-    hugepages-2Mi: "2Gi"
-    memory: "512Mi"
+    memory: "576Mi"
+
+gpuCr:
+  # hugetlbfs data mount: dump/staging buffers and the per-group destination
+  # store (groups/). Mounted at the SAME in-container path as in workload
+  # pods so -o path strings resolve to the same files in both namespaces.
+  dataDir:
+    hostPath: /var/tmp/huge-ckpt
+    mountPath: /mnt/huge-ckpt
+  # GEP-0006 control-plane tmpfs: control-<pid>, pid_map, ctl-ready
+  # advertisements. Host-level tmpfs so agent and workload share it.
+  ctl:
+    hostPath: /var/tmp/gpu-cr-ctl
+    mountPath: /mnt/gpu-cr-ctl
+    sizeMi: 64
+  # Runtime hugepage provisioning (absorbs the former hugepages-bootstrap
+  # DaemonSet): writes nr_hugepages and restarts the kubelet once per node
+  # boot so the node publishes hugepages-2Mi capacity for WORKLOAD pods.
+  # Validated blast radius of the restart: zero (see
+  # testing-artifacts/hugepages-runtime-bootstrap-results.md, T4).
+  bootstrap:
+    enabled: true
+    # 12288 x 2Mi = 24Gi, sized for two GPU-CR processes built with
+    # SHM_SIZE_GB=8; use 30720 (60Gi) for two stock 25GiB builds.
+    pages2Mi: 12288
+  opTimeoutSec: 120
+
+priorityClass:
+  # The bootstrap initContainer must win node placement over GPU workloads.
+  create: true
+  name: timeslice-snapshot-agent
+  value: 900000000
 
 nodeSelector: {}
 

@@ -10,7 +10,7 @@ The Snapshot Agent stack currently requires a GPU nodepool created with
 `--system-config-from-file` (`hugepageConfig.hugepage_size2m`), which means
 a **dedicated nodepool and node recreation** just to get a 2Mi hugepage
 pool. This proposal replaces that requirement with a privileged bootstrap
-DaemonSet (`deploy/examples/hugepages-bootstrap-daemonset.yaml`) that, on
+DaemonSet (now the `provision-hugepages` initContainer of the snapshot-agent DaemonSet, `deploy/examples/snapshot-agent-memory-addresses.yaml`) that, on
 each node of an existing **vanilla** GPU pool:
 
 1. writes the pool size to `/proc/sys/vm/nr_hugepages`, and
@@ -104,7 +104,7 @@ kernel 6.12.85+, g2-standard-24, cgroup v2).
 
 ## Rollout recommendation
 
-1. Apply `deploy/examples/hugepages-bootstrap-daemonset.yaml` with
+1. Deploy the snapshot-agent DaemonSet (its `provision-hugepages` initContainer) with
    `HUGEPAGES_2M` sized per the user guide (12288 for the SHM_SIZE_GB=8
    GPU-CR build; 30720 for the stock 25GiB build with two workloads).
 2. Wait for nodes to report `hugepages-2Mi` allocatable (seconds).

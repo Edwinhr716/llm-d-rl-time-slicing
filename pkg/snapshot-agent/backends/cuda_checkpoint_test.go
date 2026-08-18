@@ -55,7 +55,7 @@ func TestSnapshot(t *testing.T) {
 				return nil, tt.execErr
 			})
 
-			err := c.Snapshot(context.Background(), tt.pids)
+			err := c.Snapshot(context.Background(), "test-group", tt.pids)
 			if (err != nil) != tt.expectedErr {
 				t.Errorf("Snapshot() error = %v, expectedErr %v", err, tt.expectedErr)
 			}
@@ -97,7 +97,7 @@ func TestRestore(t *testing.T) {
 				return nil, tt.execErr
 			})
 
-			err := c.Restore(context.Background(), tt.pids)
+			err := c.Restore(context.Background(), "test-group", tt.pids)
 			if (err != nil) != tt.expectedErr {
 				t.Errorf("Restore() error = %v, expectedErr %v", err, tt.expectedErr)
 			}
