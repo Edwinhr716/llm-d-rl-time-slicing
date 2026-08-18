@@ -1,4 +1,4 @@
-# Builds the snapshot-agent and LoRA-swap workload images.
+# Builds the snapshot-agent image.
 # Usage:
 #   gcloud builds submit . --config=cloudbuild-snapshot-agent.yaml \
 #     --substitutions=_TAG=taska-<shortsha>
@@ -14,18 +14,8 @@ steps:
       - -t
       - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:${_TAG}
       - .
-  - id: build-lora-swap-workload
-    name: gcr.io/cloud-builders/docker
-    args:
-      - build
-      - -f
-      - testing-artifacts/Dockerfile.lora-max1
-      - -t
-      - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/lora-swap-client-max1:${_TAG}
-      - .
 images:
   - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:${_TAG}
-  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/lora-swap-client-max1:${_TAG}
 substitutions:
   _TAG: ctl-tmpfs-mr-v1
   _GPUCR_IMAGE: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/time-slicing/gpucr-so:gep0006-6bdce96
