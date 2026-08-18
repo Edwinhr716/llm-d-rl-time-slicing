@@ -2,19 +2,14 @@ package backends
 
 import (
 	"context"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
@@ -22,16 +17,27 @@ import (
 
 // MemoryRegions implements the Backend interface for selective checkpoint
 // and restore of explicit device-memory regions of a running process, using
-// the GPU-CR cr_client (`-s addr:size,...` spec). Regions are provided by the
-// caller through MemoryRegionsBackendConfig; the backend performs no
-// discovery.
+// the GPU-CR cr_client with destination-path dumps (GPU-CR GEP-0001/GEP-0006).
+// Regions are provided by the caller through MemoryRegionsBackendConfig; the
+// backend performs no discovery.
+//
+// Since GEP-0001 GA the agent moves NO dump bytes itself: each snapshot is
+// written by the workload's preloader directly into a per-slot destination
+// file (cr_client -o), and each restore reads straight from it. The agent
+// only names files, pre-creates them (via cr_client), and garbage-collects —
+// none of which faults a hugetlb page, which is what lets the DaemonSet run
+// with no hugepages-2Mi request.
 //
 // Environment configuration:
 //
-//	EXPORT_FILE_PATH       shared checkpoint/control dir (default /mnt/huge-ckpt)
-//	SNAPSHOT_DIR           disk-backed snapshot store (default <ctl>/snapshots)
-//	GPU_CR_COPY_HOST_FILE  copy the -host staging file too when set to "1"
-//	GPU_CR_OP_TIMEOUT_SEC  per-cr_client-invocation timeout (default 120)
+//	EXPORT_FILE_PATH        GPU-CR data dir: dump/staging buffers and the
+//	                        destination group store (default /mnt/huge-ckpt)
+//	GPU_CR_CTL_PATH         GEP-0006 control-plane tmpfs (control-<pid>,
+//	                        pid_map_<pid>, ctl-ready-<pid>); unset = legacy
+//	                        layout sharing the data dir
+//	GPU_CR_GROUP_STORE      destination store override (default <data>/groups)
+//	SNAPSHOT_DIR            LEGACY pre-GEP copy store; only GC reads it
+//	GPU_CR_OP_TIMEOUT_SEC   per-cr_client-invocation timeout (default 120)
 type MemoryRegions struct {
 	mu          sync.Mutex
 	execCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
@@ -51,12 +57,92 @@ func NewMemoryRegions() *MemoryRegions {
 	}
 }
 
-// exportDir returns the shared GPU-CR checkpoint/control directory.
-func exportDir() string {
+// dataDir is where GPU-CR keeps dump/staging DATA files (hugetlbfs mount).
+func dataDir() string {
 	if d := os.Getenv("EXPORT_FILE_PATH"); d != "" {
 		return d
 	}
 	return "/mnt/huge-ckpt"
+}
+
+// ctlFilesDir is where the control plane lives: control-<pid>, pid_map_<pid>,
+// ctl-ready-<pid>. With GPU_CR_CTL_PATH set (GEP-0006) that's a tmpfs; unset
+// means the legacy layout where control files share the data dir.
+func ctlFilesDir() string {
+	if d := os.Getenv("GPU_CR_CTL_PATH"); d != "" {
+		return d
+	}
+	return dataDir()
+}
+
+// groupStoreDir is where per-slot destination dumps live. Defaults to
+// <dataDir>/groups: on the hugepage mount the parked bytes consume the pool
+// the workload pod already requested, and the path string resolves
+// identically in the agent and workload mount namespaces (both mount the
+// same hostPath at the same in-container path).
+func groupStoreDir() string {
+	if d := os.Getenv("GPU_CR_GROUP_STORE"); d != "" {
+		return d
+	}
+	return filepath.Join(dataDir(), "groups")
+}
+
+// groupDir validates a snapshot slot name and returns its directory under
+// the destination store. Slots must be a single path segment: nesting is
+// rejected along with traversal because GC reaps store entries at the top
+// level only (a nested slot's .owners metadata would be invisible to it).
+func groupDir(slot string) (string, error) {
+	store := groupStoreDir()
+	dir := filepath.Join(store, filepath.Clean(slot))
+	rel, err := filepath.Rel(store, dir)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || strings.ContainsRune(rel, os.PathSeparator) {
+		return "", fmt.Errorf("invalid snapshot slot (path traversal or nested path): %q", slot)
+	}
+	return dir, nil
+}
+
+// groupMetaFile records the owning workload processes of a slot:
+// "pid starttime" per line. GC deletes a slot only when every recorded
+// owner is gone (dead, or its PID recycled to a different starttime) —
+// a parked slot's dump is meaningless once its process is, and never
+// expendable before that.
+const groupMetaName = ".owners"
+
+func writeGroupMeta(dir string, owners map[string]string) error {
+	var sb strings.Builder
+	for pid := range owners {
+		st, err := procStarttime(pid)
+		if err != nil {
+			return fmt.Errorf("starttime of owner pid %s: %w", pid, err)
+		}
+		fmt.Fprintf(&sb, "%s %d\n", pid, st)
+	}
+	return os.WriteFile(filepath.Join(dir, groupMetaName), []byte(sb.String()), 0o644)
+}
+
+// touchGroup bumps the slot dir mtime explicitly on every op.
+func touchGroup(dir string) {
+	now := time.Now()
+	_ = os.Chtimes(dir, now, now)
+}
+
+// procStarttime returns field 22 of /proc/<pid>/stat — the PID-reuse guard.
+func procStarttime(pid string) (int64, error) {
+	data, err := os.ReadFile(filepath.Join("/proc", pid, "stat"))
+	if err != nil {
+		return 0, err
+	}
+	// comm may contain spaces/parens: parse after the LAST ')'.
+	idx := strings.LastIndexByte(string(data), ')')
+	if idx < 0 || idx+2 >= len(data) {
+		return 0, fmt.Errorf("malformed /proc/%s/stat", pid)
+	}
+	fields := strings.Fields(string(data[idx+2:]))
+	// fields[0] is field 3 (state); starttime is field 22.
+	if len(fields) < 20 {
+		return 0, fmt.Errorf("short /proc/%s/stat", pid)
+	}
+	return strconv.ParseInt(fields[19], 10, 64)
 }
 
 // regionSpecs validates the config's regions and groups them per PID,
@@ -93,7 +179,7 @@ func regionPIDs(cfg *pb.MemoryRegionsBackendConfig) []int32 {
 	return pids
 }
 
-// snapshotSlot returns the snapshot-store slot for the request:
+// snapshotSlot returns the destination-store slot for the request:
 // MemoryRegionsBackendConfig.snapshot_name, falling back to the job ID when
 // empty. The request's `group` is deliberately NOT used: group identifies a
 // set of related jobs for the orchestrator and does not name agent-side
@@ -106,24 +192,14 @@ func snapshotSlot(req Request) (string, error) {
 	if slot == "" {
 		return "", fmt.Errorf("snapshot slot is empty: set snapshot_name or job_id")
 	}
-	if _, err := slotDir(snapshotStoreDir(exportDir()), slot); err != nil {
+	if _, err := groupDir(slot); err != nil {
 		return "", err
 	}
 	return slot, nil
 }
 
-// slotDir resolves the on-disk directory for a snapshot slot, rejecting
-// names that would escape the snapshot store (path traversal).
-func slotDir(snapshotsDir, slot string) (string, error) {
-	target := filepath.Join(snapshotsDir, filepath.Clean(slot))
-	rel, err := filepath.Rel(snapshotsDir, target)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("invalid snapshot name (path traversal attempt): %q", slot)
-	}
-	return target, nil
-}
-
-// Snapshot triggers a selective snapshot of the configured memory regions.
+// Snapshot triggers a selective snapshot of the configured memory regions,
+// dumped by the preloader directly into <group store>/<slot>/<id>.
 func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 	cfg := req.Config.GetMemoryRegions()
 	if cfg == nil {
@@ -140,66 +216,50 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	storeMu.Lock()
+	defer storeMu.Unlock()
 
 	slog.InfoContext(ctx, "Snapshotting memory regions using GPU-CR",
 		"jobID", req.JobID, "slot", slot, "pids", regionPIDs(cfg), "regions", len(cfg.GetRegions()))
 
-	// 1. Trigger checkpoint via cr_client, one invocation per PID.
-	t0 := time.Now()
-	for _, pid := range regionPIDs(cfg) {
-		specStr := strings.Join(specs[pid], ",")
-		if err := g.checkpointRegions(ctx, pid, specStr); err != nil {
-			return fmt.Errorf("cr_client checkpoint failed for PID %d with specs %s: %w", pid, specStr, err)
-		}
-	}
-	slog.InfoContext(ctx, "GPU-CR selective checkpoint took", "duration", time.Since(t0))
-
-	// 2. Copy dump files into the snapshot store slot.
-	ctlDir := exportDir()
-	snapshotsDir := snapshotStoreDir(ctlDir)
-	targetDir, err := slotDir(snapshotsDir, slot)
+	targetDir, err := groupDir(slot)
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create slot dir %s: %w", targetDir, err)
+	}
 
-	t1 := time.Now()
+	t0 := time.Now()
+	owners := make(map[string]string)
 	for _, pid := range regionPIDs(cfg) {
-		id, err := g.resolvePidToID(strconv.Itoa(int(pid)))
+		pidStr := strconv.Itoa(int(pid))
+		id, err := g.resolvePidToID(pidStr)
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
-
-		// Copy data file. Limit the copy to the dump's allocated extent
-		// (shared_mem_fs.current_offset) so we don't scan the full 25GB
-		// buffer, which on hugetlbfs is a zero-fill read of the whole pool.
-		srcData := filepath.Join(ctlDir, id)
-		dstData := filepath.Join(targetDir, id)
-		slog.InfoContext(ctx, "Copying checkpoint file", "src", srcData, "dst", dstData)
-		if err := copyFile(srcData, dstData, dumpDataLimit(srcData)); err != nil {
-			return fmt.Errorf("failed to copy checkpoint file from %s to %s: %w", srcData, dstData, err)
+		dest := filepath.Join(targetDir, id)
+		specStr := strings.Join(specs[pid], ",")
+		if err := g.checkpointRegions(ctx, pid, specStr, dest); err != nil {
+			return fmt.Errorf("cr_client checkpoint failed for PID %d with specs %s: %w", pid, specStr, err)
 		}
-
-		// Copy host file. The -host file is the DMA staging double-buffer —
-		// transient scratch, ~2GB of mostly-stale bytes; copying it both ways
-		// dominated swap latency in Phase 1 measurements. Skipped unless
-		// GPU_CR_COPY_HOST_FILE=1.
-		if copyHostFileEnabled() {
-			srcHost := filepath.Join(ctlDir, fmt.Sprintf("%s-host", id))
-			dstHost := filepath.Join(targetDir, fmt.Sprintf("%s-host", id))
-			if _, err := os.Stat(srcHost); err == nil {
-				slog.InfoContext(ctx, "Copying host file", "src", srcHost, "dst", dstHost)
-				if err := copyFile(srcHost, dstHost, 0); err != nil {
-					return fmt.Errorf("failed to copy host file from %s to %s: %w", srcHost, dstHost, err)
-				}
-			}
-		}
+		owners[pidStr] = id
 	}
-	slog.InfoContext(ctx, "Copying snapshot files took", "duration", time.Since(t1))
+	slog.InfoContext(ctx, "GPU-CR selective checkpoint (direct-to-destination) took", "duration", time.Since(t0))
+
+	// Slot metadata + explicit utimes: these files are the ONLY copy of a
+	// parked slot, so GC decisions must never ride on mmap-driven mtimes
+	// (which hugetlbfs does not reliably update) or on a blind TTL.
+	if err := writeGroupMeta(targetDir, owners); err != nil {
+		slog.WarnContext(ctx, "failed to write slot metadata (GC will be conservative)", "dir", targetDir, "err", err)
+	}
+	touchGroup(targetDir)
 
 	return nil
 }
 
-// Restore triggers a selective restoration of the configured memory regions.
+// Restore triggers a selective restoration of the configured memory regions,
+// read by the preloader directly from <group store>/<slot>/<id>.
 func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 	cfg := req.Config.GetMemoryRegions()
 	if cfg == nil {
@@ -216,64 +276,34 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	storeMu.Lock()
+	defer storeMu.Unlock()
 
 	slog.InfoContext(ctx, "Restoring memory regions using GPU-CR",
 		"jobID", req.JobID, "slot", slot, "pids", regionPIDs(cfg), "regions", len(cfg.GetRegions()))
 
-	ctlDir := exportDir()
-	snapshotsDir := snapshotStoreDir(ctlDir)
-	targetDir, err := slotDir(snapshotsDir, slot)
+	targetDir, err := groupDir(slot)
 	if err != nil {
 		return err
 	}
 	if _, err := os.Stat(targetDir); err != nil {
-		return fmt.Errorf("snapshot slot %q not found in snapshot store %s: %w", slot, snapshotsDir, err)
+		return fmt.Errorf("snapshot slot %q not found in group store %s: %w", slot, groupStoreDir(), err)
 	}
 
-	// 1. Copy files back from the snapshot store (overwriting the active
-	// dump buffer). When ctlDir is a hugetlbfs mount, write(2) is not
-	// supported and truncating would rip pages out of the workload's live
-	// mapping, so we write through a shared mmap of the existing buffer file
-	// instead.
-	hugetlb := isHugetlbfs(ctlDir)
 	t0 := time.Now()
 	for _, pid := range regionPIDs(cfg) {
 		id, err := g.resolvePidToID(strconv.Itoa(int(pid)))
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
-
-		// Restore data file.
-		srcData := filepath.Join(targetDir, id)
-		dstData := filepath.Join(ctlDir, id)
-		slog.InfoContext(ctx, "Restoring checkpoint file", "src", srcData, "dst", dstData, "hugetlbfs", hugetlb)
-		if err := restoreCopy(srcData, dstData, hugetlb); err != nil {
-			return fmt.Errorf("failed to restore checkpoint file from %s to %s: %w", srcData, dstData, err)
-		}
-
-		// Restore host file (skipped by default; see Snapshot).
-		if copyHostFileEnabled() {
-			srcHost := filepath.Join(targetDir, fmt.Sprintf("%s-host", id))
-			dstHost := filepath.Join(ctlDir, fmt.Sprintf("%s-host", id))
-			if _, err := os.Stat(srcHost); err == nil {
-				slog.InfoContext(ctx, "Restoring host file", "src", srcHost, "dst", dstHost, "hugetlbfs", hugetlb)
-				if err := restoreCopy(srcHost, dstHost, hugetlb); err != nil {
-					return fmt.Errorf("failed to restore host file from %s to %s: %w", srcHost, dstHost, err)
-				}
-			}
-		}
-	}
-	slog.InfoContext(ctx, "Restoring snapshot files took", "duration", time.Since(t0))
-
-	// 2. Trigger restore via cr_client.
-	t1 := time.Now()
-	for _, pid := range regionPIDs(cfg) {
+		dest := filepath.Join(targetDir, id)
 		specStr := strings.Join(specs[pid], ",")
-		if err := g.restoreRegions(ctx, pid, specStr); err != nil {
+		if err := g.restoreRegions(ctx, pid, specStr, dest); err != nil {
 			return fmt.Errorf("cr_client restore failed for PID %d with specs %s: %w", pid, specStr, err)
 		}
 	}
-	slog.InfoContext(ctx, "GPU-CR selective restore took", "duration", time.Since(t1))
+	slog.InfoContext(ctx, "GPU-CR selective restore (direct-from-destination) took", "duration", time.Since(t0))
+	touchGroup(targetDir)
 	return nil
 }
 
@@ -314,21 +344,21 @@ func (g *MemoryRegions) runCommand(ctx context.Context, name string, args ...str
 	return nil
 }
 
-func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec string) error {
+func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec string, dest string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
 	binaryPath := g.getCrClientPath()
-	if err := g.runCommand(ctx, binaryPath, "-c", "-p", strconv.Itoa(int(pid)), "-s", spec); err != nil {
+	if err := g.runCommand(ctx, binaryPath, "-c", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
 		return fmt.Errorf("cr_client checkpoint (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
 }
 
-func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec string) error {
+func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec string, dest string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
 	binaryPath := g.getCrClientPath()
-	if err := g.runCommand(ctx, binaryPath, "-r", "-p", strconv.Itoa(int(pid)), "-s", spec); err != nil {
+	if err := g.runCommand(ctx, binaryPath, "-r", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
 		return fmt.Errorf("cr_client restore (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
@@ -336,10 +366,17 @@ func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec stri
 
 // resolvePidToID maps a workload PID to its GPU-CR dump-buffer id.
 func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
-	ctlDir := exportDir()
-	mapPath := filepath.Join(ctlDir, fmt.Sprintf("pid_map_%s", pid))
-	data, err := os.ReadFile(mapPath)
-	if err == nil {
+	// pid_map lives in the ctl dir since GEP-0006 (and is finally non-empty
+	// there: the preloader writes it with write(2) on tmpfs). Check the
+	// legacy data dir too for pre-GEP workloads.
+	var lastErr error
+	for _, dir := range []string{ctlFilesDir(), dataDir()} {
+		mapPath := filepath.Join(dir, fmt.Sprintf("pid_map_%s", pid))
+		data, err := os.ReadFile(mapPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 		// Strip NULs as well as whitespace: an mmap-written map file is
 		// hugepage-sized with a zero-padded tail.
 		id := strings.TrimSpace(strings.TrimRight(string(data), "\x00"))
@@ -348,16 +385,16 @@ func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
 		}
 	}
 
-	// Fallback: the preloader writes pid_map via buffered stdio, which
+	// Fallback: pre-GEP preloaders wrote pid_map via buffered stdio, which
 	// silently produces an empty file on hugetlbfs. The dump buffer mapping
 	// is visible in /proc/<pid>/maps and its basename IS the id.
 	id, ferr := idFromProcMaps(g.procRoot, pid)
 	if ferr != nil {
 		readProblem := "contents are not a numeric id"
-		if err != nil {
-			readProblem = err.Error()
+		if lastErr != nil {
+			readProblem = lastErr.Error()
 		}
-		return "", fmt.Errorf("pid map file %s unusable (%s) and /proc fallback failed: %w", mapPath, readProblem, ferr)
+		return "", fmt.Errorf("pid map for %s unusable (%s) and /proc fallback failed: %w", pid, readProblem, ferr)
 	}
 	slog.Info("Resolved GPU-CR id from /proc/<pid>/maps fallback", "pid", pid, "id", id)
 	return id, nil
@@ -399,10 +436,9 @@ func idFromProcMaps(procRoot, pid string) (string, error) {
 	return "", fmt.Errorf("no huge-ckpt/<id> mapping found in %s/%s/maps", procRoot, pid)
 }
 
-// snapshotStoreDir returns where snapshot slot copies are kept. Defaults to
-// <ctlDir>/snapshots for backwards compatibility, but should be pointed at a
-// disk-backed path via SNAPSHOT_DIR when ctlDir is hugetlbfs (write(2) is not
-// supported there, and copies would permanently consume hugepages).
+// snapshotStoreDir returns where LEGACY snapshot slot copies were kept
+// (pre-GEP-0001 agent-side copies). Only GC still looks here, to reap
+// leftovers from older agents.
 func snapshotStoreDir(ctlDir string) string {
 	if d := os.Getenv("SNAPSHOT_DIR"); d != "" {
 		return d
@@ -410,221 +446,11 @@ func snapshotStoreDir(ctlDir string) string {
 	return filepath.Join(ctlDir, "snapshots")
 }
 
-func copyHostFileEnabled() bool {
-	return os.Getenv("GPU_CR_COPY_HOST_FILE") == "1"
-}
-
-const hugetlbfsMagic = 0x958458f6
-
-func isHugetlbfs(path string) bool {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return false
-	}
-	return st.Type == hugetlbfsMagic
-}
-
-// dumpDataLimit reads the shared_mem_fs header of a GPU-CR dump file and
-// returns current_offset — the end of allocated data — so copies can skip the
-// untouched tail of the buffer. Falls back to 0 (copy everything) if the
-// header is unreadable or implausible.
-func dumpDataLimit(path string) int64 {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-
-	st, err := f.Stat()
-	if err != nil {
-		return 0
-	}
-
-	var hdr [16]byte
-	if _, err := io.ReadFull(f, hdr[:]); err != nil {
-		return 0
-	}
-	raw := binary.LittleEndian.Uint64(hdr[8:16])
-	if raw > math.MaxInt64 {
-		return 0
-	}
-	currentOffset := int64(raw)
-	if currentOffset < 16 || currentOffset > st.Size() {
-		return 0
-	}
-	return currentOffset
-}
-
-// restoreCopy copies a saved snapshot file back over the live dump buffer.
-func restoreCopy(src, dst string, hugetlb bool) error {
-	if hugetlb {
-		return copyIntoHugetlbfs(src, dst)
-	}
-	return copyFile(src, dst, 0)
-}
-
-// copyFile copies src to dst (regular filesystem), sparse-aware. If limit > 0
-// only the first limit bytes are copied; dst is still sized to match src.
-func copyFile(src, dst string, limit int64) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	srcStat, err := srcFile.Stat()
-	if err != nil {
-		return err
-	}
-	srcSize := srcStat.Size()
-	if limit <= 0 || limit > srcSize {
-		limit = srcSize
-	}
-
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-
-	// Open with O_RDWR | O_CREATE | O_TRUNC to ensure we can write and truncate
-	dstFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
-	// Pre-set the size to match source (creates a sparse file of that size if we don't write to it)
-	if err := dstFile.Truncate(srcSize); err != nil {
-		return err
-	}
-
-	const bufSize = 4 * 1024 * 1024 // 4MB blocks: hugetlbfs zero-fill reads dominate copy time
-	buf := make([]byte, bufSize)
-
-	var writeOffset int64
-	var currentOffset int64
-
-	for currentOffset < limit {
-		want := int64(bufSize)
-		if remaining := limit - currentOffset; remaining < want {
-			want = remaining
-		}
-		n, readErr := srcFile.Read(buf[:want])
-		if n > 0 && !isAllZeros(buf[:n]) {
-			if currentOffset != writeOffset {
-				if _, err := dstFile.Seek(currentOffset, io.SeekStart); err != nil {
-					return err
-				}
-				writeOffset = currentOffset
-			}
-			nw, err := dstFile.Write(buf[:n])
-			if err != nil {
-				return err
-			}
-			writeOffset += int64(nw)
-		}
-		currentOffset += int64(n)
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return readErr
-		}
-	}
-
-	return dstFile.Sync()
-}
-
-// copyIntoHugetlbfs writes src back into the existing dump buffer file dst
-// on hugetlbfs via a shared mmap (hugetlbfs has no write(2), and truncating
-// would invalidate the workload's live mapping).
-//
-// HOLE-FAITHFUL BY CONTRACT: every byte of the dump extent is authoritative
-// checkpoint payload, INCLUDING zeros — first-step optimizer moments are
-// exactly zero by construction, and skipping them left a co-resident
-// checkpoint's bytes beneath sparse holes (the 2026-08-04 silent-corruption
-// incident; see GPU-CR GEP-0003). We therefore copy the full extent
-// [0, current_offset) unconditionally: pread reads file holes as zeros, so
-// zeros land in the buffer exactly like data. Hugepage faults stay bounded
-// by the dump extent, not the buffer size.
-func copyIntoHugetlbfs(src, dst string) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	srcStat, err := srcFile.Stat()
-	if err != nil {
-		return err
-	}
-	srcSize := srcStat.Size()
-
-	limit := dumpDataLimit(src)
-	if limit <= 0 || limit > srcSize {
-		limit = srcSize
-	}
-
-	dstFile, err := os.OpenFile(dst, os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("live dump buffer must already exist on hugetlbfs: %w", err)
-	}
-	defer dstFile.Close()
-
-	dstStat, err := dstFile.Stat()
-	if err != nil {
-		return err
-	}
-	dstSize := dstStat.Size()
-	if dstSize == 0 {
-		return fmt.Errorf("dump buffer %s has zero size", dst)
-	}
-	if limit > dstSize {
-		limit = dstSize
-	}
-
-	m, err := syscall.Mmap(int(dstFile.Fd()), 0, int(dstSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
-	if err != nil {
-		return fmt.Errorf("mmap of hugetlbfs dump buffer %s failed: %w", dst, err)
-	}
-	defer func() {
-		if merr := syscall.Munmap(m); merr != nil {
-			slog.Warn("munmap of dump buffer failed", "dst", dst, "error", merr)
-		}
-	}()
-
-	buf := make([]byte, 4*1024*1024)
-	for off := int64(0); off < limit; {
-		want := int64(len(buf))
-		if remaining := limit - off; remaining < want {
-			want = remaining
-		}
-		n, readErr := srcFile.ReadAt(buf[:want], off)
-		if n > 0 {
-			copy(m[off:off+int64(n)], buf[:n])
-			off += int64(n)
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return readErr
-		}
-	}
-	return nil
-}
-
-func isAllZeros(buf []byte) bool {
-	for _, b := range buf {
-		if b != 0 {
-			return false
-		}
-	}
-	return true
-}
-
 // opTimeout bounds a single cr_client invocation. Without it, a workload
 // dying mid-operation leaves cr_client polling the shared-memory control file
 // forever and the job wedged in TRANSITIONING (observed in Phase 0).
+// cr_client now enforces the same deadline internally (GEP-0001); this is
+// the outer belt to its braces.
 func opTimeout() time.Duration {
 	if v := os.Getenv("GPU_CR_OP_TIMEOUT_SEC"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

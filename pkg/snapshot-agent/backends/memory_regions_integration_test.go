@@ -22,13 +22,11 @@ import (
 )
 
 // fakeDevice simulates the GPU-CR data path for one workload: "device
-// memory" whose bytes cr_client -c dumps into the ctl-dir buffer file and
-// cr_client -r loads back from it.
+// memory" whose bytes cr_client -c dumps directly into the destination file
+// named by -o (GEP-0001) and cr_client -r loads back from it.
 type fakeDevice struct {
 	mu     sync.Mutex
 	memory []byte
-	ctlDir string
-	id     string
 	fail   error
 }
 
@@ -38,12 +36,20 @@ func (d *fakeDevice) exec(ctx context.Context, name string, args ...string) ([]b
 	if d.fail != nil {
 		return []byte("cr_client: injected failure"), d.fail
 	}
-	dumpPath := filepath.Join(d.ctlDir, d.id)
+	var dest string
+	for i, a := range args {
+		if a == "-o" && i+1 < len(args) {
+			dest = args[i+1]
+		}
+	}
+	if dest == "" {
+		return nil, fmt.Errorf("cr_client invoked without -o destination (args %v)", args)
+	}
 	switch args[0] {
 	case "-c":
-		return nil, os.WriteFile(dumpPath, d.memory, 0o600)
+		return nil, os.WriteFile(dest, d.memory, 0o600)
 	case "-r":
-		data, err := os.ReadFile(dumpPath)
+		data, err := os.ReadFile(dest)
 		if err != nil {
 			return nil, err
 		}
@@ -176,11 +182,11 @@ func restoreSlotAndWait(t *testing.T, client pb.SnapshotAgentServiceClient, slot
 // job state transitions, and backend failure surfacing.
 func TestMemoryRegionsEndToEnd(t *testing.T) {
 	ctlDir := t.TempDir()
-	snapDir := t.TempDir()
 	t.Setenv("EXPORT_FILE_PATH", ctlDir)
-	t.Setenv("SNAPSHOT_DIR", snapDir)
+	t.Setenv("GPU_CR_CTL_PATH", "")
+	t.Setenv("GPU_CR_GROUP_STORE", "")
 
-	dev := &fakeDevice{ctlDir: ctlDir, id: "42"}
+	dev := &fakeDevice{}
 	// pid_map written by the (simulated) preloader at workload startup.
 	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o600))
 
@@ -239,9 +245,9 @@ func TestMemoryRegionsEndToEnd(t *testing.T) {
 func TestMemoryRegionsInvalidRequests(t *testing.T) {
 	ctlDir := t.TempDir()
 	t.Setenv("EXPORT_FILE_PATH", ctlDir)
-	t.Setenv("SNAPSHOT_DIR", t.TempDir())
+	t.Setenv("GPU_CR_CTL_PATH", "")
 
-	dev := &fakeDevice{ctlDir: ctlDir, id: "42"}
+	dev := &fakeDevice{}
 	client := startAgent(t, dev)
 
 	// Empty regions: the RPC is accepted (validation runs in the backend)

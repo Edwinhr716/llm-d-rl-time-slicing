@@ -136,42 +136,50 @@ helm install snapshot-agent ./snapshot-agent \
   --set memoryRegions.enabled=true
 ```
 
-Enabling it adds, all lifted from the validated GPU-CR prototype deployment:
+Since GPU-CR GEP-0001 (destination-path checkpoints) + GEP-0006 (ctl tmpfs),
+the agent moves **no dump bytes**: snapshots are dumped by the workload's
+preloader directly into the destination group store (`cr_client -o`) and
+restores read straight from it. The agent therefore requests **no
+hugepages-2Mi** at all, which is what lets it schedule on fresh nodes before
+hugepage capacity exists and absorb the hugepage bootstrap as an init
+container.
+
+Enabling it adds:
 
 *   `hostIPC: true` — GPU-CR's shared-memory control channel between the
     agent's `cr_client` and the workload's preloader.
-*   A privileged `mount-hugetlbfs` init container that `nsenter`s the host
-    mount namespace and idempotently mounts hugetlbfs at
-    `memoryRegions.hostCtlPath` (default `/var/tmp/huge-ckpt`,
-    `pagesize=2M,mode=0777`). GPU-CR only gets hugepage backing if the
-    checkpoint dir is a real hugetlbfs mount; without it every dump silently
-    degrades to boot-disk page cache. Set `memoryRegions.hugetlbfs.mount=false`
-    if the host mounts it by other means.
-*   Env for the agent: `EXPORT_FILE_PATH` (= `memoryRegions.ctlDir`),
-    `SNAPSHOT_DIR` (= `memoryRegions.snapshotDir`), `GPU_CR_OP_TIMEOUT_SEC`,
-    and `GPU_CR_COPY_HOST_FILE=1` when `memoryRegions.copyHostFile=true`.
-    Setting `EXPORT_FILE_PATH` also switches on the agent's GPU-CR artifact
-    GC and the 0777 chmod of the checkpoint dir at startup.
-*   Volumes: the `huge-ckpt` hostPath at `ctlDir` (with
-    `mountPropagation: HostToContainer` so the init container's mount is
-    visible) and the disk-backed `gcr-snapshots` hostPath at `snapshotDir`
-    (snapshot copies must NOT live on hugetlbfs: no `write(2)` support, and
-    copies there would pin hugepages forever).
-*   `hugepages-2Mi` requests/limits (`memoryRegions.hugepagesResource`,
-    default `2Gi`) merged into the agent's resources, plus a memory request
-    (required by Kubernetes alongside hugepages). This is hugetlb cgroup
-    headroom for mmap-write restores into live dump buffers.
+*   A `PriorityClass` (`priorityClass.*`) so the agent wins node placement
+    over GPU workloads.
+*   Three privileged init containers that `nsenter` the host mount
+    namespace, all idempotent per node boot:
+    *   `provision-hugepages` (`gpuCr.bootstrap.*`) — writes
+        `vm.nr_hugepages` (`pages2Mi`, default 12288 = 24 Gi) and restarts
+        the kubelet so the node publishes `hugepages-2Mi` capacity for
+        WORKLOAD pods.
+    *   `mount-ctl-tmpfs` — mounts the GEP-0006 control-plane tmpfs at
+        `gpuCr.ctl.hostPath` (default `/var/tmp/gpu-cr-ctl`, `gpuCr.ctl.sizeMi`
+        cap).
+    *   `mount-hugetlbfs` — mounts hugetlbfs at `gpuCr.dataDir.hostPath`
+        (default `/var/tmp/huge-ckpt`, `pagesize=2M,mode=0777`); without it
+        every dump silently degrades to boot-disk page cache.
+*   Env for the agent: `EXPORT_FILE_PATH` (= `gpuCr.dataDir.mountPath`),
+    `GPU_CR_CTL_PATH` (= `gpuCr.ctl.mountPath`), `GPU_CR_OP_TIMEOUT_SEC`,
+    and — while `memoryRegions.legacySnapshots.enabled` — `SNAPSHOT_DIR`,
+    which the agent uses ONLY as a GC input to TTL-reap pre-GEP copy-store
+    leftovers. Setting `EXPORT_FILE_PATH` also switches on the agent's
+    GPU-CR artifact GC and the 0777 chmod of the checkpoint dir at startup.
+*   Volumes: `huge-ckpt` at `gpuCr.dataDir.mountPath` and `gpu-cr-ctl` at
+    `gpuCr.ctl.mountPath` (both `mountPropagation: HostToContainer` so the
+    init containers' mounts are visible), plus the legacy `gcr-snapshots`
+    hostPath while the legacy sweep is enabled.
 
 Node prerequisites:
 
-*   The node must pre-allocate hugepages (`vm.nr_hugepages`). Size the pool
-    for your workloads: a GPU-CR dump + staging pair pins **~27 Gi per
-    workload** on 2 Mi pages (25 Gi dump buffer + 2×1 Gi staging), reserved
-    at `mmap` time.
 *   Workload pods need the GPU-CR preloader (`LD_PRELOAD=vGPU-NVIDIA.so`),
     `hostPID`, `hostIPC`, the `huge-ckpt` hostPath mounted at
-    `/mnt/huge-ckpt` with `mountPropagation: HostToContainer`, and matching
-    `hugepages-2Mi` resources.
+    `/mnt/huge-ckpt` and the ctl tmpfs at `/mnt/gpu-cr-ctl` (both with
+    `mountPropagation: HostToContainer`), and `hugepages-2Mi` resources
+    sized for their dump buffers plus destination-group headroom.
 
 There is no `cr_client` install step: the binary ships inside the agent image
 at `/usr/local/bin/cr_client`, so the agent and `cr_client` versions always
