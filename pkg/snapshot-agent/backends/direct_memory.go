@@ -105,17 +105,6 @@ func (d *DirectMemory) runCommand(ctx context.Context, name string, args ...stri
 	return nil
 }
 
-// opTimeout is the per-cr_client-invocation deadline, configurable via
-// GPU_CR_OP_TIMEOUT_SEC (default 120).
-func opTimeout() time.Duration {
-	if v := os.Getenv("GPU_CR_OP_TIMEOUT_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return 120 * time.Second
-}
-
 func (d *DirectMemory) checkpointPID(ctx context.Context, pid string) error {
 	binaryPath := d.getCrClientPath()
 	if err := d.runCommand(ctx, binaryPath, "-c", "-p", pid); err != nil {
