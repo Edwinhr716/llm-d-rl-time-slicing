@@ -72,7 +72,7 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	assert.NilError(t, err)
 	s := grpc.NewServer()
-	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry())
+	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry(), nil)
 	pb.RegisterSnapshotAgentServiceServer(s, srv)
 	grpc_health_v1.RegisterHealthServer(s, server.NewHealthServer(backendsMap, backends.BackendNoop))
 	go func() {
