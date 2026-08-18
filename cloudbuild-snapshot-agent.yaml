@@ -9,6 +9,8 @@ steps:
       - build
       - -f
       - docker/snapshot-agent/Dockerfile
+      - --build-arg
+      - GPUCR_IMAGE=${_GPUCR_IMAGE}
       - -t
       - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:${_TAG}
       - .
@@ -25,7 +27,8 @@ images:
   - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:${_TAG}
   - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/lora-swap-client-max1:${_TAG}
 substitutions:
-  _TAG: dev
+  _TAG: ctl-tmpfs-mr-v1
+  _GPUCR_IMAGE: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/time-slicing/gpucr-so:gep0006-6bdce96
 options:
   machineType: E2_HIGHCPU_8
   logging: CLOUD_LOGGING_ONLY

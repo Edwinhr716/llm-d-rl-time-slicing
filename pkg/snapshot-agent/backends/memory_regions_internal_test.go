@@ -1,13 +1,11 @@
 package backends
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -51,18 +49,19 @@ func (f *fakeExec) callArgs() [][]string {
 }
 
 // newTestBackend returns a MemoryRegions backend wired to tempdirs via env.
+// The returned store dir is where destination-slot dumps land (-o paths).
 //
 //nolint:gocritic // The project configuration bans named returns, conflicting with unnamedResult
 func newTestBackend(t *testing.T, fake *fakeExec) (*MemoryRegions, string, string) {
 	t.Helper()
 	ctlDir := t.TempDir()
-	snapDir := t.TempDir()
 	t.Setenv("EXPORT_FILE_PATH", ctlDir)
-	t.Setenv("SNAPSHOT_DIR", snapDir)
+	t.Setenv("GPU_CR_CTL_PATH", "")
+	t.Setenv("GPU_CR_GROUP_STORE", "")
 	g := NewMemoryRegions()
 	g.execCommand = fake.fn
 	g.lookPath = func(string) (string, error) { return "", fmt.Errorf("not found") }
-	return g, ctlDir, snapDir
+	return g, ctlDir, filepath.Join(ctlDir, "groups")
 }
 
 // writePidMap maps the test PID 123 to dump-buffer id 42 in the ctl dir.
@@ -164,25 +163,22 @@ func TestRegionSpecs(t *testing.T) {
 }
 
 func TestMemoryRegionsSnapshot(t *testing.T) {
-	dumpContent := []byte("dump content for id 42 - definitely not a valid header")
-
 	type testCase struct {
-		name         string
-		config       *pb.BackendConfig
-		jobID        string
-		execErr      error
-		wantErr      string
-		wantArgs     [][]string
-		wantNoExec   bool
-		wantSlotFile string // relative to SNAPSHOT_DIR; verified to equal dumpContent
+		name       string
+		config     *pb.BackendConfig
+		jobID      string
+		execErr    error
+		wantErr    string
+		wantSpec   string // -s argument
+		wantSlot   string // -o = <store>/<wantSlot>/42; empty = no args check
+		wantNoExec bool
 	}
 
 	run := func(t *testing.T, tc testCase) {
 		t.Helper()
 		fake := &fakeExec{err: tc.execErr}
-		g, ctlDir, snapDir := newTestBackend(t, fake)
+		g, ctlDir, storeDir := newTestBackend(t, fake)
 		writePidMap(t, ctlDir)
-		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), dumpContent, 0o600))
 
 		err := g.Snapshot(context.Background(), Request{JobID: tc.jobID, Config: tc.config})
 		if tc.wantErr != "" {
@@ -192,37 +188,38 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 		}
 		if tc.wantNoExec {
 			assert.Assert(t, len(fake.callArgs()) == 0, "cr_client must not be invoked")
-		} else if tc.wantArgs != nil {
-			assert.DeepEqual(t, fake.callArgs(), tc.wantArgs)
-		}
-		if tc.wantSlotFile != "" {
-			got, rerr := os.ReadFile(filepath.Join(snapDir, tc.wantSlotFile))
-			assert.NilError(t, rerr)
-			assert.Assert(t, bytes.Equal(got, dumpContent), "snapshot copy differs from dump")
+		} else if tc.wantSlot != "" {
+			dest := filepath.Join(storeDir, tc.wantSlot, "42")
+			assert.DeepEqual(t, fake.callArgs(), [][]string{{"-c", "-p", "123", "-s", tc.wantSpec, "-o", dest}})
+			if tc.wantErr == "" {
+				// The slot dir must exist for the preloader to dump into.
+				_, statErr := os.Stat(filepath.Join(storeDir, tc.wantSlot))
+				assert.NilError(t, statErr, "slot dir not created")
+			}
 		}
 	}
 
 	testCases := []testCase{
 		{
-			name:         "single region invokes cr_client and copies dump",
-			config:       regionsConfig("slot-a", region(123, 0x7f00, 1024)),
-			jobID:        "job-1",
-			wantArgs:     [][]string{{"-c", "-p", "123", "-s", "0x7f00:1024"}},
-			wantSlotFile: "slot-a/42",
+			name:     "single region invokes cr_client with destination path",
+			config:   regionsConfig("slot-a", region(123, 0x7f00, 1024)),
+			jobID:    "job-1",
+			wantSpec: "0x7f00:1024",
+			wantSlot: "slot-a",
 		},
 		{
-			name:         "regions of one pid joined into one spec",
-			config:       regionsConfig("slot-a", region(123, 0x7f00, 1024), region(123, 0x8f00, 2048)),
-			jobID:        "job-1",
-			wantArgs:     [][]string{{"-c", "-p", "123", "-s", "0x7f00:1024,0x8f00:2048"}},
-			wantSlotFile: "slot-a/42",
+			name:     "regions of one pid joined into one spec",
+			config:   regionsConfig("slot-a", region(123, 0x7f00, 1024), region(123, 0x8f00, 2048)),
+			jobID:    "job-1",
+			wantSpec: "0x7f00:1024,0x8f00:2048",
+			wantSlot: "slot-a",
 		},
 		{
-			name:         "empty snapshot_name falls back to job id",
-			config:       regionsConfig("", region(123, 0x7f00, 1024)),
-			jobID:        "job-1",
-			wantArgs:     [][]string{{"-c", "-p", "123", "-s", "0x7f00:1024"}},
-			wantSlotFile: "job-1/42",
+			name:     "empty snapshot_name falls back to job id",
+			config:   regionsConfig("", region(123, 0x7f00, 1024)),
+			jobID:    "job-1",
+			wantSpec: "0x7f00:1024",
+			wantSlot: "job-1",
 		},
 		{
 			name:    "nil config rejected",
@@ -244,17 +241,55 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 			wantNoExec: true,
 		},
 		{
-			name:    "exec failure surfaces",
-			config:  regionsConfig("slot-a", region(123, 0x7f00, 1024)),
-			jobID:   "job-1",
-			execErr: fmt.Errorf("exec error"),
-			wantErr: "cr_client checkpoint failed for PID 123",
+			name:       "nested snapshot_name rejected before exec",
+			config:     regionsConfig("job/slot-a", region(123, 0x7f00, 1024)),
+			jobID:      "job-1",
+			wantErr:    "path traversal or nested",
+			wantNoExec: true,
+		},
+		{
+			name:     "exec failure surfaces",
+			config:   regionsConfig("slot-a", region(123, 0x7f00, 1024)),
+			jobID:    "job-1",
+			execErr:  fmt.Errorf("exec error"),
+			wantErr:  "cr_client checkpoint failed for PID 123",
+			wantSpec: "0x7f00:1024",
+			wantSlot: "slot-a",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) { run(t, tc) })
 	}
+}
+
+// TestMemoryRegionsSnapshotOwnersMeta verifies the .owners liveness metadata
+// (pid + starttime) that GC's owner-liveness sweep relies on. Needs a real
+// procfs, so it uses the test process itself as the owner.
+func TestMemoryRegionsSnapshotOwnersMeta(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no procfs on this host")
+	}
+	fake := &fakeExec{}
+	g, ctlDir, storeDir := newTestBackend(t, fake)
+	pid := strconv.Itoa(os.Getpid())
+	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_"+pid), []byte("42\n"), 0o600))
+
+	pidNum, err := strconv.ParseInt(pid, 10, 32)
+	assert.NilError(t, err)
+	err = g.Snapshot(context.Background(), Request{
+		JobID:  "job-1",
+		Config: regionsConfig("slot-a", region(int32(pidNum), 0x7f00, 1024)),
+	})
+	assert.NilError(t, err)
+
+	owners, err := readGroupMeta(filepath.Join(storeDir, "slot-a"))
+	assert.NilError(t, err)
+	st, ok := owners[pid]
+	assert.Assert(t, ok, "own pid missing from .owners: %v", owners)
+	want, err := procStarttime(pid)
+	assert.NilError(t, err)
+	assert.Equal(t, st, want)
 }
 
 func TestMemoryRegionsSnapshotTimeout(t *testing.T) {
@@ -276,65 +311,20 @@ func TestMemoryRegionsSnapshotTimeout(t *testing.T) {
 	assert.ErrorContains(t, err, "context deadline exceeded")
 }
 
-func TestMemoryRegionsSnapshotHostFileGating(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		t.Run(fmt.Sprintf("copyHostFile=%v", enabled), func(t *testing.T) {
-			fake := &fakeExec{}
-			g, ctlDir, snapDir := newTestBackend(t, fake)
-			if enabled {
-				t.Setenv("GPU_CR_COPY_HOST_FILE", "1")
-			}
-			writePidMap(t, ctlDir)
-			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), []byte("data"), 0o600))
-			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42-host"), []byte("host staging"), 0o600))
-
-			err := g.Snapshot(context.Background(), Request{
-				JobID:  "job-1",
-				Config: regionsConfig("slot-a", region(123, 0x7f00, 1024)),
-			})
-			assert.NilError(t, err)
-
-			_, statErr := os.Stat(filepath.Join(snapDir, "slot-a", "42-host"))
-			if enabled {
-				assert.NilError(t, statErr, "-host file should be copied when GPU_CR_COPY_HOST_FILE=1")
-			} else {
-				assert.Assert(t, os.IsNotExist(statErr), "-host file should be skipped by default")
-			}
-		})
-	}
-}
-
 func TestMemoryRegionsRestore(t *testing.T) {
-	snapContent := []byte("saved slot-a bytes: not zeros, not a header........")
-
-	t.Run("copy-back happens before cr_client -r", func(t *testing.T) {
+	t.Run("restore reads straight from the destination path", func(t *testing.T) {
 		fake := &fakeExec{}
-		g, ctlDir, snapDir := newTestBackend(t, fake)
+		g, ctlDir, storeDir := newTestBackend(t, fake)
 		writePidMap(t, ctlDir)
-
-		// Live dump buffer holds different (dirty) bytes.
-		dirty := bytes.Repeat([]byte{0xAA}, len(snapContent))
-		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), dirty, 0o600))
-		// Saved snapshot slot.
-		assert.NilError(t, os.MkdirAll(filepath.Join(snapDir, "slot-a"), 0o755))
-		assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42"), snapContent, 0o600))
-
-		// At cr_client time, the live buffer must already hold the snapshot.
-		var contentAtExec []byte
-		fake.observe = func(name string, args ...string) {
-			data, err := os.ReadFile(filepath.Join(ctlDir, "42"))
-			assert.NilError(t, err)
-			contentAtExec = data
-		}
+		assert.NilError(t, os.MkdirAll(filepath.Join(storeDir, "slot-a"), 0o755))
 
 		err := g.Restore(context.Background(), Request{
 			JobID:  "job-1",
 			Config: regionsConfig("slot-a", region(123, 0x7f00, 1024)),
 		})
 		assert.NilError(t, err)
-		assert.DeepEqual(t, fake.callArgs(), [][]string{{"-r", "-p", "123", "-s", "0x7f00:1024"}})
-		assert.Assert(t, bytes.Equal(contentAtExec, snapContent),
-			"live dump buffer was not restored before cr_client -r ran")
+		dest := filepath.Join(storeDir, "slot-a", "42")
+		assert.DeepEqual(t, fake.callArgs(), [][]string{{"-r", "-p", "123", "-s", "0x7f00:1024", "-o", dest}})
 	})
 
 	t.Run("missing snapshot slot is a clear error", func(t *testing.T) {
@@ -350,201 +340,18 @@ func TestMemoryRegionsRestore(t *testing.T) {
 		assert.Assert(t, len(fake.callArgs()) == 0, "cr_client must not run without a snapshot")
 	})
 
-	t.Run("host file restored only when enabled", func(t *testing.T) {
-		for _, enabled := range []bool{false, true} {
-			fake := &fakeExec{}
-			g, ctlDir, snapDir := newTestBackend(t, fake)
-			if enabled {
-				t.Setenv("GPU_CR_COPY_HOST_FILE", "1")
-			} else {
-				t.Setenv("GPU_CR_COPY_HOST_FILE", "")
-			}
-			writePidMap(t, ctlDir)
-			assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "42"), []byte("dirty"), 0o600))
-			assert.NilError(t, os.MkdirAll(filepath.Join(snapDir, "slot-a"), 0o755))
-			assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42"), []byte("datax"), 0o600))
-			assert.NilError(t, os.WriteFile(filepath.Join(snapDir, "slot-a", "42-host"), []byte("host bytes"), 0o600))
+	t.Run("exec failure surfaces", func(t *testing.T) {
+		fake := &fakeExec{err: fmt.Errorf("exec error")}
+		g, ctlDir, storeDir := newTestBackend(t, fake)
+		writePidMap(t, ctlDir)
+		assert.NilError(t, os.MkdirAll(filepath.Join(storeDir, "slot-a"), 0o755))
 
-			err := g.Restore(context.Background(), Request{
-				JobID:  "job-1",
-				Config: regionsConfig("slot-a", region(123, 0x7f00, 1024)),
-			})
-			assert.NilError(t, err)
-
-			_, statErr := os.Stat(filepath.Join(ctlDir, "42-host"))
-			if enabled {
-				assert.NilError(t, statErr)
-			} else {
-				assert.Assert(t, os.IsNotExist(statErr))
-			}
-		}
+		err := g.Restore(context.Background(), Request{
+			JobID:  "job-1",
+			Config: regionsConfig("slot-a", region(123, 0x7f00, 1024)),
+		})
+		assert.ErrorContains(t, err, "cr_client restore failed for PID 123")
 	})
-}
-
-func TestDumpDataLimit(t *testing.T) {
-	type testCase struct {
-		name  string
-		setup func(t *testing.T) string // returns path
-		want  int64
-	}
-
-	makeDump := func(t *testing.T, size int, offset uint64) string {
-		t.Helper()
-		buf := make([]byte, size)
-		binary.LittleEndian.PutUint64(buf[8:16], offset)
-		path := filepath.Join(t.TempDir(), "dump")
-		assert.NilError(t, os.WriteFile(path, buf, 0o600))
-		return path
-	}
-
-	run := func(t *testing.T, tc testCase) {
-		t.Helper()
-		assert.Equal(t, dumpDataLimit(tc.setup(t)), tc.want)
-	}
-
-	testCases := []testCase{
-		{
-			name:  "valid header returns current_offset",
-			setup: func(t *testing.T) string { t.Helper(); return makeDump(t, 64, 48) },
-			want:  48,
-		},
-		{
-			name:  "offset beyond file size ignored",
-			setup: func(t *testing.T) string { t.Helper(); return makeDump(t, 64, 4096) },
-			want:  0,
-		},
-		{
-			name:  "offset inside header ignored",
-			setup: func(t *testing.T) string { t.Helper(); return makeDump(t, 64, 8) },
-			want:  0,
-		},
-		{
-			name:  "unreadable file returns zero",
-			setup: func(t *testing.T) string { t.Helper(); return filepath.Join(t.TempDir(), "missing") },
-			want:  0,
-		},
-		{
-			name: "file shorter than header returns zero",
-			setup: func(t *testing.T) string {
-				t.Helper()
-				path := filepath.Join(t.TempDir(), "short")
-				assert.NilError(t, os.WriteFile(path, []byte{1, 2, 3}, 0o600))
-				return path
-			},
-			want: 0,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) { run(t, tc) })
-	}
-}
-
-func TestCopyFile(t *testing.T) {
-	t.Run("zero blocks skipped but size preserved", func(t *testing.T) {
-		dir := t.TempDir()
-		src := filepath.Join(dir, "src")
-		dst := filepath.Join(dir, "dst")
-		assert.NilError(t, os.WriteFile(src, make([]byte, 1024), 0o600))
-
-		assert.NilError(t, copyFile(src, dst, 0))
-
-		got, err := os.ReadFile(dst)
-		assert.NilError(t, err)
-		assert.Equal(t, len(got), 1024)
-		assert.Assert(t, isAllZeros(got))
-	})
-
-	t.Run("non-zero content copied", func(t *testing.T) {
-		dir := t.TempDir()
-		src := filepath.Join(dir, "src")
-		dst := filepath.Join(dir, "dst")
-		content := []byte(strings.Repeat("payload!", 128))
-		assert.NilError(t, os.WriteFile(src, content, 0o600))
-
-		assert.NilError(t, copyFile(src, dst, 0))
-
-		got, err := os.ReadFile(dst)
-		assert.NilError(t, err)
-		assert.Assert(t, bytes.Equal(got, content))
-	})
-
-	t.Run("limit honored and dst sized to src", func(t *testing.T) {
-		dir := t.TempDir()
-		src := filepath.Join(dir, "src")
-		dst := filepath.Join(dir, "dst")
-		content := bytes.Repeat([]byte{0xFF}, 100)
-		assert.NilError(t, os.WriteFile(src, content, 0o600))
-
-		assert.NilError(t, copyFile(src, dst, 10))
-
-		got, err := os.ReadFile(dst)
-		assert.NilError(t, err)
-		assert.Equal(t, len(got), 100)
-		assert.Assert(t, bytes.Equal(got[:10], content[:10]))
-		assert.Assert(t, isAllZeros(got[10:]), "bytes past limit must not be copied")
-	})
-
-	t.Run("dst truncated to src size", func(t *testing.T) {
-		dir := t.TempDir()
-		src := filepath.Join(dir, "src")
-		dst := filepath.Join(dir, "dst")
-		assert.NilError(t, os.WriteFile(src, []byte("small"), 0o600))
-		assert.NilError(t, os.WriteFile(dst, bytes.Repeat([]byte{0xBB}, 200), 0o600))
-
-		assert.NilError(t, copyFile(src, dst, 0))
-
-		st, err := os.Stat(dst)
-		assert.NilError(t, err)
-		assert.Equal(t, st.Size(), int64(5))
-	})
-
-	t.Run("dst directory created", func(t *testing.T) {
-		dir := t.TempDir()
-		src := filepath.Join(dir, "src")
-		dst := filepath.Join(dir, "nested", "deeper", "dst")
-		assert.NilError(t, os.WriteFile(src, []byte("x"), 0o600))
-		assert.NilError(t, copyFile(src, dst, 0))
-		_, err := os.Stat(dst)
-		assert.NilError(t, err)
-	})
-}
-
-// TestCopyBackHoleFaithful is the regression test for the 2026-08-04
-// co-resident-checkpoint corruption: zeros inside the dump extent are
-// authoritative payload and MUST overwrite whatever is in the destination
-// buffer (no sparse skipping on restore).
-func TestCopyBackHoleFaithful(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join(dir, "src")
-	dst := filepath.Join(dir, "dst")
-
-	const size = 64
-	const extent = 48
-
-	// Source: valid header with current_offset=extent; data at [16,32),
-	// authoritative ZEROS at [32,48), and trailing garbage at [48,64) that
-	// lies beyond the extent and must NOT be copied.
-	srcBuf := make([]byte, size)
-	binary.LittleEndian.PutUint64(srcBuf[8:16], extent)
-	copy(srcBuf[16:32], bytes.Repeat([]byte{0x11}, 16))
-	// srcBuf[32:48] stays zero.
-	copy(srcBuf[48:64], bytes.Repeat([]byte{0x22}, 16))
-	assert.NilError(t, os.WriteFile(src, srcBuf, 0o600))
-
-	// Destination buffer pre-dirtied with a co-resident checkpoint's bytes.
-	assert.NilError(t, os.WriteFile(dst, bytes.Repeat([]byte{0xAA}, size), 0o600))
-
-	assert.NilError(t, copyIntoHugetlbfs(src, dst))
-
-	got, err := os.ReadFile(dst)
-	assert.NilError(t, err)
-	assert.Assert(t, bytes.Equal(got[:extent], srcBuf[:extent]),
-		"full extent must be copied byte-for-byte, including zeros")
-	assert.Assert(t, isAllZeros(got[32:48]),
-		"authoritative zeros must overwrite pre-existing dirt")
-	assert.Assert(t, bytes.Equal(got[48:], bytes.Repeat([]byte{0xAA}, size-extent)),
-		"bytes beyond the dump extent must be left untouched")
 }
 
 func TestResolvePidToId(t *testing.T) {
@@ -556,6 +363,19 @@ func TestResolvePidToId(t *testing.T) {
 		id, err := g.resolvePidToID("555")
 		assert.NilError(t, err)
 		assert.Equal(t, id, "77")
+	})
+
+	t.Run("ctl dir consulted before data dir", func(t *testing.T) {
+		g, ctlDir, _ := newTestBackend(t, &fakeExec{})
+		tmpfsDir := t.TempDir()
+		t.Setenv("GPU_CR_CTL_PATH", tmpfsDir)
+		// Stale/empty map in the data dir, good map on the ctl tmpfs.
+		assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_555"), nil, 0o600))
+		assert.NilError(t, os.WriteFile(filepath.Join(tmpfsDir, "pid_map_555"), []byte("91\n"), 0o600))
+
+		id, err := g.resolvePidToID("555")
+		assert.NilError(t, err)
+		assert.Equal(t, id, "91")
 	})
 
 	t.Run("empty pid_map falls back to proc maps", func(t *testing.T) {
@@ -598,17 +418,17 @@ func TestMemoryRegionsHealthCheck(t *testing.T) {
 	})
 }
 
-func TestSlotDir(t *testing.T) {
+func TestGroupDir(t *testing.T) {
 	type testCase struct {
 		name    string
 		slot    string
 		wantErr bool
 	}
 
-	store := "/snapshots"
 	run := func(t *testing.T, tc testCase) {
 		t.Helper()
-		_, err := slotDir(store, tc.slot)
+		t.Setenv("GPU_CR_GROUP_STORE", "/store/groups")
+		_, err := groupDir(tc.slot)
 		if tc.wantErr {
 			assert.ErrorContains(t, err, "path traversal")
 		} else {
@@ -618,11 +438,12 @@ func TestSlotDir(t *testing.T) {
 
 	testCases := []testCase{
 		{name: "plain slot", slot: "slot-a"},
-		{name: "nested slot", slot: "job/slot-a"},
+		{name: "nested slot rejected (GC reaps top level only)", slot: "job/slot-a", wantErr: true},
 		{name: "dot dot escape", slot: "../../etc", wantErr: true},
 		{name: "dot dot exact", slot: "..", wantErr: true},
 		{name: "dot only", slot: ".", wantErr: true},
 		{name: "sneaky traversal", slot: "a/../../etc", wantErr: true},
+		{name: "empty", slot: "", wantErr: true},
 	}
 
 	for _, tc := range testCases {

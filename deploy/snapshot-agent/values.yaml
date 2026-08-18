@@ -10,13 +10,20 @@ fullnameOverride: ""
 
 podAnnotations: {}
 
-resources: {}
-#  limits:
-#    cpu: 500m
-#    memory: 1Gi
-#  requests:
-#    cpu: 100m
-#    memory: 256Mi
+# NO hugepages request since GPU-CR GEP-0001 + GEP-0006: the agent moves no
+# dump bytes (destination-path checkpoints run inside the workload's
+# preloader) and the cr_client control channel lives on the ctl tmpfs, so
+# no hugetlb page is ever faulted from this pod's cgroup. That zero request
+# is also what lets this DaemonSet schedule on fresh vanilla nodes BEFORE
+# hugepage capacity exists — which is why the hugepage bootstrap can run as
+# an initContainer here instead of a separate DaemonSet.
+# Memory = 512Mi base + the ctl tmpfs cap (worst case, tmpfs pages charge
+# the first-toucher cgroup, which can be this pod via cr_client).
+resources:
+  requests:
+    memory: "576Mi"
+  limits:
+    memory: "576Mi"
 
 nodeSelector: {}
 
@@ -49,32 +56,51 @@ nvidia:
 
 # GPU-CR memory-regions backend machinery. Default disabled: the chart is
 # identical to a CUDA/app-backend deployment unless this is turned on.
+# All gpuCr.* and priorityClass.* settings below take effect only when
+# memoryRegions.enabled=true.
 memoryRegions:
   enabled: false
-  # Shared checkpoint/control dir (EXPORT_FILE_PATH inside the agent).
-  ctlDir: /mnt/huge-ckpt
-  # Host path backing ctlDir; also the hugetlbfs mountpoint.
-  hostCtlPath: /var/tmp/huge-ckpt
-  hugetlbfs:
-    mount: true # run the nsenter init container
-    pagesize: 2M
-  # hugetlb cgroup headroom for mmap-write restores into live dump buffers.
-  # Rendered as hugepages-<pagesize>i requests/limits (k8s requires a memory
-  # request alongside hugepages; one is added if resources doesn't set one).
-  hugepagesResource: 2Gi
-  # Snapshot store. Must NOT live on hugetlbfs (no write(2); copies there
-  # would pin hugepages forever). Default is node tmpfs: dumps are multi-GB
-  # and copied on every swap, so a disk-backed store dominates swap latency
-  # (measured 2026-08-11: ~12s write / ~8.4s read per ~2GB dump on a GKE
-  # boot disk vs ~2s round-trip on tmpfs, against a 0.3s GPU-CR op).
-  # NOTE: tmpfs writes are charged to the agent's memory cgroup and are not
-  # reclaimable — size resources.limits.memory to hold the largest
-  # concurrent dump set (see the daemonset template fallback), or the agent
-  # is OOMKilled mid-copy, stranding the workload mid-checkpoint.
-  snapshotDir: /var/snapshots
-  snapshotsHostPath: /dev/shm/gcr-snapshots
-  copyHostFile: false # GPU_CR_COPY_HOST_FILE
+  # LEGACY pre-GEP-0001 snapshot COPY store (tmpfs). Since GEP-0001 the
+  # agent copies no dump bytes — parked state lives in the destination
+  # group store under gpuCr.dataDir — so this is wired ONLY as a GC input:
+  # the agent TTL-reaps leftover copies from older agent versions here.
+  # Set legacySnapshots.enabled=false once no pre-GEP leftovers remain.
+  legacySnapshots:
+    enabled: true
+    snapshotDir: /var/snapshots # SNAPSHOT_DIR inside the agent
+    snapshotsHostPath: /dev/shm/gcr-snapshots
+
+gpuCr:
+  # hugetlbfs data mount: dump/staging buffers and the per-group destination
+  # store (groups/). Mounted at the SAME in-container path as in workload
+  # pods so -o path strings resolve to the same files in both namespaces.
+  dataDir:
+    hostPath: /var/tmp/huge-ckpt
+    mountPath: /mnt/huge-ckpt
+  # GEP-0006 control-plane tmpfs: control-<pid>, pid_map, ctl-ready
+  # advertisements. Host-level tmpfs so agent and workload share it.
+  ctl:
+    hostPath: /var/tmp/gpu-cr-ctl
+    mountPath: /mnt/gpu-cr-ctl
+    sizeMi: 64
+  # Runtime hugepage provisioning (absorbs the former hugepages-bootstrap
+  # DaemonSet): writes nr_hugepages and restarts the kubelet once per node
+  # boot so the node publishes hugepages-2Mi capacity for WORKLOAD pods.
+  # Validated blast radius of the restart: zero (see
+  # docs/proposals/hugepages-runtime-bootstrap.md).
+  bootstrap:
+    enabled: true
+    # 12288 x 2Mi = 24Gi, sized for two GPU-CR processes built with
+    # SHM_SIZE_GB=8; use 30720 (60Gi) for two stock 25GiB builds.
+    pages2Mi: 12288
   opTimeoutSec: 120 # GPU_CR_OP_TIMEOUT_SEC
+
+priorityClass:
+  # The bootstrap initContainer must win node placement over GPU workloads.
+  # Created (and referenced) only when memoryRegions.enabled=true.
+  create: true
+  name: timeslice-snapshot-agent
+  value: 900000000
 
 rbac:
   create: true
