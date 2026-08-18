@@ -234,7 +234,7 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 	owners := make(map[string]string)
 	for _, pid := range regionPIDs(cfg) {
 		pidStr := strconv.Itoa(int(pid))
-		id, err := g.resolvePidToID(pidStr)
+		id, err := g.resolveOrInit(ctx, pidStr)
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
@@ -292,7 +292,7 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 
 	t0 := time.Now()
 	for _, pid := range regionPIDs(cfg) {
-		id, err := g.resolvePidToID(strconv.Itoa(int(pid)))
+		id, err := g.resolveOrInit(ctx, strconv.Itoa(int(pid)))
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
@@ -362,6 +362,26 @@ func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec stri
 		return fmt.Errorf("cr_client restore (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
+}
+
+// resolveOrInit resolves pid→id, driving the preloader's lazy init when
+// needed. Destination-path ops must know the id BEFORE the first cr_client
+// signal (the -o file is named by it), but the preloader only writes
+// pid_map/creates the buffer inside init_CR — which historically ran lazily
+// off the first checkpoint signal. cr_client -i triggers exactly that init
+// and is idempotent for already-initialized processes.
+func (g *MemoryRegions) resolveOrInit(ctx context.Context, pid string) (string, error) {
+	id, err := g.resolvePidToID(pid)
+	if err == nil {
+		return id, nil
+	}
+	slog.InfoContext(ctx, "PID not resolvable yet; driving preloader init via cr_client -i", "pid", pid)
+	ictx, cancel := context.WithTimeout(ctx, opTimeout())
+	defer cancel()
+	if ierr := g.runCommand(ictx, g.getCrClientPath(), "-i", "-p", pid); ierr != nil {
+		return "", fmt.Errorf("preloader init failed: %w (original resolve error: %v)", ierr, err)
+	}
+	return g.resolvePidToID(pid)
 }
 
 // resolvePidToID maps a workload PID to its GPU-CR dump-buffer id.
