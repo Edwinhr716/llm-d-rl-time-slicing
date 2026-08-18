@@ -74,9 +74,12 @@ func TestStartSnapshot(t *testing.T) {
 			expectErrCode: codes.Aborted,
 		},
 		{
-			name:          "Fails when FAULTED",
-			initialState:  pb.JobState_JOB_STATE_FAULTED,
-			expectErrCode: codes.FailedPrecondition,
+			// Faults are typically transient (dead PID, timed-out cr_client);
+			// a new snapshot is allowed to reset a FAULTED job.
+			name:         "FAULTED resets via new snapshot",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			expectOp:     true,
+			finalState:   pb.JobState_JOB_STATE_SAVED,
 		},
 		{
 			name:         "Worker failure leads to FAULTED",
@@ -170,9 +173,11 @@ func TestStartRestore(t *testing.T) {
 			expectErrCode: codes.Aborted,
 		},
 		{
-			name:          "Fails when FAULTED",
-			initialState:  pb.JobState_JOB_STATE_FAULTED,
-			expectErrCode: codes.FailedPrecondition,
+			// Faults are typically transient; a new restore may reset a
+			// FAULTED job (same rationale as the snapshot side).
+			name:         "FAULTED resets via new restore",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			finalState:   pb.JobState_JOB_STATE_RUNNING,
 		},
 		{
 			name:         "Worker failure leads to FAULTED",
