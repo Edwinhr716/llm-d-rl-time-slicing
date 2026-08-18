@@ -39,12 +39,6 @@ spec:
           value: "lora-group"
         - name: GPU_VENDOR
           value: "NVIDIA"
-        - name: GPUCR_NUM_THREADS
-          value: "16"
-        - name: GPUCR_SHM_GB
-          value: "60"
-        - name: GPUCR_STAGING_MB
-          value: "1024"
         - name: VLLM_ALLOW_INSECURE_SERIALIZATION
           value: "1"
         - name: LD_PRELOAD

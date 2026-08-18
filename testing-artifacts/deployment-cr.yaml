@@ -37,12 +37,6 @@ spec:
           value: "test-group"
         - name: GPU_VENDOR
           value: "NVIDIA"
-        - name: GPUCR_NUM_THREADS
-          value: "16"
-        - name: GPUCR_SHM_GB
-          value: "60"
-        - name: GPUCR_STAGING_MB
-          value: "1024"
         - name: LD_PRELOAD
           value: "/usr/local/lib/vGPU-NVIDIA.so"
         - name: LD_LIBRARY_PATH

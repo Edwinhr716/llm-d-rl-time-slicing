@@ -1,0 +1,198 @@
+# Perf-comparison ARM A: control channel on hugetlbfs (GPU_CR_CTL_PATH
+# unset), agent carries the 16Mi-floor-style hugepages request.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: snapshot-agent-legacyctl
+  namespace: timeslice-system
+  labels:
+    app.kubernetes.io/name: snapshot-agent
+    app.kubernetes.io/instance: snapshot-agent-legacyctl
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: snapshot-agent-0.1.0
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: snapshot-agent-legacyctl
+      app.kubernetes.io/name: snapshot-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: snapshot-agent-legacyctl
+        app.kubernetes.io/name: snapshot-agent
+    spec:
+      serviceAccountName: snapshot-agent
+      priorityClassName: timeslice-snapshot-agent
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+      nodeSelector:
+        cloud.google.com/gke-nodepool: ctl-tmpfs-l4
+      initContainers:
+        # Runtime hugepage provisioning for workload pods; once per node
+        # boot; kubelet restart has zero measured blast radius (see
+        # testing-artifacts/hugepages-runtime-bootstrap-results.md). Fails
+        # WITHOUT restarting the kubelet on shortfall, so an undersized
+        # pool CrashLoops here instead of SIGBUSing workloads.
+        - name: provision-hugepages
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          env:
+            # 12288 x 2Mi = 24Gi for two SHM_SIZE_GB=8 GPU-CR processes;
+            # 30720 (60Gi) for two stock 25GiB builds. Destination groups
+            # (parked snapshots) also live in this pool — add their worst
+            # case to the target.
+            - name: HUGEPAGES_2M
+              value: "12288"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              apk add --no-cache util-linux >/dev/null
+              target=$HUGEPAGES_2M
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -ge "$target" ]; then
+                echo "hugepage pool already provisioned ($current/$target pages), nothing to do"
+                exit 0
+              fi
+              echo "reserving $target 2Mi hugepages (currently $current)"
+              nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -lt "$target" ]; then
+                echo "short by $((target - current)) pages; compacting and retrying"
+                nsenter -t 1 -m -- sh -c 'echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+                nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+                current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              fi
+              if [ "$current" -lt "$target" ]; then
+                echo "ERROR: only $current of $target pages allocated (memory fragmented or exhausted)"
+                exit 1
+              fi
+              echo "pool ready; restarting kubelet so the node reports hugepages-2Mi (running pods unaffected)"
+              nsenter -t 1 -m -- systemctl restart kubelet
+        # GEP-0006 control-plane tmpfs on the HOST. Must exist before any
+        # workload loads vGPU.so (the readiness advertisement is written at
+        # library load; both binaries statfs-gate on tmpfs so a too-early
+        # workload falls back to legacy instead of stranding files that
+        # this mount would shadow).
+        - name: mount-ctl-tmpfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p /var/tmp/gpu-cr-ctl; grep -q " /var/tmp/gpu-cr-ctl tmpfs" /proc/mounts || mount -t tmpfs -o size=64m,mode=0777 gpu-cr-ctl /var/tmp/gpu-cr-ctl; chmod 0777 /var/tmp/gpu-cr-ctl' && \
+              echo "ctl tmpfs mounted at /var/tmp/gpu-cr-ctl"
+        # Mount hugetlbfs at the shared checkpoint path on the HOST. GPU-CR
+        # relies on the filesystem itself being hugetlbfs (it does not pass
+        # MAP_HUGETLB); without this mount every dump silently degrades to
+        # boot-disk page cache and the node's hugepage pool goes unused.
+        - name: mount-hugetlbfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p /var/tmp/huge-ckpt; grep -q " /var/tmp/huge-ckpt hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize=2M,mode=0777 nodev /var/tmp/huge-ckpt; chmod 0777 /var/tmp/huge-ckpt' && \
+              echo "hugetlbfs mounted at /var/tmp/huge-ckpt"
+        - name: install-cuda-checkpoint
+          image: alpine:latest
+          command: ["sh", "-c", "apk add --no-cache wget && wget -qO /opt/bin/cuda-checkpoint https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/main/bin/x86_64_Linux/cuda-checkpoint && chmod +x /opt/bin/cuda-checkpoint && echo 'cuda-checkpoint installed'"]
+          volumeMounts:
+            - name: bin-dir
+              mountPath: /opt/bin
+      containers:
+        - name: snapshot-agent
+          securityContext:
+            privileged: true
+          image: asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/time-slicing/llm-d-rl-time-slicing/snapshot-agent:ctl-tmpfs-v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin
+            - name: LD_LIBRARY_PATH
+              value: /usr/local/nvidia/lib64
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: AGENT_PORT
+              value: "9001"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+            - name: EXPORT_FILE_PATH
+              value: /mnt/huge-ckpt
+            # Legacy copy-store, GC-only since GEP-0001 (reaps leftovers
+            # from pre-destination-path agents).
+            - name: SNAPSHOT_DIR
+              value: /var/snapshots
+          ports:
+            - name: grpc
+              containerPort: 9001
+              protocol: TCP
+          # No hugepages-2Mi: see the header comment. Memory covers the
+          # agent + worst-case ctl tmpfs charging; the old 12Gi tmpfs-copy
+          # headroom is gone with the copies themselves.
+          resources:
+            requests:
+              memory: "1Gi"
+              hugepages-2Mi: "64Mi"
+            limits:
+              memory: "1Gi"
+              hugepages-2Mi: "64Mi"
+          volumeMounts:
+            - name: bin-dir
+              mountPath: /opt/bin
+            - name: nvidia-driver
+              mountPath: /usr/local/nvidia
+              readOnly: true
+            - name: nvidia-devices
+              mountPath: /dev
+            - name: huge-ckpt
+              mountPath: /mnt/huge-ckpt
+              # Pick up the mounts made by the init containers even though
+              # the hostPath was prepared before they ran.
+              mountPropagation: HostToContainer
+            - name: gpu-cr-ctl
+              mountPath: /mnt/gpu-cr-ctl
+              mountPropagation: HostToContainer
+            - name: gcr-snapshots
+              mountPath: /var/snapshots
+      volumes:
+        - name: bin-dir
+          emptyDir: {}
+        - name: nvidia-driver
+          hostPath:
+            path: /home/kubernetes/bin/nvidia
+            type: Directory
+        - name: nvidia-devices
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: huge-ckpt
+          hostPath:
+            path: /var/tmp/huge-ckpt
+            type: DirectoryOrCreate
+        - name: gpu-cr-ctl
+          hostPath:
+            path: /var/tmp/gpu-cr-ctl
+            type: DirectoryOrCreate
+        - name: gcr-snapshots
+          hostPath:
+            path: /dev/shm/gcr-snapshots
+            type: DirectoryOrCreate
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
