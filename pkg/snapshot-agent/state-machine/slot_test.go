@@ -77,10 +77,11 @@ func TestSlotSwapWhileRunning(t *testing.T) {
 	assert.Equal(t, opID, "already-running")
 }
 
-// TestSlotlessBehaviorUnchanged pins the upstream semantics for backends
-// without slot naming (CUDA/app): restore while RUNNING always
-// short-circuits, and FAULTED jobs stay rejected.
-func TestSlotlessBehaviorUnchanged(t *testing.T) {
+// TestSlotlessBehavior pins the semantics for backends without slot naming
+// (CUDA/app/direct_memory): restore while RUNNING always short-circuits, and
+// a FAULTED job accepts a fresh snapshot/restore (faults are typically
+// transient: dead PID, cr_client timeout).
+func TestSlotlessBehavior(t *testing.T) {
 	t.Run("restore while running short-circuits", func(t *testing.T) {
 		mgr := newRunningJob(t)
 		opID, err := mgr.StartRestore("job-1", "", func() error { return nil })
@@ -88,24 +89,26 @@ func TestSlotlessBehaviorUnchanged(t *testing.T) {
 		assert.Equal(t, opID, "already-running")
 	})
 
-	t.Run("snapshot of faulted job rejected", func(t *testing.T) {
+	t.Run("snapshot resets faulted job", func(t *testing.T) {
 		mgr := newRunningJob(t)
 		_, err := mgr.StartSnapshot("job-1", "", func() error { return errFailed })
 		assert.NilError(t, err)
 		waitForState(t, mgr, pb.JobState_JOB_STATE_FAULTED)
 
 		_, err = mgr.StartSnapshot("job-1", "", func() error { return nil })
-		assert.ErrorContains(t, err, "must be RUNNING")
+		assert.NilError(t, err)
+		waitForState(t, mgr, pb.JobState_JOB_STATE_SAVED)
 	})
 
-	t.Run("restore of faulted job rejected", func(t *testing.T) {
+	t.Run("restore resets faulted job", func(t *testing.T) {
 		mgr := newRunningJob(t)
 		_, err := mgr.StartSnapshot("job-1", "", func() error { return errFailed })
 		assert.NilError(t, err)
 		waitForState(t, mgr, pb.JobState_JOB_STATE_FAULTED)
 
 		_, err = mgr.StartRestore("job-1", "", func() error { return nil })
-		assert.ErrorContains(t, err, "must be SAVED")
+		assert.NilError(t, err)
+		waitForState(t, mgr, pb.JobState_JOB_STATE_RUNNING)
 	})
 }
 

@@ -85,11 +85,9 @@ func TestGetSnapshotBackendType(t *testing.T) {
 			want:   backends.BackendMemoryRegions,
 		},
 		{
-			// Documents the pre-existing upstream gap: direct_memory is not
-			// routed and falls through to the default backend.
-			name:   "direct memory unrouted",
+			name:   "direct memory",
 			config: &pb.BackendConfig{Backend: &pb.BackendConfig_DirectMemory{DirectMemory: &pb.DirectMemoryBackendConfig{}}},
-			want:   backends.BackendCuda,
+			want:   backends.BackendDirectMemory,
 		},
 	}
 
