@@ -354,6 +354,79 @@ func TestMemoryRegionsRestore(t *testing.T) {
 	})
 }
 
+// TestResolveOrInit covers the lazy-init fallback: destination-path ops
+// need the id before the first cr_client signal, but the preloader only
+// writes pid_map inside init_CR, so an unresolvable PID must be driven
+// through cr_client -i (idempotent) and re-resolved.
+func TestResolveOrInit(t *testing.T) {
+	t.Run("first snapshot drives init_CR then resolves", func(t *testing.T) {
+		fake := &fakeExec{}
+		g, ctlDir, storeDir := newTestBackend(t, fake)
+		g.procRoot = t.TempDir() // no /proc/<pid>/maps fallback either
+		// No pid_map yet: init_CR has not run. The -i exec simulates the
+		// preloader writing pid_map during init.
+		fake.observe = func(name string, args ...string) {
+			if args[0] == "-i" {
+				_ = os.WriteFile(filepath.Join(ctlDir, "pid_map_123"), []byte("42\n"), 0o600)
+			}
+		}
+
+		err := g.Snapshot(context.Background(), Request{
+			JobID:  "job-1",
+			Config: regionsConfig("slot-a", region(123, 0x7f00, 1024)),
+		})
+		assert.NilError(t, err)
+		dest := filepath.Join(storeDir, "slot-a", "42")
+		assert.DeepEqual(t, fake.callArgs(), [][]string{
+			{"-i", "-p", "123"},
+			{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", dest},
+		})
+	})
+
+	t.Run("no init when already resolvable", func(t *testing.T) {
+		fake := &fakeExec{}
+		g, ctlDir, storeDir := newTestBackend(t, fake)
+		writePidMap(t, ctlDir)
+
+		err := g.Snapshot(context.Background(), Request{
+			JobID:  "job-1",
+			Config: regionsConfig("slot-a", region(123, 0x7f00, 1024)),
+		})
+		assert.NilError(t, err)
+		dest := filepath.Join(storeDir, "slot-a", "42")
+		assert.DeepEqual(t, fake.callArgs(), [][]string{
+			{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", dest},
+		})
+	})
+
+	t.Run("init exec failure surfaces both errors", func(t *testing.T) {
+		fake := &fakeExec{err: fmt.Errorf("no such process")}
+		g, _, _ := newTestBackend(t, fake)
+		g.procRoot = t.TempDir()
+
+		err := g.Snapshot(context.Background(), Request{
+			JobID:  "job-1",
+			Config: regionsConfig("slot-a", region(123, 0x7f00, 1024)),
+		})
+		assert.ErrorContains(t, err, "preloader init failed")
+		assert.ErrorContains(t, err, "original resolve error")
+		assert.DeepEqual(t, fake.callArgs(), [][]string{{"-i", "-p", "123"}})
+	})
+
+	t.Run("still unresolvable after init fails cleanly", func(t *testing.T) {
+		fake := &fakeExec{} // -i succeeds but writes nothing
+		g, _, _ := newTestBackend(t, fake)
+		g.procRoot = t.TempDir()
+
+		err := g.Snapshot(context.Background(), Request{
+			JobID:  "job-1",
+			Config: regionsConfig("slot-a", region(123, 0x7f00, 1024)),
+		})
+		assert.ErrorContains(t, err, "failed to resolve PID 123")
+		assert.DeepEqual(t, fake.callArgs(), [][]string{{"-i", "-p", "123"}})
+	})
+}
+
 func TestResolvePidToId(t *testing.T) {
 	t.Run("NUL-padded pid_map parses", func(t *testing.T) {
 		g, ctlDir, _ := newTestBackend(t, &fakeExec{})
