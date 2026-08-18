@@ -98,7 +98,7 @@ func startAgent(t *testing.T, dev *fakeDevice) pb.SnapshotAgentServiceClient {
 
 	lis := bufconn.Listen(1024 * 1024)
 	s := grpc.NewServer()
-	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry())
+	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry(), nil)
 	pb.RegisterSnapshotAgentServiceServer(s, srv)
 	go func() {
 		if err := s.Serve(lis); err != nil {
