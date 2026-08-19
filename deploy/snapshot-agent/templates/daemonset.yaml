@@ -124,16 +124,26 @@ spec:
                   fieldPath: spec.nodeName
             - name: AGENT_PORT
               value: {{ .Values.port | quote }}
-            {{- if .Values.featureGates }}
-            {{- $gates := list }}
+            {{- /* Feature gates: explicit values from .Values.featureGates,
+                 with memoryRegions.enabled implying MemoryRegionsBackend=true
+                 (deploying the GPU-CR machinery is the opt-in). */}}
+            {{- $gates := dict }}
+            {{- if .Values.memoryRegions.enabled }}
+            {{- $_ := set $gates "MemoryRegionsBackend" true }}
+            {{- end }}
             {{- range $name, $enabled := .Values.featureGates }}
             {{- if not (kindIs "bool" $enabled) }}
             {{- fail (printf "featureGates.%s must be true or false, got %q" $name (toString $enabled)) }}
             {{- end }}
-            {{- $gates = append $gates (printf "%s=%t" $name $enabled) }}
+            {{- $_ := set $gates $name $enabled }}
+            {{- end }}
+            {{- if $gates }}
+            {{- $pairs := list }}
+            {{- range $name, $enabled := $gates }}
+            {{- $pairs = append $pairs (printf "%s=%t" $name $enabled) }}
             {{- end }}
             - name: FEATURE_GATES
-              value: {{ join "," $gates | quote }}
+              value: {{ join "," $pairs | quote }}
             {{- end }}
             {{- if .Values.nvidia.driver.enabled }}
             - name: LD_LIBRARY_PATH
