@@ -102,6 +102,14 @@ priorityClass:
   name: timeslice-snapshot-agent
   value: 900000000
 
+# Kubernetes-style feature gates for the agent (Name: bool), rendered as
+# the FEATURE_GATES env var (--feature-gates equivalent). Experimental
+# backends are off by default and requests using them fail with
+# FAILED_PRECONDITION until enabled here. memoryRegions.enabled implies
+# MemoryRegionsBackend: true; an explicit entry here overrides that.
+# Known gates: MemoryRegionsBackend, DirectMemoryBackend.
+featureGates: {}
+
 rbac:
   create: true
 

@@ -388,6 +388,13 @@ func (x *CudaBackendConfig) GetExplicitTarget() *ProcessTarget {
 }
 
 // Configuration for the Direct Memory (process-level) backend.
+//
+// Experimental: this backend is driven by GPU-CR, which is itself
+// experimental. Expect nontrivial deployment requirements and operational
+// caveats (see guides/snapshot-agent/README.md); behavior may change as
+// GPU-CR evolves. Disabled by default: requests fail with
+// FAILED_PRECONDITION unless the agent runs with
+// --feature-gates=DirectMemoryBackend=true.
 type DirectMemoryBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The target processes to checkpoint/restore.
@@ -638,6 +645,15 @@ func (x *MemoryRegion) GetSizeBytes() uint64 {
 // restore of specific device memory ranges of a running process (GPU-CR
 // cr_client with a `-s addr:size,...` spec). Regions are required on both
 // Snapshot and Restore; the agent performs no discovery for this backend.
+//
+// Experimental: this backend is driven by GPU-CR, which is itself
+// experimental. It requires a GPU-CR-enabled deployment (the workload must
+// run under the GPU-CR preloader and share the checkpoint directory with
+// the agent — see guides/snapshot-agent/README.md) and carries operational
+// caveats; behavior may change as GPU-CR evolves. Disabled by default:
+// requests fail with FAILED_PRECONDITION unless the agent runs with
+// --feature-gates=MemoryRegionsBackend=true (the Helm chart sets this when
+// memoryRegions.enabled).
 type MemoryRegionsBackendConfig struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Regions []*MemoryRegion        `protobuf:"bytes,1,rep,name=regions,proto3" json:"regions,omitempty"`
@@ -809,10 +825,12 @@ type BackendConfig_AppChannel struct {
 }
 
 type BackendConfig_DirectMemory struct {
+	// Experimental: see DirectMemoryBackendConfig.
 	DirectMemory *DirectMemoryBackendConfig `protobuf:"bytes,4,opt,name=direct_memory,json=directMemory,proto3,oneof"`
 }
 
 type BackendConfig_MemoryRegions struct {
+	// Experimental: see MemoryRegionsBackendConfig.
 	MemoryRegions *MemoryRegionsBackendConfig `protobuf:"bytes,5,opt,name=memory_regions,json=memoryRegions,proto3,oneof"`
 }
 

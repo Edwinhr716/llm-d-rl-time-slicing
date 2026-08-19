@@ -11,6 +11,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	sm "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"google.golang.org/grpc"
@@ -28,16 +29,20 @@ type Server struct {
 	defaultBackend  backends.BackendType
 	deploymentMode  string
 	channelRegistry *backends.ChannelRegistry
+	featureGates    features.Gates
 }
 
 // NewServer creates a new Server instance. channelRegistry is shared with
 // the app-channel backend so workloads registered through the
-// WorkloadChannel RPC are reachable by Snapshot/Restore.
+// WorkloadChannel RPC are reachable by Snapshot/Restore. featureGates may
+// be nil, which leaves every gate at its default (experimental backends
+// disabled).
 func NewServer(
 	backendMap map[backends.BackendType]backends.Backend,
 	defaultBackend backends.BackendType,
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
+	featureGates features.Gates,
 ) *Server {
 	return &Server{
 		state:           sm.NewStateManager(),
@@ -45,7 +50,27 @@ func NewServer(
 		defaultBackend:  defaultBackend,
 		deploymentMode:  deploymentMode,
 		channelRegistry: channelRegistry,
+		featureGates:    featureGates,
 	}
+}
+
+// checkFeatureGates rejects configs selecting an experimental backend whose
+// feature gate is off. Experimental backends are driven by GPU-CR, which
+// carries deployment requirements and operational caveats; requiring an
+// explicit per-agent opt-in (the Kubernetes feature-gate pattern) keeps
+// them from being reached by accident.
+func (s *Server) checkFeatureGates(config *pb.BackendConfig) error {
+	if config.GetMemoryRegions() != nil && !s.featureGates.Enabled(features.MemoryRegionsBackend) {
+		return status.Errorf(codes.FailedPrecondition,
+			"memory_regions backend is experimental (GPU-CR) and disabled; start the agent with --feature-gates=%s=true (FEATURE_GATES env var; set automatically by the Helm chart when memoryRegions.enabled)",
+			features.MemoryRegionsBackend)
+	}
+	if config.GetDirectMemory() != nil && !s.featureGates.Enabled(features.DirectMemoryBackend) {
+		return status.Errorf(codes.FailedPrecondition,
+			"direct_memory backend is experimental (GPU-CR) and disabled; start the agent with --feature-gates=%s=true (FEATURE_GATES env var)",
+			features.DirectMemoryBackend)
+	}
+	return nil
 }
 
 // Snapshot triggers an asynchronous snapshot of the accelerator context for a job.
@@ -53,6 +78,10 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 	ctx = logging.WithServerMethod(ctx, "Snapshot")
 	ctx = logging.WithJobID(ctx, req.GetJobId())
 	ctx = logging.WithGroupID(ctx, req.GetGroup())
+
+	if err := s.checkFeatureGates(req.GetBackendConfig()); err != nil {
+		return nil, err
+	}
 
 	backendType := s.getSnapshotBackendType(req.GetBackendConfig())
 	slog.InfoContext(ctx, "Snapshot called", "backend", backendType)
@@ -301,6 +330,10 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 	ctx = logging.WithJobID(ctx, req.GetJobId())
 	ctx = logging.WithGroupID(ctx, req.GetGroup())
 
+	if err := s.checkFeatureGates(req.GetBackendConfig()); err != nil {
+		return nil, err
+	}
+
 	backendType := s.getSnapshotBackendType(req.GetBackendConfig())
 	slog.InfoContext(ctx, "Restore called", "backend", backendType)
 
@@ -425,6 +458,7 @@ func StartServer(
 	defaultBackend backends.BackendType,
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
+	featureGates features.Gates,
 ) error {
 	lc := net.ListenConfig{}
 	lis, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
@@ -439,7 +473,7 @@ func StartServer(
 	}
 
 	// 2. Create Server (which creates StateManager internally)
-	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry)
+	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry, featureGates)
 
 	// 3. Start the Watcher internally
 	watcher, err := NewWatcher(k8sClient, srv.state)

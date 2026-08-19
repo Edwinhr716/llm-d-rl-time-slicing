@@ -59,6 +59,13 @@ steps:
         # regression guard), with an OOM-safe agent memory fallback
         grep -q "/dev/shm/gcr-snapshots" /tmp/mr.yaml
         ! grep -q "memory: 512Mi" /tmp/mr.yaml
+        # experimental-backend feature gates: off by default, implied by
+        # memoryRegions.enabled, and settable via .Values.featureGates
+        ! grep -q "FEATURE_GATES" /tmp/plain.yaml
+        grep -q "MemoryRegionsBackend=true" /tmp/mr.yaml
+        helm template snapshot-agent deploy/snapshot-agent \
+          --set featureGates.DirectMemoryBackend=true >/tmp/fg.yaml
+        grep -q "DirectMemoryBackend=true" /tmp/fg.yaml
         echo "helm template checks passed"
 options:
   machineType: E2_HIGHCPU_8

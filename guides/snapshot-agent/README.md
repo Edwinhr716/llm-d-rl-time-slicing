@@ -152,7 +152,7 @@ The Snapshot Agent supports multiple backends for different GPU memory managemen
 | CUDA Checkpoint | `cuda` | Process-level CUDA state save/restore via `cuda-checkpoint` | ~100% | ~1-3s |
 | Application-Aware | `app_endpoint` | Suspend/resume through the application's own HTTP API (vLLM, SGLang) | ~96% | ~50-100ms |
 | Application-Aware | `app_channel` | Suspend/resume pushed over a channel the workload registered (Python-API workloads, no HTTP server) | ~96% | ~50-100ms |
-| Memory Regions | `memory_regions` | Selective checkpoint/restore of explicit device-memory ranges via GPU-CR `cr_client` (named snapshot slots, e.g. LoRA adapter swap) | n/a (selective) | ~10-100ms per swapped region set |
+| Memory Regions (experimental) | `memory_regions` | Selective checkpoint/restore of explicit device-memory ranges via GPU-CR `cr_client` (named snapshot slots, e.g. LoRA adapter swap). Feature-gated: `MemoryRegionsBackend` | n/a (selective) | ~10-100ms per swapped region set |
 
 The VRAM Freed and Resume Time figures are illustrative, measured with a small model (Qwen2.5-0.5B) on an H100; actual numbers depend on the model size, hardware, and engine version.
 
@@ -356,6 +356,14 @@ snapshots of the same process coexist and can be swapped on demand — e.g.
 alternating LoRA adapters that share one vLLM LoRA slot. A RUNNING job may
 restore a *different* slot at any time (live slot swap); restoring the
 already-loaded slot is a no-op.
+
+This backend is **experimental**: it is driven by GPU-CR, which is itself
+experimental, and is disabled by default behind a Kubernetes-style feature
+gate. The agent must run with `--feature-gates=MemoryRegionsBackend=true`
+(or the `FEATURE_GATES` env var; the Helm chart sets it automatically when
+`memoryRegions.enabled=true`), otherwise Snapshot/Restore requests fail
+with `FAILED_PRECONDITION`. Multiple gates are comma-separated, e.g.
+`--feature-gates=MemoryRegionsBackend=true,DirectMemoryBackend=true`.
 
 Requirements: the workload runs with the GPU-CR preloader
 (`LD_PRELOAD=vGPU-NVIDIA.so`) and shares the checkpoint dir with the agent

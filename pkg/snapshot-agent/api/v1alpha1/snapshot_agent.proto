@@ -51,6 +51,13 @@ message CudaBackendConfig {
 }
 
 // Configuration for the Direct Memory (process-level) backend.
+//
+// Experimental: this backend is driven by GPU-CR, which is itself
+// experimental. Expect nontrivial deployment requirements and operational
+// caveats (see guides/snapshot-agent/README.md); behavior may change as
+// GPU-CR evolves. Disabled by default: requests fail with
+// FAILED_PRECONDITION unless the agent runs with
+// --feature-gates=DirectMemoryBackend=true.
 message DirectMemoryBackendConfig {
   // The target processes to checkpoint/restore.
   ProcessTarget explicit_target = 1;
@@ -129,6 +136,15 @@ message MemoryRegion {
 // restore of specific device memory ranges of a running process (GPU-CR
 // cr_client with a `-s addr:size,...` spec). Regions are required on both
 // Snapshot and Restore; the agent performs no discovery for this backend.
+//
+// Experimental: this backend is driven by GPU-CR, which is itself
+// experimental. It requires a GPU-CR-enabled deployment (the workload must
+// run under the GPU-CR preloader and share the checkpoint directory with
+// the agent — see guides/snapshot-agent/README.md) and carries operational
+// caveats; behavior may change as GPU-CR evolves. Disabled by default:
+// requests fail with FAILED_PRECONDITION unless the agent runs with
+// --feature-gates=MemoryRegionsBackend=true (the Helm chart sets this when
+// memoryRegions.enabled).
 message MemoryRegionsBackendConfig {
   repeated MemoryRegion regions = 1;
   // snapshot_name names the snapshot slot the regions are saved to
@@ -145,7 +161,9 @@ message BackendConfig {
     CudaBackendConfig cuda = 1;
     AppEndpointConfig app_endpoint = 2;
     AppChannelConfig app_channel = 3;
+    // Experimental: see DirectMemoryBackendConfig.
     DirectMemoryBackendConfig direct_memory = 4;
+    // Experimental: see MemoryRegionsBackendConfig.
     MemoryRegionsBackendConfig memory_regions = 5;
   }
 }

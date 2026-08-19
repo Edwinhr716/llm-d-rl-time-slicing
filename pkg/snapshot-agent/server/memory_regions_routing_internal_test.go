@@ -7,6 +7,9 @@ import (
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gotest.tools/v3/assert"
 )
 
@@ -54,7 +57,7 @@ func TestGetSnapshotBackendType(t *testing.T) {
 		want   backends.BackendType
 	}
 
-	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry())
+	srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry(), nil)
 
 	run := func(t *testing.T, tc testCase) {
 		t.Helper()
@@ -98,6 +101,74 @@ func TestGetSnapshotBackendType(t *testing.T) {
 	}
 }
 
+func TestCheckFeatureGates(t *testing.T) {
+	type testCase struct {
+		name     string
+		gates    features.Gates
+		config   *pb.BackendConfig
+		wantCode codes.Code
+	}
+
+	run := func(t *testing.T, tc testCase) {
+		t.Helper()
+		srv := NewServer(nil, backends.BackendCuda, "k8s", backends.NewChannelRegistry(), tc.gates)
+		err := srv.checkFeatureGates(tc.config)
+		if tc.wantCode == codes.OK {
+			assert.NilError(t, err)
+			return
+		}
+		assert.Equal(t, status.Code(err), tc.wantCode)
+	}
+
+	directMemoryConfig := &pb.BackendConfig{
+		Backend: &pb.BackendConfig_DirectMemory{DirectMemory: &pb.DirectMemoryBackendConfig{}},
+	}
+
+	testCases := []testCase{
+		{name: "nil config passes", gates: nil, config: nil, wantCode: codes.OK},
+		{
+			name:     "non-experimental backend passes without gates",
+			gates:    nil,
+			config:   &pb.BackendConfig{Backend: &pb.BackendConfig_Cuda{Cuda: &pb.CudaBackendConfig{}}},
+			wantCode: codes.OK,
+		},
+		{
+			name:     "memory_regions rejected by default",
+			gates:    nil,
+			config:   memoryRegionsTestConfig("slot-a"),
+			wantCode: codes.FailedPrecondition,
+		},
+		{
+			name:     "memory_regions allowed when gate enabled",
+			gates:    features.Gates{features.MemoryRegionsBackend: true},
+			config:   memoryRegionsTestConfig("slot-a"),
+			wantCode: codes.OK,
+		},
+		{
+			name:     "direct_memory rejected by default",
+			gates:    nil,
+			config:   directMemoryConfig,
+			wantCode: codes.FailedPrecondition,
+		},
+		{
+			name:     "direct_memory allowed when gate enabled",
+			gates:    features.Gates{features.DirectMemoryBackend: true},
+			config:   directMemoryConfig,
+			wantCode: codes.OK,
+		},
+		{
+			name:     "gates are independent",
+			gates:    features.Gates{features.DirectMemoryBackend: true},
+			config:   memoryRegionsTestConfig("slot-a"),
+			wantCode: codes.FailedPrecondition,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) { run(t, tc) })
+	}
+}
+
 func TestBuildSnapshotFnMemoryRegions(t *testing.T) {
 	type testCase struct {
 		name    string
@@ -111,6 +182,7 @@ func TestBuildSnapshotFnMemoryRegions(t *testing.T) {
 		srv := NewServer(
 			map[backends.BackendType]backends.Backend{backends.BackendMemoryRegions: spy},
 			backends.BackendCuda, tc.mode, backends.NewChannelRegistry(),
+			features.Gates{features.MemoryRegionsBackend: true},
 		)
 		config := memoryRegionsTestConfig("slot-a")
 
@@ -166,6 +238,7 @@ func TestBuildRestoreFnMemoryRegions(t *testing.T) {
 		srv := NewServer(
 			map[backends.BackendType]backends.Backend{backends.BackendMemoryRegions: spy},
 			backends.BackendCuda, tc.mode, backends.NewChannelRegistry(),
+			features.Gates{features.MemoryRegionsBackend: true},
 		)
 		config := memoryRegionsTestConfig("slot-b")
 

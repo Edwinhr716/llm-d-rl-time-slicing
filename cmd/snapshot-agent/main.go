@@ -24,6 +24,7 @@ import (
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
 )
 
@@ -35,6 +36,9 @@ func main() {
 
 	port := flag.Int("port", 9001, "The port to listen on")
 	deploymentMode := flag.String("deployment-mode", "standalone", "Deployment mode ('standalone' or 'k8s')")
+	featureGateSpec := flag.String("feature-gates", "",
+		"Comma-separated Name=bool pairs enabling experimental features, "+
+			"e.g. 'MemoryRegionsBackend=true,DirectMemoryBackend=true'")
 	flag.Parse()
 
 	depMode := *deploymentMode
@@ -52,6 +56,17 @@ func main() {
 			os.Exit(1)
 		}
 		listenPort = p
+	}
+
+	// FEATURE_GATES overrides the flag, mirroring DEPLOYMENT_MODE.
+	gateSpec := *featureGateSpec
+	if envGates := os.Getenv("FEATURE_GATES"); envGates != "" {
+		gateSpec = envGates
+	}
+	featureGates, err := features.Parse(gateSpec)
+	if err != nil {
+		slog.Error("Invalid --feature-gates / FEATURE_GATES", "value", gateSpec, "error", err)
+		os.Exit(1)
 	}
 
 	if depMode != "standalone" && depMode != "k8s" {
@@ -90,8 +105,9 @@ func main() {
 		backends.StartGC(ctx, ctlDir, 10*time.Minute)
 	}
 
-	slog.InfoContext(ctx, "Starting Snapshot Agent", "port", listenPort, "deploymentMode", depMode)
-	if err := server.StartServer(ctx, listenPort, registeredBackends, backends.BackendCuda, depMode, channelRegistry); err != nil {
+	slog.InfoContext(ctx, "Starting Snapshot Agent",
+		"port", listenPort, "deploymentMode", depMode, "featureGates", featureGates.String())
+	if err := server.StartServer(ctx, listenPort, registeredBackends, backends.BackendCuda, depMode, channelRegistry, featureGates); err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)
 	}
