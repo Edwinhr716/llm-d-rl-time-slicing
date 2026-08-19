@@ -108,7 +108,7 @@ target_link_options(vGPU PRIVATE -shared -fPIC)
 set(_COORD_COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
     # multi_cr_client maps worker buffers at SHM_SIZE, a runtime value
-    # since KEP-0002 (gpu_cr::Config).
+    # read from gpu_cr::Config().
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
 )
 
