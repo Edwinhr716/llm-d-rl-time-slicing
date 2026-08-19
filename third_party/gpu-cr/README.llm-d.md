@@ -28,10 +28,10 @@ This copy carries the consolidated changes from
 time-slicing experiments required, cleaned up and tested:
 
 - memory-address (selective) checkpoint backend, unrounded allocation-size
-  dumps, and GEP-0005 granule-chunked copies
-- GEP-0001 destination-path selective checkpoints (v2 protocol),
-  GEP-0006 control channel off hugetlbfs (readiness advertisements),
-  KEP-0002 runtime-sizable checkpoint buffers (`GPU_CR_SHM_GB`/`_MB`,
+  dumps, and granule-chunked copies
+- destination-path selective checkpoints (v2 protocol),
+  control channel off hugetlbfs (readiness advertisements),
+  runtime-sizable checkpoint buffers (`GPU_CR_SHM_GB`/`_MB`,
   `GPU_CR_STAGING_MB`)
 - Google C++ Style Guide cleanup of the added code, and cr_client
   hardening (`GPU_CR_CUDA_CHECKPOINT` override; restore fails on a failed
