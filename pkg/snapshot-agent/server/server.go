@@ -65,6 +65,13 @@ func (s *Server) checkFeatureGates(config *pb.BackendConfig) error {
 				"with --feature-gates=%s=true (or the FEATURE_GATES env var) to enable it",
 			features.DirectMemoryBackend)
 	}
+	if config.GetMemoryRegions() != nil && !s.featureGates.Enabled(features.MemoryRegionsBackend) {
+		return status.Errorf(codes.FailedPrecondition,
+			"the memory_regions backend is experimental (driven by GPU-CR, which carries deployment "+
+				"requirements and operational caveats) and is disabled by default; restart the agent "+
+				"with --feature-gates=%s=true (or the FEATURE_GATES env var) to enable it",
+			features.MemoryRegionsBackend)
+	}
 	return nil
 }
 

@@ -152,10 +152,14 @@ spec:
               value: {{ .Values.port | quote }}
             {{- /* Feature gates: explicit values from .Values.featureGates,
                  with directMemory.enabled implying DirectMemoryBackend=true
+                 and memoryRegions.enabled implying MemoryRegionsBackend=true
                  (deploying the GPU-CR machinery is the opt-in). */}}
             {{- $gates := dict }}
             {{- if .Values.directMemory.enabled }}
             {{- $_ := set $gates "DirectMemoryBackend" true }}
+            {{- end }}
+            {{- if .Values.memoryRegions.enabled }}
+            {{- $_ := set $gates "MemoryRegionsBackend" true }}
             {{- end }}
             {{- range $name, $enabled := .Values.featureGates }}
             {{- if not (kindIs "bool" $enabled) }}

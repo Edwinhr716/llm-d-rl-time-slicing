@@ -19,12 +19,19 @@ type Feature string
 // and operational caveats.
 const DirectMemoryBackend Feature = "DirectMemoryBackend"
 
+// MemoryRegionsBackend gates the memory_regions backend. Like
+// direct_memory it is driven by GPU-CR and additionally requires the
+// target workload to run under the GPU-CR preloader with a shared
+// checkpoint directory.
+const MemoryRegionsBackend Feature = "MemoryRegionsBackend"
+
 // defaults registers every known gate and its default state. Alpha gates
 // default to false; flipping a default here is the promotion path
 // (alpha → beta → GA), as in Kubernetes. Adding a gate is one const plus
 // one entry here.
 var defaults = map[Feature]bool{
-	DirectMemoryBackend: false,
+	DirectMemoryBackend:  false,
+	MemoryRegionsBackend: false,
 }
 
 // Gates holds the explicitly configured gate values. The zero value (nil)

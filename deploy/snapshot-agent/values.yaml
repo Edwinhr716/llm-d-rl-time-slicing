@@ -112,6 +112,9 @@ priorityClass:
 # Known gates:
 #   DirectMemoryBackend — the experimental direct_memory backend (driven by
 #   GPU-CR). Default: false.
+#   MemoryRegionsBackend — the experimental memory_regions backend (driven
+#   by GPU-CR). Default: false. memoryRegions.enabled implies
+#   MemoryRegionsBackend: true; an explicit entry here overrides that.
 # Example:
 #   featureGates:
 #     DirectMemoryBackend: true

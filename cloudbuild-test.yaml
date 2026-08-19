@@ -55,6 +55,9 @@ steps:
         grep -q "mount-hugetlbfs" /tmp/mr.yaml
         grep -q "hugepages-2Mi" /tmp/mr.yaml
         grep -q "mountPropagation: HostToContainer" /tmp/mr.yaml
+        # memoryRegions.enabled implies the MemoryRegionsBackend feature gate
+        grep -q "MemoryRegionsBackend=true" /tmp/mr.yaml
+        ! grep -q "MemoryRegionsBackend" /tmp/plain.yaml
         # snapshot store must default to tmpfs, not boot disk (swap-latency
         # regression guard), with an OOM-safe agent memory fallback
         grep -q "/dev/shm/gcr-snapshots" /tmp/mr.yaml
