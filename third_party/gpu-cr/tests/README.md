@@ -11,9 +11,11 @@ fails the build.
 
 - **Unit tier — no GPU, no cloud, no cluster.** Any Linux machine with
   CMake and a C++ compiler works; GoogleTest downloads at configure time,
-  so network access is the only external dependency. `docker build -f
-  Dockerfile.build .` runs the same suite hermetically if you'd rather
-  not install a toolchain.
+  so network access is the only external dependency. Build only the
+  `gpu_cr_unit_tests` target — the default targets (vGPU.so, cr_client)
+  additionally need the CUDA toolkit. `docker build -f Dockerfile.build .`
+  runs the same suite hermetically if you'd rather not install a
+  toolchain.
 - **Google Cloud Build is not required.** Every image is a plain
   `docker build`; `gcloud builds submit` flows are an optional
   convenience for building off your machine. The one exception as
@@ -72,7 +74,7 @@ Useful invocations:
 
 ```sh
 # Configure, build, and run the whole unit tier:
-cmake -DGPU_VENDOR=NVIDIA -DGPU_CR_BUILD_TESTS=ON .. && make && ctest -R unit
+cmake -DGPU_VENDOR=NVIDIA -DGPU_CR_BUILD_TESTS=ON .. && make gpu_cr_unit_tests && ctest -R unit
 
 # Show the failing assertions, not just the red summary line:
 ctest -R unit --output-on-failure
@@ -113,6 +115,8 @@ that upstream (`e9bbb52`) delivers: same workload, same node,
 baseline .so vs candidate .so, median-of-N compared against a threshold
 (default 15%).
 
-Build the baseline once with `tests/e2e/build_baseline_so.sh`, then run
+Build the baseline once with `tests/e2e/build_baseline_so.sh` (run from
+a checkout containing the pinned upstream commit — a vendored copy of
+this tree does not carry upstream history), then run
 both GPU tiers as a one-shot pod: `tests/e2e/e2e-pod.yaml` (exits 0 only if
 every e2e gate and the perf gate pass).
