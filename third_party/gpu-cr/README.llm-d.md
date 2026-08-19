@@ -20,6 +20,19 @@ external projects: see `third_party/forked/` in kubernetes/kubernetes,
 [kubernetes/klog](https://github.com/kubernetes/klog) (fork of golang/glog), and
 [kube-openapi's in-tree fork of go-openapi](https://github.com/kubernetes/kube-openapi/tree/master/pkg/validation).
 
+## Local changes
+
+This copy carries test coverage for the imported upstream `e9bbb52` sources
+(the sources themselves are unchanged):
+
+- unit tests under `tests/unit/` for the GPU-free upstream-baseline pieces
+  (wire structs, control channel, buffer mapping, fd exchange)
+- e2e and perf-regression suites under `tests/` (see `tests/README.md`);
+  `Dockerfile.build` runs the GPU-free suite on every image build
+
+Like the original import, the prebuilt `cuda-checkpoint` binary is not
+vendored; deployments provide it.
+
 ## Licensing
 
 Upstream's Apache-2.0 [LICENSE](./LICENSE) applies to this directory and is

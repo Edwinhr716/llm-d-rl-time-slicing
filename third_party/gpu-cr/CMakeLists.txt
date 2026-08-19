@@ -134,6 +134,63 @@ target_link_libraries(multi_cr_client PRIVATE ${GPU_LIBS} dl stdc++ pthread)
 target_compile_options(multi_cr_client PRIVATE -O3 -g)
 
 # ---------------------------------------------------------------------------
+# Tests (GPU-free; run in Dockerfile.build)
+#   gpu_cr_unit_tests        — GoogleTest unit suite for the upstream-baseline
+#                              control channel, buffer mapping, fd exchange
+#                              and wire structs
+# ---------------------------------------------------------------------------
+option(GPU_CR_BUILD_TESTS "Build the GPU-free unit tests" OFF)
+
+if(GPU_CR_BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+    enable_testing()
+
+    add_executable(gpu_cr_unit_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/common_baseline_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ipc_fd_exchange_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/mmap_backend_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/share_mem_comm_test.cpp
+        # GPU-free production sources under test (upstream-baseline functions)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mmap_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_fd_exchange.cpp
+    )
+    target_include_directories(gpu_cr_unit_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/coordinator
+    )
+    target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)
+    add_test(NAME unit COMMAND gpu_cr_unit_tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# E2E / perf-regression workload (needs the CUDA runtime; run on a GPU node
+# under LD_PRELOAD via tests/e2e/run_e2e.sh and tests/e2e/perf_regression.sh)
+# ---------------------------------------------------------------------------
+option(GPU_CR_BUILD_E2E "Build the CUDA pattern workload for the e2e suites" OFF)
+
+if(GPU_CR_BUILD_E2E)
+    if(NOT GPU_VENDOR STREQUAL "NVIDIA")
+        message(FATAL_ERROR "GPU_CR_BUILD_E2E requires GPU_VENDOR=NVIDIA")
+    endif()
+    add_executable(pattern_workload
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/pattern_workload.cpp
+    )
+    target_include_directories(pattern_workload PRIVATE ${GPU_INCLUDE_DIR})
+    target_link_directories(pattern_workload PRIVATE ${GPU_LIB_DIR})
+    target_link_libraries(pattern_workload PRIVATE cudart)
+    target_compile_options(pattern_workload PRIVATE -O2 -g)
+endif()
+
+
+# ---------------------------------------------------------------------------
 # Optional adapters (only meaningful on NVIDIA)
 # ---------------------------------------------------------------------------
 if(GPU_CR_BUILD_NCCL_ADAPTER)
