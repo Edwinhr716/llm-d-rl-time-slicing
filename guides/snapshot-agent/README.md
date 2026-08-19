@@ -362,6 +362,12 @@ Requirements: the workload runs with the GPU-CR preloader
 (see the `memoryRegions` block in the Helm chart, `deploy/snapshot-agent`).
 Regions are always explicit — the agent does no discovery for this backend.
 
+The backend is experimental and gated off by default: requests fail with
+`FAILED_PRECONDITION` unless the agent runs with
+`--feature-gates=MemoryRegionsBackend=true` (or the `FEATURE_GATES` env
+var). The Helm chart sets the gate automatically when
+`memoryRegions.enabled=true`.
+
 ```python
 from timeslice.snapshot_agent import (
     MemoryRegion,
