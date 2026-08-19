@@ -1,10 +1,3 @@
-# cr_client and vGPU-NVIDIA.so are version-locked through the GPU-CR v2/v3
-# control protocol (GEP-0001/GEP-0006), so the client is taken from the SAME
-# GPU-CR build image that supplies the workload's .so — never from a stale
-# checked-in binary.
-ARG GPUCR_IMAGE=asia-southeast1-docker.pkg.dev/edwinhernandez-gke-dev/time-slicing/gpucr-so:gep0006-6bdce96
-FROM ${GPUCR_IMAGE} AS gpucr
-
 # --- Build stage ---
 FROM golang:1.26.2 AS builder
 
@@ -28,6 +21,35 @@ RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /workspace/snapshot-ag
 ADD https://github.com/NVIDIA/cuda-checkpoint/raw/00d5cce84c628088d6caa203fc4af40c1538b6f7/bin/x86_64_Linux/cuda-checkpoint /workspace/bin-dist/cuda-checkpoint
 RUN chmod +x /workspace/bin-dist/cuda-checkpoint
 
+# --- GPU-CR cr_client build stage ---
+# cr_client and the workload's vGPU-NVIDIA.so preloader are version-locked
+# through the GPU-CR control protocol, so the client is built from the SAME
+# in-tree source (third_party/gpu-cr) the deployed .so ships from — never
+# from a stale checked-in binary or an out-of-tree checkout. CPU-only:
+# compiles against CUDA headers, no GPU needed.
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS gpucr-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake build-essential && rm -rf /var/lib/apt/lists/*
+COPY third_party/gpu-cr /tmp/GPU-CR
+# Build-time patches, kept byte-in-sync with third_party/gpu-cr/Dockerfile.build
+# (which builds the deployed .so):
+#   - remap checkpoint/restore signals off SIGUSR1/2 (taken by NCCL/vLLM)
+#   - create the shared-memory control file world-writable so unprivileged
+#     workloads can open it
+# The constants compile into both binaries; a mismatch makes checkpoints
+# silently no-op. A sed no-ops once its change is source truth in-tree; the
+# greps assert the end state either way.
+RUN cd /tmp/GPU-CR && \
+    sed -i 's/#define CR_CKPT_SIGNAL     SIGUSR1/#define CR_CKPT_SIGNAL     (SIGRTMAX - 8)/' src/common.h && \
+    sed -i 's/#define CR_RESTORE_SIGNAL  SIGUSR2/#define CR_RESTORE_SIGNAL  (SIGRTMAX - 7)/' src/common.h && \
+    sed -i 's/int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/int fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
+    grep -q "SIGRTMAX - 8" src/common.h && \
+    grep -q "SIGRTMAX - 7" src/common.h && \
+    grep -q "0777" src/comm/share_mem.cpp && \
+    mkdir build && cd build && \
+    cmake -DGPU_VENDOR=NVIDIA .. && \
+    make -j"$(nproc)" cr_client
+
 # --- Runtime stage ---
 # distroless/cc (base + libgcc/libstdc++): cr_client is a dynamically linked
 # C++ binary.
@@ -37,8 +59,9 @@ WORKDIR /
 COPY --from=builder /workspace/snapshot-agent .
 # Copy bundled binaries (cuda-checkpoint) from the builder's bin directory
 COPY --from=builder /workspace/bin-dist ./bin
-# cr_client at the memory-regions backend's default fallback path (also on PATH).
-COPY --from=gpucr /cr_client /usr/local/bin/cr_client
-COPY --from=gpucr /cr_client /bin/cr_client
+# cr_client at the GPU-CR backends' default fallback path (also on PATH),
+# built from the same tree as the deployed vGPU-NVIDIA.so.
+COPY --from=gpucr-builder /tmp/GPU-CR/build/cr_client /usr/local/bin/cr_client
+COPY --from=gpucr-builder /tmp/GPU-CR/build/cr_client /bin/cr_client
 
 ENTRYPOINT ["/snapshot-agent"]
