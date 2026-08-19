@@ -116,9 +116,14 @@ func opTimeout() time.Duration {
 	return 120 * time.Second
 }
 
+// Both ops pass -b: displacement leaves the process alive and unfrozen —
+// no cuda-checkpoint toggle. Without it, a working toggle freezes CUDA at
+// park and the restore signal handler deadlocks on its first CUDA call
+// while cr_client waits for FINISH before untoggling. (E13 validated this
+// backend as the alternative to cuda-checkpoint, never composed with it.)
 func (d *DirectMemory) checkpointPID(ctx context.Context, pid string) error {
 	binaryPath := d.getCrClientPath()
-	if err := d.runCommand(ctx, binaryPath, "-c", "-p", pid); err != nil {
+	if err := d.runCommand(ctx, binaryPath, "-c", "-b", "-p", pid); err != nil {
 		return err
 	}
 	return nil
@@ -126,7 +131,7 @@ func (d *DirectMemory) checkpointPID(ctx context.Context, pid string) error {
 
 func (d *DirectMemory) restorePID(ctx context.Context, pid string) error {
 	binaryPath := d.getCrClientPath()
-	if err := d.runCommand(ctx, binaryPath, "-r", "-p", pid); err != nil {
+	if err := d.runCommand(ctx, binaryPath, "-r", "-b", "-p", pid); err != nil {
 		return err
 	}
 	return nil
