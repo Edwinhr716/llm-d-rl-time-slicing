@@ -246,6 +246,265 @@ func TestStartRestore(t *testing.T) {
 	}
 }
 
+func TestStartSnapshotSlot(t *testing.T) {
+	tests := []struct {
+		name          string
+		initialState  pb.JobState
+		initialSlot   string
+		slot          string
+		workerErr     error
+		expectErrCode codes.Code
+		finalState    pb.JobState
+		finalSlot     string
+	}{
+		{
+			name:         "Success from RUNNING records slot",
+			initialState: pb.JobState_JOB_STATE_RUNNING,
+			slot:         "slot-a",
+			finalState:   pb.JobState_JOB_STATE_SAVED,
+			finalSlot:    "slot-a",
+		},
+		{
+			name:         "Success replaces loaded slot",
+			initialState: pb.JobState_JOB_STATE_RUNNING,
+			initialSlot:  "slot-a",
+			slot:         "slot-b",
+			finalState:   pb.JobState_JOB_STATE_SAVED,
+			finalSlot:    "slot-b",
+		},
+		{
+			name:         "FAULTED job reset by slot snapshot",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			slot:         "slot-a",
+			finalState:   pb.JobState_JOB_STATE_SAVED,
+			finalSlot:    "slot-a",
+		},
+		{
+			// Unlike upstream, fault recovery here is not slot-gated
+			// (direct_memory needs it too), so the slotless path resets as
+			// well.
+			name:         "FAULTED reset even without slot",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			finalState:   pb.JobState_JOB_STATE_SAVED,
+		},
+		{
+			name:          "Fails when IDLE",
+			initialState:  pb.JobState_JOB_STATE_IDLE,
+			slot:          "slot-a",
+			expectErrCode: codes.FailedPrecondition,
+		},
+		{
+			name:          "Fails when SAVED",
+			initialState:  pb.JobState_JOB_STATE_SAVED,
+			initialSlot:   "slot-a",
+			slot:          "slot-b",
+			expectErrCode: codes.FailedPrecondition,
+		},
+		{
+			name:          "Fails when TRANSITIONING",
+			initialState:  pb.JobState_JOB_STATE_TRANSITIONING,
+			slot:          "slot-a",
+			expectErrCode: codes.Aborted,
+		},
+		{
+			name:         "Worker failure leads to FAULTED and keeps loaded slot",
+			initialState: pb.JobState_JOB_STATE_RUNNING,
+			initialSlot:  "slot-a",
+			slot:         "slot-b",
+			workerErr:    errors.New("worker failed"),
+			finalState:   pb.JobState_JOB_STATE_FAULTED,
+			finalSlot:    "slot-a",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := statemachine.NewStateManager()
+			jobID := "job-1"
+			group := "group-1"
+
+			sm.InternalMu().Lock()
+			job := sm.InternalGetOrCreateJob(jobID, group)
+			job.State = tc.initialState
+			job.Slot = tc.initialSlot
+			sm.InternalMu().Unlock()
+
+			worker := func() error {
+				return tc.workerErr
+			}
+
+			opID, err := sm.StartSnapshotSlot(jobID, group, tc.slot, worker)
+
+			if tc.expectErrCode != codes.OK {
+				if err == nil {
+					t.Fatalf("Expected error, got nil")
+				}
+				st, ok := status.FromError(err)
+				if !ok || st.Code() != tc.expectErrCode {
+					t.Fatalf("Expected error code %v, got %v", tc.expectErrCode, st.Code())
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			op := waitForOperation(t, sm, opID)
+
+			expectedStatus := pb.OperationStatus_OPERATION_STATUS_COMPLETE
+			expectedErr := ""
+			if tc.workerErr != nil {
+				expectedStatus = pb.OperationStatus_OPERATION_STATUS_FAILED
+				expectedErr = tc.workerErr.Error()
+			}
+			checkOperationStatus(t, op, expectedStatus, expectedErr)
+
+			checkJobState(t, sm, jobID, tc.finalState)
+			checkJobSlot(t, sm, jobID, tc.finalSlot)
+		})
+	}
+}
+
+func TestStartRestoreSlot(t *testing.T) {
+	tests := []struct {
+		name          string
+		initialState  pb.JobState
+		initialSlot   string
+		slot          string
+		workerErr     error
+		expectErrCode codes.Code
+		expectOpID    string // special case for "already-running"
+		finalState    pb.JobState
+		finalSlot     string
+	}{
+		{
+			name:         "Success from SAVED records slot",
+			initialState: pb.JobState_JOB_STATE_SAVED,
+			slot:         "slot-a",
+			finalState:   pb.JobState_JOB_STATE_RUNNING,
+			finalSlot:    "slot-a",
+		},
+		{
+			name:         "Live slot swap while RUNNING",
+			initialState: pb.JobState_JOB_STATE_RUNNING,
+			initialSlot:  "slot-a",
+			slot:         "slot-b",
+			finalState:   pb.JobState_JOB_STATE_RUNNING,
+			finalSlot:    "slot-b",
+		},
+		{
+			name:         "Restore of loaded slot short-circuits",
+			initialState: pb.JobState_JOB_STATE_RUNNING,
+			initialSlot:  "slot-b",
+			slot:         "slot-b",
+			expectOpID:   "already-running",
+		},
+		{
+			name:         "Slotless restore while RUNNING short-circuits",
+			initialState: pb.JobState_JOB_STATE_RUNNING,
+			expectOpID:   "already-running",
+		},
+		{
+			name:         "FAULTED job reset by slot restore",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			slot:         "slot-a",
+			finalState:   pb.JobState_JOB_STATE_RUNNING,
+			finalSlot:    "slot-a",
+		},
+		{
+			// Unlike upstream, fault recovery here is not slot-gated
+			// (direct_memory needs it too), so the slotless path resets as
+			// well.
+			name:         "FAULTED reset even without slot",
+			initialState: pb.JobState_JOB_STATE_FAULTED,
+			finalState:   pb.JobState_JOB_STATE_RUNNING,
+		},
+		{
+			name:          "Fails when IDLE",
+			initialState:  pb.JobState_JOB_STATE_IDLE,
+			slot:          "slot-a",
+			expectErrCode: codes.FailedPrecondition,
+		},
+		{
+			name:          "Fails when TRANSITIONING",
+			initialState:  pb.JobState_JOB_STATE_TRANSITIONING,
+			slot:          "slot-a",
+			expectErrCode: codes.Aborted,
+		},
+		{
+			name:         "Worker failure leads to FAULTED and keeps loaded slot",
+			initialState: pb.JobState_JOB_STATE_SAVED,
+			initialSlot:  "slot-a",
+			slot:         "slot-b",
+			workerErr:    errors.New("restore failed"),
+			finalState:   pb.JobState_JOB_STATE_FAULTED,
+			finalSlot:    "slot-a",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := statemachine.NewStateManager()
+			jobID := "job-1"
+			group := "group-1"
+
+			sm.InternalMu().Lock()
+			job := sm.InternalGetOrCreateJob(jobID, group)
+			job.State = tc.initialState
+			job.Slot = tc.initialSlot
+			sm.InternalMu().Unlock()
+
+			workerRan := false
+			worker := func() error {
+				workerRan = true
+				return tc.workerErr
+			}
+
+			opID, err := sm.StartRestoreSlot(jobID, group, tc.slot, worker)
+
+			if tc.expectErrCode != codes.OK {
+				if err == nil {
+					t.Fatalf("Expected error, got nil")
+				}
+				st, ok := status.FromError(err)
+				if !ok || st.Code() != tc.expectErrCode {
+					t.Fatalf("Expected error code %v, got %v", tc.expectErrCode, st.Code())
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if tc.expectOpID != "" {
+				if opID != tc.expectOpID {
+					t.Errorf("Expected opID %s, got %s", tc.expectOpID, opID)
+				}
+				// Short-circuiting spawns no goroutine, so this read is safe.
+				if workerRan {
+					t.Error("Worker must not run for an already-loaded slot")
+				}
+				return
+			}
+
+			op := waitForOperation(t, sm, opID)
+
+			expectedStatus := pb.OperationStatus_OPERATION_STATUS_COMPLETE
+			expectedErr := ""
+			if tc.workerErr != nil {
+				expectedStatus = pb.OperationStatus_OPERATION_STATUS_FAILED
+				expectedErr = tc.workerErr.Error()
+			}
+			checkOperationStatus(t, op, expectedStatus, expectedErr)
+
+			checkJobState(t, sm, jobID, tc.finalState)
+			checkJobSlot(t, sm, jobID, tc.finalSlot)
+		})
+	}
+}
+
 func TestGetJobStatus(t *testing.T) {
 	sm := statemachine.NewStateManager()
 
@@ -439,6 +698,13 @@ func checkJobState(t *testing.T, sm *statemachine.StateManager, jobID string, ex
 		}
 	}
 	t.Errorf("Job %s status not found", jobID)
+}
+
+func checkJobSlot(t *testing.T, sm *statemachine.StateManager, jobID, expectedSlot string) {
+	t.Helper()
+	if got := sm.InternalJobSlot(jobID); got != expectedSlot {
+		t.Errorf("Expected job %s slot %q, got %q", jobID, expectedSlot, got)
+	}
 }
 
 func checkOperationStatus(t *testing.T, op *statemachine.Operation, expected pb.OperationStatus, expectedErr string) {
