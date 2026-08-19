@@ -1,4 +1,4 @@
-// Shared-protocol helpers from common.h: the GEP-0001 consume-once FINISH
+// Shared-protocol helpers from common.h: the consume-once FINISH
 // bookkeeping and the wire-layout guards for the v2 extension.
 
 #include "common.h"
@@ -47,7 +47,7 @@ TEST(FinishOpControlsTest, CapabilityPersistsAcrossOps) {
 }
 
 // Layout guards for the shared-memory wire structs: the v2 fields are
-// appended so the v1 prefix keeps its exact offsets (GEP-0001).
+// appended so the v1 prefix keeps its exact offsets.
 TEST(WireLayoutTest, V1PrefixOffsetsUnchanged) {
   EXPECT_EQ(offsetof(SelectiveCrRequest, num_regions), 0u);
   EXPECT_EQ(offsetof(SelectiveCrRequest, regions), 8u);

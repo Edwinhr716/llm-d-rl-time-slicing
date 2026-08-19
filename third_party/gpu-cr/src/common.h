@@ -25,7 +25,7 @@
 // Each GPU process allocates SHM_SIZE + STAGING_BUF_SIZE*STAGING_BUF_NUM.
 // For TP=N, total hugepage needed = N * (SHM_SIZE + 2*staging) + overhead.
 //
-// KEP-0002: these are runtime values now. The compile-time SHM_SIZE_GB
+// These are runtime values now. The compile-time SHM_SIZE_GB
 // (cmake -DSHM_SIZE_GB=40) sets the DEFAULT; GPU_CR_SHM_GB / GPU_CR_SHM_MB
 // / GPU_CR_STAGING_MB env vars override it at library load. The macros
 // below keep every historical use site source-compatible while reading
@@ -64,7 +64,7 @@ inline constexpr size_t kStagingDefaultBytes = 1UL << 30;
 // Maximum number of processes in multi-GPU checkpoint
 #define MAX_MULTI_GPU_PROCS 32
 
-#define STAGING_BUF_SIZE (gpu_cr::Config().staging_size) // default 1GB, env-overridable (KEP-0002)
+#define STAGING_BUF_SIZE (gpu_cr::Config().staging_size) // default 1GB, env-overridable
 #define STAGING_BUF_NUM 2
 
 typedef void (*sighandler_t)(int);
@@ -100,7 +100,7 @@ struct SelectiveCrRegion {
     uint64_t size;
 };
 
-// GEP-0001: destination-path selective checkpoints.
+// Destination-path selective checkpoints.
 // The v2 fields are APPENDED so the v1 prefix (num_regions + regions[])
 // keeps its exact offsets: a v1 .so never reads past regions[], and the
 // zero-initialized control mapping makes proto_version==0 (v1) the default.
@@ -112,7 +112,7 @@ inline constexpr size_t kSelectiveCrMaxPath = 256;
 struct SelectiveCrRequest {
     uint32_t num_regions;
     SelectiveCrRegion regions[gpu_cr::kMaxSelectiveRegions];
-    /* --- v2 extension (GEP-0001) --- */
+    /* --- v2 extension --- */
     uint32_t proto_version;                           /* 0 = v1, 2 = v2 */
     char     dest_path[gpu_cr::kSelectiveCrMaxPath];  /* empty = per-PID buffer */
 };
@@ -138,14 +138,14 @@ struct DumpCommit {
 struct signal_controls {
     uint32_t signal;
     SelectiveCrRequest selective_req;
-    /* --- v2 extension (GEP-0001): appended, invisible to v1 readers --- */
+    /* --- v2 extension: appended, invisible to v1 readers --- */
     uint32_t capability; /* gpu_cr::kCrCap* bits, persistent across ops */
     uint32_t proto_ack;  /* proto level the .so served the last op at */
     int32_t  op_status;  /* 0 = OK, else positive errno-style code */
 };
 
 namespace gpu_cr {
-// Post-op bookkeeping (GEP-0001, extended to full ops by KEP-0002): report
+// Post-op bookkeeping: report
 // status + proto ack, then consume the v2 request extension so a stale
 // dest_path can never redirect a later op (a v1 cr_client only rewrites
 // the v1 prefix). v2 clients gate cuda-checkpoint --toggle on op_status —
