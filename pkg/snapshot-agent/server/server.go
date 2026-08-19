@@ -118,9 +118,9 @@ func (s *Server) getSnapshotBackendType(config *pb.BackendConfig) backends.Backe
 	if config.GetAppChannel() != nil {
 		return backends.BackendAppChannel
 	}
-	// NOTE: direct_memory is not routed yet and falls through to the
-	// default backend. It is unreachable unless the DirectMemoryBackend
-	// feature gate is enabled (checkFeatureGates runs before routing).
+	if config.GetMemoryRegions() != nil {
+		return backends.BackendMemoryRegions
+	}
 	return s.defaultBackend
 }
 
