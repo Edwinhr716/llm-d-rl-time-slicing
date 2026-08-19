@@ -91,8 +91,72 @@ struct shared_mem_fs {
     struct shared_mem_file files[MAX_FILE_NUM];
 };
 
+namespace gpu_cr {
+inline constexpr uint32_t kMaxSelectiveRegions = 4096;
+}  // namespace gpu_cr
+
+struct SelectiveCrRegion {
+    void* ptr;
+    uint64_t size;
+};
+
+// GEP-0001: destination-path selective checkpoints.
+// The v2 fields are APPENDED so the v1 prefix (num_regions + regions[])
+// keeps its exact offsets: a v1 .so never reads past regions[], and the
+// zero-initialized control mapping makes proto_version==0 (v1) the default.
+namespace gpu_cr {
+inline constexpr uint32_t kSelectiveCrProtoV2 = 2;
+inline constexpr size_t kSelectiveCrMaxPath = 256;
+}  // namespace gpu_cr
+
+struct SelectiveCrRequest {
+    uint32_t num_regions;
+    SelectiveCrRegion regions[gpu_cr::kMaxSelectiveRegions];
+    /* --- v2 extension (GEP-0001) --- */
+    uint32_t proto_version;                           /* 0 = v1, 2 = v2 */
+    char     dest_path[gpu_cr::kSelectiveCrMaxPath];  /* empty = per-PID buffer */
+};
+
+namespace gpu_cr {
+// Capability bits published by the .so in signal_controls.capability at
+// init_CR and re-asserted at every FINISH (consume-once zeroing of the
+// request extension deliberately excludes this word).
+inline constexpr uint32_t kCrCapDestPath = 1u << 0;
+
+// Trailing commit marker for destination-file dumps: written at
+// fs->current_offset only after the last extent has landed, so a torn
+// dump is detectable. Restores from a destination file refuse dumps
+// whose marker is absent or stale.
+inline constexpr uint64_t kDumpCommitMagic = 0x31524347u; /* "GCR1" */
+}  // namespace gpu_cr
+
+struct DumpCommit {
+    uint64_t magic;
+    uint64_t generation;
+};
+
 struct signal_controls {
     uint32_t signal;
+    SelectiveCrRequest selective_req;
+    /* --- v2 extension (GEP-0001): appended, invisible to v1 readers --- */
+    uint32_t capability; /* gpu_cr::kCrCap* bits, persistent across ops */
+    uint32_t proto_ack;  /* proto level the .so served the last op at */
+    int32_t  op_status;  /* 0 = OK, else positive errno-style code */
 };
+
+namespace gpu_cr {
+// Post-op bookkeeping (GEP-0001, extended to full ops by KEP-0002): report
+// status + proto ack, then consume the v2 request extension so a stale
+// dest_path can never redirect a later op (a v1 cr_client only rewrites
+// the v1 prefix). v2 clients gate cuda-checkpoint --toggle on op_status —
+// never freeze a process whose state was not saved.
+inline void FinishOpControls(signal_controls* c, int32_t op_status) {
+  c->op_status = op_status;
+  c->proto_ack = kSelectiveCrProtoV2;
+  c->selective_req.proto_version = 0;
+  memset(c->selective_req.dest_path, 0, kSelectiveCrMaxPath);
+  c->capability |= kCrCapDestPath;
+}
+}  // namespace gpu_cr
 
 #endif
