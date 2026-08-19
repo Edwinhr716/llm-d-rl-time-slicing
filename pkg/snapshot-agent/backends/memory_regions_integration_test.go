@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"google.golang.org/grpc"
@@ -98,7 +99,8 @@ func startAgent(t *testing.T, dev *fakeDevice) pb.SnapshotAgentServiceClient {
 
 	lis := bufconn.Listen(1024 * 1024)
 	s := grpc.NewServer()
-	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry(), nil)
+	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry(),
+		features.Gates{features.MemoryRegionsBackend: true})
 	pb.RegisterSnapshotAgentServiceServer(s, srv)
 	go func() {
 		if err := s.Serve(lis); err != nil {
