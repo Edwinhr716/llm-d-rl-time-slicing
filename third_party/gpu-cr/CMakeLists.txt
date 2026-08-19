@@ -180,7 +180,6 @@ if(GPU_CR_BUILD_TESTS)
     )
     target_include_directories(gpu_cr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/coordinator
     )
     target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)
     add_test(NAME unit COMMAND gpu_cr_unit_tests)
