@@ -23,12 +23,26 @@
 
 // SHM_SIZE: Per-GPU checkpoint buffer on hugepages.
 // Each GPU process allocates SHM_SIZE + STAGING_BUF_SIZE*STAGING_BUF_NUM.
-// For TP=N, total hugepage needed = N * (SHM_SIZE + 2GB) + overhead.
-// Override at compile time: cmake .. -DSHM_SIZE_GB=40
+// For TP=N, total hugepage needed = N * (SHM_SIZE + 2*staging) + overhead.
+//
+// KEP-0002: these are runtime values now. The compile-time SHM_SIZE_GB
+// (cmake -DSHM_SIZE_GB=40) sets the DEFAULT; GPU_CR_SHM_GB / GPU_CR_SHM_MB
+// / GPU_CR_STAGING_MB env vars override it at library load. The macros
+// below keep every historical use site source-compatible while reading
+// the cached runtime config.
 #ifndef SHM_SIZE_GB
 #define SHM_SIZE_GB 25
 #endif
-#define SHM_SIZE ((unsigned long)SHM_SIZE_GB << 30)
+
+#include "gpu_cr_config.h"
+
+namespace gpu_cr {
+inline constexpr size_t kShmDefaultBytes =
+    static_cast<size_t>(SHM_SIZE_GB) << 30;
+inline constexpr size_t kStagingDefaultBytes = 1UL << 30;
+}  // namespace gpu_cr
+
+#define SHM_SIZE (gpu_cr::Config().shm_size)
 
 #define MAX_FILE_NUM 4096
 #define COPY_THRESHOLD (1UL << 29) // 0.5GB, when to copy from host_buf to shm
@@ -50,7 +64,7 @@
 // Maximum number of processes in multi-GPU checkpoint
 #define MAX_MULTI_GPU_PROCS 32
 
-#define STAGING_BUF_SIZE (1UL << 30) // 1GB staging buffer
+#define STAGING_BUF_SIZE (gpu_cr::Config().staging_size) // default 1GB, env-overridable (KEP-0002)
 #define STAGING_BUF_NUM 2
 
 typedef void (*sighandler_t)(int);
