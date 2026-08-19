@@ -50,9 +50,8 @@ gcloud builds submit --config cloudbuild-test.yaml .
 ## 3. End-to-end — `tests/e2e/run_e2e.sh` (GPU node)
 
 A real CUDA workload (`pattern_workload`) under `LD_PRELOAD=vGPU-NVIDIA.so`
-goes through full checkpoint/restore, gating on **byte-identical GPU memory
-after every restore**. The selective gates (G2-G5) land with the preloader
-implementation.
+goes through destination-path selective C/R, buffer-path selective C/R, and
+full C/R, gating on **byte-identical GPU memory after every restore**.
 
 ## 4. Performance regression — `tests/e2e/perf_regression.sh` (GPU node)
 
