@@ -138,9 +138,10 @@ target_compile_options(multi_cr_client PRIVATE -O3 -g)
 
 # ---------------------------------------------------------------------------
 # Tests (GPU-free; run in Dockerfile.build)
-#   gpu_cr_unit_tests        — GoogleTest unit suite for the config code,
-#                              plus the upstream-baseline control channel,
-#                              buffer mapping, fd exchange and wire structs
+#   gpu_cr_unit_tests        — GoogleTest unit suite for the config and
+#                              ctl-path code, plus the upstream-baseline
+#                              control channel, buffer mapping, fd exchange
+#                              and wire structs
 # ---------------------------------------------------------------------------
 option(GPU_CR_BUILD_TESTS "Build the GPU-free unit tests" OFF)
 
@@ -157,6 +158,7 @@ if(GPU_CR_BUILD_TESTS)
 
     add_executable(gpu_cr_unit_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/common_baseline_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ctl_path_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/gpu_cr_config_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ipc_fd_exchange_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/mmap_backend_test.cpp
