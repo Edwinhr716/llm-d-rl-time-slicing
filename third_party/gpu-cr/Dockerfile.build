@@ -1,8 +1,7 @@
-# Builds vGPU-NVIDIA.so from the LOCAL source tree (not the GitHub branch),
-# applying the same build-time patches the deployed prebuilt carries
-# (see docs/gke-memory-address-integration.md in llm-d-rl-time-slicing,
-# branch gcr-backend-memory-allocation): SIGRTMAX-8/-7 signal remap and
-# control-file 0777. CPU-only; compiles against CUDA headers, no GPU needed.
+# Builds vGPU-NVIDIA.so from the LOCAL source tree, applying the same
+# build-time patches the deployed prebuilt carries: SIGRTMAX-8/-7 signal
+# remap and control-file 0777. CPU-only; compiles against CUDA headers, no
+# GPU needed.
 #
 # Stages:
 #   builder  compiles everything and (RUN_TESTS=1, default) runs the
@@ -46,7 +45,7 @@ ENV CR_CLIENT=/opt/gpu-cr/cr_client \
 
 FROM busybox:stable
 COPY --from=builder /tmp/GPU-CR/build/vGPU-NVIDIA.so /vGPU-NVIDIA.so
-# The coordinator ships too since GEP-0001/0006: cr_client and vGPU.so are
-# version-locked through the v2/v3 protocol, so consumers (snapshot-agent
+# The coordinator ships too: cr_client and vGPU.so are version-locked
+# through the control-channel protocol, so consumers (snapshot-agent
 # image) should copy BOTH from the same build.
 COPY --from=builder /tmp/GPU-CR/build/cr_client /cr_client
