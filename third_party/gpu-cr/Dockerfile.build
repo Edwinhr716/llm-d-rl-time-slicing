@@ -5,7 +5,7 @@
 #
 # Stages:
 #   builder  compiles everything and (RUN_TESTS=1, default) runs the
-#            GPU-free unit + integration suites — a red suite fails the build
+#            GPU-free test suites (ctest) — a red suite fails the build
 #   e2e      carries the CUDA runtime, binaries and e2e/perf scripts for
 #            running tests/e2e/ on a GPU node
 #   (final)  minimal artifact carrier: vGPU-NVIDIA.so + cr_client
@@ -18,7 +18,7 @@ COPY . /tmp/GPU-CR
 RUN cd /tmp/GPU-CR && \
     sed -i 's/#define CR_CKPT_SIGNAL     SIGUSR1/#define CR_CKPT_SIGNAL     (SIGRTMAX - 8)/' src/common.h && \
     sed -i 's/#define CR_RESTORE_SIGNAL  SIGUSR2/#define CR_RESTORE_SIGNAL  (SIGRTMAX - 7)/' src/common.h && \
-    sed -i 's/O_CREAT | O_RDWR, 0755/O_CREAT | O_RDWR, 0777/' src/comm/share_mem.cpp && \
+    sed -i 's/int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/int fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
     grep -q "SIGRTMAX - 8" src/common.h && \
     grep -q "0777" src/comm/share_mem.cpp && \
     mkdir build && cd build && \

@@ -9,7 +9,8 @@
 # (G2-G5 cover the selective-checkpointing surface and land with it.)
 #
 # Required env: CR_CLIENT, WORKLOAD, VGPU_SO, STORE.
-# Optional env: E2E_NUM_BUFFERS, E2E_BUFFER_MB.
+# Optional env: E2E_NUM_BUFFERS, E2E_BUFFER_MB, CR_TIMEOUT (seconds per
+# cr_client call, default 120).
 set -u
 HERE=$(dirname "$(readlink -f "$0")")
 . "$HERE/e2e_lib.sh"
@@ -24,7 +25,7 @@ gate() {
     if "$@"; then echo "PASS: $name"; PASS=$((PASS+1));
     else echo "FAIL: $name"; FAIL=$((FAIL+1)); fi
 }
-cr() { env EXPORT_FILE_PATH="$STORE" "$CR_CLIENT" "$@"; }
+cr() { env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" "$CR_CLIENT" "$@"; }
 
 trap 'stop_workload' EXIT
 if [ "${E2E_FULL_TOGGLE:-0}" != "1" ]; then stub_cuda_checkpoint; fi
