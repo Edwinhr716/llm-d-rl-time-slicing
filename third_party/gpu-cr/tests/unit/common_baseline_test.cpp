@@ -33,6 +33,13 @@ TEST(RoundUp2MBTest, Idempotent) {
   EXPECT_EQ(ROUND_UP_2MB(once), once);
 }
 
+// The VMM mapping granule and the hugepage size are the same 2MB constant;
+// ROUND_UP_2MB and GranuleClampLen must agree on where boundaries are.
+TEST(HugePageGeometryTest, GranuleMatchesHugePageSize) {
+  EXPECT_EQ(static_cast<size_t>(HUGE_PAGE_SIZE), kVmmGranuleSize);
+  EXPECT_EQ(ROUND_UP_2MB(1UL), kVmmGranuleSize);
+}
+
 // The v1 control word must stay at offset 0: a v0.2.1 cr_client and a
 // current .so share the same zero-initialized mapping.
 TEST(SignalControlsLayoutTest, SignalWordIsFirst) {
@@ -44,7 +51,7 @@ TEST(SignalControlsLayoutTest, SignalWordIsFirst) {
 TEST(SharedMemFsTest, HeaderFitsReservedExtent) {
   size_t first_data_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
   EXPECT_GE(first_data_offset, sizeof(shared_mem_fs));
-  EXPECT_EQ(first_data_offset % static_cast<size_t>(HUGE_PAGE_SIZE), 0u);
+  EXPECT_EQ(first_data_offset % kVmmGranuleSize, 0u);
 }
 
 TEST(SharedMemFsTest, FileTableHoldsMaxFileNumEntries) {

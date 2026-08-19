@@ -1,9 +1,7 @@
 // Upstream-baseline ShareMem backend (mmap_backend.cpp): setup() maps the
 // dump buffer and the two-slot host staging buffer, get_tmp_buf() /
 // get_host_buffer() hand them out. Exercised through the file backend
-// (EXPORT_FILE_PATH) so no hugepages are needed; the backing files are
-// sparse, so the compile-time SHM_SIZE costs address space, not disk.
-// Linux-only.
+// (EXPORT_FILE_PATH) so no hugepages are needed. Linux-only.
 
 #include "backend/backend.h"
 
@@ -22,9 +20,22 @@
 namespace gpu_cr {
 namespace {
 
+// Pin small KEP-0002 buffer sizes (floors: 64MiB dump, 128MiB staging) and
+// capture them into the cached gpu_cr::Config() singleton at static-init
+// time — gpu_cr_config_test's fixture scrubs these env vars, so waiting
+// until the first test-time Config() call would fall back to the 25GiB
+// build default and fallocate that per test.
+const bool kBufEnvPinned = [] {
+  setenv("GPU_CR_SHM_MB", "64", 1);
+  setenv("GPU_CR_STAGING_MB", "128", 1);
+  return Config().shm_size == (64UL << 20) &&
+         Config().staging_size == (128UL << 20);
+}();
+
 class MmapBackendTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    ASSERT_TRUE(kBufEnvPinned);
     strcpy(dir_, "/tmp/gpu-cr-mmap-backend-XXXXXX");
     ASSERT_NE(mkdtemp(dir_), nullptr);
     setenv("EXPORT_FILE_PATH", dir_, 1);
@@ -70,11 +81,11 @@ TEST_F(MmapBackendTest, FilesCreatedAtConfiguredSizes) {
 
   struct stat st;
   ASSERT_EQ(stat(DumpPath(3).c_str(), &st), 0);
-  EXPECT_EQ(static_cast<size_t>(st.st_size), static_cast<size_t>(SHM_SIZE));
+  EXPECT_EQ(static_cast<size_t>(st.st_size), Config().shm_size);
 
   ASSERT_EQ(stat(HostPath(3).c_str(), &st), 0);
   EXPECT_EQ(static_cast<size_t>(st.st_size),
-            static_cast<size_t>(STAGING_BUF_SIZE) * STAGING_BUF_NUM);
+            Config().staging_size * STAGING_BUF_NUM);
 }
 
 TEST_F(MmapBackendTest, BuffersAreWritable) {
@@ -92,9 +103,9 @@ TEST_F(MmapBackendTest, BuffersAreWritable) {
   ASSERT_NE(host, nullptr);
   // Touch both staging slots.
   host[0] = 0x11;
-  host[STAGING_BUF_SIZE] = 0x22;
+  host[Config().staging_size] = 0x22;
   EXPECT_EQ(host[0], 0x11);
-  EXPECT_EQ(host[STAGING_BUF_SIZE], 0x22);
+  EXPECT_EQ(host[Config().staging_size], 0x22);
   (void)DumpPath(5);
 }
 
@@ -124,14 +135,14 @@ TEST_F(MmapBackendTest, DistinctIdsGetDistinctFiles) {
   EXPECT_EQ(stat(DumpPath(2).c_str(), &st), 0);
 }
 
-// setup() keeps the historical fatal-exit contract when the data dir is
-// unusable.
+// Eager setup keeps the historical fatal-exit contract when the data dir
+// is unusable.
 TEST_F(MmapBackendTest, MissingDataDirExitsFatally) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   setenv("EXPORT_FILE_PATH", "/nonexistent-gpu-cr-unit-dir", 1);
   ShareMem backend(9);
   EXPECT_EXIT(backend.setup(), ::testing::ExitedWithCode(EXIT_FAILURE),
-              "open");
+              "dump buffer");
 }
 
 }  // namespace

@@ -17,9 +17,28 @@
 #include <map>
 #include <utility>
 #include <atomic>
+#include <mutex>
 
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 #define ROUND_UP_2MB(x) (((x) + (2 * 1024 * 1024 - 1)) & ~(2 * 1024 * 1024 - 1))
+
+namespace gpu_cr {
+// CUDA VMM mapping granularity: every hooked allocation is reserved/mapped in
+// units of this size (see ROUND_UP_2MB uses in the cudaMalloc hook).
+inline constexpr size_t kVmmGranuleSize = 2UL * 1024 * 1024;
+
+// GEP-0005 §3: the driver rejects a cudaMemcpyAsync on a hooked VMM mapping
+// when the copy crosses a 2MB granule boundary with an unrounded length.
+// Clamps a device copy so it ends at the next granule boundary or at the
+// region end: every issued copy is <=2MB and granule-aligned at its start
+// or its end — the copy shapes validated at scale. Applies to the selective
+// (unrounded) paths only; the full-checkpoint paths copy rounded extents
+// and never hit this boundary.
+constexpr size_t GranuleClampLen(uintptr_t dev_addr, size_t len) {
+  size_t to_boundary = kVmmGranuleSize - (dev_addr & (kVmmGranuleSize - 1));
+  return len < to_boundary ? len : to_boundary;
+}
+}  // namespace gpu_cr
 
 // SHM_SIZE: Per-GPU checkpoint buffer on hugepages.
 // Each GPU process allocates SHM_SIZE + STAGING_BUF_SIZE*STAGING_BUF_NUM.
@@ -75,6 +94,8 @@ extern std::map<void*, size_t> allocated_memory;
 
 // Global memory type tracking: ptr -> type (0=runtime Malloc, 1=VMM)
 extern std::map<void*, int> allocated_memory_type;
+
+extern std::mutex gpu_mem_mutex;
 
 // Helper function declarations
 void memcpy_multi(void* dest, void* src, size_t size);
