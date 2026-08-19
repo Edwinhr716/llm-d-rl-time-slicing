@@ -25,7 +25,7 @@
 // Each GPU process allocates SHM_SIZE + STAGING_BUF_SIZE*STAGING_BUF_NUM.
 // For TP=N, total hugepage needed = N * (SHM_SIZE + 2*staging) + overhead.
 //
-// KEP-0002: these are runtime values now. The compile-time SHM_SIZE_GB
+// These are runtime values now. The compile-time SHM_SIZE_GB
 // (cmake -DSHM_SIZE_GB=40) sets the DEFAULT; GPU_CR_SHM_GB / GPU_CR_SHM_MB
 // / GPU_CR_STAGING_MB env vars override it at library load. The macros
 // below keep every historical use site source-compatible while reading
@@ -64,7 +64,7 @@ inline constexpr size_t kStagingDefaultBytes = 1UL << 30;
 // Maximum number of processes in multi-GPU checkpoint
 #define MAX_MULTI_GPU_PROCS 32
 
-#define STAGING_BUF_SIZE (gpu_cr::Config().staging_size) // default 1GB, env-overridable (KEP-0002)
+#define STAGING_BUF_SIZE (gpu_cr::Config().staging_size) // default 1GB, env-overridable
 #define STAGING_BUF_NUM 2
 
 typedef void (*sighandler_t)(int);
