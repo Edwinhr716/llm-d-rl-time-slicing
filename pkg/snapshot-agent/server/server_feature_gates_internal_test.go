@@ -158,6 +158,10 @@ func newFeatureGateTestServer(
 	noopBackend := backends.NewNoopBackend()
 	backendsMap := map[backends.BackendType]backends.Backend{
 		backends.BackendNoop: noopBackend,
+		// direct_memory routes to its own backend type; back it with the
+		// noop backend so gate-enabled requests exercise routing without
+		// needing a real cr_client.
+		backends.BackendDirectMemory: noopBackend,
 	}
 
 	lisLocal := bufconn.Listen(bufSize)
