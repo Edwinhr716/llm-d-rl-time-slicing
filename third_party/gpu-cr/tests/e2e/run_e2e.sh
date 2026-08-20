@@ -4,10 +4,8 @@
 # Drives a real CUDA workload under LD_PRELOAD through the checkpoint/
 # restore surface, gating on byte-identical GPU memory after every restore:
 #   G1  baseline pattern verify
-#   G6  full checkpoint/restore data plane + verify (stubbed toggle unless
+#   G2  full checkpoint/restore data plane + verify (stubbed toggle unless
 #       E2E_FULL_TOGGLE=1 and a real cuda-checkpoint is on PATH)
-# (Gate numbers G2-G5 are reserved for later additions in this series;
-#  their gates land with them.)
 #
 # Required env: CR_CLIENT, WORKLOAD, VGPU_SO, STORE.
 # Optional env: E2E_NUM_BUFFERS, E2E_BUFFER_MB, CR_TIMEOUT (seconds per
@@ -39,9 +37,9 @@ cr -i -p "$WL_PID" || { echo "FATAL: init failed ($?)"; exit 1; }
 
 gate "G1 baseline verify" wl_cmd verify
 
-gate "G6a full ckpt" cr -c -p "$WL_PID"
-gate "G6b full restore" cr -r -p "$WL_PID"
-gate "G6c verify after full restore" wl_cmd verify
+gate "G2a full ckpt" cr -c -p "$WL_PID"
+gate "G2b full restore" cr -r -p "$WL_PID"
+gate "G2c verify after full restore" wl_cmd verify
 
 stop_workload
 echo
