@@ -180,12 +180,13 @@ func TestGates_String(t *testing.T) {
 	withGate(t, "AAATestGate", false)
 
 	got := Gates{DirectMemoryBackend: true}.String()
-	want := "AAATestGate=false,DirectMemoryBackend=true"
+	want := "AAATestGate=false,DirectMemoryBackend=true,MemoryRegionsBackend=false"
 	if got != want {
 		t.Errorf("String() = %q, want %q", got, want)
 	}
 
-	if got := Gates(nil).String(); !strings.Contains(got, "DirectMemoryBackend=false") {
+	if got := Gates(nil).String(); !strings.Contains(got, "DirectMemoryBackend=false") ||
+		!strings.Contains(got, "MemoryRegionsBackend=false") {
 		t.Errorf("nil Gates String() should show defaults, got %q", got)
 	}
 }
