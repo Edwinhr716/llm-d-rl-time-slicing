@@ -265,3 +265,39 @@ func TestSweepLegacySnapshotStoreMisconfigGuard(t *testing.T) {
 
 	assertKept(t, store, "parked-group")
 }
+
+// TestSweepIncompleteProcScan: when a maps file is unreadable for a reason
+// other than process exit, the scan cannot prove any dump is unmapped, so
+// dump deletion is skipped; per-PID files are still reaped (their liveness
+// check does not depend on the maps scan).
+func TestSweepIncompleteProcScan(t *testing.T) {
+	ctl := t.TempDir()
+	t.Setenv("EXPORT_FILE_PATH", ctl)
+	t.Setenv("GPU_CR_CTL_PATH", "")
+	t.Setenv("GPU_CR_GROUP_STORE", "")
+	t.Setenv("SNAPSHOT_DIR", t.TempDir())
+
+	fakeProc := t.TempDir()
+	pidDir := filepath.Join(fakeProc, "42")
+	assert.NilError(t, os.MkdirAll(pidDir, 0o755))
+	// A self-referencing symlink makes ReadFile fail with ELOOP — neither
+	// IsNotExist nor ESRCH, so the scan must report incomplete.
+	loop := filepath.Join(pidDir, "maps")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Skipf("cannot create symlink loop: %v", err)
+	}
+	oldRoot := procfsRoot
+	procfsRoot = fakeProc
+	defer func() { procfsRoot = oldRoot }()
+
+	_, complete := liveMappedIds()
+	assert.Assert(t, !complete, "scan must report incomplete on unreadable maps file")
+
+	writeAged(t, ctl, "123", true)              // stale dump, but scan incomplete -> kept
+	writeAged(t, ctl, "control-"+deadPID, true) // dead pid -> still removed
+
+	sweep(ctl)
+
+	assertKept(t, ctl, "123")
+	assertGone(t, ctl, "control-"+deadPID)
+}
