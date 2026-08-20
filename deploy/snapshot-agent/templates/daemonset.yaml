@@ -89,7 +89,7 @@ spec:
             {{- if .Values.directMemory.enabled }}
             - name: EXPORT_FILE_PATH
               value: {{ .Values.directMemory.ctlDir | quote }}
-            - name: GPU_CR_OP_TIMEOUT_SEC
+            - name: DIRECT_MEMORY_OP_TIMEOUT_SEC
               value: {{ .Values.directMemory.opTimeoutSec | quote }}
             {{- end }}
             {{- if .Values.nvidia.driver.enabled }}

@@ -90,7 +90,7 @@ directMemory:
   # checkpoints the dump is written by the workload's preloader, not the
   # agent, so the agent normally needs no hugepage allowance.
   hugepagesResource: ""
-  # Per-cr_client-invocation timeout (GPU_CR_OP_TIMEOUT_SEC).
+  # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC).
   opTimeoutSec: 120
 
 rbac:
