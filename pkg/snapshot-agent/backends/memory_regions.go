@@ -13,6 +13,7 @@ import (
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
 // MemoryRegions implements the Backend interface for selective checkpoint
@@ -57,14 +58,6 @@ func NewMemoryRegions() *MemoryRegions {
 	}
 }
 
-// dataDir is where GPU-CR keeps dump/staging DATA files (hugetlbfs mount).
-func dataDir() string {
-	if d := os.Getenv("EXPORT_FILE_PATH"); d != "" {
-		return d
-	}
-	return "/mnt/huge-ckpt"
-}
-
 // ctlFilesDir is where the control plane lives: control-<pid>, pid_map_<pid>,
 // ctl-ready-<pid>. With GPU_CR_CTL_PATH set (GEP-0006) that's a tmpfs; unset
 // means the legacy layout where control files share the data dir.
@@ -72,19 +65,7 @@ func ctlFilesDir() string {
 	if d := os.Getenv("GPU_CR_CTL_PATH"); d != "" {
 		return d
 	}
-	return dataDir()
-}
-
-// groupStoreDir is where per-slot destination dumps live. Defaults to
-// <dataDir>/groups: on the hugepage mount the parked bytes consume the pool
-// the workload pod already requested, and the path string resolves
-// identically in the agent and workload mount namespaces (both mount the
-// same hostPath at the same in-container path).
-func groupStoreDir() string {
-	if d := os.Getenv("GPU_CR_GROUP_STORE"); d != "" {
-		return d
-	}
-	return filepath.Join(dataDir(), "groups")
+	return utils.DataDir()
 }
 
 // groupDir validates a snapshot slot name and returns its directory under
@@ -92,7 +73,7 @@ func groupStoreDir() string {
 // rejected along with traversal because GC reaps store entries at the top
 // level only (a nested slot's .owners metadata would be invisible to it).
 func groupDir(slot string) (string, error) {
-	store := groupStoreDir()
+	store := utils.GroupStoreDir()
 	dir := filepath.Join(store, filepath.Clean(slot))
 	rel, err := filepath.Rel(store, dir)
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || strings.ContainsRune(rel, os.PathSeparator) {
@@ -101,48 +82,22 @@ func groupDir(slot string) (string, error) {
 	return dir, nil
 }
 
-// groupMetaFile records the owning workload processes of a slot:
-// "pid starttime" per line. GC deletes a slot only when every recorded
-// owner is gone (dead, or its PID recycled to a different starttime) —
-// a parked slot's dump is meaningless once its process is, and never
-// expendable before that.
-const groupMetaName = ".owners"
-
 func writeGroupMeta(dir string, owners map[string]string) error {
 	var sb strings.Builder
 	for pid := range owners {
-		st, err := procStarttime(pid)
+		st, err := utils.ProcStarttime(pid)
 		if err != nil {
 			return fmt.Errorf("starttime of owner pid %s: %w", pid, err)
 		}
 		fmt.Fprintf(&sb, "%s %d\n", pid, st)
 	}
-	return os.WriteFile(filepath.Join(dir, groupMetaName), []byte(sb.String()), 0o644)
+	return os.WriteFile(filepath.Join(dir, utils.GroupMetaName), []byte(sb.String()), 0o644)
 }
 
 // touchGroup bumps the slot dir mtime explicitly on every op.
 func touchGroup(dir string) {
 	now := time.Now()
 	_ = os.Chtimes(dir, now, now)
-}
-
-// procStarttime returns field 22 of /proc/<pid>/stat — the PID-reuse guard.
-func procStarttime(pid string) (int64, error) {
-	data, err := os.ReadFile(filepath.Join("/proc", pid, "stat"))
-	if err != nil {
-		return 0, err
-	}
-	// comm may contain spaces/parens: parse after the LAST ')'.
-	idx := strings.LastIndexByte(string(data), ')')
-	if idx < 0 || idx+2 >= len(data) {
-		return 0, fmt.Errorf("malformed /proc/%s/stat", pid)
-	}
-	fields := strings.Fields(string(data[idx+2:]))
-	// fields[0] is field 3 (state); starttime is field 22.
-	if len(fields) < 20 {
-		return 0, fmt.Errorf("short /proc/%s/stat", pid)
-	}
-	return strconv.ParseInt(fields[19], 10, 64)
 }
 
 // regionSpecs validates the config's regions and groups them per PID,
@@ -216,8 +171,8 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	storeMu.Lock()
-	defer storeMu.Unlock()
+	utils.StoreMu.Lock()
+	defer utils.StoreMu.Unlock()
 
 	slog.InfoContext(ctx, "Snapshotting memory regions using GPU-CR",
 		"jobID", req.JobID, "slot", slot, "pids", regionPIDs(cfg), "regions", len(cfg.GetRegions()))
@@ -276,8 +231,8 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	storeMu.Lock()
-	defer storeMu.Unlock()
+	utils.StoreMu.Lock()
+	defer utils.StoreMu.Unlock()
 
 	slog.InfoContext(ctx, "Restoring memory regions using GPU-CR",
 		"jobID", req.JobID, "slot", slot, "pids", regionPIDs(cfg), "regions", len(cfg.GetRegions()))
@@ -287,7 +242,7 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 		return err
 	}
 	if _, err := os.Stat(targetDir); err != nil {
-		return fmt.Errorf("snapshot slot %q not found in group store %s: %w", slot, groupStoreDir(), err)
+		return fmt.Errorf("snapshot slot %q not found in group store %s: %w", slot, utils.GroupStoreDir(), err)
 	}
 
 	t0 := time.Now()
@@ -390,7 +345,7 @@ func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
 	// there: the preloader writes it with write(2) on tmpfs). Check the
 	// legacy data dir too for pre-GEP workloads.
 	var lastErr error
-	for _, dir := range []string{ctlFilesDir(), dataDir()} {
+	for _, dir := range []string{ctlFilesDir(), utils.DataDir()} {
 		mapPath := filepath.Join(dir, fmt.Sprintf("pid_map_%s", pid))
 		data, err := os.ReadFile(mapPath)
 		if err != nil {
@@ -454,16 +409,6 @@ func idFromProcMaps(procRoot, pid string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no huge-ckpt/<id> mapping found in %s/%s/maps", procRoot, pid)
-}
-
-// snapshotStoreDir returns where LEGACY snapshot slot copies were kept
-// (pre-GEP-0001 agent-side copies). Only GC still looks here, to reap
-// leftovers from older agents.
-func snapshotStoreDir(ctlDir string) string {
-	if d := os.Getenv("SNAPSHOT_DIR"); d != "" {
-		return d
-	}
-	return filepath.Join(ctlDir, "snapshots")
 }
 
 // opTimeout bounds a single cr_client invocation. Without it, a workload

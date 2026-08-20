@@ -26,6 +26,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
 func main() {
@@ -89,8 +90,7 @@ func main() {
 	}
 
 	// GPU-CR housekeeping runs only when the shared checkpoint dir is
-	// configured (the Helm chart sets EXPORT_FILE_PATH iff memoryRegions or
-	// directMemory is enabled), keeping CUDA/app-only deployments untouched.
+	// configured, keeping CUDA/app-only deployments untouched.
 	if ctlDir := os.Getenv("EXPORT_FILE_PATH"); ctlDir != "" {
 		// The dir must be writable by the (unprivileged) GPU-CR workloads
 		// that mmap their dump buffers in it.
@@ -104,7 +104,7 @@ func main() {
 		// Sweep stale GPU-CR artifacts: on hugetlbfs each leaked dump pair
 		// pins ~27Gi of hugepage reservations, so leaks exhaust the pool in
 		// two runs.
-		backends.StartGC(ctx, ctlDir, 10*time.Minute)
+		utils.StartGPUCRSweeper(ctx, ctlDir, 10*time.Minute)
 	}
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
