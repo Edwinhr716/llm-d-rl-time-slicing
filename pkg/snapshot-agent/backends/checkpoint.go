@@ -23,6 +23,8 @@ const (
 	// BackendMemoryRegions selectively checkpoints/restores explicit device
 	// memory regions of a running process via the GPU-CR cr_client.
 	BackendMemoryRegions BackendType = "memory-regions"
+	// BackendDirectMemory is the Direct Memory (process-level) checkpointing backend.
+	BackendDirectMemory BackendType = "direct-memory"
 )
 
 // Request carries one backend invocation: the job it targets and the
