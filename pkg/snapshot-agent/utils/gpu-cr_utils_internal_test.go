@@ -43,6 +43,23 @@ func TestGCFilePatterns(t *testing.T) {
 func TestSweep(t *testing.T) {
 	ctl := t.TempDir()
 
+	// Deterministic maps scan: a fixture procfs with one process mapping
+	// huge-ckpt/789. Scanning the real /proc would make the test depend on
+	// host privileges (an unprivileged runner cannot read other users'
+	// maps, which correctly marks the scan incomplete and skips deletion).
+	fakeProc := t.TempDir()
+	pidDir := filepath.Join(fakeProc, "1")
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n"
+	if err := os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldRoot := procfsRoot
+	procfsRoot = fakeProc
+	defer func() { procfsRoot = oldRoot }()
+
 	old := time.Now().Add(-time.Hour)
 
 	writeAged := func(name string, aged bool) {
@@ -61,6 +78,7 @@ func TestSweep(t *testing.T) {
 	writeAged("123", true)              // stale dump, no live mapping -> removed
 	writeAged("123-host", true)         // stale staging -> removed
 	writeAged("456", false)             // fresh dump -> kept (min-age guard)
+	writeAged("789", true)              // stale dump, live mapping -> kept
 	writeAged("control-"+deadPID, true) // dead pid -> removed
 	writeAged("pid_map_"+deadPID, true) // dead pid -> removed
 	writeAged("control", true)          // bare counter -> kept
@@ -93,6 +111,7 @@ func TestSweep(t *testing.T) {
 	assertGone("control-" + deadPID)
 	assertGone("pid_map_" + deadPID)
 	assertKept("456")
+	assertKept("789")
 	assertKept("control")
 	assertKept("unrelated.bin")
 	if procErr == nil {
