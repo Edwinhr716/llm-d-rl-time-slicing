@@ -13,11 +13,15 @@ import (
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 )
 
+// crClientPath is the only location cr_client is expected at: the
+// snapshot-agent image installs it there, so anything else is a broken
+// deployment and should fail loudly rather than resolve to a dangling path.
+const crClientPath = "/usr/local/bin/cr_client"
+
 // DirectMemory implements the Backend interface using cr_client.
 type DirectMemory struct {
 	mu          sync.Mutex
 	execCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
-	lookPath    func(string) (string, error)
 	statFunc    func(string) (os.FileInfo, error)
 }
 
@@ -27,7 +31,6 @@ func NewDirectMemory() *DirectMemory {
 		execCommand: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
-		lookPath: exec.LookPath,
 		statFunc: os.Stat,
 	}
 }
@@ -75,22 +78,11 @@ func (d *DirectMemory) Restore(ctx context.Context, req Request) error {
 	return nil
 }
 
-func (d *DirectMemory) getCrClientPath() string {
-	for _, p := range []string{
-		"cr_client",
-		"/usr/bin/cr_client",
-		"/bin/cr_client",
-		"/opt/bin/cr_client",
-		"/usr/local/bin/cr_client",
-	} {
-		if path, err := d.lookPath(p); err == nil {
-			return path
-		}
-		if _, err := d.statFunc(p); err == nil {
-			return p
-		}
+func (d *DirectMemory) getCrClientPath() (string, error) {
+	if _, err := d.statFunc(crClientPath); err != nil {
+		return "", fmt.Errorf("cr_client not found at %s: %w", crClientPath, err)
 	}
-	return "/usr/local/bin/cr_client"
+	return crClientPath, nil
 }
 
 func (d *DirectMemory) runCommand(ctx context.Context, name string, args ...string) error {
@@ -106,30 +98,25 @@ func (d *DirectMemory) runCommand(ctx context.Context, name string, args ...stri
 }
 
 func (d *DirectMemory) checkpointPID(ctx context.Context, pid string) error {
-	binaryPath := d.getCrClientPath()
-	if err := d.runCommand(ctx, binaryPath, "-c", "-p", pid); err != nil {
+	binaryPath, err := d.getCrClientPath()
+	if err != nil {
 		return err
 	}
-	return nil
+	return d.runCommand(ctx, binaryPath, "-c", "-p", pid)
 }
 
 func (d *DirectMemory) restorePID(ctx context.Context, pid string) error {
-	binaryPath := d.getCrClientPath()
-	if err := d.runCommand(ctx, binaryPath, "-r", "-p", pid); err != nil {
+	binaryPath, err := d.getCrClientPath()
+	if err != nil {
 		return err
 	}
-	return nil
+	return d.runCommand(ctx, binaryPath, "-r", "-p", pid)
 }
 
 // HealthCheck checks if the Direct Memory backend is healthy.
 func (d *DirectMemory) HealthCheck(ctx context.Context) error {
-	binaryPath := d.getCrClientPath()
-	if _, err := d.lookPath(binaryPath); err != nil {
-		if _, errStat := d.statFunc(binaryPath); errStat != nil {
-			return fmt.Errorf("cr_client executable not found: %w", err)
-		}
-	}
-	return nil
+	_, err := d.getCrClientPath()
+	return err
 }
 
 // ExtractDirectMemoryPIDStrings extracts PID strings from a DirectMemory BackendConfig.

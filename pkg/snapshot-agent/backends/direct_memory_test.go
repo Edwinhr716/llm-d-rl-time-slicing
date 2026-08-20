@@ -69,8 +69,12 @@ func TestDirectMemorySnapshot(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dm := backends.NewDirectMemory()
+			dm.SetStatFunc(func(string) (os.FileInfo, error) { return os.Stat(".") })
 			var calledArgs [][]string
-			dm.SetExecCommand(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			dm.SetExecCommand(func(_ context.Context, name string, args ...string) ([]byte, error) {
+				if name != backends.CrClientPath {
+					t.Errorf("exec binary = %q, want %q", name, backends.CrClientPath)
+				}
 				calledArgs = append(calledArgs, args)
 				return nil, tt.execErr
 			})
@@ -126,8 +130,12 @@ func TestDirectMemoryRestore(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dm := backends.NewDirectMemory()
+			dm.SetStatFunc(func(string) (os.FileInfo, error) { return os.Stat(".") })
 			var calledArgs [][]string
-			dm.SetExecCommand(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			dm.SetExecCommand(func(_ context.Context, name string, args ...string) ([]byte, error) {
+				if name != backends.CrClientPath {
+					t.Errorf("exec binary = %q, want %q", name, backends.CrClientPath)
+				}
 				calledArgs = append(calledArgs, args)
 				return nil, tt.execErr
 			})
@@ -146,25 +154,16 @@ func TestDirectMemoryRestore(t *testing.T) {
 func TestDirectMemoryHealthCheck(t *testing.T) {
 	tests := []struct {
 		name        string
-		lookErr     error
 		statErr     error
 		expectedErr bool
 	}{
 		{
-			name:        "SuccessInPath",
-			lookErr:     nil,
+			name:        "Installed",
 			statErr:     nil,
 			expectedErr: false,
 		},
 		{
-			name:        "SuccessViaStat",
-			lookErr:     fmt.Errorf("not in path"),
-			statErr:     nil,
-			expectedErr: false,
-		},
-		{
-			name:        "NotFoundAnywhere",
-			lookErr:     fmt.Errorf("not in path"),
+			name:        "Missing",
 			statErr:     fmt.Errorf("no stat"),
 			expectedErr: true,
 		},
@@ -173,13 +172,10 @@ func TestDirectMemoryHealthCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dm := backends.NewDirectMemory()
-			dm.SetLookPath(func(path string) (string, error) {
-				if tt.lookErr != nil {
-					return "", tt.lookErr
-				}
-				return path, nil
-			})
 			dm.SetStatFunc(func(path string) (os.FileInfo, error) {
+				if path != backends.CrClientPath {
+					t.Errorf("stat path = %q, want %q", path, backends.CrClientPath)
+				}
 				if tt.statErr != nil {
 					return nil, tt.statErr
 				}
@@ -191,6 +187,25 @@ func TestDirectMemoryHealthCheck(t *testing.T) {
 				t.Errorf("HealthCheck() error = %v, expectedErr %v", err, tt.expectedErr)
 			}
 		})
+	}
+}
+
+func TestDirectMemoryCrClientMissing(t *testing.T) {
+	// cr_client lives at exactly one path in the image; a deployment without
+	// it must fail the operation outright, not exec a dangling fallback.
+	dm := backends.NewDirectMemory()
+	dm.SetStatFunc(func(string) (os.FileInfo, error) { return nil, os.ErrNotExist })
+	dm.SetExecCommand(func(_ context.Context, name string, _ ...string) ([]byte, error) {
+		t.Errorf("exec called with %q despite missing cr_client", name)
+		return nil, nil
+	})
+
+	req := backends.Request{JobID: "test-job", Config: directMemoryConfig(123)}
+	if err := dm.Snapshot(context.Background(), req); err == nil {
+		t.Error("Snapshot() expected error for missing cr_client, got nil")
+	}
+	if err := dm.Restore(context.Background(), req); err == nil {
+		t.Error("Restore() expected error for missing cr_client, got nil")
 	}
 }
 
@@ -219,6 +234,7 @@ func TestDirectMemoryOpTimeout(t *testing.T) {
 	t.Setenv("GPU_CR_OP_TIMEOUT_SEC", "1")
 
 	dm := backends.NewDirectMemory()
+	dm.SetStatFunc(func(string) (os.FileInfo, error) { return os.Stat(".") })
 	dm.SetExecCommand(func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
 		// Simulate cr_client hanging on a dead workload's control channel:
 		// block until the per-operation deadline cancels the context.
