@@ -6,7 +6,8 @@
 #   G1  baseline pattern verify
 #   G6  full checkpoint/restore data plane + verify (stubbed toggle unless
 #       E2E_FULL_TOGGLE=1 and a real cuda-checkpoint is on PATH)
-# (G2-G5 cover the selective-checkpointing surface and land with it.)
+# (Gate numbers G2-G5 are reserved for later additions in this series;
+#  their gates land with them.)
 #
 # Required env: CR_CLIENT, WORKLOAD, VGPU_SO, STORE.
 # Optional env: E2E_NUM_BUFFERS, E2E_BUFFER_MB, CR_TIMEOUT (seconds per
@@ -32,7 +33,7 @@ if [ "${E2E_FULL_TOGGLE:-0}" != "1" ]; then stub_cuda_checkpoint; fi
 
 start_workload "$VGPU_SO" \
     E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" || exit 1
-echo "workload up: pid=$WL_PID regions=$WL_REGIONS (run dir $RUN)"
+echo "workload up: pid=$WL_PID (run dir $RUN)"
 
 cr -i -p "$WL_PID" || { echo "FATAL: init failed ($?)"; exit 1; }
 

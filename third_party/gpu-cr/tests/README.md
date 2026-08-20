@@ -137,16 +137,15 @@ gcloud builds submit --config cloudbuild-test.yaml .
 
 A real CUDA workload (`pattern_workload`) under `LD_PRELOAD=vGPU-NVIDIA.so`
 goes through full checkpoint/restore, gating on **byte-identical GPU memory
-after every restore**. The selective gates (G2-G5) land with the preloader
-implementation.
+after every restore**. (Gate numbers G2-G5 are reserved for later
+additions in this series.)
 
 ## 4. Performance regression — `tests/e2e/perf_regression.sh` (GPU node)
 
 Verifies the consolidated build has not regressed the full checkpoint/
 restore data plane that upstream (`e9bbb52`) delivers: same workload,
 same node, baseline .so vs candidate .so, median-of-N compared against a
-threshold (default 15%). Candidate selective-path timings are recorded as
-informational (no upstream baseline exists for them).
+threshold (default 15%).
 
 Build the baseline once with `tests/e2e/build_baseline_so.sh` (run from
 a checkout containing the pinned upstream commit — a vendored copy of

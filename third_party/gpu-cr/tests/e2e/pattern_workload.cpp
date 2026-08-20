@@ -4,8 +4,8 @@
 // GPU memory is byte-identical after restore.
 //
 // Protocol (file-based, single-threaded):
-//   E2E_SPEC_FILE  written once at startup: "<pid>\n<ptr>:<size>,...\n" —
-//                  the exact -s spec for cr_client.
+//   E2E_SPEC_FILE  written once at startup: "<pid>\n" — the readiness
+//                  marker, and the pid the runner passes to cr_client.
 //   E2E_CMD_FILE   runner writes "<seq> verify" or "<seq> exit", then this
 //                  process consumes (unlinks) it.
 //   E2E_RESP_FILE  responses appended: "<seq> ok" or "<seq> fail <detail>".
@@ -20,7 +20,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <string>
 #include <vector>
 
 namespace {
@@ -75,20 +74,14 @@ int main() {
   }
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  // Publish the selective-region spec.
+  // Publish readiness: every buffer is allocated and patterned, so it is
+  // now safe to checkpoint. The runner also reads the pid from here.
   {
-    std::string spec;
-    char one[64];
-    for (int i = 0; i < num_buffers; i++) {
-      snprintf(one, sizeof(one), "%s%p:%zu", i ? "," : "", bufs[i], bytes);
-      spec += one;
-    }
     FILE* f = fopen(spec_file, "w");
     if (!f) { perror("spec file"); return 1; }
-    fprintf(f, "%d\n%s\n", getpid(), spec.c_str());
+    fprintf(f, "%d\n", getpid());
     fclose(f);
-    fprintf(stderr, "[pattern-workload] pid=%d spec=%s\n", getpid(),
-            spec.c_str());
+    fprintf(stderr, "[pattern-workload] ready pid=%d\n", getpid());
   }
 
   auto respond = [&](const char* seq, const char* result) {
