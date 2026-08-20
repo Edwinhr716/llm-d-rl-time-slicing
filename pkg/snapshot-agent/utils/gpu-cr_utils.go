@@ -1,4 +1,4 @@
-package backends
+package utils
 
 import (
 	"context"
@@ -29,8 +29,9 @@ var (
 // mmap'd them yet (files appear before the mapping does).
 const gcMinAge = 5 * time.Minute
 
-// StartGC sweeps stale GPU-CR artifacts at startup and every interval.
-func StartGC(ctx context.Context, ctlDir string, interval time.Duration) {
+// StartGPUCRSweeper sweeps stale GPU-CR artifacts at startup and every
+// interval.
+func StartGPUCRSweeper(ctx context.Context, ctlDir string, interval time.Duration) {
 	go func() {
 		sweep(ctlDir)
 		t := time.NewTicker(interval)
