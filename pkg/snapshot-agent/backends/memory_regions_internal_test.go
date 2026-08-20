@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"gotest.tools/v3/assert"
 )
 
@@ -283,11 +284,11 @@ func TestMemoryRegionsSnapshotOwnersMeta(t *testing.T) {
 	})
 	assert.NilError(t, err)
 
-	owners, err := readGroupMeta(filepath.Join(storeDir, "slot-a"))
+	owners, err := utils.ReadGroupMeta(filepath.Join(storeDir, "slot-a"))
 	assert.NilError(t, err)
 	st, ok := owners[pid]
 	assert.Assert(t, ok, "own pid missing from .owners: %v", owners)
-	want, err := procStarttime(pid)
+	want, err := utils.ProcStarttime(pid)
 	assert.NilError(t, err)
 	assert.Equal(t, st, want)
 }

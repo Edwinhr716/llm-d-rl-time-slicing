@@ -1,8 +1,9 @@
-package backends
+package utils
 
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -33,9 +34,9 @@ var (
 	pidFileRe  = regexp.MustCompile(`^(?:control-|pid_map_|ctl-ready-)(\d+)$`)
 )
 
-// storeMu serializes group-store mutation between backend ops and GC, so a
+// StoreMu serializes group-store mutation between backend ops and GC, so a
 // sweep can never unlink a destination file mid-checkpoint/restore.
-var storeMu sync.Mutex
+var StoreMu sync.Mutex
 
 // gcMinAge guards against racing a process that created its files but hasn't
 // mmap'd them yet (files appear before the mapping does).
@@ -47,8 +48,65 @@ const gcMinAge = 5 * time.Minute
 // sweep.
 const ctlMinAge = time.Minute
 
-// StartGC sweeps stale GPU-CR artifacts at startup and every interval.
-func StartGC(ctx context.Context, ctlDir string, interval time.Duration) {
+// DataDir is where GPU-CR keeps dump/staging DATA files (hugetlbfs mount).
+func DataDir() string {
+	if d := os.Getenv("EXPORT_FILE_PATH"); d != "" {
+		return d
+	}
+	return "/mnt/huge-ckpt"
+}
+
+// GroupStoreDir is where per-slot destination dumps live. Defaults to
+// <DataDir>/groups: on the hugepage mount the parked bytes consume the pool
+// the workload pod already requested, and the path string resolves
+// identically in the agent and workload mount namespaces (both mount the
+// same hostPath at the same in-container path).
+func GroupStoreDir() string {
+	if d := os.Getenv("GPU_CR_GROUP_STORE"); d != "" {
+		return d
+	}
+	return filepath.Join(DataDir(), "groups")
+}
+
+// SnapshotStoreDir returns where LEGACY snapshot slot copies were kept
+// (pre-GEP-0001 agent-side copies). Only GC still looks here, to reap
+// leftovers from older agents.
+func SnapshotStoreDir(ctlDir string) string {
+	if d := os.Getenv("SNAPSHOT_DIR"); d != "" {
+		return d
+	}
+	return filepath.Join(ctlDir, "snapshots")
+}
+
+// GroupMetaName is the per-slot metadata file recording the owning workload
+// processes of a slot: "pid starttime" per line. GC deletes a slot only when
+// every recorded owner is gone (dead, or its PID recycled to a different
+// starttime) — a parked slot's dump is meaningless once its process is, and
+// never expendable before that.
+const GroupMetaName = ".owners"
+
+// ProcStarttime returns field 22 of /proc/<pid>/stat — the PID-reuse guard.
+func ProcStarttime(pid string) (int64, error) {
+	data, err := os.ReadFile(filepath.Join("/proc", pid, "stat"))
+	if err != nil {
+		return 0, err
+	}
+	// comm may contain spaces/parens: parse after the LAST ')'.
+	idx := strings.LastIndexByte(string(data), ')')
+	if idx < 0 || idx+2 >= len(data) {
+		return 0, fmt.Errorf("malformed /proc/%s/stat", pid)
+	}
+	fields := strings.Fields(string(data[idx+2:]))
+	// fields[0] is field 3 (state); starttime is field 22.
+	if len(fields) < 20 {
+		return 0, fmt.Errorf("short /proc/%s/stat", pid)
+	}
+	return strconv.ParseInt(fields[19], 10, 64)
+}
+
+// StartGPUCRSweeper sweeps stale GPU-CR artifacts at startup and every
+// interval.
+func StartGPUCRSweeper(ctx context.Context, ctlDir string, interval time.Duration) {
 	go func() {
 		sweep(ctlDir)
 		t := time.NewTicker(interval)
@@ -70,9 +128,9 @@ func sweep(dataDir string) {
 		sweepPidFiles(ctl, ctlMinAge)
 	}
 
-	storeMu.Lock()
+	StoreMu.Lock()
 	sweepGroupStore(time.Now())
-	storeMu.Unlock()
+	StoreMu.Unlock()
 
 	sweepLegacySnapshotStore(dataDir, time.Now())
 }
@@ -157,7 +215,7 @@ func sweepPidFiles(dir string, minAge time.Duration) {
 // PID (alive, different starttime) makes the file stale even though
 // /proc/<pid> exists (GEP-0006 F3).
 func pidGone(pid string, path string) bool {
-	cur, err := procStarttime(pid)
+	cur, err := ProcStarttime(pid)
 	if err != nil {
 		return os.IsNotExist(err) || !procExists(pid)
 	}
@@ -207,7 +265,7 @@ func sweepGroupStore(now time.Time) {
 			grace = n
 		}
 	}
-	store := groupStoreDir()
+	store := GroupStoreDir()
 	entries, err := os.ReadDir(store)
 	if err != nil {
 		return
@@ -221,14 +279,14 @@ func sweepGroupStore(now time.Time) {
 		if err != nil || now.Sub(info.ModTime()) < grace {
 			continue
 		}
-		owners, err := readGroupMeta(dir)
+		owners, err := ReadGroupMeta(dir)
 		if err != nil || len(owners) == 0 {
 			// No metadata: be conservative, never delete.
 			continue
 		}
 		allGone := true
 		for pid, st := range owners {
-			cur, err := procStarttime(pid)
+			cur, err := ProcStarttime(pid)
 			if err == nil && cur == st {
 				allGone = false
 				break
@@ -244,8 +302,9 @@ func sweepGroupStore(now time.Time) {
 	}
 }
 
-func readGroupMeta(dir string) (map[string]int64, error) {
-	data, err := os.ReadFile(filepath.Join(dir, groupMetaName))
+// ReadGroupMeta parses a slot's GroupMetaName file into pid -> starttime.
+func ReadGroupMeta(dir string) (map[string]int64, error) {
+	data, err := os.ReadFile(filepath.Join(dir, GroupMetaName))
 	if err != nil {
 		return nil, err
 	}
@@ -274,8 +333,8 @@ func sweepLegacySnapshotStore(ctlDir string, now time.Time) {
 			ttl = n
 		}
 	}
-	snapDir := snapshotStoreDir(ctlDir)
-	if snapDir == groupStoreDir() {
+	snapDir := SnapshotStoreDir(ctlDir)
+	if snapDir == GroupStoreDir() {
 		return // misconfiguration guard: never TTL the destination store
 	}
 	entries, err := os.ReadDir(snapDir)

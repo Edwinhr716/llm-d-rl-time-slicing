@@ -1,4 +1,4 @@
-package backends
+package utils
 
 import (
 	"fmt"
@@ -143,7 +143,7 @@ func TestPidGoneStarttime(t *testing.T) {
 	}
 	dir := t.TempDir()
 	pid := strconv.Itoa(os.Getpid())
-	st, err := procStarttime(pid)
+	st, err := ProcStarttime(pid)
 	assert.NilError(t, err)
 
 	stale := filepath.Join(dir, "ctl-ready-"+pid)
@@ -194,7 +194,7 @@ func TestSweepGroupStore(t *testing.T) {
 		dir := filepath.Join(store, name)
 		assert.NilError(t, os.MkdirAll(dir, 0o755))
 		if meta != "" {
-			assert.NilError(t, os.WriteFile(filepath.Join(dir, groupMetaName), []byte(meta), 0o600))
+			assert.NilError(t, os.WriteFile(filepath.Join(dir, GroupMetaName), []byte(meta), 0o600))
 		}
 		if aged {
 			old := time.Now().Add(-2 * time.Hour) // default grace is 1h
@@ -208,7 +208,7 @@ func TestSweepGroupStore(t *testing.T) {
 	makeGroup("garbage-meta", "not a pid line\n", true) // unparseable = no owners -> kept
 	if hasProcfs() {
 		pid := strconv.Itoa(os.Getpid())
-		st, err := procStarttime(pid)
+		st, err := ProcStarttime(pid)
 		assert.NilError(t, err)
 		makeGroup("live-owner", fmt.Sprintf("%s %d\n", pid, st), true) // live owner -> kept
 	}
