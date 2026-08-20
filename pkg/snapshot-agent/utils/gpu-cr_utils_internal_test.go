@@ -79,9 +79,23 @@ func TestSweep(t *testing.T) {
 	t.Setenv("GPU_CR_GROUP_STORE", "")    // default <data>/groups
 	t.Setenv("SNAPSHOT_DIR", t.TempDir()) // keep legacy snapshot sweep away from ctl
 
+	// Deterministic maps scan: a fixture procfs with one process mapping
+	// huge-ckpt/789. Scanning the real /proc would make the test depend on
+	// host privileges (an unprivileged runner cannot read other users'
+	// maps, which correctly marks the scan incomplete and skips deletion).
+	fakeProc := t.TempDir()
+	pidDir := filepath.Join(fakeProc, "1")
+	assert.NilError(t, os.MkdirAll(pidDir, 0o755))
+	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n"
+	assert.NilError(t, os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o644))
+	oldRoot := procfsRoot
+	procfsRoot = fakeProc
+	defer func() { procfsRoot = oldRoot }()
+
 	writeAged(t, ctl, "123", true)                // stale dump, no live mapping -> removed
 	writeAged(t, ctl, "123-host", true)           // stale staging -> removed
 	writeAged(t, ctl, "456", false)               // fresh dump -> kept (min-age guard)
+	writeAged(t, ctl, "789", true)                // stale dump, live mapping -> kept
 	writeAged(t, ctl, "control-"+deadPID, true)   // dead pid -> removed
 	writeAged(t, ctl, "pid_map_"+deadPID, true)   // dead pid -> removed
 	writeAged(t, ctl, "ctl-ready-"+deadPID, true) // dead pid -> removed
@@ -102,6 +116,7 @@ func TestSweep(t *testing.T) {
 	assertGone(t, ctl, "pid_map_"+deadPID)
 	assertGone(t, ctl, "ctl-ready-"+deadPID)
 	assertKept(t, ctl, "456")
+	assertKept(t, ctl, "789")
 	assertKept(t, ctl, "control")
 	assertKept(t, ctl, "unrelated.bin")
 	if hasProcfs() {
