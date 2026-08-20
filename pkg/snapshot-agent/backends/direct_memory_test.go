@@ -231,7 +231,7 @@ func TestDirectMemoryConfigHelpers(t *testing.T) {
 }
 
 func TestDirectMemoryOpTimeout(t *testing.T) {
-	t.Setenv("GPU_CR_OP_TIMEOUT_SEC", "1")
+	t.Setenv("DIRECT_MEMORY_OP_TIMEOUT_SEC", "1")
 
 	dm := backends.NewDirectMemory()
 	dm.SetStatFunc(func(string) (os.FileInfo, error) { return os.Stat(".") })
@@ -248,7 +248,7 @@ func TestDirectMemoryOpTimeout(t *testing.T) {
 		t.Fatal("Snapshot() expected timeout error, got nil")
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("Snapshot() took %v; the 1s GPU_CR_OP_TIMEOUT_SEC deadline was not applied", elapsed)
+		t.Errorf("Snapshot() took %v; the 1s DIRECT_MEMORY_OP_TIMEOUT_SEC deadline was not applied", elapsed)
 	}
 
 	err = dm.Restore(context.Background(), backends.Request{JobID: "test-job", Config: directMemoryConfig(123)})
