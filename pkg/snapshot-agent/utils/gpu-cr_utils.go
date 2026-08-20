@@ -89,7 +89,7 @@ const GroupMetaName = ".owners"
 
 // ProcStarttime returns field 22 of /proc/<pid>/stat — the PID-reuse guard.
 func ProcStarttime(pid string) (int64, error) {
-	data, err := os.ReadFile(filepath.Join("/proc", pid, "stat"))
+	data, err := os.ReadFile("/proc/" + pid + "/stat")
 	if err != nil {
 		return 0, err
 	}
@@ -219,7 +219,7 @@ func sweepPidFiles(dir string, minAge time.Duration) {
 // For ctl-ready files the advertised starttime is compared too: a recycled
 // PID (alive, different starttime) makes the file stale even though
 // /proc/<pid> exists (GEP-0006 F3).
-func pidGone(pid string, path string) bool {
+func pidGone(pid, path string) bool {
 	cur, err := ProcStarttime(pid)
 	if err != nil {
 		return os.IsNotExist(err) || !procExists(pid)
@@ -234,7 +234,7 @@ func pidGone(pid string, path string) bool {
 }
 
 func procExists(pid string) bool {
-	_, err := os.Stat(filepath.Join("/proc", pid))
+	_, err := os.Stat("/proc/" + pid)
 	return err == nil
 }
 
@@ -275,12 +275,12 @@ func sweepGroupStore(now time.Time) {
 	if err != nil {
 		return
 	}
-	for _, e := range entries {
-		if !e.IsDir() {
+	for _, entry := range entries {
+		if !entry.IsDir() {
 			continue
 		}
-		dir := filepath.Join(store, e.Name())
-		info, err := e.Info()
+		dir := filepath.Join(store, entry.Name())
+		info, err := entry.Info()
 		if err != nil || now.Sub(info.ModTime()) < grace {
 			continue
 		}
@@ -302,7 +302,7 @@ func sweepGroupStore(now time.Time) {
 		}
 		if err := os.RemoveAll(dir); err == nil {
 			slog.Info("GC: removed orphaned destination slot (all owners dead)",
-				"slot", e.Name(), "idle", now.Sub(info.ModTime()).Round(time.Minute).String())
+				"slot", entry.Name(), "idle", now.Sub(info.ModTime()).Round(time.Minute).String())
 		}
 	}
 }

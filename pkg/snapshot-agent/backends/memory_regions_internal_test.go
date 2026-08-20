@@ -368,7 +368,7 @@ func TestResolveOrInit(t *testing.T) {
 		// preloader writing pid_map during init.
 		fake.observe = func(name string, args ...string) {
 			if args[0] == "-i" {
-				_ = os.WriteFile(filepath.Join(ctlDir, "pid_map_123"), []byte("42\n"), 0o600)
+				assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_123"), []byte("42\n"), 0o600))
 			}
 		}
 
