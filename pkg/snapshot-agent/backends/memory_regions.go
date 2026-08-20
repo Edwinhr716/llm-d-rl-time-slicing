@@ -91,13 +91,15 @@ func writeGroupMeta(dir string, owners map[string]string) error {
 		}
 		fmt.Fprintf(&sb, "%s %d\n", pid, st)
 	}
-	return os.WriteFile(filepath.Join(dir, utils.GroupMetaName), []byte(sb.String()), 0o644)
+	return os.WriteFile(filepath.Join(dir, utils.GroupMetaName), []byte(sb.String()), 0o600)
 }
 
 // touchGroup bumps the slot dir mtime explicitly on every op.
 func touchGroup(dir string) {
 	now := time.Now()
-	_ = os.Chtimes(dir, now, now)
+	if err := os.Chtimes(dir, now, now); err != nil {
+		slog.Warn("touch group dir", "dir", dir, "err", err)
+	}
 }
 
 // regionSpecs validates the config's regions and groups them per PID,
@@ -299,7 +301,7 @@ func (g *MemoryRegions) runCommand(ctx context.Context, name string, args ...str
 	return nil
 }
 
-func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec string, dest string) error {
+func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec, dest string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
 	binaryPath := g.getCrClientPath()
@@ -309,7 +311,7 @@ func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec s
 	return nil
 }
 
-func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec string, dest string) error {
+func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec, dest string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
 	binaryPath := g.getCrClientPath()
@@ -334,7 +336,7 @@ func (g *MemoryRegions) resolveOrInit(ctx context.Context, pid string) (string, 
 	ictx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
 	if ierr := g.runCommand(ictx, g.getCrClientPath(), "-i", "-p", pid); ierr != nil {
-		return "", fmt.Errorf("preloader init failed: %w (original resolve error: %v)", ierr, err)
+		return "", fmt.Errorf("preloader init failed: %w (original resolve error: %w)", ierr, err)
 	}
 	return g.resolvePidToID(pid)
 }
