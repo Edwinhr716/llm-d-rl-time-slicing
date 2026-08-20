@@ -93,12 +93,16 @@ func main() {
 	// untouched.
 	if ctlDir := os.Getenv("EXPORT_FILE_PATH"); ctlDir != "" {
 		// The dir must be writable by the (unprivileged) GPU-CR workloads
-		// that mmap their dump buffers in it.
+		// that mmap their dump buffers in it. Tenant UIDs aren't known up
+		// front and hostPath volumes get no fsGroup remapping, so
+		// world-writable is the only workable mode; the sticky bit (the
+		// /tmp model) keeps one tenant from deleting or renaming another's
+		// artifacts.
 		if _, err := os.Stat(ctlDir); err == nil {
-			if err := os.Chmod(ctlDir, 0o777); err != nil {
-				slog.WarnContext(ctx, "Failed to chmod GPU-CR checkpoint dir to 0777", "dir", ctlDir, "error", err)
+			if err := os.Chmod(ctlDir, 0o777|os.ModeSticky); err != nil {
+				slog.WarnContext(ctx, "Failed to chmod GPU-CR checkpoint dir to 1777", "dir", ctlDir, "error", err)
 			} else {
-				slog.InfoContext(ctx, "Set GPU-CR checkpoint dir permissions to 0777", "dir", ctlDir)
+				slog.InfoContext(ctx, "Set GPU-CR checkpoint dir permissions to 1777 (world-writable, sticky)", "dir", ctlDir)
 			}
 		}
 		// Sweep stale GPU-CR artifacts: on hugetlbfs each leaked dump pair
