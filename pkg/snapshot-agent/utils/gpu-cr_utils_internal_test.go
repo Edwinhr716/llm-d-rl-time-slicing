@@ -99,3 +99,52 @@ func TestSweep(t *testing.T) {
 		assertKept(ownPidMap)
 	}
 }
+
+// TestSweepIncompleteProcScan: when a maps file is unreadable for a reason
+// other than process exit, the scan cannot prove any dump is unmapped, so
+// dump deletion is skipped; per-PID files are still reaped (their liveness
+// check does not depend on the maps scan).
+func TestSweepIncompleteProcScan(t *testing.T) {
+	ctl := t.TempDir()
+	fakeProc := t.TempDir()
+	pidDir := filepath.Join(fakeProc, "42")
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A self-referencing symlink makes ReadFile fail with ELOOP — neither
+	// IsNotExist nor ESRCH, so the scan must report incomplete.
+	loop := filepath.Join(pidDir, "maps")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Skipf("cannot create symlink loop: %v", err)
+	}
+	oldRoot := procfsRoot
+	procfsRoot = fakeProc
+	defer func() { procfsRoot = oldRoot }()
+
+	if _, complete := liveMappedIds(); complete {
+		t.Fatal("liveMappedIds() reported a complete scan despite an unreadable maps file")
+	}
+
+	old := time.Now().Add(-time.Hour)
+	write := func(name string) {
+		t.Helper()
+		path := filepath.Join(ctl, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("Chtimes(%s): %v", name, err)
+		}
+	}
+	write("123") // stale dump, but scan incomplete -> kept
+	write("control-" + deadPID)
+
+	sweep(ctl)
+
+	if _, err := os.Stat(filepath.Join(ctl, "123")); err != nil {
+		t.Errorf("dump should have been kept on incomplete scan: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(ctl, "control-"+deadPID)); !os.IsNotExist(err) {
+		t.Errorf("dead-pid control file should still be removed (stat err: %v)", err)
+	}
+}

@@ -2,11 +2,13 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -54,7 +56,10 @@ func sweep(ctlDir string) {
 		return
 	}
 
-	liveIds := liveMappedIds()
+	liveIds, complete := liveMappedIds()
+	if !complete {
+		slog.Warn("GC: procfs scan incomplete; keeping all dump files this sweep", "dir", ctlDir)
+	}
 	now := time.Now()
 	var removed []string
 
@@ -69,7 +74,7 @@ func sweep(ctlDir string) {
 		}
 
 		if m := dumpFileRe.FindStringSubmatch(name); m != nil {
-			if !liveIds[m[1]] {
+			if complete && !liveIds[m[1]] {
 				if os.Remove(filepath.Join(ctlDir, name)) == nil {
 					removed = append(removed, name)
 				}
@@ -90,18 +95,31 @@ func sweep(ctlDir string) {
 	}
 }
 
+// procfsRoot is the procfs mount scanned for live mappings; a var so tests
+// can point the scan at a fixture tree.
+var procfsRoot = "/proc"
+
 // liveMappedIds returns the set of dump-buffer ids currently mmap'd by any
 // live process (agent runs with hostPID, so /proc covers the whole node).
-func liveMappedIds() map[string]bool {
-	ids := make(map[string]bool)
-	procs, err := filepath.Glob("/proc/[0-9]*/maps")
+// complete is false when any maps file was unreadable for a reason other
+// than its process exiting mid-scan: a partial scan cannot prove a dump is
+// unmapped, so the caller must skip dump deletion for that sweep.
+func liveMappedIds() (ids map[string]bool, complete bool) {
+	ids = make(map[string]bool)
+	complete = true
+	procs, err := filepath.Glob(filepath.Join(procfsRoot, "[0-9]*", "maps"))
 	if err != nil {
-		return ids
+		return ids, false
 	}
 	for _, mapsPath := range procs {
 		data, err := os.ReadFile(mapsPath)
 		if err != nil {
-			continue // process exited or unreadable; skip
+			// Gone between glob and read is normal process churn; anything
+			// else (EACCES, hidepid, ...) hides mappings from the scan.
+			if !os.IsNotExist(err) && !errors.Is(err, syscall.ESRCH) {
+				complete = false
+			}
+			continue
 		}
 		for _, line := range strings.Split(string(data), "\n") {
 			idx := strings.Index(line, "huge-ckpt/")
@@ -114,5 +132,5 @@ func liveMappedIds() map[string]bool {
 			}
 		}
 	}
-	return ids
+	return ids, complete
 }
