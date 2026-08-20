@@ -65,6 +65,13 @@ func (s *Server) checkFeatureGates(config *pb.BackendConfig) error {
 				"with --feature-gates=%s=true (or the FEATURE_GATES env var) to enable it",
 			features.DirectMemoryBackend)
 	}
+	if config.GetMemoryRegions() != nil && !s.featureGates.Enabled(features.MemoryRegionsBackend) {
+		return status.Errorf(codes.FailedPrecondition,
+			"the memory_regions backend is experimental (driven by GPU-CR, which carries deployment "+
+				"requirements and operational caveats) and is disabled by default; restart the agent "+
+				"with --feature-gates=%s=true (or the FEATURE_GATES env var) to enable it",
+			features.MemoryRegionsBackend)
+	}
 	return nil
 }
 
@@ -118,9 +125,9 @@ func (s *Server) getSnapshotBackendType(config *pb.BackendConfig) backends.Backe
 	if config.GetAppChannel() != nil {
 		return backends.BackendAppChannel
 	}
-	// NOTE: direct_memory is not routed yet and falls through to the
-	// default backend. It is unreachable unless the DirectMemoryBackend
-	// feature gate is enabled (checkFeatureGates runs before routing).
+	if config.GetMemoryRegions() != nil {
+		return backends.BackendMemoryRegions
+	}
 	return s.defaultBackend
 }
 
