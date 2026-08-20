@@ -20,6 +20,9 @@ const (
 	// BackendAppChannel suspends/resumes application-aware workloads through
 	// their registered workload channels (see the WorkloadChannel RPC).
 	BackendAppChannel BackendType = "app-channel"
+	// BackendMemoryRegions selectively checkpoints/restores explicit device
+	// memory regions of a running process via the GPU-CR cr_client.
+	BackendMemoryRegions BackendType = "memory-regions"
 	// BackendDirectMemory is the Direct Memory (process-level) checkpointing backend.
 	BackendDirectMemory BackendType = "direct-memory"
 )
