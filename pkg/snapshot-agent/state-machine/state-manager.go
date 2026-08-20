@@ -1,6 +1,7 @@
 package statemachine
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -24,7 +25,11 @@ type Job struct {
 	Group string
 	State pb.JobState
 	PIDs  []int
-	mu    sync.Mutex
+	// Slot is the snapshot slot currently loaded on the device, for backends
+	// with named snapshot slots (memory-regions). Empty for backends without
+	// slot semantics.
+	Slot string
+	mu   sync.Mutex
 }
 
 // Operation represents a long-running snapshot or restore task.
@@ -44,7 +49,10 @@ type Operation struct {
 type StateManager struct {
 	jobs       map[string]*Job
 	operations map[string]*Operation
-	mu         sync.RWMutex
+
+	// mu guards jobs and operations.
+	// Lock order: mu → Job.mu. The reverse order deadlocks.
+	mu sync.RWMutex
 }
 
 // NewStateManager creates a new StateManager instance.
@@ -79,9 +87,20 @@ func (sm *StateManager) RegisterJob(jobID, group string) {
 
 // StartSnapshot initiates a snapshot operation if the job state allows it.
 func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) (string, error) {
+	return sm.StartSnapshotSlot(jobID, group, "", worker)
+}
+
+// StartSnapshotSlot is StartSnapshot for backends with named snapshot slots
+// (memory-regions): slot names the snapshot being taken and is recorded as
+// the job's loaded slot on success. With slot == "" the behavior is exactly
+// StartSnapshot's. With a non-empty slot, a FAULTED job may also be
+// snapshotted: faults are typically transient (dead workload PID, timed-out
+// cr_client) and a fresh attempt should reset the job rather than requiring
+// an agent redeploy.
+func (sm *StateManager) StartSnapshotSlot(jobID, group, slot string, worker func() error) (string, error) {
 	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	job := sm.getOrCreateJob(jobID, group)
-	sm.mu.Unlock()
 
 	job.mu.Lock()
 	defer job.mu.Unlock()
@@ -91,8 +110,11 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 2. State Validation: Only allow snapshotting of RUNNING jobs
-	if job.State != pb.JobState_JOB_STATE_RUNNING {
+	// 2. Fault Recovery (slot-aware backends only)
+	if slot != "" && job.State == pb.JobState_JOB_STATE_FAULTED {
+		slog.Warn("Job is FAULTED; allowing new snapshot to reset it", "jobID", jobID, "slot", slot)
+	} else if job.State != pb.JobState_JOB_STATE_RUNNING {
+		// 3. State Validation: Only allow snapshotting of RUNNING jobs
 		return "", status.Errorf(codes.FailedPrecondition, "cannot snapshot job %s in state %s (must be RUNNING)", jobID, job.State)
 	}
 
@@ -105,9 +127,7 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 		StartedAt: time.Now(),
 	}
 
-	sm.mu.Lock()
 	sm.operations[opID] = op
-	sm.mu.Unlock()
 
 	// Update job state to TRANSITIONING
 	job.State = pb.JobState_JOB_STATE_TRANSITIONING
@@ -131,6 +151,7 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 			op.Status = pb.OperationStatus_OPERATION_STATUS_COMPLETE
 			op.StorageBytes = 1024
 			job.State = pb.JobState_JOB_STATE_SAVED
+			job.Slot = slot
 		}
 	}()
 
@@ -139,15 +160,26 @@ func (sm *StateManager) StartSnapshot(jobID, group string, worker func() error) 
 
 // StartRestore initiates a restore operation if the job state allows it.
 func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (string, error) {
+	return sm.StartRestoreSlot(jobID, group, "", worker)
+}
+
+// StartRestoreSlot is StartRestore for backends with named snapshot slots
+// (memory-regions). With slot == "" the behavior is exactly StartRestore's.
+// With a non-empty slot:
+//   - a RUNNING job only short-circuits to "already-running" when the
+//     requested slot is already the loaded one; restoring a different slot
+//     proceeds (live slot swap, the core memory-regions use case);
+//   - a FAULTED job may be restored (fault recovery; see StartSnapshotSlot).
+func (sm *StateManager) StartRestoreSlot(jobID, group, slot string, worker func() error) (string, error) {
 	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	job := sm.getOrCreateJob(jobID, group)
-	sm.mu.Unlock()
 
 	job.mu.Lock()
 	defer job.mu.Unlock()
 
-	// 1. Redundancy Optimization
-	if job.State == pb.JobState_JOB_STATE_RUNNING {
+	// 1. Redundancy Optimization: the requested state is already live.
+	if job.State == pb.JobState_JOB_STATE_RUNNING && job.Slot == slot {
 		return "already-running", nil
 	}
 
@@ -156,8 +188,12 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 		return "", status.Errorf(codes.Aborted, "job %s is already transitioning", jobID)
 	}
 
-	// 3. State Validation: Only allow restoring of SAVED jobs
-	if job.State != pb.JobState_JOB_STATE_SAVED {
+	// 3. Fault Recovery (slot-aware backends only)
+	if slot != "" && job.State == pb.JobState_JOB_STATE_FAULTED {
+		slog.Warn("Job is FAULTED; allowing new restore to reset it", "jobID", jobID, "slot", slot)
+	} else if job.State != pb.JobState_JOB_STATE_SAVED && (slot == "" || job.State != pb.JobState_JOB_STATE_RUNNING) {
+		// 4. State Validation: restores need a SAVED job — or, for
+		// slot-aware backends, a RUNNING job swapping to a different slot.
 		return "", status.Errorf(codes.FailedPrecondition, "cannot restore job %s in state %s (must be SAVED)", jobID, job.State)
 	}
 
@@ -170,9 +206,7 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 		StartedAt: time.Now(),
 	}
 
-	sm.mu.Lock()
 	sm.operations[opID] = op
-	sm.mu.Unlock()
 
 	// Update job state to TRANSITIONING
 	job.State = pb.JobState_JOB_STATE_TRANSITIONING
@@ -195,6 +229,7 @@ func (sm *StateManager) StartRestore(jobID, group string, worker func() error) (
 		} else {
 			op.Status = pb.OperationStatus_OPERATION_STATUS_COMPLETE
 			job.State = pb.JobState_JOB_STATE_RUNNING
+			job.Slot = slot
 			op.SnapshotDeviceBytes = 1024
 		}
 	}()
@@ -235,9 +270,8 @@ func (sm *StateManager) GetJobStatus() []*pb.JobStatus {
 // UpdateJobPIDs updates the PIDs associated with a job.
 func (sm *StateManager) UpdateJobPIDs(jobID string, pids []int) {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
 	job, ok := sm.jobs[jobID]
+	sm.mu.Unlock()
 	if !ok {
 		return
 	}
@@ -250,9 +284,8 @@ func (sm *StateManager) UpdateJobPIDs(jobID string, pids []int) {
 // GetJobPIDs returns the PIDs associated with a job.
 func (sm *StateManager) GetJobPIDs(jobID string) ([]int, error) {
 	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
 	job, ok := sm.jobs[jobID]
+	sm.mu.RUnlock()
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "job %s not found", jobID)
 	}
@@ -274,7 +307,6 @@ func (sm *StateManager) TransitionToRunning(jobID string, pids []int) error {
 	sm.mu.Lock()
 	job, ok := sm.jobs[jobID]
 	sm.mu.Unlock()
-
 	if !ok {
 		return status.Errorf(codes.NotFound, "job %s not found", jobID)
 	}
