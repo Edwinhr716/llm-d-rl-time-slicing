@@ -18,6 +18,11 @@ COPY . /tmp/GPU-CR
 RUN cd /tmp/GPU-CR && \
     sed -i 's/#define CR_CKPT_SIGNAL     SIGUSR1/#define CR_CKPT_SIGNAL     (SIGRTMAX - 8)/' src/common.h && \
     sed -i 's/#define CR_RESTORE_SIGNAL  SIGUSR2/#define CR_RESTORE_SIGNAL  (SIGRTMAX - 7)/' src/common.h && \
+    # 0777 is deliberate, not an oversight: the coordinator (agent pod) and
+    # the workload run as different UIDs in different pods and share the
+    # control file only through a dedicated volume — the volume mount is the
+    # access boundary. A stricter mode would need a UID/GID contract across
+    # pods that the deployment cannot assume.
     sed -i 's/int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/int fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
     grep -q "SIGRTMAX - 8" src/common.h && \
     grep -q "0777" src/comm/share_mem.cpp && \
@@ -28,7 +33,8 @@ RUN cd /tmp/GPU-CR && \
         make -j$(nproc) && \
         ctest --output-on-failure; \
     else \
-        cmake -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB=${SHM_SIZE_GB} .. && \
+        cmake -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB=${SHM_SIZE_GB} \
+              -DGPU_CR_BUILD_E2E=ON .. && \
         make -j$(nproc); \
     fi
 
