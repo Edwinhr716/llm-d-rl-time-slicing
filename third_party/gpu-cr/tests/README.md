@@ -137,8 +137,7 @@ gcloud builds submit --config cloudbuild-test.yaml .
 
 A real CUDA workload (`pattern_workload`) under `LD_PRELOAD=vGPU-NVIDIA.so`
 goes through full checkpoint/restore, gating on **byte-identical GPU memory
-after every restore**. (Gate numbers G2-G5 are reserved for later
-additions in this series.)
+after every restore**.
 
 ## 4. Performance regression — `tests/e2e/perf_regression.sh` (GPU node)
 
