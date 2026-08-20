@@ -29,10 +29,9 @@ func (d *DirectMemory) SetExecCommand(f func(ctx context.Context, name string, a
 	d.execCommand = f
 }
 
-func (d *DirectMemory) SetLookPath(f func(string) (string, error)) {
-	d.lookPath = f
-}
-
 func (d *DirectMemory) SetStatFunc(f func(string) (os.FileInfo, error)) {
 	d.statFunc = f
 }
+
+// CrClientPath exposes the fixed cr_client install location for tests.
+const CrClientPath = crClientPath
