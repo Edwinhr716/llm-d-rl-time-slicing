@@ -41,8 +41,8 @@ func TestDirectMemorySnapshot(t *testing.T) {
 			name:   "SuccessMultiplePIDs",
 			config: directMemoryConfig(123, 456),
 			expectArgs: [][]string{
-				{"-c", "-b", "-p", "123"},
-				{"-c", "-b", "-p", "456"},
+				{"-c", "-p", "123"},
+				{"-c", "-p", "456"},
 			},
 		},
 		{
@@ -51,7 +51,7 @@ func TestDirectMemorySnapshot(t *testing.T) {
 			execErr:     fmt.Errorf("exec error"),
 			expectedErr: true,
 			expectArgs: [][]string{
-				{"-c", "-b", "-p", "123"},
+				{"-c", "-p", "123"},
 			},
 		},
 		{
@@ -98,8 +98,8 @@ func TestDirectMemoryRestore(t *testing.T) {
 			name:   "SuccessMultiplePIDs",
 			config: directMemoryConfig(123, 456),
 			expectArgs: [][]string{
-				{"-r", "-b", "-p", "123"},
-				{"-r", "-b", "-p", "456"},
+				{"-r", "-p", "123"},
+				{"-r", "-p", "456"},
 			},
 		},
 		{
@@ -118,7 +118,7 @@ func TestDirectMemoryRestore(t *testing.T) {
 			execErr:     fmt.Errorf("exec error"),
 			expectedErr: true,
 			expectArgs: [][]string{
-				{"-r", "-b", "-p", "123"},
+				{"-r", "-p", "123"},
 			},
 		},
 	}
