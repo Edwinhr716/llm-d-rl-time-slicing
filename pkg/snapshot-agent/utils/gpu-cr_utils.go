@@ -100,13 +100,14 @@ func sweep(ctlDir string) {
 var procfsRoot = "/proc"
 
 // liveMappedIds returns the set of dump-buffer ids currently mmap'd by any
-// live process (agent runs with hostPID, so /proc covers the whole node).
-// complete is false when any maps file was unreadable for a reason other
-// than its process exiting mid-scan: a partial scan cannot prove a dump is
-// unmapped, so the caller must skip dump deletion for that sweep.
-func liveMappedIds() (ids map[string]bool, complete bool) {
-	ids = make(map[string]bool)
-	complete = true
+// live process (agent runs with hostPID, so /proc covers the whole node),
+// plus whether the scan was complete. The scan is incomplete when any maps
+// file was unreadable for a reason other than its process exiting mid-scan:
+// a partial scan cannot prove a dump is unmapped, so the caller must skip
+// dump deletion for that sweep.
+func liveMappedIds() (map[string]bool, bool) {
+	ids := make(map[string]bool)
+	complete := true
 	procs, err := filepath.Glob(filepath.Join(procfsRoot, "[0-9]*", "maps"))
 	if err != nil {
 		return ids, false
