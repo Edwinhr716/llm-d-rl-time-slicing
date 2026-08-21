@@ -316,3 +316,17 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 	assertKept(t, ctl, "123")
 	assertGone(t, ctl, "control-"+deadPID)
 }
+
+// TestLiveMappedIdsExitedProcess: a numeric dir with no maps file is a
+// process that exited between enumeration and read — benign churn, the
+// scan stays complete.
+func TestLiveMappedIdsExitedProcess(t *testing.T) {
+	fakeProc := t.TempDir()
+	assert.NilError(t, os.MkdirAll(filepath.Join(fakeProc, "7"), 0o755))
+	oldRoot := procfsRoot
+	procfsRoot = fakeProc
+	defer func() { procfsRoot = oldRoot }()
+
+	_, complete := liveMappedIds()
+	assert.Assert(t, complete, "missing maps file (exited process) must not mark the scan incomplete")
+}

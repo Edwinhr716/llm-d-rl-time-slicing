@@ -365,24 +365,33 @@ func sweepLegacySnapshotStore(ctlDir string, now time.Time) {
 // can point the scan at a fixture tree.
 var procfsRoot = "/proc"
 
+// pidDirRe matches the numeric process dirs under /proc.
+var pidDirRe = regexp.MustCompile(`^\d+$`)
+
 // liveMappedIds returns the set of dump-buffer ids currently mmap'd by any
 // live process (agent runs with hostPID, so /proc covers the whole node),
-// plus whether the scan was complete. The scan is incomplete when any maps
-// file was unreadable for a reason other than its process exiting mid-scan:
-// a partial scan cannot prove a dump is unmapped, so the caller must skip
-// dump deletion for that sweep.
+// plus whether the scan was complete. PID dirs are enumerated with ReadDir
+// rather than a glob: Glob silently drops paths it cannot traverse, which
+// would under-report live mappings with no error to classify. The scan is
+// incomplete when the enumeration or any maps read fails for a reason other
+// than the process exiting mid-scan: a partial scan cannot prove a dump is
+// unmapped, so the caller must skip dump deletion for that sweep.
 func liveMappedIds() (map[string]bool, bool) {
 	ids := make(map[string]bool)
 	complete := true
-	procs, err := filepath.Glob(filepath.Join(procfsRoot, "[0-9]*", "maps"))
+	entries, err := os.ReadDir(procfsRoot)
 	if err != nil {
 		return ids, false
 	}
-	for _, mapsPath := range procs {
-		data, err := os.ReadFile(mapsPath)
+	for _, entry := range entries {
+		if !entry.IsDir() || !pidDirRe.MatchString(entry.Name()) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(procfsRoot, entry.Name(), "maps"))
 		if err != nil {
-			// Gone between glob and read is normal process churn; anything
-			// else (EACCES, hidepid, ...) hides mappings from the scan.
+			// Gone between enumerate and read is normal process churn;
+			// anything else (EACCES, hidepid, ...) hides mappings from
+			// the scan.
 			if !os.IsNotExist(err) && !errors.Is(err, syscall.ESRCH) {
 				complete = false
 			}
