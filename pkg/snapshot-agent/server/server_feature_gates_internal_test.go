@@ -27,12 +27,24 @@ func directMemoryConfig() *pb.BackendConfig {
 	}
 }
 
+func memoryRegionsGatedConfig() *pb.BackendConfig {
+	return &pb.BackendConfig{
+		Backend: &pb.BackendConfig_MemoryRegions{
+			MemoryRegions: &pb.MemoryRegionsBackendConfig{
+				Regions: []*pb.MemoryRegion{{Pid: 123, Address: 0x7f0000000000, SizeBytes: 4096}},
+			},
+		},
+	}
+}
+
 func TestServer_CheckFeatureGates(t *testing.T) {
 	tests := []struct {
 		name     string
 		gates    features.Gates
 		config   *pb.BackendConfig
 		wantCode codes.Code
+		// wantGate is the gate a FailedPrecondition error must name.
+		wantGate features.Feature
 	}{
 		{
 			name:     "nil config passes with nil gates",
@@ -53,12 +65,48 @@ func TestServer_CheckFeatureGates(t *testing.T) {
 			gates:    nil,
 			config:   directMemoryConfig(),
 			wantCode: codes.FailedPrecondition,
+			wantGate: features.DirectMemoryBackend,
 		},
 		{
 			name:     "gated config rejected with explicit false",
 			gates:    features.Gates{features.DirectMemoryBackend: false},
 			config:   directMemoryConfig(),
 			wantCode: codes.FailedPrecondition,
+			wantGate: features.DirectMemoryBackend,
+		},
+		{
+			name:     "memory-regions config rejected by default",
+			gates:    nil,
+			config:   memoryRegionsGatedConfig(),
+			wantCode: codes.FailedPrecondition,
+			wantGate: features.MemoryRegionsBackend,
+		},
+		{
+			name:     "memory-regions config rejected with explicit false",
+			gates:    features.Gates{features.MemoryRegionsBackend: false},
+			config:   memoryRegionsGatedConfig(),
+			wantCode: codes.FailedPrecondition,
+			wantGate: features.MemoryRegionsBackend,
+		},
+		{
+			name:     "memory-regions config passes with its gate enabled",
+			gates:    features.Gates{features.MemoryRegionsBackend: true},
+			config:   memoryRegionsGatedConfig(),
+			wantCode: codes.OK,
+		},
+		{
+			name:     "direct-memory gate does not enable memory-regions",
+			gates:    features.Gates{features.DirectMemoryBackend: true},
+			config:   memoryRegionsGatedConfig(),
+			wantCode: codes.FailedPrecondition,
+			wantGate: features.MemoryRegionsBackend,
+		},
+		{
+			name:     "memory-regions gate does not enable direct-memory",
+			gates:    features.Gates{features.MemoryRegionsBackend: true},
+			config:   directMemoryConfig(),
+			wantCode: codes.FailedPrecondition,
+			wantGate: features.DirectMemoryBackend,
 		},
 		{
 			name:     "gated config passes with its gate enabled",
@@ -85,8 +133,8 @@ func TestServer_CheckFeatureGates(t *testing.T) {
 				t.Fatalf("checkFeatureGates() = %v, want code %v", err, tc.wantCode)
 			}
 			if tc.wantCode == codes.FailedPrecondition {
-				if !strings.Contains(err.Error(), string(features.DirectMemoryBackend)) {
-					t.Errorf("Expected error to name the gate, got: %v", err)
+				if !strings.Contains(err.Error(), string(tc.wantGate)) {
+					t.Errorf("Expected error to name gate %s, got: %v", tc.wantGate, err)
 				}
 				if !strings.Contains(err.Error(), "--feature-gates") {
 					t.Errorf("Expected error to name the --feature-gates flag, got: %v", err)
@@ -110,6 +158,10 @@ func newFeatureGateTestServer(
 	noopBackend := backends.NewNoopBackend()
 	backendsMap := map[backends.BackendType]backends.Backend{
 		backends.BackendNoop: noopBackend,
+		// direct_memory routes to its own backend type; back it with the
+		// noop backend so gate-enabled requests exercise routing without
+		// needing a real cr_client.
+		backends.BackendDirectMemory: noopBackend,
 	}
 
 	lisLocal := bufconn.Listen(bufSize)

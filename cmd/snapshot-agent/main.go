@@ -81,10 +81,11 @@ func main() {
 	// server's WorkloadChannel RPC handler.
 	channelRegistry := backends.NewChannelRegistry()
 	registeredBackends := map[backends.BackendType]backends.Backend{
-		backends.BackendCuda:        backends.NewCudaCheckpoint(),
-		backends.BackendNoop:        backends.NewNoopBackend(),
-		backends.BackendAppEndpoint: backends.NewAppEndpointBackend(),
-		backends.BackendAppChannel:  backends.NewAppChannelBackend(channelRegistry),
+		backends.BackendCuda:         backends.NewCudaCheckpoint(),
+		backends.BackendNoop:         backends.NewNoopBackend(),
+		backends.BackendAppEndpoint:  backends.NewAppEndpointBackend(),
+		backends.BackendAppChannel:   backends.NewAppChannelBackend(channelRegistry),
+		backends.BackendDirectMemory: backends.NewDirectMemory(),
 	}
 
 	// GPU-CR housekeeping runs only when the shared checkpoint dir is
