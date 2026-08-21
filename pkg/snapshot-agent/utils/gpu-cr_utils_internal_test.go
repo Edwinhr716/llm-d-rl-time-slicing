@@ -53,7 +53,7 @@ func TestSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n"
-	if err := os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	oldRoot := procfsRoot
