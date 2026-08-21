@@ -14,6 +14,7 @@
 #include <sys/mman.h>  // for mmap
 #include <pthread.h>  // for mutex lock
 #include <signal.h>   // for signal handling
+#include <cstring>    // for memset
 #include <map>
 #include <utility>
 #include <atomic>
