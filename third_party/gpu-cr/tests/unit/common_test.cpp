@@ -12,6 +12,12 @@
 namespace gpu_cr {
 namespace {
 
+TEST(GranuleClampLenTest, ZeroLengthStaysZero) {
+  // A clamp must never turn an empty copy into a 2MB one.
+  EXPECT_EQ(GranuleClampLen(0, 0), 0u);
+  EXPECT_EQ(GranuleClampLen(kVmmGranuleSize - 4, 0), 0u);
+}
+
 TEST(GranuleClampLenTest, ShortCopyFromAlignedStartUnclamped) {
   EXPECT_EQ(GranuleClampLen(0, 4096), 4096u);
 }
