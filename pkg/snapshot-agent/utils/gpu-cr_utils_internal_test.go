@@ -167,3 +167,20 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 		t.Errorf("dead-pid control file should still be removed (stat err: %v)", err)
 	}
 }
+
+// TestLiveMappedIdsExitedProcess: a numeric dir with no maps file is a
+// process that exited between enumeration and read — benign churn, the
+// scan stays complete.
+func TestLiveMappedIdsExitedProcess(t *testing.T) {
+	fakeProc := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(fakeProc, "7"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldRoot := procfsRoot
+	procfsRoot = fakeProc
+	defer func() { procfsRoot = oldRoot }()
+
+	if _, complete := liveMappedIds(); !complete {
+		t.Error("missing maps file (exited process) must not mark the scan incomplete")
+	}
+}
