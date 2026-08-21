@@ -39,7 +39,6 @@ static void*  g_local_alloc_data_buf  = nullptr;
 static size_t g_local_alloc_data_size = 0;
 
 std::mutex fs_mutex;
-std::mutex gpu_mem_mutex;
 Comm *comm;
 Backend *backend;
 GPU *gpu;
