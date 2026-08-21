@@ -87,7 +87,7 @@ func TestSweep(t *testing.T) {
 	pidDir := filepath.Join(fakeProc, "1")
 	assert.NilError(t, os.MkdirAll(pidDir, 0o755))
 	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n"
-	assert.NilError(t, os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o644))
+	assert.NilError(t, os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o600))
 	oldRoot := procfsRoot
 	procfsRoot = fakeProc
 	defer func() { procfsRoot = oldRoot }()
