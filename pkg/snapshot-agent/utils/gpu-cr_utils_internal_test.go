@@ -167,13 +167,17 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 			t.Fatalf("Chtimes(%s): %v", name, err)
 		}
 	}
-	write("123") // stale dump, but scan incomplete -> kept
+	write("123")           // stale dump, but scan incomplete -> kept
+	write("ckpt-123.data") // file-backend dump, same protection -> kept
 	write("control-" + deadPID)
 
 	sweep(ctl)
 
 	if _, err := os.Stat(filepath.Join(ctl, "123")); err != nil {
 		t.Errorf("dump should have been kept on incomplete scan: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(ctl, "ckpt-123.data")); err != nil {
+		t.Errorf("file-backend dump should have been kept on incomplete scan: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(ctl, "control-"+deadPID)); !os.IsNotExist(err) {
 		t.Errorf("dead-pid control file should still be removed (stat err: %v)", err)
