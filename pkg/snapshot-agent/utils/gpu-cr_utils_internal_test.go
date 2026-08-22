@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -85,16 +86,16 @@ func TestSweep(t *testing.T) {
 	t.Setenv("GPU_CR_GROUP_STORE", "")    // default <data>/groups
 	t.Setenv("SNAPSHOT_DIR", t.TempDir()) // keep legacy snapshot sweep away from ctl
 
-	// Deterministic maps scan: a fixture procfs with one process mapping
-	// huge-ckpt/789. Scanning the real /proc would make the test depend on
-	// host privileges (an unprivileged runner cannot read other users'
+	// Deterministic maps scan: a fixture procfs whose one process maps the
+	// two "live" dumps. Scanning the real /proc would make the test depend
+	// on host privileges (an unprivileged runner cannot read other users'
 	// maps, which correctly marks the scan incomplete and skips deletion).
+	// The maps entries are written after the files exist, from their real
+	// device:inode, under pathnames from a foreign mount namespace — the
+	// scan must match by inode, never by name.
 	fakeProc := t.TempDir()
 	pidDir := filepath.Join(fakeProc, "1")
 	assert.NilError(t, os.MkdirAll(pidDir, 0o755))
-	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n" +
-		"7f0000200000-7f0000400000 rw-s 00000000 00:31 43 /mnt/huge-ckpt/ckpt-790.data\n"
-	assert.NilError(t, os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o600))
 	oldRoot := procfsRoot
 	procfsRoot = fakeProc
 	defer func() { procfsRoot = oldRoot }()
@@ -117,6 +118,10 @@ func TestSweep(t *testing.T) {
 	if hasProcfs() {
 		writeAged(t, ctl, ownPidMap, true) // live pid -> kept
 	}
+
+	mapsLines := mapsEntry(t, filepath.Join(ctl, "789"), "/workload/ns/buf0") +
+		mapsEntry(t, filepath.Join(ctl, "ckpt-790.data"), "/workload/ns/buf1")
+	assert.NilError(t, os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLines), 0o600))
 
 	sweep(ctl)
 
@@ -318,7 +323,7 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 	procfsRoot = fakeProc
 	defer func() { procfsRoot = oldRoot }()
 
-	_, complete := liveMappedIds()
+	_, complete := liveMappedInodes()
 	assert.Assert(t, !complete, "scan must report incomplete on unreadable maps file")
 
 	writeAged(t, ctl, "123", true)              // stale dump, but scan incomplete -> kept
@@ -335,13 +340,24 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 // TestLiveMappedIdsExitedProcess: a numeric dir with no maps file is a
 // process that exited between enumeration and read — benign churn, the
 // scan stays complete.
-func TestLiveMappedIdsExitedProcess(t *testing.T) {
+func TestLiveMappedInodesExitedProcess(t *testing.T) {
 	fakeProc := t.TempDir()
 	assert.NilError(t, os.MkdirAll(filepath.Join(fakeProc, "7"), 0o755))
 	oldRoot := procfsRoot
 	procfsRoot = fakeProc
 	defer func() { procfsRoot = oldRoot }()
 
-	_, complete := liveMappedIds()
+	_, complete := liveMappedInodes()
 	assert.Assert(t, complete, "missing maps file (exited process) must not mark the scan incomplete")
+}
+
+// mapsEntry renders a /proc/<pid>/maps line for path from its real
+// device:inode, under a pathname the agent has never mounted.
+func mapsEntry(t *testing.T, path, nsPath string) string {
+	t.Helper()
+	var st syscall.Stat_t
+	assert.NilError(t, syscall.Stat(path, &st))
+	major, minor := devMajMin(uint64(st.Dev))
+	return fmt.Sprintf("7f0000000000-7f0000200000 rw-s 00000000 %02x:%02x %d %s\n",
+		major, minor, uint64(st.Ino), nsPath)
 }
