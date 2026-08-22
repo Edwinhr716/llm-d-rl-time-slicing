@@ -30,13 +30,19 @@ func TestGCFilePatterns(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		t.Helper()
-		assert.Equal(t, dumpFileRe.MatchString(tc.file), tc.dumpMatch, "dumpFileRe")
+		_, dumpOK := dumpID(tc.file)
+		assert.Equal(t, dumpOK, tc.dumpMatch, "dumpID")
 		assert.Equal(t, pidFileRe.MatchString(tc.file), tc.pidMatch, "pidFileRe")
 	}
 
 	testCases := []testCase{
 		{name: "dump id", file: "123", dumpMatch: true},
 		{name: "host staging", file: "123-host", dumpMatch: true},
+		{name: "file-backend dump", file: "ckpt-123.data", dumpMatch: true},
+		{name: "file-backend staging", file: "ckpt-123-host.data", dumpMatch: true},
+		{name: "file-backend prefix without suffix", file: "ckpt-123"},
+		{name: "suffix without prefix", file: "123.data"},
+		{name: "non-numeric file-backend id", file: "ckpt-abc.data"},
 		{name: "control channel", file: "control-4567", pidMatch: true},
 		{name: "pid map", file: "pid_map_4567", pidMatch: true},
 		{name: "ctl readiness advertisement", file: "ctl-ready-4567", pidMatch: true},
@@ -86,16 +92,20 @@ func TestSweep(t *testing.T) {
 	fakeProc := t.TempDir()
 	pidDir := filepath.Join(fakeProc, "1")
 	assert.NilError(t, os.MkdirAll(pidDir, 0o755))
-	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n"
+	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n" +
+		"7f0000200000-7f0000400000 rw-s 00000000 00:31 43 /mnt/huge-ckpt/ckpt-790.data\n"
 	assert.NilError(t, os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o600))
 	oldRoot := procfsRoot
 	procfsRoot = fakeProc
 	defer func() { procfsRoot = oldRoot }()
 
-	writeAged(t, ctl, "123", true)                // stale dump, no live mapping -> removed
-	writeAged(t, ctl, "123-host", true)           // stale staging -> removed
-	writeAged(t, ctl, "456", false)               // fresh dump -> kept (min-age guard)
-	writeAged(t, ctl, "789", true)                // stale dump, live mapping -> kept
+	writeAged(t, ctl, "123", true)           // stale dump, no live mapping -> removed
+	writeAged(t, ctl, "123-host", true)      // stale staging -> removed
+	writeAged(t, ctl, "456", false)          // fresh dump -> kept (min-age guard)
+	writeAged(t, ctl, "789", true)           // stale dump, live mapping -> kept
+	writeAged(t, ctl, "ckpt-321.data", true) // stale file-backend dump -> removed
+	writeAged(t, ctl, "ckpt-321-host.data", true)
+	writeAged(t, ctl, "ckpt-790.data", true)      // stale file-backend dump, live mapping -> kept
 	writeAged(t, ctl, "control-"+deadPID, true)   // dead pid -> removed
 	writeAged(t, ctl, "pid_map_"+deadPID, true)   // dead pid -> removed
 	writeAged(t, ctl, "ctl-ready-"+deadPID, true) // dead pid -> removed
@@ -112,11 +122,14 @@ func TestSweep(t *testing.T) {
 
 	assertGone(t, ctl, "123")
 	assertGone(t, ctl, "123-host")
+	assertGone(t, ctl, "ckpt-321.data")
+	assertGone(t, ctl, "ckpt-321-host.data")
 	assertGone(t, ctl, "control-"+deadPID)
 	assertGone(t, ctl, "pid_map_"+deadPID)
 	assertGone(t, ctl, "ctl-ready-"+deadPID)
 	assertKept(t, ctl, "456")
 	assertKept(t, ctl, "789")
+	assertKept(t, ctl, "ckpt-790.data")
 	assertKept(t, ctl, "control")
 	assertKept(t, ctl, "unrelated.bin")
 	if hasProcfs() {
