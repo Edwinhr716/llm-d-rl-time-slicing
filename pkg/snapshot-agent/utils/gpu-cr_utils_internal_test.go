@@ -31,8 +31,7 @@ func TestGCFilePatterns(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		t.Helper()
-		_, dumpOK := dumpID(tc.file)
-		assert.Equal(t, dumpOK, tc.dumpMatch, "dumpID")
+		assert.Equal(t, isDumpFile(tc.file), tc.dumpMatch, "isDumpFile")
 		assert.Equal(t, pidFileRe.MatchString(tc.file), tc.pidMatch, "pidFileRe")
 	}
 
@@ -337,7 +336,7 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 	assertGone(t, ctl, "control-"+deadPID)
 }
 
-// TestLiveMappedIdsExitedProcess: a numeric dir with no maps file is a
+// TestLiveMappedInodesExitedProcess: a numeric dir with no maps file is a
 // process that exited between enumeration and read — benign churn, the
 // scan stays complete.
 func TestLiveMappedInodesExitedProcess(t *testing.T) {
@@ -357,7 +356,7 @@ func mapsEntry(t *testing.T, path, nsPath string) string {
 	t.Helper()
 	var st syscall.Stat_t
 	assert.NilError(t, syscall.Stat(path, &st))
-	major, minor := devMajMin(uint64(st.Dev))
+	nums := devMajMin(st.Dev)
 	return fmt.Sprintf("7f0000000000-7f0000200000 rw-s 00000000 %02x:%02x %d %s\n",
-		major, minor, uint64(st.Ino), nsPath)
+		nums.major, nums.minor, st.Ino, nsPath)
 }

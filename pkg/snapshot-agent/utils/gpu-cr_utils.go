@@ -42,15 +42,10 @@ var (
 	pidFileRe  = regexp.MustCompile(`^(?:control-|pid_map_|ctl-ready-)(\d+)$`)
 )
 
-// dumpID returns the GPU-CR buffer id a dump/staging file name belongs to,
-// in either naming scheme.
-func dumpID(name string) (string, bool) {
-	for _, re := range []*regexp.Regexp{fileDumpRe, hugeDumpRe} {
-		if m := re.FindStringSubmatch(name); m != nil {
-			return m[1], true
-		}
-	}
-	return "", false
+// isDumpFile reports whether name is a GPU-CR dump/staging buffer file, in
+// either naming scheme.
+func isDumpFile(name string) bool {
+	return fileDumpRe.MatchString(name) || hugeDumpRe.MatchString(name)
 }
 
 // StoreMu serializes group-store mutation between backend ops and GC, so a
@@ -178,7 +173,7 @@ func sweepDataDir(dir string) {
 			continue
 		}
 
-		if _, ok := dumpID(name); ok {
+		if isDumpFile(name) {
 			key, ok := fileDevIno(filepath.Join(dir, name))
 			if complete && ok && !liveInodes[key] {
 				if os.Remove(filepath.Join(dir, name)) == nil {
@@ -461,14 +456,20 @@ func fileDevIno(path string) (string, bool) {
 	if err := syscall.Stat(path, &st); err != nil {
 		return "", false
 	}
-	major, minor := devMajMin(uint64(st.Dev))
-	return fmt.Sprintf("%d:%d:%d", major, minor, uint64(st.Ino)), true
+	nums := devMajMin(st.Dev)
+	return fmt.Sprintf("%d:%d:%d", nums.major, nums.minor, st.Ino), true
+}
+
+// devNums is a stat dev_t split into its device-number halves.
+type devNums struct {
+	major, minor uint64
 }
 
 // devMajMin splits a stat dev_t with the Linux huge-dev encoding — the same
 // split the kernel uses to print the maps device column.
-func devMajMin(dev uint64) (uint64, uint64) {
-	major := ((dev >> 8) & 0xfff) | ((dev >> 32) &^ 0xfff)
-	minor := (dev & 0xff) | ((dev >> 12) &^ 0xff)
-	return major, minor
+func devMajMin(dev uint64) devNums {
+	return devNums{
+		major: ((dev >> 8) & 0xfff) | ((dev >> 32) &^ 0xfff),
+		minor: (dev & 0xff) | ((dev >> 12) &^ 0xff),
+	}
 }
