@@ -21,6 +21,11 @@ func TestGCFilePatterns(t *testing.T) {
 	}{
 		{name: "dump id", file: "123", dumpMatch: true},
 		{name: "host staging", file: "123-host", dumpMatch: true},
+		{name: "file-backend dump", file: "ckpt-123.data", dumpMatch: true},
+		{name: "file-backend staging", file: "ckpt-123-host.data", dumpMatch: true},
+		{name: "file-backend prefix without suffix", file: "ckpt-123"},
+		{name: "suffix without prefix", file: "123.data"},
+		{name: "non-numeric file-backend id", file: "ckpt-abc.data"},
 		{name: "control channel", file: "control-4567", pidMatch: true},
 		{name: "pid map", file: "pid_map_4567", pidMatch: true},
 		{name: "bare control counter untouched", file: "control"},
@@ -30,8 +35,8 @@ func TestGCFilePatterns(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := dumpFileRe.MatchString(tc.file); got != tc.dumpMatch {
-				t.Errorf("dumpFileRe.MatchString(%q) = %v, want %v", tc.file, got, tc.dumpMatch)
+			if _, got := dumpID(tc.file); got != tc.dumpMatch {
+				t.Errorf("dumpID(%q) matched = %v, want %v", tc.file, got, tc.dumpMatch)
 			}
 			if got := pidFileRe.MatchString(tc.file); got != tc.pidMatch {
 				t.Errorf("pidFileRe.MatchString(%q) = %v, want %v", tc.file, got, tc.pidMatch)
@@ -52,7 +57,8 @@ func TestSweep(t *testing.T) {
 	if err := os.MkdirAll(pidDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n"
+	mapsLine := "7f0000000000-7f0000200000 rw-s 00000000 00:31 42 /mnt/huge-ckpt/789\n" +
+		"7f0000200000-7f0000400000 rw-s 00000000 00:31 43 /mnt/huge-ckpt/ckpt-790.data\n"
 	if err := os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLine), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -75,10 +81,13 @@ func TestSweep(t *testing.T) {
 		}
 	}
 
-	writeAged("123", true)              // stale dump, no live mapping -> removed
-	writeAged("123-host", true)         // stale staging -> removed
-	writeAged("456", false)             // fresh dump -> kept (min-age guard)
-	writeAged("789", true)              // stale dump, live mapping -> kept
+	writeAged("123", true)           // stale dump, no live mapping -> removed
+	writeAged("123-host", true)      // stale staging -> removed
+	writeAged("456", false)          // fresh dump -> kept (min-age guard)
+	writeAged("789", true)           // stale dump, live mapping -> kept
+	writeAged("ckpt-321.data", true) // stale file-backend dump -> removed
+	writeAged("ckpt-321-host.data", true)
+	writeAged("ckpt-790.data", true)    // stale file-backend dump, live mapping -> kept
 	writeAged("control-"+deadPID, true) // dead pid -> removed
 	writeAged("pid_map_"+deadPID, true) // dead pid -> removed
 	writeAged("control", true)          // bare counter -> kept
@@ -108,10 +117,13 @@ func TestSweep(t *testing.T) {
 
 	assertGone("123")
 	assertGone("123-host")
+	assertGone("ckpt-321.data")
+	assertGone("ckpt-321-host.data")
 	assertGone("control-" + deadPID)
 	assertGone("pid_map_" + deadPID)
 	assertKept("456")
 	assertKept("789")
+	assertKept("ckpt-790.data")
 	assertKept("control")
 	assertKept("unrelated.bin")
 	if procErr == nil {
