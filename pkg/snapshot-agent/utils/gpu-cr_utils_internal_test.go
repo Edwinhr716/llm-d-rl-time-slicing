@@ -322,11 +322,13 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 	assert.Assert(t, !complete, "scan must report incomplete on unreadable maps file")
 
 	writeAged(t, ctl, "123", true)              // stale dump, but scan incomplete -> kept
+	writeAged(t, ctl, "ckpt-123.data", true)    // file-backend dump, same protection -> kept
 	writeAged(t, ctl, "control-"+deadPID, true) // dead pid -> still removed
 
 	sweep(ctl)
 
 	assertKept(t, ctl, "123")
+	assertKept(t, ctl, "ckpt-123.data")
 	assertGone(t, ctl, "control-"+deadPID)
 }
 
