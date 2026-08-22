@@ -14,18 +14,35 @@ import (
 
 // GPU-CR leaves per-process artifacts in the shared checkpoint dir:
 //
-//	<id>, <id>-host   dump + staging buffers (hugetlbfs: MAP_SHARED
+//	ckpt-<id>.data, ckpt-<id>-host.data
+//	                  dump + staging buffers, file backend — the naming
+//	                  GPU-CR uses whenever EXPORT_FILE_PATH is set, i.e. in
+//	                  every agent-managed deployment (MAP_SHARED
 //	                  reservations stick to the FILE, so a leaked pair pins
-//	                  the reserved hugepages even after the process dies)
+//	                  its whole extent even after the process dies)
+//	<id>, <id>-host   the same pair in hugepage mode (EXPORT_FILE_PATH
+//	                  unset, hardcoded /mnt/huge-ckpt)
 //	control-<pid>     shared-memory control channel
 //	pid_map_<pid>     pid→id map (may be empty on hugetlbfs)
 //
 // Nothing deletes them on process exit, so the agent sweeps them.
 
 var (
-	dumpFileRe = regexp.MustCompile(`^(\d+)(-host)?$`)
+	fileDumpRe = regexp.MustCompile(`^ckpt-(\d+)(-host)?\.data$`)
+	hugeDumpRe = regexp.MustCompile(`^(\d+)(-host)?$`)
 	pidFileRe  = regexp.MustCompile(`^(?:control|pid_map)[-_](\d+)$`)
 )
+
+// dumpID returns the GPU-CR buffer id a dump/staging file name belongs to,
+// in either naming scheme.
+func dumpID(name string) (string, bool) {
+	for _, re := range []*regexp.Regexp{fileDumpRe, hugeDumpRe} {
+		if m := re.FindStringSubmatch(name); m != nil {
+			return m[1], true
+		}
+	}
+	return "", false
+}
 
 // gcMinAge guards against racing a process that created its files but hasn't
 // mmap'd them yet (files appear before the mapping does).
@@ -73,8 +90,8 @@ func sweep(ctlDir string) {
 			continue
 		}
 
-		if m := dumpFileRe.FindStringSubmatch(name); m != nil {
-			if complete && !liveIds[m[1]] {
+		if id, ok := dumpID(name); ok {
+			if complete && !liveIds[id] {
 				if os.Remove(filepath.Join(ctlDir, name)) == nil {
 					removed = append(removed, name)
 				}
@@ -137,8 +154,8 @@ func liveMappedIds() (map[string]bool, bool) {
 				continue
 			}
 			base := filepath.Base(strings.Fields(line[idx:])[0])
-			if m := dumpFileRe.FindStringSubmatch(base); m != nil {
-				ids[m[1]] = true
+			if id, ok := dumpID(base); ok {
+				ids[id] = true
 			}
 		}
 	}
