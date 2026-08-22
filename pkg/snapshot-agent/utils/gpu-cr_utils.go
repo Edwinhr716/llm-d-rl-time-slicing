@@ -21,9 +21,14 @@ import (
 //
 // Data dir (hugetlbfs mount):
 //
-//	<id>, <id>-host   dump + staging buffers (MAP_SHARED reservations stick
-//	                  to the FILE, so a leaked pair pins hugepages even
-//	                  after the process dies)
+//	ckpt-<id>.data, ckpt-<id>-host.data
+//	                  dump + staging buffers, file backend — the naming
+//	                  GPU-CR uses whenever EXPORT_FILE_PATH is set, i.e. in
+//	                  every agent-managed deployment (MAP_SHARED
+//	                  reservations stick to the FILE, so a leaked pair pins
+//	                  its whole extent even after the process dies)
+//	<id>, <id>-host   the same pair in hugepage mode (EXPORT_FILE_PATH
+//	                  unset, hardcoded /mnt/huge-ckpt)
 //	control-<pid>     legacy control channel / v3 dual-flock lock files
 //	groups/<slot>/    destination dumps (GEP-0001) — the ONLY copy of each
 //	                  parked slot; reaped by owner-liveness, never blind TTL
@@ -32,9 +37,21 @@ import (
 //
 //	control-<pid>, pid_map_<pid>, ctl-ready-<pid>
 var (
-	dumpFileRe = regexp.MustCompile(`^(\d+)(-host)?$`)
+	fileDumpRe = regexp.MustCompile(`^ckpt-(\d+)(-host)?\.data$`)
+	hugeDumpRe = regexp.MustCompile(`^(\d+)(-host)?$`)
 	pidFileRe  = regexp.MustCompile(`^(?:control-|pid_map_|ctl-ready-)(\d+)$`)
 )
+
+// dumpID returns the GPU-CR buffer id a dump/staging file name belongs to,
+// in either naming scheme.
+func dumpID(name string) (string, bool) {
+	for _, re := range []*regexp.Regexp{fileDumpRe, hugeDumpRe} {
+		if m := re.FindStringSubmatch(name); m != nil {
+			return m[1], true
+		}
+	}
+	return "", false
+}
 
 // StoreMu serializes group-store mutation between backend ops and GC, so a
 // sweep can never unlink a destination file mid-checkpoint/restore.
@@ -161,8 +178,8 @@ func sweepDataDir(dir string) {
 			continue
 		}
 
-		if m := dumpFileRe.FindStringSubmatch(name); m != nil {
-			if complete && !liveIds[m[1]] {
+		if id, ok := dumpID(name); ok {
+			if complete && !liveIds[id] {
 				if os.Remove(filepath.Join(dir, name)) == nil {
 					removed = append(removed, name)
 				}
@@ -403,8 +420,8 @@ func liveMappedIds() (map[string]bool, bool) {
 				continue
 			}
 			base := filepath.Base(strings.Fields(line[idx:])[0])
-			if m := dumpFileRe.FindStringSubmatch(base); m != nil {
-				ids[m[1]] = true
+			if id, ok := dumpID(base); ok {
+				ids[id] = true
 			}
 		}
 	}
