@@ -37,8 +37,8 @@ func TestGCFilePatterns(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, got := dumpID(tc.file); got != tc.dumpMatch {
-				t.Errorf("dumpID(%q) matched = %v, want %v", tc.file, got, tc.dumpMatch)
+			if got := isDumpFile(tc.file); got != tc.dumpMatch {
+				t.Errorf("isDumpFile(%q) = %v, want %v", tc.file, got, tc.dumpMatch)
 			}
 			if got := pidFileRe.MatchString(tc.file); got != tc.pidMatch {
 				t.Errorf("pidFileRe.MatchString(%q) = %v, want %v", tc.file, got, tc.pidMatch)
@@ -190,7 +190,7 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 	}
 }
 
-// TestLiveMappedIdsExitedProcess: a numeric dir with no maps file is a
+// TestLiveMappedInodesExitedProcess: a numeric dir with no maps file is a
 // process that exited between enumeration and read — benign churn, the
 // scan stays complete.
 func TestLiveMappedInodesExitedProcess(t *testing.T) {
@@ -215,7 +215,7 @@ func mapsEntry(t *testing.T, path, nsPath string) string {
 	if err := syscall.Stat(path, &st); err != nil {
 		t.Fatal(err)
 	}
-	major, minor := devMajMin(uint64(st.Dev))
+	nums := devMajMin(st.Dev)
 	return fmt.Sprintf("7f0000000000-7f0000200000 rw-s 00000000 %02x:%02x %d %s\n",
-		major, minor, uint64(st.Ino), nsPath)
+		nums.major, nums.minor, st.Ino, nsPath)
 }
