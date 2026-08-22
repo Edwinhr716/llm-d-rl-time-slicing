@@ -161,7 +161,7 @@ func sweepDataDir(dir string) {
 		return
 	}
 
-	liveIds, complete := liveMappedIds()
+	liveInodes, complete := liveMappedInodes()
 	if !complete {
 		slog.Warn("GC: procfs scan incomplete; keeping all dump files this sweep", "dir", dir)
 	}
@@ -178,8 +178,9 @@ func sweepDataDir(dir string) {
 			continue
 		}
 
-		if id, ok := dumpID(name); ok {
-			if complete && !liveIds[id] {
+		if _, ok := dumpID(name); ok {
+			key, ok := fileDevIno(filepath.Join(dir, name))
+			if complete && ok && !liveInodes[key] {
 				if os.Remove(filepath.Join(dir, name)) == nil {
 					removed = append(removed, name)
 				}
@@ -385,20 +386,24 @@ var procfsRoot = "/proc"
 // pidDirRe matches the numeric process dirs under /proc.
 var pidDirRe = regexp.MustCompile(`^\d+$`)
 
-// liveMappedIds returns the set of dump-buffer ids currently mmap'd by any
-// live process (agent runs with hostPID, so /proc covers the whole node),
-// plus whether the scan was complete. PID dirs are enumerated with ReadDir
-// rather than a glob: Glob silently drops paths it cannot traverse, which
-// would under-report live mappings with no error to classify. The scan is
+// liveMappedInodes returns the device:inode key of every file currently
+// mmap'd by any live process (agent runs with hostPID, so /proc covers the
+// whole node), plus whether the scan was complete. Liveness matches by
+// inode, never by pathname: a maps line renders the path in the OWNING
+// process's mount namespace, so the same checkpoint file can appear under a
+// path the agent has never mounted — dev:inode is namespace- and
+// name-independent. PID dirs are enumerated with ReadDir rather than a
+// glob: Glob silently drops paths it cannot traverse, which would
+// under-report live mappings with no error to classify. The scan is
 // incomplete when the enumeration or any maps read fails for a reason other
 // than the process exiting mid-scan: a partial scan cannot prove a dump is
 // unmapped, so the caller must skip dump deletion for that sweep.
-func liveMappedIds() (map[string]bool, bool) {
-	ids := make(map[string]bool)
+func liveMappedInodes() (map[string]bool, bool) {
+	live := make(map[string]bool)
 	complete := true
 	entries, err := os.ReadDir(procfsRoot)
 	if err != nil {
-		return ids, false
+		return live, false
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() || !pidDirRe.MatchString(entry.Name()) {
@@ -415,15 +420,55 @@ func liveMappedIds() (map[string]bool, bool) {
 			continue
 		}
 		for _, line := range strings.Split(string(data), "\n") {
-			idx := strings.Index(line, "huge-ckpt/")
-			if idx < 0 {
-				continue
+			// address perms offset dev inode [pathname]
+			fields := strings.Fields(line)
+			if len(fields) < 5 || fields[4] == "0" {
+				continue // anonymous or malformed: nothing to key on
 			}
-			base := filepath.Base(strings.Fields(line[idx:])[0])
-			if id, ok := dumpID(base); ok {
-				ids[id] = true
+			if key, ok := mapsDevIno(fields[3], fields[4]); ok {
+				live[key] = true
 			}
 		}
 	}
-	return ids, complete
+	return live, complete
+}
+
+// mapsDevIno turns a maps-line device field (hex "major:minor") and decimal
+// inode field into the key fileDevIno produces for the same file.
+func mapsDevIno(dev, ino string) (string, bool) {
+	majField, minField, found := strings.Cut(dev, ":")
+	if !found {
+		return "", false
+	}
+	major, err := strconv.ParseUint(majField, 16, 64)
+	if err != nil {
+		return "", false
+	}
+	minor, err := strconv.ParseUint(minField, 16, 64)
+	if err != nil {
+		return "", false
+	}
+	inode, err := strconv.ParseUint(ino, 10, 64)
+	if err != nil {
+		return "", false
+	}
+	return fmt.Sprintf("%d:%d:%d", major, minor, inode), true
+}
+
+// fileDevIno stats path into the same key space as mapsDevIno.
+func fileDevIno(path string) (string, bool) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return "", false
+	}
+	major, minor := devMajMin(uint64(st.Dev))
+	return fmt.Sprintf("%d:%d:%d", major, minor, uint64(st.Ino)), true
+}
+
+// devMajMin splits a stat dev_t with the Linux huge-dev encoding — the same
+// split the kernel uses to print the maps device column.
+func devMajMin(dev uint64) (uint64, uint64) {
+	major := ((dev >> 8) & 0xfff) | ((dev >> 32) &^ 0xfff)
+	minor := (dev & 0xff) | ((dev >> 12) &^ 0xff)
+	return major, minor
 }
