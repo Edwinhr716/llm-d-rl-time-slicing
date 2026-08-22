@@ -130,9 +130,9 @@ featureGates: {}
 # sized for whole-VRAM dumps (the GPU-CR SHM_SIZE_GB build knob).
 directMemory:
   enabled: false
-  # Shared checkpoint/control dir (EXPORT_FILE_PATH inside the agent). The
-  # agent GC only recognizes dump mappings under a path containing
-  # "huge-ckpt/" — keep that segment if you change these.
+  # Shared checkpoint/control dir (EXPORT_FILE_PATH inside the agent). Any
+  # path works: the agent GC matches live dump mappings by device:inode,
+  # not by name.
   ctlDir: /mnt/huge-ckpt
   # Host path backing ctlDir; also the hugetlbfs mountpoint when
   # hugetlbfs.mount is on.
