@@ -1,0 +1,57 @@
+# Builds vGPU-NVIDIA.so from the LOCAL source tree, applying the same
+# build-time patches the deployed prebuilt carries: SIGRTMAX-8/-7 signal
+# remap and control-file 0777. CPU-only; compiles against CUDA headers, no
+# GPU needed.
+#
+# Stages:
+#   builder  compiles everything and (RUN_TESTS=1, default) runs the
+#            GPU-free test suites (ctest) — a red suite fails the build
+#   e2e      carries the CUDA runtime, binaries and e2e/perf scripts for
+#            running tests/e2e/ on a GPU node
+#   (final)  minimal artifact carrier: vGPU-NVIDIA.so + cr_client
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS builder
+ARG SHM_SIZE_GB=25
+ARG RUN_TESTS=1
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential && rm -rf /var/lib/apt/lists/*
+
+COPY . /tmp/GPU-CR
+RUN cd /tmp/GPU-CR && \
+    sed -i 's/#define CR_CKPT_SIGNAL     SIGUSR1/#define CR_CKPT_SIGNAL     (SIGRTMAX - 8)/' src/common.h && \
+    sed -i 's/#define CR_RESTORE_SIGNAL  SIGUSR2/#define CR_RESTORE_SIGNAL  (SIGRTMAX - 7)/' src/common.h && \
+    # 0777 is deliberate, not an oversight: the coordinator (agent pod) and
+    # the workload run as different UIDs in different pods and share the
+    # control file only through a dedicated volume — the volume mount is the
+    # access boundary. A stricter mode would need a UID/GID contract across
+    # pods that the deployment cannot assume.
+    sed -i 's/int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/int fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
+    grep -q "SIGRTMAX - 8" src/common.h && \
+    grep -q "0777" src/comm/share_mem.cpp && \
+    mkdir build && cd build && \
+    if [ "$RUN_TESTS" = "1" ]; then \
+        cmake -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB=${SHM_SIZE_GB} \
+              -DGPU_CR_BUILD_TESTS=ON -DGPU_CR_BUILD_E2E=ON .. && \
+        make -j$(nproc) && \
+        ctest --output-on-failure; \
+    else \
+        cmake -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB=${SHM_SIZE_GB} \
+              -DGPU_CR_BUILD_E2E=ON .. && \
+        make -j$(nproc); \
+    fi
+
+# GPU-node test image: run tests/e2e/run_e2e.sh (correctness gates) and
+# tests/e2e/perf_regression.sh (baseline-vs-candidate data-plane timing).
+FROM nvidia/cuda:13.0.0-runtime-ubuntu22.04 AS e2e
+COPY --from=builder /tmp/GPU-CR/build/vGPU-NVIDIA.so /opt/gpu-cr/vGPU-NVIDIA.so
+COPY --from=builder /tmp/GPU-CR/build/cr_client /opt/gpu-cr/cr_client
+COPY --from=builder /tmp/GPU-CR/build/pattern_workload /opt/gpu-cr/pattern_workload
+COPY --from=builder /tmp/GPU-CR/tests/e2e/ /opt/gpu-cr/e2e/
+ENV CR_CLIENT=/opt/gpu-cr/cr_client \
+    WORKLOAD=/opt/gpu-cr/pattern_workload \
+    VGPU_SO=/opt/gpu-cr/vGPU-NVIDIA.so
+
+FROM busybox:stable
+COPY --from=builder /tmp/GPU-CR/build/vGPU-NVIDIA.so /vGPU-NVIDIA.so
+# The coordinator ships too: cr_client and vGPU.so are version-locked
+# through the control-channel protocol, so consumers (snapshot-agent
+# image) should copy BOTH from the same build.
+COPY --from=builder /tmp/GPU-CR/build/cr_client /cr_client
