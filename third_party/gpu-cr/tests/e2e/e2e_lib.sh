@@ -11,6 +11,7 @@ SPEC="$RUN/spec"
 CMD="$RUN/cmd"
 RESP="$RUN/resp"
 WL_PID=""
+WL_REGIONS=""
 SEQ=0
 
 # start_workload <vgpu_so> [ENV=VAL ...]
@@ -37,6 +38,7 @@ start_workload() {
     done
     [ -s "$SPEC" ] || { echo "FATAL: workload spec never appeared" >&2; return 1; }
     WL_PID=$(sed -n 1p "$SPEC")
+    WL_REGIONS=$(sed -n 2p "$SPEC")
     return 0
 }
 
@@ -85,7 +87,8 @@ stub_cuda_checkpoint() {
 }
 
 # extract_ms <stderr-file> <prefix> — prints one time-in-ms per matching
-# ".. size: X GB, time: Y ms, .." line (prefix: "ckpt" | "restore").
+# ".. size: X GB, time: Y ms, .." line (prefix: "ckpt" | "restore" |
+# "selective ckpt" | "selective restore").
 extract_ms() {
     sed -n "s/^$2 size: .* time: \([0-9][0-9]*\) ms.*/\1/p" "$1"
 }

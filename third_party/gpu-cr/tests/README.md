@@ -126,15 +126,16 @@ ctest -R cr_client_integration --output-on-failure
 ## 3. End-to-end — `tests/e2e/run_e2e.sh` (GPU node)
 
 A real CUDA workload (`pattern_workload`) under `LD_PRELOAD=vGPU-NVIDIA.so`
-goes through full checkpoint/restore, gating on **byte-identical GPU memory
-after every restore**.
+goes through destination-path selective C/R, buffer-path selective C/R, and
+full C/R, gating on **byte-identical GPU memory after every restore**.
 
 ## 4. Performance regression — `tests/e2e/perf_regression.sh` (GPU node)
 
 Verifies the consolidated build has not regressed the full checkpoint/
 restore data plane that upstream (`e9bbb52`) delivers: same workload,
 same node, baseline .so vs candidate .so, median-of-N compared against a
-threshold (default 15%).
+threshold (default 15%). Candidate selective-path timings are recorded as
+informational (no upstream baseline exists for them).
 
 Build the baseline once with `tests/e2e/build_baseline_so.sh` (run from
 a checkout containing the pinned upstream commit — a vendored copy of

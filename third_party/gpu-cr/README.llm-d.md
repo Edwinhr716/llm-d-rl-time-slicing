@@ -22,16 +22,23 @@ external projects: see `third_party/forked/` in kubernetes/kubernetes,
 
 ## Local changes
 
-This copy carries test coverage for the imported upstream `e9bbb52` sources
-(the sources themselves are unchanged):
+This copy carries the consolidated changes from
+[Edwinhr716/GPU-CR@`experiments-e1-e16`](https://github.com/Edwinhr716/GPU-CR/tree/experiments-e1-e16)
+(head `08ec862`), which is upstream `e9bbb52` plus everything the E1–E16
+time-slicing experiments required, cleaned up and tested:
 
-- unit tests under `tests/unit/` for the GPU-free upstream-baseline pieces
-  (wire structs, control channel, buffer mapping, fd exchange)
-- e2e and perf-regression suites under `tests/` (see `tests/README.md`);
-  `Dockerfile.build` runs the GPU-free suite on every image build
+- memory-address (selective) checkpoint backend, unrounded allocation-size
+  dumps, and granule-chunked copies
+- destination-path selective checkpoints (v2 protocol)
+- Google C++ Style Guide cleanup of the added code, and cr_client
+  hardening (`GPU_CR_CUDA_CHECKPOINT` override; restore fails on a failed
+  cuda-checkpoint toggle)
+- unit, integration, e2e and perf-regression suites under `tests/`
+  (see `tests/README.md`); `Dockerfile.build` runs the GPU-free suites on
+  every image build
 
 Like the original import, the prebuilt `cuda-checkpoint` binary is not
-vendored; deployments provide it.
+vendored; deployments provide it (or set `GPU_CR_CUDA_CHECKPOINT`).
 
 ## Licensing
 
