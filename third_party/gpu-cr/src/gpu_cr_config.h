@@ -24,7 +24,11 @@
 // workers may run with different GPU_CR_* env.
 //
 // No upper clamp: the hugepage pool is the real bound and mmap reports
-// ENOMEM honestly. Floors: 64MiB dump (2MiB-aligned), 128MiB staging.
+// ENOMEM honestly. The only "too big" that is rejected at parse time is
+// a size the platform cannot represent at all — beyond signed off_t
+// (ftruncate's extent type), or a staging size whose x2 buffer total
+// would wrap size_t; such values could never be honored on any pool.
+// Floors: 64MiB dump (2MiB-aligned), 128MiB staging.
 // Unparsable, out-of-range, or below-floor values warn and fall back to
 // the default — never a silent clamp.
 //
