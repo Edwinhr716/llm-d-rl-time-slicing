@@ -130,6 +130,21 @@ TEST_F(ConfigLoadTest, ShmMbAlignmentWrapFallsBackToDefault) {
   EXPECT_EQ(Load().shm_size, kShm8);
 }
 
+// Fits size_t but not signed off_t: 2^33 GB resolves to 2^63 bytes, which
+// ftruncate() cannot represent. Must be rejected at parse, not crash the
+// workload at init.
+TEST_F(ConfigLoadTest, ShmGbOffTOverflowFallsBackToDefault) {
+  setenv("GPU_CR_SHM_GB", "8589934592", 1);  // 2^33
+  EXPECT_EQ(Load().shm_size, kShm8);
+}
+
+// The exact off_t boundary: 2^33-1 GB resolves to 2^63-2^30, the largest
+// 2MiB-aligned extent a signed 64-bit off_t can carry after round-up.
+TEST_F(ConfigLoadTest, ShmGbAtOffTBoundAccepted) {
+  setenv("GPU_CR_SHM_GB", "8589934591", 1);  // 2^33 - 1
+  EXPECT_EQ(Load().shm_size, (8589934591ULL << 30));
+}
+
 TEST_F(ConfigLoadTest, ShmAlignsUpTo2MiB) {
   setenv("GPU_CR_SHM_MB", "129", 1);
   EXPECT_EQ(Load().shm_size, 130UL << 20);
@@ -162,6 +177,28 @@ TEST_F(ConfigLoadTest, StagingNoUpperBound) {
 
 TEST_F(ConfigLoadTest, StagingOverflowFallsBackToDefault) {
   setenv("GPU_CR_STAGING_MB", "17592186044416", 1);
+  EXPECT_EQ(Load().staging_size, kStg1);
+}
+
+// The two staging buffers are ftruncate'd/mmap'd as ONE file of
+// staging x 2 bytes: 2^43 MB resolves to 2^63 per buffer, so the total
+// wraps size_t to 0 (and each buffer alone already exceeds off_t). Must
+// be rejected at parse, not discovered as a zero-extent mapping.
+TEST_F(ConfigLoadTest, StagingTotalWrapFallsBackToDefault) {
+  setenv("GPU_CR_STAGING_MB", "8796093022208", 1);  // 2^43
+  EXPECT_EQ(Load().staging_size, kStg1);
+}
+
+// The exact total-representability boundary: 2^42-2 MB rounds to
+// 2^62-2^21 per buffer; the x2 total is 2^63-2^22, still within off_t.
+// One MB more would round the total past the off_t ceiling.
+TEST_F(ConfigLoadTest, StagingAtTotalBoundAccepted) {
+  setenv("GPU_CR_STAGING_MB", "4398046511102", 1);  // 2^42 - 2
+  EXPECT_EQ(Load().staging_size, (4398046511102ULL << 20));
+}
+
+TEST_F(ConfigLoadTest, StagingJustPastTotalBoundFallsBackToDefault) {
+  setenv("GPU_CR_STAGING_MB", "4398046511103", 1);  // 2^42 - 1
   EXPECT_EQ(Load().staging_size, kStg1);
 }
 
