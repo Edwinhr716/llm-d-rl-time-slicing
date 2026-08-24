@@ -51,7 +51,22 @@ cr() { env EXPORT_FILE_PATH="$STORE" \
 # from earlier runs, so the check is bound to THIS workload: snapshot the
 # store before init and judge only files that appeared after — exactly one
 # must, and its extent must match.
-record_store_files() { ls "$STORE"/ckpt-*.data > "$RUN/store-pre" 2>/dev/null || :; }
+#
+# The snapshot itself fails CLOSED: an empty store is a legitimate empty
+# snapshot, but an unreadable $STORE or unwritable snapshot file aborts
+# the run — with a missing snapshot every pre-existing file would look
+# new to dump_extent_ok, and a stale file could satisfy (or wrongly
+# fail) the extent gate.
+record_store_files() {
+    : > "$RUN/store-pre" || { echo "FATAL: cannot write $RUN/store-pre" >&2; exit 1; }
+    [ -r "$STORE" ] && [ -x "$STORE" ] || { echo "FATAL: cannot read $STORE" >&2; exit 1; }
+    local f
+    for f in "$STORE"/ckpt-*.data; do
+        [ -e "$f" ] || continue    # unmatched glob literal
+        printf '%s\n' "$f" >> "$RUN/store-pre" \
+            || { echo "FATAL: cannot write $RUN/store-pre" >&2; exit 1; }
+    done
+}
 dump_extent_ok() {
     local f sz found=""
     for f in "$STORE"/ckpt-*.data; do
