@@ -40,17 +40,27 @@ cr() { env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" "$CR_CLIENT" "
 
 # The dump buffer is the one ckpt-<id>.data under $STORE that is not the
 # -host staging file; its extent is the ftruncate the workload performed
-# from the cached env config.
+# from the cached env config. A shared/dirty $STORE may hold dump files
+# from earlier runs, so the check is bound to THIS workload: snapshot the
+# store before init and judge only files that appeared after — exactly one
+# must, and its extent must match.
+record_store_files() { ls "$STORE"/ckpt-*.data > "$RUN/store-pre" 2>/dev/null || :; }
 dump_extent_ok() {
-    local f sz
+    local f sz found=""
     for f in "$STORE"/ckpt-*.data; do
         case "$f" in *-host.data) continue ;; esac
-        sz=$(stat -c %s "$f" 2>/dev/null) || continue
-        [ "$sz" -eq "$SHM_BYTES" ] && return 0
-        echo "dump file $f: $sz bytes, expected $SHM_BYTES" >&2
-        return 1
+        [ -e "$f" ] || continue
+        grep -qxF "$f" "$RUN/store-pre" 2>/dev/null && continue
+        if [ -n "$found" ]; then
+            echo "multiple new dump files: $found, $f" >&2
+            return 1
+        fi
+        found=$f
     done
-    echo "no dump-buffer file under $STORE" >&2
+    [ -n "$found" ] || { echo "no new dump-buffer file under $STORE" >&2; return 1; }
+    sz=$(stat -c %s "$found" 2>/dev/null) || { echo "stat $found failed" >&2; return 1; }
+    [ "$sz" -eq "$SHM_BYTES" ] && return 0
+    echo "dump file $found: $sz bytes, expected $SHM_BYTES" >&2
     return 1
 }
 
@@ -68,6 +78,7 @@ gate "G0a env config parsed at load" \
     grep -qF "[gpu-cr-config] dump buffer ${SHM_MIB} MiB (env GPU_CR_SHM_MB)" \
     "$RUN/workload.stderr"
 
+record_store_files
 cr -i -p "$WL_PID" || { echo "FATAL: init failed ($?)"; exit 1; }
 
 gate "G0b dump buffer extent matches env" dump_extent_ok
