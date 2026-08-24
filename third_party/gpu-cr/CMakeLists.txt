@@ -107,9 +107,6 @@ target_link_options(vGPU PRIVATE -shared -fPIC)
 # ---------------------------------------------------------------------------
 set(_COORD_COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
-    # multi_cr_client maps worker buffers at SHM_SIZE, a runtime value
-    # read from gpu_cr::Config().
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
 )
 
 add_executable(cr_client
@@ -137,11 +134,13 @@ target_link_libraries(multi_cr_client PRIVATE ${GPU_LIBS} dl stdc++ pthread)
 target_compile_options(multi_cr_client PRIVATE -O3 -g)
 
 # ---------------------------------------------------------------------------
-# Tests (GPU-free; run in Dockerfile.build)
+# Tests (GPU-free; run in Dockerfile.build and cloudbuild-test.yaml)
 #   gpu_cr_unit_tests        — GoogleTest unit suite for the config, ctl-path,
 #                              dump-format, granule-clamp and region-spec code,
 #                              plus the upstream-baseline control channel,
 #                              buffer mapping, fd exchange and memcpy_multi
+#   gpu_cr_deferred_tests    — deferred dump-buffer mode (GPU_CR_SHM_MB=0);
+#                              its own process because Config() is cached
 #   fake_workload            — GPU-free stand-in for the vGPU.so side of the
 #                              control channel
 #   cr_client_integration    — drives the real cr_client binary against
@@ -184,19 +183,27 @@ if(GPU_CR_BUILD_TESTS)
         # selective_spec_test includes coordinator/selective_spec.h
         ${CMAKE_CURRENT_SOURCE_DIR}/coordinator
     )
-    # The file backend reserves the full dump-buffer size up front
-    # (posix_fallocate); pin the suite to the 1GiB minimum so the
-    # mmap-backend tests don't reserve the 25GiB production default per
-    # checkpoint id. Expressed as compile *options* (-U then -D) so the
-    # override lands after any directory-level -DSHM_SIZE_GB from the
-    # build harness in the generated compile command.
-    target_compile_options(gpu_cr_unit_tests PRIVATE -USHM_SIZE_GB -DSHM_SIZE_GB=1)
     target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)
     add_test(NAME unit COMMAND gpu_cr_unit_tests)
+
+    # Deferred dump-buffer mode needs its own process: Config() is a
+    # process-cached singleton, so GPU_CR_SHM_MB=0 cannot coexist with the
+    # eager-mode suite above.
+    add_executable(gpu_cr_deferred_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/mmap_backend_deferred_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mmap_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
+    )
+    target_include_directories(gpu_cr_deferred_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(gpu_cr_deferred_tests PRIVATE GTest::gtest_main pthread)
+    add_test(NAME unit_deferred COMMAND gpu_cr_deferred_tests)
 
     add_executable(fake_workload
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/fake_workload.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
     )
     target_include_directories(fake_workload PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

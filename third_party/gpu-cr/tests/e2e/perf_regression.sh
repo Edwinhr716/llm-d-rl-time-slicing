@@ -100,7 +100,8 @@ EOF
 # baseline-only client the ops fail fast and both medians report -1.
 : > "$RUN/workload.stderr"
 if start_workload "$CANDIDATE_SO" \
-        E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB"; then
+        E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" \
+        GPU_CR_SHM_MB="$SHM_MB"; then
     env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" \
         "$CANDIDATE_CLIENT" -i -p "$WL_PID" > /dev/null 2>&1
     for i in $(seq 1 "$ITERS"); do

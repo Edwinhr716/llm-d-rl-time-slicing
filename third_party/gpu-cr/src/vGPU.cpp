@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "common.h"
+#include "ctl_path.h"
 #include "dump_format.h"
 #include "comm/comm.h"
 #include "backend/backend.h"
@@ -120,7 +121,7 @@ double ckpt() {
             required += ROUND_UP_2MB(entry.second);
         if (required > SHM_SIZE) {
             fprintf(stderr, "[vGPU-CKPT] Error: checkpoint needs %zu MiB but the dump buffer is "
-                            "%zu MiB (rebuild with a larger SHM_SIZE_GB); failing cleanly\n",
+                            "%zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
                     required >> 20, static_cast<size_t>(SHM_SIZE) >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
@@ -486,11 +487,12 @@ double ckpt_selective(const SelectiveCrRequest* req) {
             return -1;
         }
         fs_capacity = SHM_SIZE;
-        // Same clean pre-op failure as the dest path instead of the
-        // historical mid-loop exit(-1).
+        // The legacy buffer is env-shrinkable now — same clean
+        // pre-op failure as the dest path instead of the historical
+        // mid-loop exit(-1).
         if (dump_total > fs_capacity) {
             fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: selective checkpoint needs %zu MiB but the "
-                            "dump buffer is %zu MiB (rebuild with a larger SHM_SIZE_GB); failing cleanly\n",
+                            "dump buffer is %zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
                     dump_total >> 20, fs_capacity >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
@@ -1044,21 +1046,32 @@ double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
 
 int get_id() {
     char id_name[512];
-    const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
-    if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
+    bool ctl_mode = false;
+    const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
     snprintf(id_name, sizeof(id_name), "%s/control", ctl_dir);
     int fd_id = open(id_name, O_CREAT | O_RDWR, 0755);
     if (fd_id < 0) {
         perror("open()");
         exit(EXIT_FAILURE);
     }
+    // The counter is a single atomic int: on the ctl tmpfs one 4KiB page
+    // suffices (and frees the hugepage the legacy layout pinned); on
+    // hugetlbfs the historical 2MiB sizing is kept.
+    size_t id_size = ctl_mode ? 4096 : HUGE_PAGE_SIZE;
     // Set file size before mmap to avoid Bus error
-    if (ftruncate(fd_id, HUGE_PAGE_SIZE) < 0) {
+    if (ftruncate(fd_id, id_size) < 0) {
         perror("ftruncate()");
         exit(EXIT_FAILURE);
     }
+    if (ctl_mode) {
+        int rc = posix_fallocate(fd_id, 0, static_cast<off_t>(id_size));
+        if (rc != 0) {
+            fprintf(stderr, "posix_fallocate(%s): %s (ctl tmpfs full?)\n", id_name, strerror(rc));
+            exit(EXIT_FAILURE);
+        }
+    }
     std::atomic<int>* id_ptr = static_cast<std::atomic<int>*>(
-        mmap(nullptr, HUGE_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_id, 0));
+        mmap(nullptr, id_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_id, 0));
     if (id_ptr == MAP_FAILED) {
         perror("mmap()");
         exit(EXIT_FAILURE);
@@ -1080,9 +1093,9 @@ void init_CR() {
 
     // Write PID -> ID mapping file. write(2), not stdio: buffered stdio
     // silently produces an EMPTY file on hugetlbfs (the historical pid_map
-    // bug).
-    const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
-    if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
+    // bug); on the ctl tmpfs plain writes just work.
+    bool ctl_mode = false;
+    const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
     char map_name[512];
     snprintf(map_name, sizeof(map_name), "%s/pid_map_%d", ctl_dir, getpid());
     int fd_map = open(map_name, O_CREAT | O_TRUNC | O_WRONLY, 0666);
@@ -1542,7 +1555,7 @@ __attribute__((constructor)) void init() {
     // Resolve buffer config FIRST — a function-local-static
     // singleton invoked here (not a second ELF constructor, whose order vs
     // this one would be unspecified). Signal handlers only read the cache.
-    gpu_cr::Config();
+    const gpu_cr::BufConfig& buf_cfg = gpu_cr::Config();
 
     fprintf(stderr, "[vGPU] Library loaded! Registering signal handlers...\n");
     fprintf(stderr, "[vGPU] Multi-GPU CR support enabled (IPC hook mode)\n");
@@ -1562,4 +1575,27 @@ __attribute__((constructor)) void init() {
         ipc_validate_all_mappings("ON-DEMAND");
         fflush(stderr);
     });
+
+    // Readiness advertisement: written LAST, in the same constructor that
+    // installs the handlers, so its existence proves every handler above
+    // is in place before any coordinator can see the file — cr_client
+    // refuses to kill() without it. starttime makes the file
+    // self-invalidating across PID reuse. Never written in legacy mode (a
+    // disk-backed dir could be shadowed by a later tmpfs mount, stranding
+    // a stale advertisement). Failures are logged, never fatal: this must
+    // not take down the workload.
+    {
+        bool ctl_mode = false;
+        const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
+        if (ctl_mode) {
+            // shm_mb/staging_mb/deferred: additive keys so the
+            // agent can OBSERVE workload buffer sizing and cross-check it
+            // against pod hugepage requests — closing the observability
+            // corner of the three-way consistency triangle.
+            if (gpu_cr::WriteAdvertisement(ctl_dir, getpid(), buf_cfg.shm_size >> 20,
+                                           buf_cfg.staging_size >> 20, buf_cfg.shm_deferred))
+                fprintf(stderr, "[vGPU] ctl-ready advertisement written: %s/ctl-ready-%d\n",
+                        ctl_dir, getpid());
+        }
+    }
 }

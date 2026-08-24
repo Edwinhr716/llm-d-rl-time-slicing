@@ -14,11 +14,11 @@
 #   G5  buffer-path selective checkpoint/restore + verify
 #   G6  full checkpoint/restore data plane + verify (stubbed toggle unless
 #       E2E_FULL_TOGGLE=1 and a real cuda-checkpoint is on PATH)
-#   G3  below-floor GPU_CR_SHM_MB warns at load and falls back to the
+#   G7  below-floor GPU_CR_SHM_MB warns at load and falls back to the
 #       build default; the workload stays healthy
 #
 # Required env: CR_CLIENT, WORKLOAD, VGPU_SO, STORE.
-# Optional env: E2E_NUM_BUFFERS, E2E_BUFFER_MB,
+# Optional env: GPU_CR_CTL_PATH, E2E_NUM_BUFFERS, E2E_BUFFER_MB,
 #               GPU_CR_SHM_MB (defaults to a size fitting the buffers),
 #               CR_TIMEOUT (seconds per cr_client call, default 120).
 set -u
@@ -41,7 +41,9 @@ gate() {
     if "$@"; then echo "PASS: $name"; PASS=$((PASS+1));
     else echo "FAIL: $name"; FAIL=$((FAIL+1)); fi
 }
-cr() { env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" "$CR_CLIENT" "$@"; }
+cr() { env EXPORT_FILE_PATH="$STORE" \
+          ${GPU_CR_CTL_PATH:+GPU_CR_CTL_PATH="$GPU_CR_CTL_PATH"} \
+          timeout "${CR_TIMEOUT:-120}" "$CR_CLIENT" "$@"; }
 
 # The dump buffer is the one ckpt-<id>.data under $STORE that is not the
 # -host staging file; its extent is the ftruncate the workload performed
@@ -121,7 +123,7 @@ gate "G6a full ckpt" cr -c -p "$WL_PID"
 gate "G6b full restore" cr -r -p "$WL_PID"
 gate "G6c verify after full restore" wl_cmd verify
 
-# G3: a below-floor value must warn and fall back at library load. No CR
+# G7: a below-floor value must warn and fall back at library load. No CR
 # signal is ever sent to this workload, so a parse deferred to the signal
 # path would produce neither line — and since init never runs, the
 # build-default-sized buffer is never allocated (the banner alone is
@@ -130,11 +132,11 @@ stop_workload
 start_workload "$VGPU_SO" \
     E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" \
     GPU_CR_SHM_MB=10 || exit 1
-gate "G3a below-floor value warns" \
+gate "G7a below-floor value warns" \
     grep -qF "WARNING: GPU_CR_SHM below the 64MiB floor (10)" "$RUN/workload.stderr"
-gate "G3b falls back to build default" \
+gate "G7b falls back to build default" \
     grep -qF "MiB (build default)" "$RUN/workload.stderr"
-gate "G3c workload healthy after fallback" wl_cmd verify
+gate "G7c workload healthy after fallback" wl_cmd verify
 
 stop_workload
 echo
