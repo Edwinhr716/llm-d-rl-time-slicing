@@ -1,9 +1,12 @@
 #include "gpu_cr_config.h"
 
+#include <sys/types.h>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #include "common.h"
 
@@ -20,10 +23,21 @@ long long ParseNonNegative(const char* value, bool* ok) {
 
 namespace {
 
-// Largest value that survives `n << shift` and the subsequent 2MiB
-// round-up without wrapping size_t.
-long long MaxShiftable(int shift) {
-  return static_cast<long long>((SIZE_MAX - (HUGE_PAGE_SIZE - 1)) >> shift);
+// Largest value that survives `n << shift`, the subsequent 2MiB round-up,
+// and every downstream consumer of the resolved size. size_t alone is not
+// enough: the extent is handed to ftruncate() as a signed off_t, and the
+// staging buffers are ftruncate'd/mmap'd as ONE file of
+// `staging * consumers` bytes, whose product must not wrap either. A value
+// beyond this bound can never be honored on this platform, so it is
+// invalid input (warn + default) — unlike a large-but-representable size,
+// which is legal and bounded only by the hugepage pool at mmap time.
+long long MaxShiftable(int shift, unsigned long long consumers) {
+  unsigned long long cap = SIZE_MAX;
+  const unsigned long long off_cap = static_cast<unsigned long long>(
+      std::numeric_limits<off_t>::max());
+  if (off_cap < cap) cap = off_cap;
+  cap /= consumers;
+  return static_cast<long long>((cap - (HUGE_PAGE_SIZE - 1)) >> shift);
 }
 
 }  // namespace
@@ -53,7 +67,7 @@ BufConfig Load(size_t shm_default, size_t staging_default) {
     const int shift = use_mb ? 20 : 30;
     bool ok = false;
     long long n = ParseNonNegative(val, &ok);
-    if (!ok || n > MaxShiftable(shift)) {
+    if (!ok || n > MaxShiftable(shift, 1)) {
       fprintf(stderr,
               "[gpu-cr-config] WARNING: unparsable or out-of-range "
               "GPU_CR_SHM_%s=%s; using build default\n",
@@ -78,7 +92,7 @@ BufConfig Load(size_t shm_default, size_t staging_default) {
   if (smb && smb[0]) {
     bool ok = false;
     long long n = ParseNonNegative(smb, &ok);
-    if (!ok || n > MaxShiftable(20) ||
+    if (!ok || n > MaxShiftable(20, STAGING_BUF_NUM) ||
         (static_cast<size_t>(n) << 20) < kStagingFloorBytes) {
       fprintf(stderr,
               "[gpu-cr-config] WARNING: GPU_CR_STAGING_MB=%s unparsable, "
