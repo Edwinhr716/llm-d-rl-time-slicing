@@ -23,7 +23,7 @@ RUN cd /tmp/GPU-CR && \
     # control file only through a dedicated volume — the volume mount is the
     # access boundary. A stricter mode would need a UID/GID contract across
     # pods that the deployment cannot assume.
-    sed -i 's/int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/int fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
+    sed -i 's/fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
     grep -q "SIGRTMAX - 8" src/common.h && \
     grep -q "0777" src/comm/share_mem.cpp && \
     mkdir build && cd build && \
