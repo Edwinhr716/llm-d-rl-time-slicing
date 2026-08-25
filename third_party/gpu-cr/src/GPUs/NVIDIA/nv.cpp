@@ -203,6 +203,8 @@ int nv::registerHostMemory(void* ptr, size_t size) {
 // ========== Checkpoint/Restore memory management implementation ==========
 
 int nv::releasePhysicalMemory(void* ptr) {
+    // Same locking contract as remapPhysicalMemory: called with gpu_mem_mutex
+    // held at operation scope by the CR handler paths; do not lock here.
     auto it = allocated_memory.find(ptr);
     if (it == allocated_memory.end()) {
         fprintf(stderr, "[NVIDIA] Warning: Pointer %p not found in allocated_memory\n", ptr);
@@ -245,6 +247,11 @@ int nv::releasePhysicalMemory(void* ptr) {
 
 
 int nv::remapPhysicalMemory(void* ptr, size_t size) {
+    // Locking contract: the caller serializes against the allocation hooks
+    // (which erase these same map entries under gpu_mem_mutex) by holding
+    // gpu_mem_mutex for the whole checkpoint/restore operation — op scope,
+    // not per pointer, because the dump path also iterates allocated_memory.
+    // Do NOT lock here: a nested lock would self-deadlock those callers.
     // Check if this pointer is in our tracking
     auto it = allocated_memory.find(ptr);
     if (it == allocated_memory.end()) {
