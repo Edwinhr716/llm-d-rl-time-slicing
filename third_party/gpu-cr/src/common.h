@@ -109,10 +109,15 @@ struct SelectiveCrRequest {
 };
 
 namespace gpu_cr {
-// Capability bits published by the .so in signal_controls.capability at
-// init_CR and re-asserted at every FINISH (consume-once zeroing of the
-// request extension deliberately excludes this word).
-inline constexpr uint32_t kCrCapDestPath = 1u << 0;
+// The .so publishes the selective protocol level it speaks in
+// signal_controls.proto_supported at init_CR and re-asserts it at every
+// FINISH (consume-once zeroing of the request extension deliberately
+// excludes this word). Zero means no .so has published yet — the mapping
+// zero-initializes — so a client that races init_CR fails fast instead of
+// signaling a library whose handlers are not armed. The word also lets a
+// future client detect an older resident .so: the library is LD_PRELOADed
+// for the life of the workload process, so rev N must publish the level
+// for a rev N+1 client to have anything to read.
 
 // Trailing commit marker for destination-file dumps: written at
 // fs->current_offset only after the last extent has landed, so a torn
@@ -131,7 +136,7 @@ struct signal_controls {
     uint32_t signal;
     SelectiveCrRequest selective_req;
     /* --- v2 extension: appended, invisible to v1 readers --- */
-    uint32_t capability; /* gpu_cr::kCrCap* bits, persistent across ops */
+    uint32_t proto_supported; /* selective proto level the .so speaks; 0 = not yet published */
     uint32_t proto_ack;  /* proto level the .so served the last op at */
     int32_t  op_status;  /* 0 = OK, else positive errno-style code */
 };
@@ -141,13 +146,14 @@ namespace gpu_cr {
 // status + proto ack, then consume the v2 request extension so a stale
 // dest_path can never redirect a later op (a v1 cr_client only rewrites
 // the v1 prefix). v2 clients gate cuda-checkpoint --toggle on op_status —
-// never freeze a process whose state was not saved.
+// never freeze a process whose state was not saved. proto_supported is
+// re-asserted so a client that attaches after init_CR still sees it.
 inline void FinishOpControls(signal_controls* c, int32_t op_status) {
   c->op_status = op_status;
   c->proto_ack = kSelectiveCrProtoV2;
   c->selective_req.proto_version = 0;
   std::memset(c->selective_req.dest_path, 0, kSelectiveCrMaxPath);
-  c->capability |= kCrCapDestPath;
+  c->proto_supported = kSelectiveCrProtoV2;
 }
 }  // namespace gpu_cr
 

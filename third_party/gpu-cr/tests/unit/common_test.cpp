@@ -18,7 +18,7 @@ TEST(FinishOpControlsTest, ReportsStatusAndAck) {
   FinishOpControls(&c, ENOSPC);
   EXPECT_EQ(c.op_status, ENOSPC);
   EXPECT_EQ(c.proto_ack, kSelectiveCrProtoV2);
-  EXPECT_EQ(c.capability & kCrCapDestPath, kCrCapDestPath);
+  EXPECT_EQ(c.proto_supported, kSelectiveCrProtoV2);
 }
 
 // A stale dest_path must never redirect a later op: the v2 extension is
@@ -38,17 +38,14 @@ TEST(FinishOpControlsTest, ConsumesRequestExtension) {
   EXPECT_EQ(c.selective_req.num_regions, 2u);
 }
 
-// Bits FINISH does not own must survive it: pre-set a foreign bit with
-// kCrCapDestPath clear and check FINISH keeps the former while OR-ing in
-// the latter.
-TEST(FinishOpControlsTest, CapabilityPersistsAcrossOps) {
-  constexpr uint32_t kForeignCap = 1u << 1;
+// The published proto level must survive the consume-once zeroing and be
+// re-asserted at every FINISH, so a client that attaches after init_CR
+// (word still 0 from its point of view) sees it once any op completes.
+TEST(FinishOpControlsTest, ReassertsProtoSupported) {
   signal_controls c;
-  memset(&c, 0, sizeof(c));
-  c.capability = kForeignCap;
+  memset(&c, 0, sizeof(c));  // as if the client raced init_CR
   FinishOpControls(&c, EIO);
-  EXPECT_EQ(c.capability & kForeignCap, kForeignCap);
-  EXPECT_EQ(c.capability & kCrCapDestPath, kCrCapDestPath);
+  EXPECT_EQ(c.proto_supported, kSelectiveCrProtoV2);
 }
 
 // Layout guards for the shared-memory wire structs: the v2 fields are
@@ -76,7 +73,7 @@ TEST(WireLayoutTest, V2ExtensionOffsetsPinned) {
   EXPECT_EQ(offsetof(SelectiveCrRequest, dest_path), 65548u);
   EXPECT_EQ(sizeof(SelectiveCrRequest), 65808u);
 
-  EXPECT_EQ(offsetof(signal_controls, capability), 65816u);
+  EXPECT_EQ(offsetof(signal_controls, proto_supported), 65816u);
   EXPECT_EQ(offsetof(signal_controls, proto_ack), 65820u);
   EXPECT_EQ(offsetof(signal_controls, op_status), 65824u);
   EXPECT_EQ(sizeof(signal_controls), 65832u);
