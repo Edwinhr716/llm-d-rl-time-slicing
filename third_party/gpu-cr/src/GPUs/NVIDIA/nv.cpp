@@ -21,8 +21,10 @@ std::mutex gpu_mem_mutex;
 
 // Global handle map for all VMM allocations (both from hook and nv::allocate)
 static std::map<void*, CUmemGenericAllocationHandle> global_handle_map;
-// External linkage is intentional: the IPC hooks consume this via extern.
-CUcontext g_pytorch_context = nullptr;
+// The application's CUDA context, captured at first allocation (PyTorch's,
+// in our deployments). External linkage is intentional: the IPC hooks
+// consume this via extern.
+CUcontext g_application_context = nullptr;
 
 namespace {
 
@@ -343,7 +345,7 @@ int nv::externalRestore(int pid) {
 
 int nv::pushContext() {
     ensureCudaInitialized();
-    // Snapshot under the allocation lock: the hooks write g_pytorch_context
+    // Snapshot under the allocation lock: the hooks write g_application_context
     // while application threads may still be allocating. Release before the
     // driver call. The signal guard also covers handler context: a handler
     // only auto-blocks its own signum, so a different CR signal nesting here
@@ -352,12 +354,12 @@ int nv::pushContext() {
     {
         ScopedBlockCrSignals signal_block;
         std::lock_guard<std::mutex> lock(gpu_mem_mutex);
-        captured = g_pytorch_context;
+        captured = g_application_context;
     }
     CUcontext target_context = context_;
     if (captured != nullptr) {
         target_context = captured;
-        fprintf(stderr, "[NVIDIA] Pushing captured PyTorch context: %p\n", target_context);
+        fprintf(stderr, "[NVIDIA] Pushing captured application context: %p\n", target_context);
     } else {
         fprintf(stderr, "[NVIDIA] Pushing default context: %p\n", target_context);
     }
@@ -408,9 +410,9 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
     fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu, current ctx=%p\n", size, curr_ctx);
     fflush(stderr);
 
-    if (g_pytorch_context == nullptr && curr_ctx != nullptr) {
-        g_pytorch_context = curr_ctx;
-        fprintf(stderr, "[HOOK] Captured PyTorch CUDA context (fallback): %p\n", g_pytorch_context);
+    if (g_application_context == nullptr && curr_ctx != nullptr) {
+        g_application_context = curr_ctx;
+        fprintf(stderr, "[HOOK] Captured application CUDA context (fallback): %p\n", g_application_context);
         fflush(stderr);
     }
 
@@ -454,7 +456,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return cudaErrorInitializationError;
             }
             fprintf(stderr, "[HOOK] Using existing context, device=%d\n", device);
-            g_pytorch_context = context;
+            g_application_context = context;
         } else {
             res = cuDeviceGet(&device, 0);
             if (res != CUDA_SUCCESS) {
@@ -471,7 +473,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return cudaErrorInitializationError;
             }
             fprintf(stderr, "[HOOK] Created new context, device=%d\n", device);
-            g_pytorch_context = context;
+            g_application_context = context;
         }
     }
     
