@@ -23,6 +23,9 @@ class ShareMemCommTest : public ::testing::Test {
  protected:
   void SetUp() override {
     unsetenv("GPU_CR_CTL_PATH");
+    // CtlDir memoizes per process; each test must re-resolve under its
+    // own layout.
+    ResetCtlDirCacheForTests();
     strcpy(dir_, "/tmp/gpu-cr-shm-comm-XXXXXX");
     ASSERT_NE(mkdtemp(dir_), nullptr);
     setenv("EXPORT_FILE_PATH", dir_, 1);
@@ -88,6 +91,37 @@ TEST_F(ShareMemCommTest, SetupUsesCtlDirWhenTmpfs) {
   unlink(ctl_control.c_str());
   rmdir(ctl_dir);
   unsetenv("GPU_CR_CTL_PATH");
+}
+
+// Zero-config discovery: with NO env at all, a tmpfs-backed <data>/ctl
+// subdir is found through the data dir the workload already has, and
+// setup() puts the control file there — the consumer-side contract stays
+// LD_PRELOAD + EXPORT_FILE_PATH only.
+TEST_F(ShareMemCommTest, SetupDiscoversNestedCtlDir) {
+  if (!DirIsTmpfs("/dev/shm")) GTEST_SKIP() << "/dev/shm is not tmpfs here";
+  char data_dir[] = "/dev/shm/gpu-cr-data-XXXXXX";
+  ASSERT_NE(mkdtemp(data_dir), nullptr);
+  setenv("EXPORT_FILE_PATH", data_dir, 1);
+  std::string nested = std::string(data_dir) + "/" + kCtlSubdir;
+  ASSERT_EQ(mkdir(nested.c_str(), 0777), 0);
+  ResetCtlDirCacheForTests();  // EXPORT_FILE_PATH changed after SetUp
+
+  ShareMemComm comm(777);
+  comm.setup();
+
+  std::string ctl_control = nested + "/control-777";
+  struct stat st;
+  ASSERT_EQ(stat(ctl_control.c_str(), &st), 0);
+  EXPECT_EQ(st.st_size, static_cast<off_t>(HUGE_PAGE_SIZE));
+  // posix_fallocate pinned: at least the stored extent is backed.
+  EXPECT_GE(static_cast<size_t>(st.st_blocks) * 512,
+            RoundUp4K(sizeof(signal_controls)));
+  // The data dir root must NOT grow a control file in ctl mode.
+  EXPECT_NE(stat((std::string(data_dir) + "/control-777").c_str(), &st), 0);
+
+  unlink(ctl_control.c_str());
+  rmdir(nested.c_str());
+  rmdir(data_dir);
 }
 
 // A fresh (zero-filled) mapping reads FINISH: cr_client relies on an idle

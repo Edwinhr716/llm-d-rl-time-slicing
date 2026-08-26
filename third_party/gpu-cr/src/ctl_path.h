@@ -2,16 +2,37 @@
 #define GPU_CR_SRC_CTL_PATH_H_
 
 // The control plane (control-<pid>, ctl-ready-<pid>, pid_map_*,
-// the id counter) moves off hugetlbfs onto a caller-provided tmpfs, so no
-// hugetlb page is ever faulted from the coordinating process's cgroup.
-// Dump/staging DATA files stay in EXPORT_FILE_PATH untouched.
+// the id counter) moves off hugetlbfs onto a tmpfs, so no hugetlb page is
+// ever faulted from the coordinating process's cgroup. Dump/staging DATA
+// files stay in EXPORT_FILE_PATH untouched.
 //
-// GPU_CR_CTL_PATH unset            -> legacy: ctl dir == data dir.
-// GPU_CR_CTL_PATH set, tmpfs       -> ctl mode.
-// GPU_CR_CTL_PATH set, NOT tmpfs   -> legacy fallback (the .so must never
-//     write an advertisement into a disk-backed hostPath dir that a later
-//     tmpfs mount would shadow); cr_client refuses instead, so the
-//     misconfiguration is loud on the coordinator side.
+// The tmpfs is found without ANY workload-side configuration: the
+// coordinator mounts it at <data dir>/ctl on the host, inside the dump
+// store the workload already mounts, so the .so discovers it through the
+// volume it has anyway. The consumer contract stays exactly LD_PRELOAD +
+// EXPORT_FILE_PATH. Resolution order:
+//
+// GPU_CR_CTL_PATH set, tmpfs       -> ctl mode with that dir (coordinator-
+//     side override; kept for compat, never required on the consumer).
+// GPU_CR_CTL_PATH set, NOT tmpfs   -> legacy fallback, loud warning.
+//     Explicit config never silently redirects: discovery is NOT consulted
+//     (the .so must never write an advertisement into a disk-backed dir
+//     that a later tmpfs mount would shadow); cr_client refuses instead,
+//     so the misconfiguration surfaces on the coordinator side.
+// GPU_CR_CTL_PATH unset, <data dir>/ctl tmpfs-backed -> ctl mode
+//     (zero-config discovery). The statfs gate reports the CONTAINING
+//     filesystem: a plain "ctl" subdir inside a store that is itself
+//     tmpfs also enables ctl mode — intended, the control plane lands
+//     where legacy mode would have put it anyway.
+// otherwise                        -> legacy: ctl dir == data dir.
+//
+// CtlDir() memoizes the resolution on first use. In the .so that first
+// use is the ELF-constructor advertisement block (it runs before init_CR),
+// so the snapshot is taken exactly when the advertisement is written and
+// one process can never straddle two layouts, even if a tmpfs appears
+// mid-life. A tmpfs mounted after that point is simply not seen; the
+// coordinator's advertisement gate turns the mixed-order case into a loud
+// refusal, same contract as the env-based mount-order rule.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -31,6 +52,12 @@ inline constexpr unsigned long kTmpfsMagic = 0x01021994UL;
 // destination-path support.
 inline constexpr int kCtlProto = 3;
 
+// Subdirectory of the data dir probed for the zero-config control plane.
+// Reserved: nothing else may claim <data dir>/ctl (dumps are files at the
+// store root, destination slots live under <data dir>/groups, and the GC
+// sweeper skips directories in the store root).
+inline constexpr char kCtlSubdir[] = "ctl";
+
 constexpr size_t RoundUp4K(size_t x) { return (x + 4095UL) & ~4095UL; }
 
 // Directory holding dump/staging DATA files (unchanged by the ctl split).
@@ -45,22 +72,83 @@ inline bool DirIsTmpfs(const char* dir) {
   return static_cast<unsigned long>(sfs.f_type) == kTmpfsMagic;
 }
 
-// Resolves the control-plane directory. Sets *ctl_mode to true when a
-// valid tmpfs-backed GPU_CR_CTL_PATH is in effect, false for legacy mode.
-inline const char* CtlDir(bool* ctl_mode) {
-  const char* path = getenv("GPU_CR_CTL_PATH");
-  if (path && path[0] && DirIsTmpfs(path)) {
-    if (ctl_mode) *ctl_mode = true;
-    return path;
-  }
-  if (path && path[0]) {
+// Writes "<DataDir()>/ctl" into buf. Returns false when it does not fit.
+inline bool CtlCandidatePath(char* buf, size_t n) {
+  int len = snprintf(buf, n, "%s/%s", DataDir(), kCtlSubdir);
+  return len > 0 && static_cast<size_t>(len) < n;
+}
+
+// A resolved control-plane directory. dir is a copy, not a pointer into
+// the environment: the cache below outlives any putenv/setenv churn.
+// 480, not 512: every caller formats "<dir>/<name>-<pid>" into a 512-byte
+// name buffer, and bounding the dir keeps those snprintfs provably
+// truncation-free (-Wformat-truncation) with headroom for the longest
+// name pattern. A dir this long could not have produced usable control
+// paths before either; ResolveCtlDir clamps, and the clamped path then
+// simply fails the statfs/open exactly like any other wrong path.
+inline constexpr size_t kCtlDirMax = 480;
+
+struct CtlResolution {
+  bool ctl_mode = false;
+  char dir[kCtlDirMax] = "";
+};
+
+// Pure resolver (no caching — one statfs per call): applies the header's
+// resolution order. Unit tests target this directly; production code goes
+// through the memoizing CtlDir() below.
+inline void ResolveCtlDir(CtlResolution* out) {
+  out->ctl_mode = false;
+  const char* env = getenv("GPU_CR_CTL_PATH");
+  if (env && env[0]) {
+    if (DirIsTmpfs(env)) {
+      snprintf(out->dir, sizeof(out->dir), "%s", env);
+      out->ctl_mode = true;
+      return;
+    }
     fprintf(stderr,
             "[gpu-cr] GPU_CR_CTL_PATH=%s missing or not tmpfs; using legacy "
             "control dir %s\n",
-            path, DataDir());
+            env, DataDir());
+    snprintf(out->dir, sizeof(out->dir), "%s", DataDir());
+    return;
   }
-  if (ctl_mode) *ctl_mode = false;
-  return DataDir();
+  if (CtlCandidatePath(out->dir, sizeof(out->dir)) && DirIsTmpfs(out->dir)) {
+    out->ctl_mode = true;
+    return;
+  }
+  snprintf(out->dir, sizeof(out->dir), "%s", DataDir());
+}
+
+namespace internal {
+struct CtlCache {
+  bool resolved = false;
+  CtlResolution res;
+};
+inline CtlCache& GetCtlCache() {
+  static CtlCache cache;
+  return cache;
+}
+}  // namespace internal
+
+// Resolves the control-plane directory, memoized on first call (see the
+// header comment for why the snapshot matters). Sets *ctl_mode to true
+// when a tmpfs-backed control dir is in effect, false for legacy mode.
+// Not locked: the first call happens before any threads exist (the .so's
+// ELF constructor; cr_client's main), later calls only read.
+inline const char* CtlDir(bool* ctl_mode) {
+  internal::CtlCache& cache = internal::GetCtlCache();
+  if (!cache.resolved) {
+    ResolveCtlDir(&cache.res);
+    cache.resolved = true;
+  }
+  if (ctl_mode) *ctl_mode = cache.res.ctl_mode;
+  return cache.res.dir;
+}
+
+// Unit-test hook: a gtest binary drives resolution under several layouts
+// in one process, which the memoization would otherwise pin to the first.
+inline void ResetCtlDirCacheForTests() {
+  internal::GetCtlCache().resolved = false;
 }
 
 // Extracts starttime (field 22 of /proc/<pid>/stat) from a stat line.
