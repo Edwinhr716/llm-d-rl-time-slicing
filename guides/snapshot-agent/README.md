@@ -360,6 +360,9 @@ already-loaded slot is a no-op.
 Requirements: the workload runs with the GPU-CR preloader
 (`LD_PRELOAD=vGPU-NVIDIA.so`) and shares the checkpoint dir with the agent
 (see the `memoryRegions` block in the Helm chart, `deploy/snapshot-agent`).
+Nothing else: the control-plane tmpfs is provisioned by the agent nested
+inside the checkpoint dir (`<store>/ctl`) and discovered by the preloader
+automatically — no `GPU_CR_CTL_PATH` env or extra mount on the workload.
 Regions are always explicit — the agent does no discovery for this backend.
 
 The backend is experimental and gated off by default: requests fail with

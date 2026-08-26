@@ -156,30 +156,44 @@ Enabling it adds:
         `vm.nr_hugepages` (`pages2Mi`, default 12288 = 24 Gi) and restarts
         the kubelet so the node publishes `hugepages-2Mi` capacity for
         WORKLOAD pods.
-    *   `mount-ctl-tmpfs` — mounts the GEP-0006 control-plane tmpfs at
-        `gpuCr.ctl.hostPath` (default `/var/tmp/gpu-cr-ctl`, `gpuCr.ctl.sizeMi`
-        cap).
     *   `mount-hugetlbfs` — mounts hugetlbfs at `gpuCr.dataDir.hostPath`
         (default `/var/tmp/huge-ckpt`, `pagesize=2M,mode=0777`); without it
-        every dump silently degrades to boot-disk page cache.
+        every dump silently degrades to boot-disk page cache. Runs before
+        `mount-ctl-tmpfs`, which nests inside it.
+    *   `mount-ctl-tmpfs` — provides the GEP-0006 control-plane tmpfs at
+        `gpuCr.ctl.hostPath` (default `/var/tmp/huge-ckpt/ctl`, i.e.
+        NESTED inside the dump store; `gpuCr.ctl.sizeMi` cap). Workloads
+        inherit it through the store volume they already mount, and the
+        preloader/cr_client discover it by statfs — **no ctl env var or
+        extra volume on the workload side**. On nodes carrying a
+        pre-nesting ctl tmpfs (`gpuCr.ctl.legacyHostPath`) that same
+        filesystem is bind-mounted at the nested path, preserving the
+        node-global id counter and live control files across the layout
+        switch; `gpuCr.ctl.legacyBind` additionally exposes the nested
+        tmpfs at the legacy path for workload manifests that still set
+        `GPU_CR_CTL_PATH`.
 *   Env for the agent: `EXPORT_FILE_PATH` (= `gpuCr.dataDir.mountPath`),
     `GPU_CR_CTL_PATH` (= `gpuCr.ctl.mountPath`), `GPU_CR_OP_TIMEOUT_SEC`,
     and — while `memoryRegions.legacySnapshots.enabled` — `SNAPSHOT_DIR`,
     which the agent uses ONLY as a GC input to TTL-reap pre-GEP copy-store
     leftovers. Setting `EXPORT_FILE_PATH` also switches on the agent's
     GPU-CR artifact GC and the 0777 chmod of the checkpoint dir at startup.
-*   Volumes: `huge-ckpt` at `gpuCr.dataDir.mountPath` and `gpu-cr-ctl` at
-    `gpuCr.ctl.mountPath` (both `mountPropagation: HostToContainer` so the
-    init containers' mounts are visible), plus the legacy `gcr-snapshots`
-    hostPath while the legacy sweep is enabled.
+*   Volumes: `huge-ckpt` at `gpuCr.dataDir.mountPath`
+    (`mountPropagation: HostToContainer` so the init containers' mounts are
+    visible) — the nested ctl tmpfs rides along at
+    `<dataDir.mountPath>/ctl`, so no separate ctl volume exists — plus the
+    legacy `gcr-snapshots` hostPath while the legacy sweep is enabled.
 
 Node prerequisites:
 
 *   Workload pods need the GPU-CR preloader (`LD_PRELOAD=vGPU-NVIDIA.so`),
     `hostPID`, `hostIPC`, the `huge-ckpt` hostPath mounted at
-    `/mnt/huge-ckpt` and the ctl tmpfs at `/mnt/gpu-cr-ctl` (both with
-    `mountPropagation: HostToContainer`), and `hugepages-2Mi` resources
-    sized for their dump buffers plus destination-group headroom.
+    `/mnt/huge-ckpt` (with `mountPropagation: HostToContainer`), and
+    `hugepages-2Mi` resources sized for their dump buffers plus
+    destination-group headroom. That is the WHOLE contract: the control
+    plane is discovered through the nested `<store>/ctl` tmpfs — no
+    `GPU_CR_CTL_PATH` env and no ctl volume on the workload
+    (`GPU_CR_CTL_PATH` is still honored if a manifest sets it).
 
 There is no `cr_client` install step: the binary ships inside the agent image
 at `/usr/local/bin/cr_client`, so the agent and `cr_client` versions always

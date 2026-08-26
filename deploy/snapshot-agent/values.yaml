@@ -81,11 +81,25 @@ gpuCr:
     hostPath: /var/tmp/huge-ckpt
     mountPath: /mnt/huge-ckpt
   # GEP-0006 control-plane tmpfs: control-<pid>, pid_map, ctl-ready
-  # advertisements. Host-level tmpfs so agent and workload share it.
+  # advertisements. Mounted on the HOST at <dataDir.hostPath>/ctl — nested
+  # INSIDE the dump store — so workloads inherit it through the store
+  # volume they already mount and both binaries zero-config-discover it
+  # (no ctl env var, no extra volume on the workload side). hostPath and
+  # mountPath MUST stay <dataDir>/ctl for that discovery to hold.
   ctl:
-    hostPath: /var/tmp/gpu-cr-ctl
-    mountPath: /mnt/gpu-cr-ctl
+    hostPath: /var/tmp/huge-ckpt/ctl
+    mountPath: /mnt/huge-ckpt/ctl
     sizeMi: 64
+    # Where a pre-nesting deployment mounted the ctl tmpfs. On an in-place
+    # layout switch the init container bind-mounts THAT filesystem at the
+    # nested path, preserving the node-global id counter and live control
+    # files; a fresh tmpfs is created only when none exists.
+    legacyHostPath: /var/tmp/gpu-cr-ctl
+    # Also expose the nested tmpfs at legacyHostPath (matters on FRESH
+    # nodes), for not-yet-updated workload manifests that still set
+    # GPU_CR_CTL_PATH and mount the old path. Disable once every workload
+    # manifest is stripped of ctl config.
+    legacyBind: false
   # Runtime hugepage provisioning (absorbs the former hugepages-bootstrap
   # DaemonSet): writes nr_hugepages and restarts the kubelet once per node
   # boot so the node publishes hugepages-2Mi capacity for WORKLOAD pods.

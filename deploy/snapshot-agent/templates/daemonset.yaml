@@ -79,25 +79,11 @@ spec:
               echo "pool ready; restarting kubelet so the node reports hugepages-2Mi (running pods unaffected)"
               nsenter -t 1 -m -- systemctl restart kubelet
         {{- end }}
-        # GEP-0006 control-plane tmpfs on the HOST: cr_client and the
-        # workload's vGPU.so communicate through files here instead of
-        # hugetlbfs. Must exist BEFORE workloads start (their .so writes the
-        # readiness advertisement at load time; a disk-backed dir would be
-        # shadowed by this mount — both binaries statfs-gate on tmpfs).
-        - name: mount-ctl-tmpfs
-          image: alpine:latest
-          securityContext:
-            privileged: true
-          command:
-            - sh
-            - -c
-            - |
-              apk add --no-cache util-linux >/dev/null && \
-              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.gpuCr.ctl.hostPath }}; grep -q " {{ .Values.gpuCr.ctl.hostPath }} tmpfs" /proc/mounts || mount -t tmpfs -o size={{ .Values.gpuCr.ctl.sizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.gpuCr.ctl.hostPath }}; chmod 0777 {{ .Values.gpuCr.ctl.hostPath }}' && \
-              echo "ctl tmpfs mounted at {{ .Values.gpuCr.ctl.hostPath }}"
         # hugetlbfs at the shared checkpoint path on the HOST. GPU-CR relies
         # on the filesystem itself being hugetlbfs; without this mount every
-        # dump silently degrades to boot-disk page cache.
+        # dump silently degrades to boot-disk page cache. Runs BEFORE
+        # mount-ctl-tmpfs: the ctl tmpfs nests inside this mount, and a ctl
+        # dir created first would land on the disk dir and be shadowed.
         - name: mount-hugetlbfs
           image: alpine:latest
           securityContext:
@@ -109,6 +95,48 @@ spec:
               apk add --no-cache util-linux >/dev/null && \
               nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.gpuCr.dataDir.hostPath }}; grep -q " {{ .Values.gpuCr.dataDir.hostPath }} hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize=2M,mode=0777 nodev {{ .Values.gpuCr.dataDir.hostPath }}; chmod 0777 {{ .Values.gpuCr.dataDir.hostPath }}' && \
               echo "hugetlbfs mounted at {{ .Values.gpuCr.dataDir.hostPath }}"
+        # GEP-0006 control-plane tmpfs on the HOST, nested INSIDE the dump
+        # store (<dataDir>/ctl) so workloads inherit it through the store
+        # volume they already mount — zero workload-side ctl config: the
+        # .so and cr_client discover a tmpfs-backed <data>/ctl by statfs.
+        # Must exist BEFORE workloads start (their .so resolves the ctl dir
+        # once, at load). Continuity-aware, all steps idempotent per boot:
+        #   1. nested path already a tmpfs mountpoint -> done;
+        #   2. else a pre-nesting ctl tmpfs at legacyHostPath is bind-
+        #      mounted at the nested path — an in-place layout switch keeps
+        #      the SAME filesystem (node-global id counter, live control
+        #      files and advertisements), so env-configured and discovery
+        #      processes share one counter and no drain is needed;
+        #   3. else a fresh tmpfs is created.
+        # legacyBind additionally exposes the nested tmpfs at
+        # legacyHostPath for not-yet-updated workload manifests (its own
+        # mountpoint check, so it works whether the tmpfs was fresh, bound
+        # from legacy, or already present).
+        - name: mount-ctl-tmpfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c ' \
+                mkdir -p {{ .Values.gpuCr.ctl.hostPath }}; \
+                if ! grep -q " {{ .Values.gpuCr.ctl.hostPath }} tmpfs" /proc/mounts; then \
+                  if grep -q " {{ .Values.gpuCr.ctl.legacyHostPath }} tmpfs" /proc/mounts; then \
+                    mount --bind {{ .Values.gpuCr.ctl.legacyHostPath }} {{ .Values.gpuCr.ctl.hostPath }}; \
+                  else \
+                    mount -t tmpfs -o size={{ .Values.gpuCr.ctl.sizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.gpuCr.ctl.hostPath }}; \
+                  fi; \
+                fi; \
+                chmod 0777 {{ .Values.gpuCr.ctl.hostPath }}; \
+                {{- if .Values.gpuCr.ctl.legacyBind }}
+                mkdir -p {{ .Values.gpuCr.ctl.legacyHostPath }}; \
+                grep -q " {{ .Values.gpuCr.ctl.legacyHostPath }} tmpfs" /proc/mounts || mount --bind {{ .Values.gpuCr.ctl.hostPath }} {{ .Values.gpuCr.ctl.legacyHostPath }}; \
+                {{- end }}
+                true' && \
+              echo "ctl tmpfs ready at {{ .Values.gpuCr.ctl.hostPath }}"
       {{- end }}
       {{- if .Values.directMemory.enabled }}
       # GPU-CR uses a host-shared-memory control channel between the agent's
@@ -236,10 +264,10 @@ spec:
             - name: huge-ckpt
               mountPath: {{ .Values.gpuCr.dataDir.mountPath }}
               # Pick up the mounts made by the init containers even though
-              # the hostPath was bound before they ran.
-              mountPropagation: HostToContainer
-            - name: gpu-cr-ctl
-              mountPath: {{ .Values.gpuCr.ctl.mountPath }}
+              # the hostPath was bound before they ran. This one mount also
+              # exposes the NESTED ctl tmpfs at <mountPath>/ctl — no
+              # separate ctl volume needed (gpuCr.ctl.mountPath must stay
+              # <dataDir.mountPath>/ctl).
               mountPropagation: HostToContainer
             {{- if .Values.memoryRegions.legacySnapshots.enabled }}
             - name: gcr-snapshots
@@ -270,10 +298,6 @@ spec:
         - name: huge-ckpt
           hostPath:
             path: {{ .Values.gpuCr.dataDir.hostPath }}
-            type: DirectoryOrCreate
-        - name: gpu-cr-ctl
-          hostPath:
-            path: {{ .Values.gpuCr.ctl.hostPath }}
             type: DirectoryOrCreate
         {{- if .Values.memoryRegions.legacySnapshots.enabled }}
         - name: gcr-snapshots
