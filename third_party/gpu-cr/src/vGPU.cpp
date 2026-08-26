@@ -46,8 +46,9 @@ void* staging_buf[STAGING_BUF_NUM];
 
 bool CR_initialized = false;
 
-// errno-style op status; copied into control->op_status at FINISH so v2
-// clients can distinguish clean failures from success.
+// Positive errno recorded by op sites (0 = success); FinishOpControls
+// negates it into control->op_status at FINISH so clients can
+// distinguish a served op's outcome from an unreported one.
 int g_op_status = 0;
 
 // memcpy_multi lives in src/memcpy_multi.cpp (declared in common.h) so the
@@ -1222,8 +1223,8 @@ void cr_signal_handler(int signum) {
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         if (tot_size < 0) {
             // Clean pre-op failure: nothing dumped, nothing released —
-            // the workload keeps running. P2P must NOT be disabled and a
-            // v2 cr_client must NOT proceed to cuda-checkpoint --toggle.
+            // the workload keeps running. P2P must NOT be disabled and
+            // cr_client must NOT proceed to cuda-checkpoint --toggle.
             fprintf(stderr, "ckpt FAILED, status=%d (%s)\n", g_op_status, strerror(g_op_status));
         } else {
             fprintf(stderr, "ckpt size: %f GB, time: %ld ms, bw: %f GB/s\n",

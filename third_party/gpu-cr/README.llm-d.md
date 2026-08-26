@@ -29,7 +29,7 @@ time-slicing experiments required, cleaned up and tested:
 
 - memory-address (selective) checkpoint backend, unrounded allocation-size
   dumps, and granule-chunked copies
-- destination-path selective checkpoints (v2 protocol)
+- destination-path selective checkpoints
 - Google C++ Style Guide cleanup of the added code, and cr_client
   hardening (`GPU_CR_CUDA_CHECKPOINT` override; restore fails on a failed
   cuda-checkpoint toggle)
