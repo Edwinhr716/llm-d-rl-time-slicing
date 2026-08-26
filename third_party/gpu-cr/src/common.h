@@ -80,8 +80,12 @@ struct shared_mem_fs {
 
 namespace gpu_cr {
 // Exclusive bound on regions per selective request: a request must carry
-// FEWER than this many regions. The dump writer refuses to fill the last
-// extent-table slot (file_num < MAX_FILE_NUM, matching
+// FEWER than this many regions. Each region becomes one shared_mem_fs
+// extent-table entry, so this equals MAX_FILE_NUM (the pristine GPU-CR
+// table size); at 16 bytes/region it also keeps the request at 64KiB in
+// the control mapping. Observed swaps use ~1000 regions, so the 4095
+// usable slots leave ~4x headroom. The dump writer refuses to fill the
+// last extent-table slot (file_num < MAX_FILE_NUM, matching
 // DumpHeaderPlausible), so a request gated at num_regions <
 // kMaxSelectiveRegions can never fail for capacity after the
 // device-to-host copy work has already been done.
@@ -99,6 +103,10 @@ struct SelectiveCrRegion {
 // APPENDED so the region-list prefix keeps its exact offsets across
 // separately-built cr_client and .so binaries sharing the mapping.
 namespace gpu_cr {
+// Destination paths are agent store files (<store>/<group>/ckpt-<id>.data,
+// well under 100 chars); 256 gives ample headroom while keeping the
+// request struct small. Not PATH_MAX: the client rejects longer paths
+// before signaling, so the cap fails crisply rather than by truncation.
 inline constexpr size_t kSelectiveCrMaxPath = 256;
 }  // namespace gpu_cr
 
