@@ -392,7 +392,8 @@ static bool DestOpenForRestore(const char* path, DestMap* dm) {
         return false;
     }
     const DumpCommit* dc = reinterpret_cast<const DumpCommit*>(
-        static_cast<const char*>(dm->addr) + fs->current_offset);
+        static_cast<const char*>(dm->addr) +
+        gpu_cr::DumpCommitOffset(fs->current_offset));
     if (dc->magic != gpu_cr::kDumpCommitMagic) {
         g_op_status = EINVAL;
         fprintf(stderr, "[vGPU-DEST] %s has no commit marker: torn or foreign dump, refusing restore\n", path);
@@ -418,8 +419,8 @@ double ckpt_selective(const SelectiveCrRequest* req) {
 
     // The request lives in a caller-writable mapping: bound it like the
     // dump header, before any lock or open.
-    if (req->num_regions > gpu_cr::kMaxSelectiveRegions) {
-        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: num_regions %u exceeds max %u; rejecting\n",
+    if (req->num_regions >= gpu_cr::kMaxSelectiveRegions) {
+        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: num_regions %u not below bound %u; rejecting\n",
                 req->num_regions, gpu_cr::kMaxSelectiveRegions);
         g_op_status = EINVAL;
         return -1;
@@ -468,7 +469,7 @@ double ckpt_selective(const SelectiveCrRequest* req) {
     shared_mem_fs* fs;
     size_t fs_capacity; // extent bound: header + extents, excluding the marker
     if (dest_path) {
-        if (!DestOpenForCkpt(dest_path, dump_total + sizeof(DumpCommit), &dm)) {
+        if (!DestOpenForCkpt(dest_path, gpu_cr::DumpCommitOffset(dump_total) + sizeof(DumpCommit), &dm)) {
             fs_mutex.unlock();
             return -1;
         }
@@ -656,10 +657,14 @@ double ckpt_selective(const SelectiveCrRequest* req) {
     // The magic store is release-ordered so it lands last by construction
     // (not just in program order) — a marker is never observed with a
     // half-written generation.
-    if (fs->current_offset + sizeof(DumpCommit) <=
+    const uint64_t marker_off = gpu_cr::DumpCommitOffset(fs->current_offset);
+    if (marker_off + sizeof(DumpCommit) <=
             (dest_path ? dm.capacity : static_cast<size_t>(SHM_SIZE))) {
+        // Extents are unpadded, so current_offset can be misaligned; the
+        // marker sits at the next alignof(DumpCommit) boundary so this
+        // release store (and the restore-side load) is naturally aligned.
         DumpCommit* dc = reinterpret_cast<DumpCommit*>(
-            reinterpret_cast<char*>(fs) + fs->current_offset);
+            reinterpret_cast<char*>(fs) + marker_off);
         dc->generation = ++g_dump_generation;
         __atomic_store_n(&dc->magic, gpu_cr::kDumpCommitMagic, __ATOMIC_RELEASE);
     }
@@ -843,8 +848,8 @@ double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
     const char* dest_path = req->dest_path[0] != '\0' ? req->dest_path : nullptr;
     // The request lives in a caller-writable mapping: bound it like the
     // dump header, before any lock or open.
-    if (req->num_regions > gpu_cr::kMaxSelectiveRegions) {
-        fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: num_regions %u exceeds max %u; rejecting\n",
+    if (req->num_regions >= gpu_cr::kMaxSelectiveRegions) {
+        fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: num_regions %u not below bound %u; rejecting\n",
                 req->num_regions, gpu_cr::kMaxSelectiveRegions);
         g_op_status = EINVAL;
         return -1;
