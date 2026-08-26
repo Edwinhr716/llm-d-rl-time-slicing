@@ -4,7 +4,7 @@
 # Exercises the real control-channel protocol end to end on Linux without
 # a GPU: destination-path checkpoint/restore, dump validation, op_status
 # propagation (including the cuda-checkpoint toggle gate), timeouts, and
-# version-skew refusals. Asserts the documented exit codes: 0 OK,
+# not-ready refusals. Asserts the documented exit codes: 0 OK,
 # 1 usage, 2 op failed, 3 refused, 4 timeout.
 #
 # Usage: cr_client_integration_test.sh <cr_client> <fake_workload>
@@ -136,12 +136,16 @@ start_fake $ENV FAKE_NO_FINISH=1
 check "timeout: wedged workload fails the op" 4 \
     env $ENV GPU_CR_OP_TIMEOUT_SEC=2 "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
 
-# --- version skew: v1 .so ----------------------------------------------------
-start_fake $ENV FAKE_V1=1
-check "skew: v1 .so + dest-path -> refused pre-signal" 3 \
+# --- not-ready .so: selective ops refused pre-signal -------------------------
+start_fake $ENV FAKE_NOT_READY=1
+check "not-ready .so: dest-path op refused pre-signal" 3 \
     env $ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/dump.bin"
-check "skew: v1 .so + buffer op keeps historical behavior" 0 \
+check "not-ready .so: buffer selective op refused pre-signal" 3 \
     env $ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
+# Full-process ops stay ungated: a silent .so (no op_status) keeps
+# historical tolerance.
+check "not-ready .so: full ckpt keeps historical behavior" 0 \
+    env $ENV "$CR_CLIENT" -c -p "$FAKE_PID"
 
 # --- usage errors ------------------------------------------------------------
 check "usage: -o without -s"          1 env $ENV "$CR_CLIENT" -c -o "$WORK/dump.bin" -p 1

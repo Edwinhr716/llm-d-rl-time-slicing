@@ -28,7 +28,7 @@ namespace {
 
 // Exit codes (consumed by the snapshot agent):
 //   0 OK, 1 usage/parse, 2 op failed (op_status or invalid dump),
-//   3 gate refused (capability), 4 timeout.
+//   3 gate refused (.so not ready), 4 timeout.
 constexpr int kExitOpFailed = 2;
 constexpr int kExitRefused = 3;
 constexpr int kExitTimeout = 4;
@@ -171,34 +171,35 @@ bool WaitFinished(ShareMemComm* comm) {
     return true;
 }
 
-// After a FULL ckpt/restore: a v2 .so reports op_status (clean
+// After a FULL ckpt/restore: the .so reports op_status at FINISH (clean
 // failures: oversized checkpoint, deferred-buffer ENOMEM). On checkpoint
 // failure we must NOT proceed to cuda-checkpoint --toggle — freezing a
 // process whose state was never saved is unrecoverable; on restore
-// failure we must not unfreeze onto stale weights. A v1 .so leaves
-// proto_ack at 0 and keeps historical behavior.
+// failure we must not unfreeze onto stale weights. op_status == 0 means
+// no result was reported (a .so that predates status reporting, or a
+// FINISH raced by a crash): full ops keep historical tolerance.
 void CheckFullResult(ShareMemComm* comm, const char* what) {
-    if (comm->control->proto_ack >= gpu_cr::kSelectiveCrProtoV2 && comm->control->op_status != 0) {
-        int32_t st = comm->control->op_status;
+    int32_t st = comm->control->op_status;
+    if (st < 0) {
         fprintf(stderr, "Error: vGPU.so reported %s failure: %s (status=%d); NOT toggling cuda-checkpoint\n",
-                what, strerror(st), st);
+                what, strerror(-st), st);
         exit(kExitOpFailed);
     }
 }
 
-// After a selective op: surface the .so-reported status. A v2 ack with a
-// nonzero status is a clean op failure; a missing ack on a dest-path op
-// means the .so never saw the destination (v1 skew) — refuse loudly.
-void CheckSelectiveResult(ShareMemComm* comm, const char* dest_path) {
-    if (comm->control->proto_ack >= gpu_cr::kSelectiveCrProtoV2) {
-        int32_t st = comm->control->op_status;
-        if (st != 0) {
-            fprintf(stderr, "Error: vGPU.so reported op failure: %s (status=%d)\n", strerror(st), st);
-            exit(kExitOpFailed);
-        }
-    } else if (dest_path) {
-        fprintf(stderr, "Error: no v2 ack from vGPU.so — destination path was ignored (version skew)\n");
-        exit(kExitRefused);
+// After a selective op: surface the .so-reported status. Negative is a
+// clean op failure. Zero means the op never reached FINISH bookkeeping
+// (the client zeroed the word before signaling) — for selective ops that
+// is out of contract, so fail rather than trust the dump.
+void CheckSelectiveResult(ShareMemComm* comm) {
+    int32_t st = comm->control->op_status;
+    if (st < 0) {
+        fprintf(stderr, "Error: vGPU.so reported op failure: %s (status=%d)\n", strerror(-st), st);
+        exit(kExitOpFailed);
+    }
+    if (st == 0) {
+        fprintf(stderr, "Error: vGPU.so reported no op result\n");
+        exit(kExitOpFailed);
     }
 }
 
@@ -279,15 +280,23 @@ int main(int argc, char* argv[]) {
     if (flock(comm->fd_control, LOCK_EX) != 0)
         fprintf(stderr, "Warning: flock(control-%d) failed: %s\n", pid, strerror(errno));
 
-    // Dest-path gate, BEFORE any signal: a .so that never advertised the
-    // capability would silently serve the op from the per-PID buffer — for
-    // a restore that replays stale bytes into GPU memory, which no post-op
-    // check can undo.
-    if (dest_path && !(comm->control->capability & gpu_cr::kCrCapDestPath)) {
-        fprintf(stderr, "Error: vGPU.so has not advertised dest-path support "
-                        "(run -i first, or upgrade the preloaded library)\n");
+    // Selective-op gate, BEFORE any signal: a .so that never published
+    // selective_ready (init_CR not yet run, or a mismatched build) has no
+    // armed handlers — a signaled op would just burn the FINISH timeout,
+    // and a dest-path restore served from the per-PID buffer would replay
+    // stale bytes into GPU memory, which no post-op check can undo.
+    // Full-process ops stay ungated (historical behavior).
+    if ((selective_spec || dest_path) &&
+        comm->control->selective_ready != gpu_cr::kSelectiveReady) {
+        fprintf(stderr, "Error: vGPU.so has not published selective support "
+                        "(run -i first, or fix the preloaded library)\n");
         exit(kExitRefused);
     }
+
+    // Consume any earlier op result before signaling: op_status semantics
+    // are "0 = this op never reported", which is only true if the word
+    // cannot carry a stale success from a previous op across a crash.
+    comm->control->op_status = 0;
 
     int ret = 0;
 
@@ -306,9 +315,8 @@ int main(int argc, char* argv[]) {
         for (uint32_t i = 0; i < req.num_regions; i++) {
             printf("  region %u: ptr=%p size=%lu\n", i, req.regions[i].ptr, req.regions[i].size);
         }
-        // Always write the full v2 extension (zeroed dest when -o absent) so
-        // a stale dest_path from an earlier op can never survive this write.
-        req.proto_version = gpu_cr::kSelectiveCrProtoV2;
+        // Always write the whole request (zeroed dest when -o absent) so a
+        // stale dest_path from an earlier op can never survive this write.
         if (dest_path) {
             if (!SecurePrecreate(dest_path)) exit(kExitOpFailed);
             strncpy(req.dest_path, dest_path, gpu_cr::kSelectiveCrMaxPath - 1);
@@ -318,7 +326,7 @@ int main(int argc, char* argv[]) {
         SignalOrDie(pid, CR_CKPT_SIGNAL);
         printf("Selective dump signal sent.\n");
         if (!WaitFinished(comm)) exit(kExitTimeout);
-        CheckSelectiveResult(comm, dest_path);
+        CheckSelectiveResult(comm);
         if (dest_path && !ValidateDestDump(dest_path)) exit(kExitOpFailed);
         printf("Selective checkpointing done\n");
     } else if (restore && selective_spec) {
@@ -329,7 +337,6 @@ int main(int argc, char* argv[]) {
             exit(EXIT_FAILURE);
         }
         printf("Selective restore: %u regions\n", req.num_regions);
-        req.proto_version = gpu_cr::kSelectiveCrProtoV2;
         if (dest_path) {
             struct stat st;
             if (stat(dest_path, &st) != 0) {
@@ -343,7 +350,7 @@ int main(int argc, char* argv[]) {
         SignalOrDie(pid, CR_RESTORE_SIGNAL);
         printf("Selective restore signal sent.\n");
         if (!WaitFinished(comm)) exit(kExitTimeout);
-        CheckSelectiveResult(comm, dest_path);
+        CheckSelectiveResult(comm);
         printf("Selective restore done\n");
     } else if(ckpt) {
         comm->send_msg(CKPT_MSG);

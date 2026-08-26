@@ -7,8 +7,9 @@
 //   FAKE_OP_STATUS   errno-style status to report at FINISH (default 0)
 //   FAKE_SKIP_COMMIT write destination dumps WITHOUT the commit marker
 //   FAKE_NO_FINISH   never send FINISH (drives the cr_client timeout path)
-//   FAKE_V1          behave like a v1-only .so: no capability, no
-//                    proto_ack/op_status, no consume-once, no dest-path
+//   FAKE_NOT_READY   behave like a .so that never armed selective
+//                    support: no selective_ready, no op_status, no
+//                    consume-once, no dest-path
 //   FAKE_READY_FILE  file created once the control channel is up
 //   FAKE_LOG         per-op log: "op=<msg> dest=<path-or-empty>" lines
 
@@ -27,7 +28,7 @@
 namespace {
 
 ShareMemComm* g_comm = nullptr;
-bool g_v1 = false;
+bool g_not_ready = false;
 int g_fake_status = 0;
 
 void LogOp(uint32_t msg, const char* dest) {
@@ -79,17 +80,15 @@ bool WriteFakeDump(const SelectiveCrRequest* req, const char* dest_path) {
 }
 
 void Finish(int op_status) {
-  if (!g_v1) gpu_cr::FinishOpControls(g_comm->control, op_status);
+  if (!g_not_ready) gpu_cr::FinishOpControls(g_comm->control, op_status);
   if (!getenv("FAKE_NO_FINISH")) g_comm->send_msg(FINISH_MSG);
 }
 
 void SignalHandler(int signum) {
   uint32_t msg = g_comm->recv_msg();
   const SelectiveCrRequest* req = &g_comm->control->selective_req;
-  const char* dest = (!g_v1 && req->proto_version >= gpu_cr::kSelectiveCrProtoV2 &&
-                      req->dest_path[0] != '\0')
-                         ? req->dest_path
-                         : nullptr;
+  const char* dest =
+      (!g_not_ready && req->dest_path[0] != '\0') ? req->dest_path : nullptr;
   fprintf(stderr, "[fake-workload] signal %d msg %u dest %s\n", signum, msg,
           dest ? dest : "(buffer)");
   LogOp(msg, dest);
@@ -97,7 +96,7 @@ void SignalHandler(int signum) {
   int status = g_fake_status;
   switch (msg) {
     case INIT_MSG:
-      if (!g_v1) g_comm->control->capability |= gpu_cr::kCrCapDestPath;
+      if (!g_not_ready) g_comm->control->selective_ready = gpu_cr::kSelectiveReady;
       if (!getenv("FAKE_NO_FINISH")) g_comm->send_msg(FINISH_MSG);
       return;  // real init path predates op_status reporting
     case SELECTIVE_CKPT_MSG:
@@ -125,13 +124,13 @@ void SignalHandler(int signum) {
 }  // namespace
 
 int main() {
-  g_v1 = getenv("FAKE_V1") != nullptr;
+  g_not_ready = getenv("FAKE_NOT_READY") != nullptr;
   const char* st = getenv("FAKE_OP_STATUS");
   if (st) g_fake_status = atoi(st);
 
   g_comm = new ShareMemComm(getpid());
   g_comm->setup();
-  if (!g_v1) g_comm->control->capability |= gpu_cr::kCrCapDestPath;
+  if (!g_not_ready) g_comm->control->selective_ready = gpu_cr::kSelectiveReady;
 
   signal(CR_INIT_SIGNAL, SignalHandler);
   signal(CR_CKPT_SIGNAL, SignalHandler);
@@ -146,7 +145,7 @@ int main() {
     }
   }
 
-  fprintf(stderr, "[fake-workload] ready, pid=%d v1=%d\n",
-          getpid(), g_v1 ? 1 : 0);
+  fprintf(stderr, "[fake-workload] ready, pid=%d not_ready=%d\n",
+          getpid(), g_not_ready ? 1 : 0);
   for (;;) pause();
 }
