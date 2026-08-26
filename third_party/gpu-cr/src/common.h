@@ -87,43 +87,46 @@ struct SelectiveCrRegion {
     uint64_t size;
 };
 
-// Destination-path selective checkpoints.
-// The v2 fields are APPENDED so the v1 prefix (num_regions + regions[])
-// keeps its exact offsets: a v1 .so never reads past regions[], and the
-// zero-initialized control mapping makes proto_version==0 (v1) the default.
+// Selective checkpoint/restore request: the region list names the
+// allocations to save/restore, and dest_path routes the dump to a
+// caller-named file instead of the per-PID buffer. Fields are only ever
+// APPENDED so the region-list prefix keeps its exact offsets across
+// separately-built cr_client and .so binaries sharing the mapping.
 namespace gpu_cr {
-inline constexpr uint32_t kSelectiveCrProtoV2 = 2;
 inline constexpr size_t kSelectiveCrMaxPath = 256;
 }  // namespace gpu_cr
 
 struct SelectiveCrRequest {
     uint32_t num_regions;
     SelectiveCrRegion regions[gpu_cr::kMaxSelectiveRegions];
-    /* --- v2 extension --- */
-    uint32_t proto_version;                           /* 0 = v1, 2 = v2 */
-    /* dest_path: empty = per-PID buffer. Must be NUL-terminated; the
-     * client rejects paths >= kSelectiveCrMaxPath-1 chars before writing,
-     * and readers should treat dest_path[kSelectiveCrMaxPath-1] != '\0'
-     * as an invalid request. */
+    /* dest_path: empty = per-PID buffer; non-empty = destination-file
+     * routing. Must be NUL-terminated: the client rejects paths
+     * >= kSelectiveCrMaxPath-1 chars before writing, and the .so refuses
+     * a request with dest_path[kSelectiveCrMaxPath-1] != '\0' (-EINVAL). */
     char     dest_path[gpu_cr::kSelectiveCrMaxPath];
 };
 
 namespace gpu_cr {
-// The .so publishes the selective protocol level it speaks in
-// signal_controls.proto_supported at init_CR and re-asserts it at every
-// FINISH (consume-once zeroing of the request extension deliberately
-// excludes this word). Zero means no .so has published yet — the mapping
-// zero-initializes — so a client that races init_CR fails fast instead of
-// signaling a library whose handlers are not armed. The word also lets a
-// future client detect an older resident .so: the library is LD_PRELOADed
-// for the life of the workload process, so rev N must publish the level
-// for a rev N+1 client to have anything to read.
+// The .so stores kSelectiveReady in signal_controls.selective_ready at
+// init_CR and re-asserts it at every FINISH (the consume-once zeroing of
+// the request deliberately leaves this word alone). Zero means no .so has
+// published yet — the mapping zero-initializes — so a client that races
+// init_CR, or one attached to a mismatched build, fails fast instead of
+// signaling a library whose handlers are not armed.
+inline constexpr uint32_t kSelectiveReady = 1;
+
+// op_status encoding: 0 = no result reported (fresh mapping, or the op
+// never reached FINISH), kOpStatusOk = success, negative = -errno.
+// FinishOpControls is the only writer: op sites record positive errno
+// values and FINISH negates, so 0 can never be mistaken for success.
+inline constexpr int32_t kOpStatusOk = 1;
 
 // Trailing commit marker for destination-file dumps: written at
 // fs->current_offset only after the last extent has landed, so a torn
-// dump is detectable. Restores from a destination file refuse dumps
-// whose marker is absent or has the wrong magic; generation is recorded
-// per dump and reserved for future staleness checks (not yet compared).
+// dump is detectable. Restores from a
+// destination file refuse dumps whose marker is absent or has the wrong
+// magic; generation is recorded per dump and reserved for future
+// staleness checks (not yet compared).
 inline constexpr uint64_t kDumpCommitMagic = 0x31524347u; /* "GCR1" */
 }  // namespace gpu_cr
 
@@ -135,25 +138,23 @@ struct DumpCommit {
 struct signal_controls {
     uint32_t signal;
     SelectiveCrRequest selective_req;
-    /* --- v2 extension: appended, invisible to v1 readers --- */
-    uint32_t proto_supported; /* selective proto level the .so speaks; 0 = not yet published */
-    uint32_t proto_ack;  /* proto level the .so served the last op at */
-    int32_t  op_status;  /* 0 = OK, else positive errno-style code */
+    uint32_t selective_ready; /* 0 until the .so publishes kSelectiveReady */
+    int32_t  op_status;       /* 0 = not reported, kOpStatusOk, or -errno */
 };
 
 namespace gpu_cr {
-// Post-op bookkeeping: report
-// status + proto ack, then consume the v2 request extension so a stale
-// dest_path can never redirect a later op (a v1 cr_client only rewrites
-// the v1 prefix). v2 clients gate cuda-checkpoint --toggle on op_status —
-// never freeze a process whose state was not saved. proto_supported is
-// re-asserted so a client that attaches after init_CR still sees it.
-inline void FinishOpControls(signal_controls* c, int32_t op_status) {
-  c->op_status = op_status;
-  c->proto_ack = kSelectiveCrProtoV2;
-  c->selective_req.proto_version = 0;
+// Post-op bookkeeping: publish the op result, then consume the request's
+// dest_path so a stale path can never redirect a later op — zeroing the
+// path IS the consumption, since a non-empty dest_path is what selects
+// destination-file routing. The region-list prefix is left alone: the
+// client rewrites it under flock for every op. Clients gate
+// cuda-checkpoint --toggle on a positive op_status — never freeze a
+// process whose state was not saved. selective_ready is re-asserted so a
+// client that attaches after init_CR still sees it.
+inline void FinishOpControls(signal_controls* c, int32_t rc) {
+  c->op_status = rc == 0 ? kOpStatusOk : -rc;
   std::memset(c->selective_req.dest_path, 0, kSelectiveCrMaxPath);
-  c->proto_supported = kSelectiveCrProtoV2;
+  c->selective_ready = kSelectiveReady;
 }
 }  // namespace gpu_cr
 
