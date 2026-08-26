@@ -116,7 +116,8 @@ Function-level coverage of two layers:
 `cr_client_integration_test.sh` drives the **real `cr_client` binary**
 against `fake_workload`, a GPU-free stand-in for the vGPU.so side that
 reuses the production control-channel code (ShareMemComm, advertisement
-writer, FINISH bookkeeping, dump validator). Covers ctl and legacy modes,
+writer, FINISH bookkeeping, dump validator). Covers ctl (env-configured
+AND zero-config `<data>/ctl` discovery) and legacy modes,
 destination-path checkpoint/restore, torn-dump refusal, op_status
 propagation (including the "never freeze after a failed checkpoint" gate),
 timeouts, PID-reuse refusal, version skew, and the documented exit codes
@@ -137,7 +138,10 @@ gcloud builds submit --config cloudbuild-test.yaml .
 
 A real CUDA workload (`pattern_workload`) under `LD_PRELOAD=vGPU-NVIDIA.so`
 goes through destination-path selective C/R, buffer-path selective C/R, and
-full C/R, gating on **byte-identical GPU memory after every restore**.
+full C/R, gating on **byte-identical GPU memory after every restore**. The
+final gate (G8) reruns a dest-path round trip with `GPU_CR_CTL_PATH` unset
+on both sides, proving the zero-config `<store>/ctl` discovery path on the
+production nested-tmpfs layout (skipped when `$STORE/ctl` is not tmpfs).
 
 ## 4. Performance regression — `tests/e2e/perf_regression.sh` (GPU node)
 

@@ -16,6 +16,10 @@
 #       E2E_FULL_TOGGLE=1 and a real cuda-checkpoint is on PATH)
 #   G7  below-floor GPU_CR_SHM_MB warns at load and falls back to the
 #       build default; the workload stays healthy
+#   G8  zero-config ctl discovery: with NO GPU_CR_CTL_PATH anywhere, a
+#       tmpfs-backed $STORE/ctl is found by both sides and a dest-path
+#       C/R round-trips byte-identically (skipped, not failed, when
+#       $STORE/ctl is not a tmpfs — e.g. the baseline pod layout)
 #
 # Required env: CR_CLIENT, WORKLOAD, VGPU_SO, STORE.
 # Optional env: GPU_CR_CTL_PATH, E2E_NUM_BUFFERS, E2E_BUFFER_MB,
@@ -137,6 +141,34 @@ gate "G7a below-floor value warns" \
 gate "G7b falls back to build default" \
     grep -qF "MiB (build default)" "$RUN/workload.stderr"
 gate "G7c workload healthy after fallback" wl_cmd verify
+
+# G8: zero-config ctl discovery. Restart the workload with GPU_CR_CTL_PATH
+# scrubbed on BOTH sides; the .so and cr_client must independently find the
+# tmpfs at $STORE/ctl through EXPORT_FILE_PATH alone (the consumer-side
+# contract of the discovery design). Environments without a nested ctl
+# tmpfs (baseline pod layout, bare runs) skip rather than fail.
+CTL_CAND="$STORE/ctl"
+if [ "$(stat -f -c %T "$CTL_CAND" 2>/dev/null)" = "tmpfs" ]; then
+    stop_workload
+    cr8() { env -u GPU_CR_CTL_PATH EXPORT_FILE_PATH="$STORE" \
+                timeout "${CR_TIMEOUT:-120}" "$CR_CLIENT" "$@"; }
+    GPU_CR_CTL_PATH="" start_workload "$VGPU_SO" \
+        E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" \
+        GPU_CR_SHM_MB="$SHM_MB" || exit 1
+    gate "G8a advert discovered under \$STORE/ctl" \
+        test -f "$CTL_CAND/ctl-ready-$WL_PID"
+    gate "G8b init (no ctl env)" cr8 -i -p "$WL_PID"
+    DUMP8="$STORE/e2e-dump-disc.bin"
+    rm -f "$DUMP8"
+    gate "G8c dest-path selective ckpt (no ctl env)" \
+        cr8 -c -p "$WL_PID" -s "$WL_REGIONS" -o "$DUMP8"
+    gate "G8d dest-path selective restore (no ctl env)" \
+        cr8 -r -p "$WL_PID" -s "$WL_REGIONS" -o "$DUMP8"
+    gate "G8e verify after discovery restore" wl_cmd verify
+    rm -f "$DUMP8"
+else
+    echo "SKIP: G8 zero-config discovery ($CTL_CAND is not tmpfs-backed)"
+fi
 
 stop_workload
 echo

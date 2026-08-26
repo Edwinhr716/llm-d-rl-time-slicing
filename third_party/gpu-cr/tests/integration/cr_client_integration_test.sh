@@ -15,6 +15,11 @@ FAKE=$(readlink -f "$2")
 
 WORK=$(mktemp -d /tmp/gpu-cr-it-data.XXXXXX)
 CTL=$(mktemp -d /dev/shm/gpu-cr-it-ctl.XXXXXX)
+# Zero-config discovery data dir: on tmpfs, so its plain ctl/ subdir
+# satisfies the containing-filesystem statfs gate — the same predicate a
+# nested tmpfs mount satisfies in production.
+DISC=$(mktemp -d /dev/shm/gpu-cr-it-disc.XXXXXX)
+mkdir "$DISC/ctl"
 STUB_DIR=$(mktemp -d /tmp/gpu-cr-it-stub.XXXXXX)
 TOGGLE_MARKER="$STUB_DIR/toggled"
 cat > "$STUB_DIR/cuda-checkpoint" <<EOF
@@ -33,7 +38,7 @@ FAIL=0
 
 cleanup() {
     stop_fake
-    rm -rf "$WORK" "$CTL" "$STUB_DIR"
+    rm -rf "$WORK" "$CTL" "$DISC" "$STUB_DIR"
 }
 trap cleanup EXIT
 
@@ -152,6 +157,23 @@ check "gate: non-tmpfs GPU_CR_CTL_PATH -> refused" 3 \
     env EXPORT_FILE_PATH="$WORK" GPU_CR_CTL_PATH="$WORK" "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
 check "gate: missing GPU_CR_CTL_PATH dir -> refused" 3 \
     env EXPORT_FILE_PATH="$WORK" GPU_CR_CTL_PATH=/nonexistent-ctl "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
+
+# --- zero-config discovery: NO env, ctl plane found at <data>/ctl -----------
+# The whole point of discovery: both sides run with nothing but
+# EXPORT_FILE_PATH and still agree on a tmpfs control plane.
+start_fake "EXPORT_FILE_PATH=$DISC"
+expect_file "discovery: advert written to <data>/ctl" "$DISC/ctl/ctl-ready-$FAKE_PID"
+check "discovery: init" 0 env EXPORT_FILE_PATH="$DISC" "$CR_CLIENT" -i -p "$FAKE_PID"
+expect_file "discovery: control channel on <data>/ctl" "$DISC/ctl/control-$FAKE_PID"
+check "discovery: dest-path selective ckpt" 0 \
+    env EXPORT_FILE_PATH="$DISC" "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$DISC/dump.bin"
+check "discovery: dest-path selective restore" 0 \
+    env EXPORT_FILE_PATH="$DISC" "$CR_CLIENT" -r -p "$FAKE_PID" -s "$REGIONS" -o "$DISC/dump.bin"
+# The advertisement gate (here: PID reuse) holds without env too.
+sed -i 's/starttime=[0-9]*/starttime=1/' "$DISC/ctl/ctl-ready-$FAKE_PID"
+check "discovery: starttime mismatch -> refused" 3 \
+    env EXPORT_FILE_PATH="$DISC" "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
+rm -rf "$DISC"/ctl/* "$DISC"/dump.bin "$DISC"/control-*
 
 # --- legacy mode -------------------------------------------------------------
 start_fake "EXPORT_FILE_PATH=$WORK"
