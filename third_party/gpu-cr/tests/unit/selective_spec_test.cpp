@@ -84,20 +84,22 @@ TEST(ParseSelectiveRegionsTest, AcceptsDuplicateRegions) {
   EXPECT_EQ(req.regions[0].size, req.regions[1].size);
 }
 
-TEST(ParseSelectiveRegionsTest, AcceptsExactlyMaxRegions) {
+// The bound is exclusive: kMaxSelectiveRegions-1 is the largest request
+// the dump writer can serve without filling the last extent-table slot.
+TEST(ParseSelectiveRegionsTest, AcceptsLargestServableRequest) {
   std::string spec;
-  for (uint32_t i = 0; i < kMaxSelectiveRegions; i++) {
+  for (uint32_t i = 0; i < kMaxSelectiveRegions - 1; i++) {
     if (i) spec += ",";
     spec += "0x1000:1";
   }
   SelectiveCrRequest req;
   ASSERT_TRUE(ParseSelectiveRegions(spec.c_str(), &req));
-  EXPECT_EQ(req.num_regions, kMaxSelectiveRegions);
+  EXPECT_EQ(req.num_regions, kMaxSelectiveRegions - 1);
 }
 
-TEST(ParseSelectiveRegionsTest, RejectsOverMaxRegions) {
+TEST(ParseSelectiveRegionsTest, RejectsRequestAtExclusiveBound) {
   std::string spec;
-  for (uint32_t i = 0; i < kMaxSelectiveRegions + 1; i++) {
+  for (uint32_t i = 0; i < kMaxSelectiveRegions; i++) {
     if (i) spec += ",";
     spec += "0x1000:1";
   }

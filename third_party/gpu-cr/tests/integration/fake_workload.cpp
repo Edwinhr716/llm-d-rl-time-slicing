@@ -66,13 +66,14 @@ bool WriteFakeDump(const SelectiveCrRequest* req, const char* dest_path) {
     for (uint64_t b = 0; b < req->regions[i].size; b++) fputc(0xAB, f);
     offset += req->regions[i].size;
   }
+  uint64_t marker = gpu_cr::DumpCommitOffset(current_offset);
   if (!getenv("FAKE_SKIP_COMMIT")) {
     DumpCommit commit = {gpu_cr::kDumpCommitMagic, 1};
-    fseek(f, current_offset, SEEK_SET);
+    fseek(f, marker, SEEK_SET);
     fwrite(&commit, sizeof(commit), 1, f);
   } else {
     // Still size the file past the marker so only the magic is missing.
-    fseek(f, current_offset + sizeof(DumpCommit) - 1, SEEK_SET);
+    fseek(f, marker + sizeof(DumpCommit) - 1, SEEK_SET);
     fputc(0, f);
   }
   fclose(f);

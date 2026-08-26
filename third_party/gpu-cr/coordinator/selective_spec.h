@@ -31,7 +31,9 @@ inline bool ParseFullUint64(const char* s, uint64_t* out) {
 // semantics belong to the .so and the agent above it. Returns false —
 // with a message on stderr — for an empty spec, an empty or malformed
 // region (missing colon, sign, junk before or after either number), a
-// zero size, or more than kMaxSelectiveRegions regions. req->num_regions
+// zero size, or kMaxSelectiveRegions-or-more regions (the bound is
+// exclusive: the dump writer refuses to fill the last extent-table slot,
+// so a request must stay below it — see common.h). req->num_regions
 // is only meaningful on success.
 inline bool ParseSelectiveRegions(const char* spec, SelectiveCrRequest* req) {
   req->num_regions = 0;
@@ -41,9 +43,9 @@ inline bool ParseSelectiveRegions(const char* spec, SelectiveCrRequest* req) {
   // ("a:1,,b:2", trailing comma), not silently collapse.
   char* rest = buf;
   for (char* token = strsep(&rest, ","); token; token = strsep(&rest, ",")) {
-    if (req->num_regions >= kMaxSelectiveRegions) {
+    if (req->num_regions >= kMaxSelectiveRegions - 1) {
       fprintf(stderr, "Error: too many selective regions (max %u)\n",
-              kMaxSelectiveRegions);
+              kMaxSelectiveRegions - 1);
       free(buf);
       return false;
     }
