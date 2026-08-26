@@ -206,6 +206,46 @@ TEST_F(CtlPathTest, InvalidEnvNeverDiscovers) {
   RemoveDataDir(data);
 }
 
+// A GPU_CR_CTL_PATH longer than the resolution buffer is INVALID even
+// when it names a real tmpfs dir: the clamp runs before the statfs, so a
+// truncated dir can never silently enable ctl mode (kCtlDirMax contract).
+TEST_F(CtlPathTest, OverlongEnvIsInvalidEvenOnRealTmpfs) {
+  if (!DirIsTmpfs("/dev/shm")) GTEST_SKIP() << "/dev/shm is not tmpfs here";
+  std::string deep = MakeTmpfsDataDir();
+  ASSERT_FALSE(deep.empty());
+  std::string root = deep;
+  std::string level(60, 'd');
+  while (deep.size() < kCtlDirMax + 40) {
+    deep += "/" + level;
+    ASSERT_EQ(mkdir(deep.c_str(), 0777), 0);
+  }
+  ASSERT_TRUE(DirIsTmpfs(deep.c_str()));  // real, reachable tmpfs dir
+  setenv("GPU_CR_CTL_PATH", deep.c_str(), 1);
+
+  CtlResolution res;
+  ResolveCtlDir(&res);
+  EXPECT_FALSE(res.ctl_mode);
+  EXPECT_STREQ(res.dir, "/mnt/huge-ckpt");  // legacy, not a truncated dir
+
+  while (deep.size() > root.size()) {
+    rmdir(deep.c_str());
+    deep.resize(deep.rfind('/'));
+  }
+  rmdir(root.c_str());
+}
+
+// An overlong data dir cannot produce a discovery candidate; resolution
+// clamps into legacy deterministically (prefix copy) instead of misbehaving.
+TEST_F(CtlPathTest, OverlongDataDirFallsBackClamped) {
+  std::string longdata = "/" + std::string(kCtlDirMax + 60, 'x');
+  setenv("EXPORT_FILE_PATH", longdata.c_str(), 1);
+
+  CtlResolution res;
+  ResolveCtlDir(&res);
+  EXPECT_FALSE(res.ctl_mode);
+  EXPECT_EQ(std::string(res.dir), longdata.substr(0, kCtlDirMax - 1));
+}
+
 // CtlDir pins the first resolution for the life of the process: a tmpfs
 // appearing later must not split one process across two layouts.
 TEST_F(CtlPathTest, CtlDirMemoizesFirstResolution) {

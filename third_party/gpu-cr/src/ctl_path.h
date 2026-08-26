@@ -84,8 +84,12 @@ inline bool CtlCandidatePath(char* buf, size_t n) {
 // name buffer, and bounding the dir keeps those snprintfs provably
 // truncation-free (-Wformat-truncation) with headroom for the longest
 // name pattern. A dir this long could not have produced usable control
-// paths before either; ResolveCtlDir clamps, and the clamped path then
-// simply fails the statfs/open exactly like any other wrong path.
+// paths before either. A configured GPU_CR_CTL_PATH that does not fit is
+// treated as INVALID (warn + legacy, cr_client refuses) — never statfs'd
+// unclamped, so a real tmpfs at an unaddressable path can't silently
+// enable ctl mode on a truncated dir. The discovery candidate and the
+// legacy data dir clamp the same way; a clamped legacy dir then simply
+// fails open() exactly like any other wrong path.
 inline constexpr size_t kCtlDirMax = 480;
 
 struct CtlResolution {
@@ -100,14 +104,18 @@ inline void ResolveCtlDir(CtlResolution* out) {
   out->ctl_mode = false;
   const char* env = getenv("GPU_CR_CTL_PATH");
   if (env && env[0]) {
-    if (DirIsTmpfs(env)) {
-      snprintf(out->dir, sizeof(out->dir), "%s", env);
+    // Copy/clamp BEFORE the statfs: validating the unclamped path would
+    // enable ctl mode on a dir the callers cannot address. A path that
+    // does not fit is invalid, same as missing or non-tmpfs.
+    int len = snprintf(out->dir, sizeof(out->dir), "%s", env);
+    bool fits = len > 0 && static_cast<size_t>(len) < sizeof(out->dir);
+    if (fits && DirIsTmpfs(out->dir)) {
       out->ctl_mode = true;
       return;
     }
     fprintf(stderr,
-            "[gpu-cr] GPU_CR_CTL_PATH=%s missing or not tmpfs; using legacy "
-            "control dir %s\n",
+            "[gpu-cr] GPU_CR_CTL_PATH=%s missing, not tmpfs, or too long; "
+            "using legacy control dir %s\n",
             env, DataDir());
     snprintf(out->dir, sizeof(out->dir), "%s", DataDir());
     return;
