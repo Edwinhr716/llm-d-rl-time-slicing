@@ -15,6 +15,7 @@
 // magic carries 32 significant bits — "GCR1" as the first four bytes on
 // disk — with the upper half zero for extra discrimination.
 
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -48,6 +49,14 @@ inline bool DumpHeaderPlausible(uint64_t file_num, uint64_t current_offset,
          marker >= current_offset &&
          marker <= total_size - sizeof(DumpCommit);
 }
+
+// ValidateDumpFd reads the header as two raw 64-bit words instead of a
+// shared_mem_fs (whose extent table would drag 64KiB through the pread);
+// pin the layout that shortcut hard-codes.
+static_assert(offsetof(shared_mem_fs, file_num) == 0,
+              "ValidateDumpFd reads file_num as raw word 0");
+static_assert(offsetof(shared_mem_fs, current_offset) == 8,
+              "ValidateDumpFd reads current_offset as raw word 1");
 
 // Validates a whole dump file through an open fd using pread(2) — no
 // mmap, so no hugetlb reservation or fault lands in the caller's cgroup.
