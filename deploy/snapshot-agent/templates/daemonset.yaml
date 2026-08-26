@@ -125,15 +125,15 @@ spec:
                 mkdir -p {{ .Values.gpuCr.ctl.hostPath }}; \
                 if ! grep -q " {{ .Values.gpuCr.ctl.hostPath }} tmpfs" /proc/mounts; then \
                   if grep -q " {{ .Values.gpuCr.ctl.legacyHostPath }} tmpfs" /proc/mounts; then \
-                    mount --bind {{ .Values.gpuCr.ctl.legacyHostPath }} {{ .Values.gpuCr.ctl.hostPath }}; \
+                    mount --bind {{ .Values.gpuCr.ctl.legacyHostPath }} {{ .Values.gpuCr.ctl.hostPath }} || exit 1; \
                   else \
-                    mount -t tmpfs -o size={{ .Values.gpuCr.ctl.sizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.gpuCr.ctl.hostPath }}; \
+                    mount -t tmpfs -o size={{ .Values.gpuCr.ctl.sizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.gpuCr.ctl.hostPath }} || exit 1; \
                   fi; \
                 fi; \
                 chmod 0777 {{ .Values.gpuCr.ctl.hostPath }}; \
                 {{- if .Values.gpuCr.ctl.legacyBind }}
                 mkdir -p {{ .Values.gpuCr.ctl.legacyHostPath }}; \
-                grep -q " {{ .Values.gpuCr.ctl.legacyHostPath }} tmpfs" /proc/mounts || mount --bind {{ .Values.gpuCr.ctl.hostPath }} {{ .Values.gpuCr.ctl.legacyHostPath }}; \
+                grep -q " {{ .Values.gpuCr.ctl.legacyHostPath }} tmpfs" /proc/mounts || mount --bind {{ .Values.gpuCr.ctl.hostPath }} {{ .Values.gpuCr.ctl.legacyHostPath }} || exit 1; \
                 {{- end }}
                 true' && \
               echo "ctl tmpfs ready at {{ .Values.gpuCr.ctl.hostPath }}"

@@ -85,7 +85,11 @@ gpuCr:
   # INSIDE the dump store — so workloads inherit it through the store
   # volume they already mount and both binaries zero-config-discover it
   # (no ctl env var, no extra volume on the workload side). hostPath and
-  # mountPath MUST stay <dataDir>/ctl for that discovery to hold.
+  # mountPath MUST stay <dataDir>/ctl for that discovery to hold, and NO
+  # TRAILING SLASH on any of these paths: the init container's idempotence
+  # check greps /proc/mounts for the exact string, so a trailing slash
+  # would stack a fresh tmpfs (and reset the id counter) on every agent
+  # restart.
   ctl:
     hostPath: /var/tmp/huge-ckpt/ctl
     mountPath: /mnt/huge-ckpt/ctl
