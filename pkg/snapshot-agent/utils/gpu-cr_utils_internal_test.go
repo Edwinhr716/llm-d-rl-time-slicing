@@ -217,6 +217,7 @@ func TestAdvertisedStarttime(t *testing.T) {
 func TestSweepGroupStore(t *testing.T) {
 	data := t.TempDir()
 	t.Setenv("EXPORT_FILE_PATH", data)
+	t.Setenv("GPU_CR_CTL_PATH", "")
 	t.Setenv("GPU_CR_GROUP_STORE", "")
 	t.Setenv("GPU_CR_GROUP_GRACE_HOURS", "")
 	store := filepath.Join(data, "groups")
@@ -359,4 +360,63 @@ func mapsEntry(t *testing.T, path, nsPath string) string {
 	nums := devMajMin(st.Dev)
 	return fmt.Sprintf("7f0000000000-7f0000200000 rw-s 00000000 %02x:%02x %d %s\n",
 		nums.major, nums.minor, st.Ino, nsPath)
+}
+
+func TestSweepGroupStoreMetaFallback(t *testing.T) {
+	// Hugetlbfs group store: the in-slot .owners is an unwritable 0-byte
+	// stub and the real metadata lives on the ctl tmpfs. The sweeper must
+	// read owners through the fallback, delete the slot when they are all
+	// dead, drop the fallback file with it, and reap orphaned fallback
+	// files whose slot is already gone.
+	data := t.TempDir()
+	ctl := t.TempDir()
+	t.Setenv("EXPORT_FILE_PATH", data)
+	t.Setenv("GPU_CR_CTL_PATH", ctl)
+	t.Setenv("GPU_CR_GROUP_STORE", "")
+	t.Setenv("GPU_CR_GROUP_GRACE_HOURS", "")
+	store := filepath.Join(data, "groups")
+
+	makeSlot := func(name, fallbackMeta string, aged bool) string {
+		t.Helper()
+		dir := filepath.Join(store, name)
+		assert.NilError(t, os.MkdirAll(dir, 0o755))
+		// 0-byte in-slot stub, as left behind by a failed write(2).
+		assert.NilError(t, os.WriteFile(filepath.Join(dir, GroupMetaName), nil, 0o600))
+		if fallbackMeta != "" {
+			assert.NilError(t, os.WriteFile(GroupMetaFallbackPath(dir), []byte(fallbackMeta), 0o600))
+		}
+		if aged {
+			old := time.Now().Add(-2 * time.Hour)
+			assert.NilError(t, os.Chtimes(dir, old, old))
+		}
+		return dir
+	}
+
+	deadDir := makeSlot("dead-owner", deadPID+" 123\n", true)
+	makeSlot("stub-only", "", true) // no metadata anywhere -> kept
+	freshDir := makeSlot("fresh", deadPID+" 123\n", false)
+
+	// The reader must see the fallback owners through the empty stub.
+	owners, err := ReadGroupMeta(deadDir)
+	assert.NilError(t, err)
+	assert.Equal(t, len(owners), 1)
+
+	orphan := filepath.Join(ctl, "owners-long-gone")
+	assert.NilError(t, os.WriteFile(orphan, []byte(deadPID+" 123\n"), 0o600))
+	unrelated := filepath.Join(ctl, "pid_map_123")
+	assert.NilError(t, os.WriteFile(unrelated, []byte("42\n"), 0o600))
+
+	sweepGroupStore(time.Now())
+
+	assertGone(t, store, "dead-owner")
+	assertKept(t, store, "stub-only")
+	assertKept(t, store, "fresh")
+	_, err = os.Stat(GroupMetaFallbackPath(deadDir))
+	assert.Assert(t, os.IsNotExist(err), "dead slot's fallback meta must go with it")
+	_, err = os.Stat(GroupMetaFallbackPath(freshDir))
+	assert.NilError(t, err, "kept slot's fallback meta must stay")
+	_, err = os.Stat(orphan)
+	assert.Assert(t, os.IsNotExist(err), "orphaned fallback meta must be reaped")
+	_, err = os.Stat(unrelated)
+	assert.NilError(t, err, "non-owners ctl files are not this sweep's business")
 }

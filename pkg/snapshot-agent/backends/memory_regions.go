@@ -2,6 +2,7 @@ package backends
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
@@ -91,7 +93,36 @@ func writeGroupMeta(dir string, owners map[string]string) error {
 		}
 		fmt.Fprintf(&sb, "%s %d\n", pid, st)
 	}
-	return os.WriteFile(filepath.Join(dir, utils.GroupMetaName), []byte(sb.String()), 0o600)
+	return writeMetaFile(dir, []byte(sb.String()))
+}
+
+// osWriteFile is a test seam: only unit tests replace it, to exercise the
+// EINVAL fallback without a hugetlbfs mount.
+var osWriteFile = os.WriteFile
+
+// writeMetaFile is os.WriteFile with a fallback for a group store that
+// rejects write(2) with EINVAL — hugetlbfs, where the store lives whenever
+// EXPORT_FILE_PATH points at the hugepage mount and GPU_CR_GROUP_STORE is
+// unset. Without the fallback the .owners stub is created empty, and the
+// group-store sweeper then keeps the dead slot forever ("no metadata: be
+// conservative"), pinning its hugepages until deleted by hand.
+//
+// The fallback writes the metadata to the control-plane tmpfs, NOT through
+// an mmap of the hugetlbfs file: a shared hugetlbfs mapping would charge a
+// hugetlb page to this pod's cgroup, and the agent deliberately runs with
+// no hugepages request (that mmap fails ENOMEM under the zero limit).
+func writeMetaFile(slotDir string, data []byte) error {
+	err := osWriteFile(filepath.Join(slotDir, utils.GroupMetaName), data, 0o600)
+	if err == nil || !errors.Is(err, syscall.EINVAL) {
+		return err
+	}
+	fallback := utils.GroupMetaFallbackPath(slotDir)
+	if fallback == "" {
+		// Legacy layout: the ctl dir shares the hugetlbfs data dir, so
+		// there is nowhere writable — surface the original error.
+		return err
+	}
+	return osWriteFile(fallback, data, 0o600)
 }
 
 // touchGroup bumps the slot dir mtime explicitly on every op.

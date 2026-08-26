@@ -316,13 +316,70 @@ func sweepGroupStore(now time.Time) {
 		if err := os.RemoveAll(dir); err == nil {
 			slog.Info("GC: removed orphaned destination slot (all owners dead)",
 				"slot", entry.Name(), "idle", now.Sub(info.ModTime()).Round(time.Minute).String())
+			if fp := GroupMetaFallbackPath(dir); fp != "" {
+				_ = os.Remove(fp)
+			}
+		}
+	}
+	sweepOrphanedMetaFallbacks(store)
+}
+
+// sweepOrphanedMetaFallbacks removes ctl-tmpfs owners-<slot> files whose
+// slot directory no longer exists (e.g. a slot deleted by hand). Runs under
+// StoreMu like the rest of the group-store sweep, so it cannot race a
+// Snapshot writing metadata for a slot it just created.
+func sweepOrphanedMetaFallbacks(store string) {
+	ctl := os.Getenv("GPU_CR_CTL_PATH")
+	if ctl == "" {
+		return
+	}
+	entries, err := os.ReadDir(ctl)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		slot, ok := strings.CutPrefix(e.Name(), "owners-")
+		if !ok || e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(store, slot)); os.IsNotExist(err) {
+			_ = os.Remove(filepath.Join(ctl, e.Name()))
 		}
 	}
 }
 
+// GroupMetaFallbackPath is where a slot's metadata lives when the group
+// store itself rejects write(2) — hugetlbfs. The ctl tmpfs is the one
+// place guaranteed writable in that layout; only this agent process reads
+// and writes slot metadata, so no cross-process path contract is needed.
+// Empty when GPU_CR_CTL_PATH is unset (legacy layout, no fallback).
+func GroupMetaFallbackPath(slotDir string) string {
+	ctl := os.Getenv("GPU_CR_CTL_PATH")
+	if ctl == "" {
+		return ""
+	}
+	return filepath.Join(ctl, "owners-"+filepath.Base(slotDir))
+}
+
 // ReadGroupMeta parses a slot's GroupMetaName file into pid -> starttime.
+// A slot on a hugetlbfs store carries a 0-byte in-slot stub (creation
+// succeeds, write(2) does not), so when the in-slot file yields no owners
+// the ctl-tmpfs fallback location is consulted before giving up.
 func ReadGroupMeta(dir string) (map[string]int64, error) {
-	data, err := os.ReadFile(filepath.Join(dir, GroupMetaName))
+	owners, err := parseGroupMeta(filepath.Join(dir, GroupMetaName))
+	if err == nil && len(owners) > 0 {
+		return owners, nil
+	}
+	if fp := GroupMetaFallbackPath(dir); fp != "" {
+		if fbOwners, fbErr := parseGroupMeta(fp); fbErr == nil {
+			return fbOwners, nil
+		}
+	}
+	return owners, err
+}
+
+func parseGroupMeta(path string) (map[string]int64, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}

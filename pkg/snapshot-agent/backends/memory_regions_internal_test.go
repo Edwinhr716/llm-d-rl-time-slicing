@@ -2,11 +2,13 @@ package backends
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
@@ -523,4 +525,67 @@ func TestGroupDir(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) { run(t, tc) })
 	}
+}
+
+func TestWriteMetaFile(t *testing.T) {
+	// Ordinary filesystems take the plain write(2) path: exact bytes in the
+	// slot dir, fallback untouched.
+	t.Run("plain write", func(t *testing.T) {
+		dir := t.TempDir()
+		ctl := t.TempDir()
+		t.Setenv("GPU_CR_CTL_PATH", ctl)
+		assert.NilError(t, writeMetaFile(dir, []byte("123 456\n")))
+		data, err := os.ReadFile(filepath.Join(dir, utils.GroupMetaName))
+		assert.NilError(t, err)
+		assert.Equal(t, string(data), "123 456\n")
+		_, err = os.Stat(utils.GroupMetaFallbackPath(dir))
+		assert.Assert(t, os.IsNotExist(err))
+	})
+
+	// A hugetlbfs store rejects write(2) with EINVAL (leaving a 0-byte
+	// stub); the metadata must land on the ctl tmpfs instead, where
+	// ReadGroupMeta picks it up.
+	t.Run("EINVAL falls back to ctl tmpfs", func(t *testing.T) {
+		dir := t.TempDir()
+		ctl := t.TempDir()
+		t.Setenv("GPU_CR_CTL_PATH", ctl)
+		orig := osWriteFile
+		defer func() { osWriteFile = orig }()
+		osWriteFile = func(name string, data []byte, perm os.FileMode) error {
+			if filepath.Dir(name) == dir {
+				// Mimic hugetlbfs: open+create succeed, write(2) EINVALs.
+				f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+				if err != nil {
+					return err
+				}
+				f.Close()
+				return &os.PathError{Op: "write", Path: name, Err: syscall.EINVAL}
+			}
+			return os.WriteFile(name, data, perm)
+		}
+		assert.NilError(t, writeMetaFile(dir, []byte("123 456\n789 42\n")))
+
+		data, err := os.ReadFile(utils.GroupMetaFallbackPath(dir))
+		assert.NilError(t, err)
+		assert.Equal(t, string(data), "123 456\n789 42\n")
+
+		owners, err := utils.ReadGroupMeta(dir)
+		assert.NilError(t, err)
+		assert.Equal(t, len(owners), 2)
+		assert.Equal(t, owners["123"], int64(456))
+	})
+
+	// Legacy layout (no ctl tmpfs): nothing writable exists, the original
+	// error must surface so Snapshot's warn names the real failure.
+	t.Run("EINVAL without ctl dir surfaces the error", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("GPU_CR_CTL_PATH", "")
+		orig := osWriteFile
+		defer func() { osWriteFile = orig }()
+		osWriteFile = func(name string, data []byte, perm os.FileMode) error {
+			return &os.PathError{Op: "write", Path: name, Err: syscall.EINVAL}
+		}
+		err := writeMetaFile(dir, []byte("123 456\n"))
+		assert.Assert(t, errors.Is(err, syscall.EINVAL))
+	})
 }
