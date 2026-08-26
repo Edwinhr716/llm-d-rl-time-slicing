@@ -403,8 +403,15 @@ static bool DestOpenForRestore(const char* path, DestMap* dm) {
 }
 
 double ckpt_selective(const SelectiveCrRequest* req) {
-    const char* dest_path = (req->proto_version >= gpu_cr::kSelectiveCrProtoV2 && req->dest_path[0] != '\0')
-                                ? req->dest_path : nullptr;
+    // A non-empty dest_path selects destination-file routing; it must be
+    // NUL-terminated within the array (the request lives in a
+    // caller-writable mapping, so treat it as untrusted).
+    if (req->dest_path[gpu_cr::kSelectiveCrMaxPath - 1] != '\0') {
+        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: dest_path is not NUL-terminated; rejecting\n");
+        g_op_status = EINVAL;
+        return -1;
+    }
+    const char* dest_path = req->dest_path[0] != '\0' ? req->dest_path : nullptr;
     fprintf(stderr, "[vGPU-SELECTIVE-CKPT] ckpt_selective() entered, %u regions, PID=%d, dest=%s\n",
             req->num_regions, getpid(), dest_path ? dest_path : "(per-PID buffer)");
     fflush(stderr);
@@ -826,8 +833,14 @@ double restore_ptr_and_content() {
 }
 
 double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
-    const char* dest_path = (req->proto_version >= gpu_cr::kSelectiveCrProtoV2 && req->dest_path[0] != '\0')
-                                ? req->dest_path : nullptr;
+    // Same untrusted-request handling as ckpt_selective: NUL-termination
+    // first, then a non-empty dest_path selects destination-file routing.
+    if (req->dest_path[gpu_cr::kSelectiveCrMaxPath - 1] != '\0') {
+        fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: dest_path is not NUL-terminated; rejecting\n");
+        g_op_status = EINVAL;
+        return -1;
+    }
+    const char* dest_path = req->dest_path[0] != '\0' ? req->dest_path : nullptr;
     // The request lives in a caller-writable mapping: bound it like the
     // dump header, before any lock or open.
     if (req->num_regions > gpu_cr::kMaxSelectiveRegions) {
@@ -1085,9 +1098,12 @@ void init_CR() {
 
     comm = new ShareMemComm(getpid());
     comm->setup();
-    // Publish dest-path capability. Persistent across ops: the
-    // consume-once zeroing at FINISH deliberately leaves this word alone.
-    (static_cast<ShareMemComm*>(comm))->control->capability |= gpu_cr::kCrCapDestPath;
+    // Publish selective support. Persistent across ops: the consume-once
+    // zeroing at FINISH deliberately leaves this word alone (FINISH
+    // re-asserts it for clients that attach later). Until this store a
+    // fresh mapping reads 0, so a client that races init_CR refuses
+    // selective ops instead of signaling unarmed handlers.
+    (static_cast<ShareMemComm*>(comm))->control->selective_ready = gpu_cr::kSelectiveReady;
     backend = new ShareMem(id);
     backend->setup();
     gpu = createGPU();  // createGPU() will detect the GPU vendor and return the appropriate GPU object
@@ -1117,11 +1133,10 @@ void init_CR() {
     fprintf(stderr, "[init_CR] Initialization complete, setting CR_initialized = true\n");
 }
 
-// Post-op bookkeeping: report
-// status + proto ack, then consume the v2 request extension so a stale
-// dest_path can never redirect a later op (a v1 cr_client only rewrites
-// the v1 prefix). v2 clients gate cuda-checkpoint --toggle on op_status —
-// never freeze a process whose state was not saved.
+// Post-op bookkeeping: publish the op result, then consume the request's
+// dest_path so a stale path can never redirect a later op. Clients gate
+// cuda-checkpoint --toggle on a positive op_status — never freeze a
+// process whose state was not saved.
 static void FinishOp(ShareMemComm* scomm) {
     gpu_cr::FinishOpControls(scomm->control, g_op_status);
 }
