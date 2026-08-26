@@ -79,6 +79,12 @@ struct shared_mem_fs {
 };
 
 namespace gpu_cr {
+// Exclusive bound on regions per selective request: a request must carry
+// FEWER than this many regions. The dump writer refuses to fill the last
+// extent-table slot (file_num < MAX_FILE_NUM, matching
+// DumpHeaderPlausible), so a request gated at num_regions <
+// kMaxSelectiveRegions can never fail for capacity after the
+// device-to-host copy work has already been done.
 inline constexpr uint32_t kMaxSelectiveRegions = 4096;
 }  // namespace gpu_cr
 
@@ -122,8 +128,8 @@ inline constexpr uint32_t kSelectiveReady = 1;
 inline constexpr int32_t kOpStatusOk = 1;
 
 // Trailing commit marker for destination-file dumps: written at
-// fs->current_offset only after the last extent has landed, so a torn
-// dump is detectable. Restores from a
+// DumpCommitOffset(fs->current_offset) (see dump_format.h) only after
+// the last extent has landed, so a torn dump is detectable. Restores from a
 // destination file refuse dumps whose marker is absent or has the wrong
 // magic; generation is recorded per dump and reserved for future
 // staleness checks (not yet compared).

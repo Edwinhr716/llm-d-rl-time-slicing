@@ -50,6 +50,28 @@ TEST(DumpHeaderPlausibleTest, RejectsWrappingOffset) {
                                    kHeaderSize + sizeof(DumpCommit)));
 }
 
+// An offset whose alignment ROUNDING wraps must be rejected too:
+// DumpCommitOffset(UINT64_MAX - 3) wraps to 0.
+TEST(DumpHeaderPlausibleTest, RejectsOffsetWhoseRoundingWraps) {
+  EXPECT_FALSE(DumpHeaderPlausible(1, UINT64_MAX - 3,
+                                   kHeaderSize + sizeof(DumpCommit)));
+}
+
+// Extents are unpadded, so current_offset is routinely misaligned; the
+// marker sits at the next alignof(DumpCommit) boundary.
+TEST(DumpHeaderPlausibleTest, AcceptsMisalignedCurrentOffset) {
+  const uint64_t misaligned = kHeaderSize + 4093;  // 4093 % 8 != 0
+  EXPECT_TRUE(DumpHeaderPlausible(
+      1, misaligned, DumpCommitOffset(misaligned) + sizeof(DumpCommit)));
+}
+
+TEST(DumpCommitOffsetTest, RoundsUpToMarkerAlignment) {
+  EXPECT_EQ(DumpCommitOffset(0), 0u);
+  EXPECT_EQ(DumpCommitOffset(8), 8u);
+  EXPECT_EQ(DumpCommitOffset(9), 16u);
+  EXPECT_EQ(DumpCommitOffset(15), 16u);
+}
+
 // Writes a synthetic dump: header (file_num, current_offset), one extent of
 // `extent` bytes, and (optionally) the trailing commit marker.
 class ValidateDumpFdTest : public ::testing::Test {
@@ -67,14 +89,15 @@ class ValidateDumpFdTest : public ::testing::Test {
   void WriteDump(uint64_t file_num, uint64_t extent, bool with_commit,
                  uint64_t magic = kDumpCommitMagic) {
     uint64_t current_offset = kHeaderSize + extent;
+    uint64_t marker = DumpCommitOffset(current_offset);
     uint64_t hdr[2] = {file_num, current_offset};
     ASSERT_EQ(pwrite(fd_, hdr, sizeof(hdr), 0),
               static_cast<ssize_t>(sizeof(hdr)));
-    ASSERT_EQ(ftruncate(fd_, current_offset + sizeof(DumpCommit)), 0);
+    ASSERT_EQ(ftruncate(fd_, marker + sizeof(DumpCommit)), 0);
     if (with_commit) {
       DumpCommit commit = {magic, /*generation=*/1};
       ASSERT_EQ(pwrite(fd_, &commit, sizeof(commit),
-                       static_cast<off_t>(current_offset)),
+                       static_cast<off_t>(marker)),
                 static_cast<ssize_t>(sizeof(commit)));
     }
   }
@@ -85,6 +108,11 @@ class ValidateDumpFdTest : public ::testing::Test {
 
 TEST_F(ValidateDumpFdTest, AcceptsCommittedDump) {
   WriteDump(/*file_num=*/1, /*extent=*/4096, /*with_commit=*/true);
+  EXPECT_TRUE(ValidateDumpFd(fd_));
+}
+
+TEST_F(ValidateDumpFdTest, AcceptsCommittedDumpWithMisalignedExtent) {
+  WriteDump(/*file_num=*/1, /*extent=*/4093, /*with_commit=*/true);
   EXPECT_TRUE(ValidateDumpFd(fd_));
 }
 
