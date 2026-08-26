@@ -148,6 +148,9 @@ gate "G7c workload healthy after fallback" wl_cmd verify
 # contract of the discovery design). Environments without a nested ctl
 # tmpfs (baseline pod layout, bare runs) skip rather than fail.
 CTL_CAND="$STORE/ctl"
+# stat -f -c %T is GNU coreutils (fine in the CUDA/Ubuntu e2e image); on
+# busybox/BSD stat this prints nothing and G8 skips — adjust if the suite
+# ever moves off a GNU userland.
 if [ "$(stat -f -c %T "$CTL_CAND" 2>/dev/null)" = "tmpfs" ]; then
     stop_workload
     cr8() { env -u GPU_CR_CTL_PATH EXPORT_FILE_PATH="$STORE" \
