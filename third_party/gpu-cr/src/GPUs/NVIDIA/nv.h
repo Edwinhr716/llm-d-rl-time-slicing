@@ -11,6 +11,9 @@ private:
     CUdevice device_;
     CUcontext context_;
     bool cuda_initialized_;
+    // Context pushed by the last successful pushContext(), cleared by its
+    // matching popContext(). Single slot: nested pushes are unsupported.
+    CUcontext pushed_context_;
     
     void ensureCudaInitialized();
     
@@ -43,6 +46,9 @@ public:
     // ========== external tool interfaces ==========
     int externalCheckpoint(int pid) override;
     int externalRestore(int pid) override;
+    
+    int pushContext() override;
+    int popContext() override;
     
     GPUVendor getVendor() const override { return GPUVendor::NVIDIA; }
     std::string getVendorName() const override { return "NVIDIA"; }
