@@ -17,7 +17,9 @@ def _process_target(pids: Sequence[int]) -> snapshot_agent_pb2.ProcessTarget:
     return snapshot_agent_pb2.ProcessTarget(pids=validated)
 
 
-def cuda_config(pids: Optional[Sequence[int]] = None) -> snapshot_agent_pb2.BackendConfig:
+def cuda_config(
+    pids: Optional[Sequence[int]] = None,
+) -> snapshot_agent_pb2.BackendConfig:
     """Builds a BackendConfig selecting the cuda (cuda-checkpoint) backend.
 
     In k8s mode the agent discovers PIDs itself from the
@@ -30,7 +32,9 @@ def cuda_config(pids: Optional[Sequence[int]] = None) -> snapshot_agent_pb2.Back
     return snapshot_agent_pb2.BackendConfig(cuda=cuda)
 
 
-def direct_memory_config(pids: Optional[Sequence[int]] = None) -> snapshot_agent_pb2.BackendConfig:
+def direct_memory_config(
+    pids: Optional[Sequence[int]] = None,
+) -> snapshot_agent_pb2.BackendConfig:
     """Builds a BackendConfig selecting the direct_memory (GPU-CR
     full-process) backend.
 
