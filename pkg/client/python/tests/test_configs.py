@@ -16,6 +16,16 @@ class TestBackendConfigBuilders(unittest.TestCase):
         self.assertEqual(cfg.WhichOneof("backend"), "direct_memory")
         self.assertEqual(list(cfg.direct_memory.explicit_target.pids), [101, 102])
 
+    def test_cuda_config_omits_target_when_pids_not_given(self):
+        cfg = cuda_config()
+        self.assertEqual(cfg.WhichOneof("backend"), "cuda")
+        self.assertFalse(cfg.cuda.HasField("explicit_target"))
+
+    def test_direct_memory_config_omits_target_when_pids_not_given(self):
+        cfg = direct_memory_config()
+        self.assertEqual(cfg.WhichOneof("backend"), "direct_memory")
+        self.assertFalse(cfg.direct_memory.HasField("explicit_target"))
+
     def test_rejects_empty_pids(self):
         with self.assertRaises(ValueError):
             cuda_config([])
