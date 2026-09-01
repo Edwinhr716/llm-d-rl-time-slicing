@@ -9,6 +9,7 @@
 #include <set>
 
 #include "gtest/gtest.h"
+#include "ipc_hooks.h"
 
 namespace gpu_cr {
 namespace {
@@ -39,6 +40,13 @@ TEST(RoundUp2MBTest, Idempotent) {
 TEST(RoundUp2MBTest, LargeValuesKeepFullWidth) {
   EXPECT_EQ(ROUND_UP_2MB(25UL << 30), 25UL << 30);
   EXPECT_EQ(ROUND_UP_2MB((25UL << 30) + 1), (25UL << 30) + (2UL << 20));
+}
+
+// The VMM mapping granule and the hugepage size are the same 2MB constant;
+// ROUND_UP_2MB and GranuleClampLen must agree on where boundaries are.
+TEST(HugePageGeometryTest, GranuleMatchesHugePageSize) {
+  EXPECT_EQ(static_cast<size_t>(HUGE_PAGE_SIZE), kVmmGranuleSize);
+  EXPECT_EQ(ROUND_UP_2MB(1UL), kVmmGranuleSize);
 }
 
 // The upstream control word must stay at offset 0: an upstream cr_client
