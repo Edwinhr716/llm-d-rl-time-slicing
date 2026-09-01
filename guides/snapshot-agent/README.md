@@ -152,6 +152,7 @@ The Snapshot Agent supports multiple backends for different GPU memory managemen
 | CUDA Checkpoint | `cuda` | Process-level CUDA state save/restore via `cuda-checkpoint` | ~100% | ~1-3s |
 | Application-Aware | `app_endpoint` | Suspend/resume through the application's own HTTP API (vLLM, SGLang) | ~96% | ~50-100ms |
 | Application-Aware | `app_channel` | Suspend/resume pushed over a channel the workload registered (Python-API workloads, no HTTP server) | ~96% | ~50-100ms |
+| Memory Regions | `memory_regions` | Selective checkpoint/restore of explicit device-memory ranges via GPU-CR `cr_client` (named snapshot slots, e.g. LoRA adapter swap) | n/a (selective) | ~10-100ms per swapped region set |
 
 The VRAM Freed and Resume Time figures are illustrative, measured with a small model (Qwen2.5-0.5B) on an H100; actual numbers depend on the model size, hardware, and engine version.
 
@@ -343,6 +344,56 @@ result = client.restore_and_wait(job_id="my-sampler", backend_config=channel_con
 A request for a job with no registered channel fails fast with
 `no workload channel registered for job "..."`. If the workload's suspend
 raises, the operation fails with the workload's error text.
+
+### Memory Regions (memory_regions)
+
+Selectively checkpoints and restores explicit device-memory ranges of a
+running process through GPU-CR's `cr_client`. Unlike the process-level
+backends, the workload keeps running; only the named regions are saved or
+overwritten. Snapshots are stored in named **snapshot slots**
+(`snapshot_name`, defaulting to the request's `job_id`), so multiple
+snapshots of the same process coexist and can be swapped on demand — e.g.
+alternating LoRA adapters that share one vLLM LoRA slot. A RUNNING job may
+restore a *different* slot at any time (live slot swap); restoring the
+already-loaded slot is a no-op.
+
+Requirements: the workload runs with the GPU-CR preloader
+(`LD_PRELOAD=vGPU-NVIDIA.so`) and shares the checkpoint dir with the agent
+(see the `memoryRegions` block in the Helm chart, `deploy/snapshot-agent`).
+Regions are always explicit — the agent does no discovery for this backend.
+
+The backend is experimental and gated off by default: requests fail with
+`FAILED_PRECONDITION` unless the agent runs with
+`--feature-gates=MemoryRegionsBackend=true` (or the `FEATURE_GATES` env
+var). The Helm chart sets the gate automatically when
+`memoryRegions.enabled=true`.
+
+```python
+from timeslice.snapshot_agent import (
+    MemoryRegion,
+    SnapshotAgentClient,
+    memory_regions_config,
+)
+
+regions = [MemoryRegion(pid=1234, address=0x7F0000000000, size_bytes=1 << 20)]
+
+with SnapshotAgentClient("localhost:9001") as client:
+    # Save the regions into slot "adapter-a"
+    client.snapshot_and_wait(
+        job_id="my-job",
+        backend_config=memory_regions_config(regions, snapshot_name="adapter-a"),
+    )
+    # ... later: load them back (works while the job is RUNNING)
+    client.restore_and_wait(
+        job_id="my-job",
+        backend_config=memory_regions_config(regions, snapshot_name="adapter-a"),
+    )
+```
+
+Note `snapshot_name` — not the request's `group` — names the slot: `group`
+identifies a set of related jobs for the orchestrator and does not name
+agent-side storage. Health: `grpc.health.v1.Health/Check` with
+`service: "memory-regions"` reports whether `cr_client` is available.
 
 ### Composing Backends
 
