@@ -9,14 +9,17 @@ fails the build.
 
 ## What you need
 
-- **GPU-free tiers (unit + integration) — no GPU, no cloud, no
-  cluster.** Any Linux machine with
-  CMake and a C++ compiler works; GoogleTest downloads at configure time,
-  so network access is the only external dependency. Build only the
-  `gpu_cr_unit_tests` target — the default targets (vGPU.so, cr_client)
-  additionally need the CUDA toolkit. `docker build -f Dockerfile.build .`
-  runs the same suite hermetically if you'd rather not install a
-  toolchain.
+- **Unit tier — no GPU, no cloud, no cluster, no CUDA.** Any Linux
+  machine with CMake and a C++ compiler works; GoogleTest downloads at
+  configure time, so network access is the only external dependency.
+  Build only the `gpu_cr_unit_tests` target — the default targets
+  (vGPU.so, cr_client) additionally need the CUDA toolkit.
+- **Integration tier — no GPU or driver, but the CUDA toolkit to
+  compile.** The `cr_client_integration` ctest entry drives the real
+  `cr_client` binary, which includes `<cuda.h>` and links the CUDA
+  stubs, so a plain C++ box cannot build it. Nothing at run time touches
+  a GPU. `docker build -f Dockerfile.build .` runs both GPU-free tiers
+  hermetically if you'd rather not install the toolchain.
 - **Google Cloud Build is not required.** Every image is a plain
   `docker build`; `gcloud builds submit` flows are an optional
   convenience for building off your machine. The one exception as
@@ -116,8 +119,21 @@ reuses the production control-channel code (ShareMemComm, FINISH
 bookkeeping, dump validator). Covers the control-file flow,
 destination-path checkpoint/restore, torn-dump refusal, op_status
 propagation (including the "never freeze after a failed checkpoint" gate),
-timeouts, version skew, and the documented exit codes
-(0 OK / 1 usage / 2 op failed / 3 refused / 4 timeout).
+timeouts, not-ready refusals, and the documented exit codes
+(0 OK / 1 usage / 2 op failed / 3 refused pre-signal — not-ready gate or
+dead target / 4 timeout).
+
+Two contract points the suite pins, worth knowing when driving
+`cr_client` from the agent:
+
+- **Every op now carries a deadline** (`GPU_CR_OP_TIMEOUT_SEC`, default
+  120s) — including full-process ops, which historically waited forever.
+- **Exit 4 poisons the control channel.** The client's flock releases at
+  exit while the wedged in-process handler may still be mid-op, and the
+  next invocation rewrites the shared request words. After a timeout,
+  restart the workload (or prove the handler finished) before issuing
+  another op against that PID; a dest-path dump interrupted by a timeout
+  carries no commit marker and is refused on restore.
 
 ```sh
 ctest -R cr_client_integration --output-on-failure
