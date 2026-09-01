@@ -6,6 +6,7 @@ from . import snapshot_agent_pb2
 
 
 def _process_target(pids: Sequence[int]) -> snapshot_agent_pb2.ProcessTarget:
+    """Validates pids and builds a ProcessTarget proto."""
     if not pids:
         raise ValueError("at least one PID is required")
     validated = []
