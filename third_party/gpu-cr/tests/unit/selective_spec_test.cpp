@@ -74,6 +74,23 @@ TEST(ParseSelectiveRegionsTest, RejectsNegativeSize) {
   EXPECT_FALSE(ParseSelectiveRegions("0x1000:-1", &req));
 }
 
+TEST(ParseSelectiveRegionsTest, RejectsOverflowingPtr) {
+  SelectiveCrRequest req;
+  // strtoull would saturate 2^65-ish to ULLONG_MAX (ERANGE) — the parser
+  // must reject, not hand the .so a region at 0xFFFFFFFFFFFFFFFF.
+  EXPECT_FALSE(ParseSelectiveRegions("0x1FFFFFFFFFFFFFFFF:4096", &req));
+}
+
+TEST(ParseSelectiveRegionsTest, RejectsOverflowingSize) {
+  SelectiveCrRequest req;
+  EXPECT_FALSE(ParseSelectiveRegions("0x1000:18446744073709551616", &req));
+}
+
+TEST(ParseSelectiveRegionsTest, RejectsEmptySize) {
+  SelectiveCrRequest req;
+  EXPECT_FALSE(ParseSelectiveRegions("0x1000:", &req));
+}
+
 // Syntax-only parser: duplicate regions pass through untouched —
 // dedup/overlap semantics belong to the .so and the agent above it.
 TEST(ParseSelectiveRegionsTest, AcceptsDuplicateRegions) {

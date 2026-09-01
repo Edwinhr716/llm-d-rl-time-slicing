@@ -28,7 +28,10 @@ namespace {
 
 // Exit codes (consumed by the snapshot agent):
 //   0 OK, 1 usage/parse, 2 op failed (op_status or invalid dump),
-//   3 gate refused (.so not ready), 4 timeout.
+//   3 refused pre-signal (.so not ready, or target dead), 4 timeout.
+// Exit 4 poisons the channel: the flock releases at exit while the
+// wedged handler may still be mid-op, so the workload must be restarted
+// (or proven idle) before another op targets this PID.
 constexpr int kExitOpFailed = 2;
 constexpr int kExitRefused = 3;
 constexpr int kExitTimeout = 4;
@@ -95,9 +98,12 @@ void SignalOrDie(pid_t target_pid, int sig) {
     }
 }
 
-// Pre-creates the destination file: existence only (O_CREAT), never sizing —
+// Pre-creates the destination file empty (O_CREAT|O_TRUNC), never sized —
 // the .so alone can compute the dump total (preloader-authoritative
-// sizing), and an inode costs no hugepages/blocks in this cgroup.
+// sizing), and an inode costs no hugepages/blocks in this cgroup. The
+// truncate matters: a recycled path holding an older valid dump could
+// otherwise false-validate a torn write whenever the new commit-marker
+// offset landed on old payload bytes that happen to spell the magic.
 bool SecurePrecreate(const char* path) {
     if (path[0] != '/') {
         fprintf(stderr, "Error: -o path must be absolute: %s\n", path);
@@ -120,15 +126,18 @@ bool SecurePrecreate(const char* path) {
         fprintf(stderr, "Error: cannot open destination dir %s: %s\n", dir, strerror(errno));
         return false;
     }
-    // Symlink hardening: cr_client runs as root in the agent pod against a
-    // workload-writable store, so a symlink swap must not let it
-    // create/truncate arbitrary host files. `base` is a single slash-free
-    // component resolved relative to the already-opened parent, so
-    // O_NOFOLLOW closes the only traversal left — a trailing symlink fails
-    // with ELOOP (dangling included; O_CREAT does not create through one).
-    // For this shape, openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS) would
-    // add nothing.
-    int fd = openat(dfd, base, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0644);
+    // Symlink hardening, trailing component only: cr_client runs as root
+    // in the agent pod against a workload-writable store, so a symlink
+    // swap of the final component must not let it create/truncate
+    // arbitrary host files. `base` is a single slash-free component
+    // resolved relative to the already-opened parent, so O_NOFOLLOW makes
+    // a trailing symlink fail with ELOOP (dangling included; O_CREAT does
+    // not create through one). Intermediate components of `dir` are NOT
+    // defended — the agent passes store paths whose parents it owns; a
+    // workload-writable intermediate would need
+    // openat2(RESOLVE_NO_SYMLINKS) to close.
+    int fd = openat(dfd, base,
+                    O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
     close(dfd);
     if (fd < 0) {
         fprintf(stderr, "Error: cannot create destination %s: %s\n", path, strerror(errno));
@@ -159,7 +168,10 @@ bool ValidateDestDump(const char* path) {
 bool WaitFinished(ShareMemComm* comm) {
     long timeout_sec = 120;
     const char* t = getenv("GPU_CR_OP_TIMEOUT_SEC");
-    if (t && atol(t) > 0) timeout_sec = atol(t);
+    if (t) {
+        long v = atol(t);
+        if (v > 0) timeout_sec = v;
+    }
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
     while (!comm->is_finished()) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -256,8 +268,12 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Only one of -i, -c, or -r  can be specified\n");
         exit(EXIT_FAILURE);
     }
+    if (selective_spec && !ckpt && !restore) {
+        fprintf(stderr, "Error: -s requires -c or -r\n");
+        exit(EXIT_FAILURE);
+    }
     if (dest_path) {
-        if (!selective_spec || (!ckpt && !restore)) {
+        if (!selective_spec) {
             fprintf(stderr, "Error: -o requires -c or -r together with -s\n");
             exit(EXIT_FAILURE);
         }
@@ -286,7 +302,7 @@ int main(int argc, char* argv[]) {
     // and a dest-path restore served from the per-PID buffer would replay
     // stale bytes into GPU memory, which no post-op check can undo.
     // Full-process ops stay ungated (historical behavior).
-    if ((selective_spec || dest_path) &&
+    if (selective_spec &&
         comm->control->selective_ready != gpu_cr::kSelectiveReady) {
         fprintf(stderr, "Error: vGPU.so has not published selective support "
                         "(run -i first, or fix the preloaded library)\n");
@@ -296,6 +312,10 @@ int main(int argc, char* argv[]) {
     // Consume any earlier op result before signaling: op_status semantics
     // are "0 = this op never reported", which is only true if the word
     // cannot carry a stale success from a previous op across a crash.
+    // Control-word accesses here and in WaitFinished are plain loads and
+    // stores, matching the pre-existing channel style: safe on the pinned
+    // x86-64 target (TSO) with the opaque call boundaries as compiler
+    // barriers, not portable to weaker memory models.
     comm->control->op_status = 0;
 
     int ret = 0;
