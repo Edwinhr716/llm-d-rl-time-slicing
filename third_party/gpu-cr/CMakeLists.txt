@@ -140,12 +140,17 @@ target_compile_options(multi_cr_client PRIVATE -O3 -g)
 
 # ---------------------------------------------------------------------------
 # Tests (GPU-free; run in Dockerfile.build)
-#   gpu_cr_unit_tests        — GoogleTest unit suite for the dump-format
-#                              and granule-clamp code, plus the
+#   gpu_cr_unit_tests        — GoogleTest unit suite for the dump-format,
+#                              granule-clamp and region-spec code, plus the
 #                              upstream-baseline control channel, buffer
 #                              mapping, fd exchange and memcpy_multi
+#   fake_workload            — GPU-free stand-in for the vGPU.so side of the
+#                              control channel
+#   cr_client_integration    — drives the real cr_client binary against
+#                              fake_workload, asserting protocol behavior and
+#                              the documented exit codes
 # ---------------------------------------------------------------------------
-option(GPU_CR_BUILD_TESTS "Build the GPU-free unit tests" OFF)
+option(GPU_CR_BUILD_TESTS "Build the GPU-free unit and integration tests" OFF)
 
 if(GPU_CR_BUILD_TESTS)
     include(FetchContent)
@@ -165,6 +170,7 @@ if(GPU_CR_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ipc_fd_exchange_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/memcpy_multi_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/mmap_backend_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/selective_spec_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/share_mem_comm_test.cpp
         # GPU-free production sources under test (upstream-baseline functions)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mmap_backend.cpp
@@ -174,6 +180,8 @@ if(GPU_CR_BUILD_TESTS)
     )
     target_include_directories(gpu_cr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        # selective_spec_test includes coordinator/selective_spec.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/coordinator
     )
     # The file backend reserves the full dump-buffer size up front
     # (posix_fallocate); pin the suite to the 1GiB minimum so the
@@ -184,6 +192,20 @@ if(GPU_CR_BUILD_TESTS)
     target_compile_options(gpu_cr_unit_tests PRIVATE -USHM_SIZE_GB -DSHM_SIZE_GB=1)
     target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)
     add_test(NAME unit COMMAND gpu_cr_unit_tests)
+
+    add_executable(fake_workload
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/fake_workload.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
+    )
+    target_include_directories(fake_workload PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+
+    add_test(NAME cr_client_integration
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/cr_client_integration_test.sh
+                $<TARGET_FILE:cr_client> $<TARGET_FILE:fake_workload>
+    )
+    set_tests_properties(cr_client_integration PROPERTIES TIMEOUT 300)
 endif()
 
 # ---------------------------------------------------------------------------

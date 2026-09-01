@@ -1,15 +1,16 @@
 # GPU-CR test suites
 
-Three tiers, from GPU-free unit tests to on-node performance regression.
+Four tiers, from GPU-free unit tests to on-node performance regression.
 Throughout, "upstream" means the original GPU-CR project this tree builds
 on — <https://github.com/gpu-os/GPU-CR/tree/main> — pinned at commit
-`e9bbb52`. The unit tier runs automatically inside every
+`e9bbb52`. The first two tiers run automatically inside every
 `Dockerfile.build` image build (`RUN_TESTS=1`, the default) — a red suite
 fails the build.
 
 ## What you need
 
-- **Unit tier — no GPU, no cloud, no cluster.** Any Linux machine with
+- **GPU-free tiers (unit + integration) — no GPU, no cloud, no
+  cluster.** Any Linux machine with
   CMake and a C++ compiler works; GoogleTest downloads at configure time,
   so network access is the only external dependency. Build only the
   `gpu_cr_unit_tests` target — the default targets (vGPU.so, cr_client)
@@ -88,32 +89,52 @@ and rebuild — registration is automatic. A brand-new test file must also
 be added to the `gpu_cr_unit_tests` source list in the top-level
 `CMakeLists.txt`, or it will not be compiled in.
 
-The two GPU tiers below are plain bash scripts, not GoogleTest: each
-prints a `PASS`/`FAIL` line per gate and exits nonzero if any gate
-failed.
+The remaining tiers are bash scripts, not GoogleTest: each prints a
+`PASS`/`FAIL` line per scenario or gate and exits nonzero if anything
+failed. The integration script is registered with ctest too, so it
+reports through the same `ctest` front end as the unit tier.
 
 ## 1. Unit tests — `tests/unit/` (GoogleTest, no GPU, Linux)
 
-Function-level coverage of the upstream-baseline functions: the
-2MB rounding macro, signal numbers and wire structs
-(`common_baseline_test`), the ShareMemComm control channel
-(`share_mem_comm_test`), the ShareMem dump/staging buffer mapping via the
-file backend (`mmap_backend_test`), and the UDS SCM_RIGHTS fd exchange
-(`ipc_fd_exchange_test`). `createGPU()` and the CUDA/HIP hook layers need
-a driver link, so they stay covered by the e2e tier.
+Function-level coverage of two layers:
 
-## 2. End-to-end — `tests/e2e/run_e2e.sh` (GPU node)
+- **Code added on top of upstream**: dump-format validation, consume-once
+  FINISH bookkeeping, region-spec parsing, and wire-layout guards.
+- **The upstream-baseline functions themselves**: the 2MB rounding macro,
+  signal numbers and wire structs (`common_baseline_test`), the
+  ShareMemComm control channel (`share_mem_comm_test`), the ShareMem
+  dump/staging buffer mapping via the file backend (`mmap_backend_test`),
+  and the UDS SCM_RIGHTS fd exchange (`ipc_fd_exchange_test`).
+  `createGPU()` and the CUDA/HIP hook layers need a driver link, so they
+  stay covered by the integration and e2e tiers.
+
+## 2. Integration tests — `tests/integration/` (no GPU, Linux)
+
+`cr_client_integration_test.sh` drives the **real `cr_client` binary**
+against `fake_workload`, a GPU-free stand-in for the vGPU.so side that
+reuses the production control-channel code (ShareMemComm, FINISH
+bookkeeping, dump validator). Covers the control-file flow,
+destination-path checkpoint/restore, torn-dump refusal, op_status
+propagation (including the "never freeze after a failed checkpoint" gate),
+timeouts, version skew, and the documented exit codes
+(0 OK / 1 usage / 2 op failed / 3 refused / 4 timeout).
+
+```sh
+ctest -R cr_client_integration --output-on-failure
+```
+
+## 3. End-to-end — `tests/e2e/run_e2e.sh` (GPU node)
 
 A real CUDA workload (`pattern_workload`) under `LD_PRELOAD=vGPU-NVIDIA.so`
 goes through full checkpoint/restore, gating on **byte-identical GPU memory
 after every restore**.
 
-## 3. Performance regression — `tests/e2e/perf_regression.sh` (GPU node)
+## 4. Performance regression — `tests/e2e/perf_regression.sh` (GPU node)
 
-Verifies a build has not regressed the full checkpoint/restore data plane
-that upstream (`e9bbb52`) delivers: same workload, same node,
-baseline .so vs candidate .so, median-of-N compared against a threshold
-(default 15%).
+Verifies the consolidated build has not regressed the full checkpoint/
+restore data plane that upstream (`e9bbb52`) delivers: same workload,
+same node, baseline .so vs candidate .so, median-of-N compared against a
+threshold (default 15%).
 
 Build the baseline once with `tests/e2e/build_baseline_so.sh` (run from
 a checkout containing the pinned upstream commit — a vendored copy of

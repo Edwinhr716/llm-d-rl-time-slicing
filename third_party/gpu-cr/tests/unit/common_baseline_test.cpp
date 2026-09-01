@@ -9,6 +9,7 @@
 #include <set>
 
 #include "gtest/gtest.h"
+#include "ipc_hooks.h"
 
 namespace gpu_cr {
 namespace {
