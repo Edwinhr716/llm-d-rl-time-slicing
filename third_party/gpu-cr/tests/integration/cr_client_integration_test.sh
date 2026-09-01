@@ -137,10 +137,37 @@ expect_no_file "op_status: NOT frozen after a failed ckpt" "$TOGGLE_MARKER"
 check "op_status: full restore fails cleanly" 2 env $CTL_ENV "$CR_CLIENT" -r -p "$FAKE_PID"
 expect_file "op_status: restore thawed before the failed op" "$TOGGLE_MARKER"
 
+# --- recycled destination is truncated at precreate --------------------------
+# A dest path holding an older, larger dump must not contribute stale bytes
+# to the new file: after a smaller dump to the same path, the file must
+# shrink (O_TRUNC), or a torn write could false-validate against leftover
+# marker bytes.
+start_fake $CTL_ENV
+check "recycle setup: 2-region dump"  0 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/recycle.bin"
+big_size=$(stat -c %s "$WORK/recycle.bin")
+check "recycled dest: smaller dump"   0 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "0x7f0000000000:4096" -o "$WORK/recycle.bin"
+small_size=$(stat -c %s "$WORK/recycle.bin")
+if [ "$small_size" -lt "$big_size" ]; then
+    echo "ok:   recycled dest truncated ($big_size -> $small_size bytes)"; PASS=$((PASS + 1))
+else
+    echo "FAIL: recycled dest not truncated ($big_size -> $small_size bytes)"; FAIL=$((FAIL + 1))
+fi
+
 # --- timeout ----------------------------------------------------------------
 start_fake $CTL_ENV FAKE_NO_FINISH=1
 check "timeout: wedged workload fails the op" 4 \
     env $CTL_ENV GPU_CR_OP_TIMEOUT_SEC=2 "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
+
+# --- timeout leaves an uncommitted dest artifact ------------------------------
+# Pins the exit-4 on-disk contract: the precreated dest survives, carries no
+# commit marker, and a later restore must refuse it.
+start_fake $CTL_ENV FAKE_NO_FINISH=1 FAKE_SKIP_COMMIT=1
+check "timeout: dest-path ckpt fails" 4 \
+    env $CTL_ENV GPU_CR_OP_TIMEOUT_SEC=2 "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/t4.bin"
+expect_file "timeout leaves the precreated dest" "$WORK/t4.bin"
+start_fake $CTL_ENV
+check "timeout artifact: restore refuses the unmarked dump" 2 \
+    env $CTL_ENV "$CR_CLIENT" -r -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/t4.bin"
 
 # --- advertisement gating ----------------------------------------------------
 start_fake $CTL_ENV FAKE_NOT_READY=1     # not-ready .so: no advertisement written
@@ -188,6 +215,12 @@ check "not-ready .so: dest-path op refused pre-signal" 3 \
     env EXPORT_FILE_PATH="$WORK" "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/dump.bin"
 check "not-ready .so: buffer selective op refused pre-signal" 3 \
     env EXPORT_FILE_PATH="$WORK" "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
+# The gate's worst case: a dest-path restore served from the stale per-PID
+# buffer would replay old bytes into GPU memory — must refuse pre-signal.
+check "not-ready .so: dest-path restore refused pre-signal" 3 \
+    env EXPORT_FILE_PATH="$WORK" "$CR_CLIENT" -r -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/dump.bin"
+check "not-ready .so: buffer selective restore refused pre-signal" 3 \
+    env EXPORT_FILE_PATH="$WORK" "$CR_CLIENT" -r -p "$FAKE_PID" -s "$REGIONS"
 # Full-process ops stay ungated: a silent .so (no op_status) keeps
 # historical tolerance.
 check "not-ready .so: full ckpt keeps historical behavior" 0 \
@@ -195,9 +228,21 @@ check "not-ready .so: full ckpt keeps historical behavior" 0 \
 
 # --- usage errors ------------------------------------------------------------
 check "usage: -o without -s"          1 env $CTL_ENV "$CR_CLIENT" -c -o "$WORK/dump.bin" -p 1
+check "usage: -s without -c or -r"    1 env $CTL_ENV "$CR_CLIENT" -i -p 1 -s "$REGIONS"
+check "usage: -o path too long"       1 env $CTL_ENV "$CR_CLIENT" -c -p 1 -s "$REGIONS" \
+    -o "/$(printf 'a%.0s' $(seq 1 300))"
 start_fake $CTL_ENV
+check "usage: malformed -s fails at parse" 1 \
+    env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "bogus"
 check "usage: restore from missing file" 2 \
     env $CTL_ENV "$CR_CLIENT" -r -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/nonexistent.bin"
+
+# --- destination hardening ----------------------------------------------------
+check "dest: relative -o refused" 2 \
+    env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "rel/dump.bin"
+ln -s /etc/hostname "$WORK/link.bin"
+check "dest: symlink dest refused (ELOOP)" 2 \
+    env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/link.bin"
 
 echo
 echo "cr_client integration: $PASS passed, $FAIL failed"
