@@ -25,6 +25,91 @@ spec:
       serviceAccountName: {{ include "snapshot-agent.serviceAccountName" . }}
       hostNetwork: true
       hostPID: true
+      {{- if and .Values.memoryRegions.enabled .Values.directMemory.enabled }}
+      {{- fail "memoryRegions and directMemory are mutually exclusive: both drive GPU-CR through the same shared checkpoint dir (EXPORT_FILE_PATH)" }}
+      {{- end }}
+      {{- if .Values.memoryRegions.enabled }}
+      {{- if .Values.priorityClass.name }}
+      priorityClassName: {{ .Values.priorityClass.name }}
+      {{- end }}
+      # GPU-CR uses a host-shared-memory control channel between the agent's
+      # cr_client and the workload's preloader.
+      hostIPC: true
+      initContainers:
+        {{- if .Values.gpuCr.bootstrap.enabled }}
+        # Runtime hugepage provisioning for WORKLOAD pods (the agent itself
+        # requests none). Once per node boot: allocate the 2Mi pool, then
+        # restart the kubelet so the node publishes hugepages-2Mi capacity.
+        # On shortfall it exits 1 WITHOUT restarting the kubelet, so an
+        # undersized pool surfaces as this pod CrashLooping, not as workload
+        # SIGBUS. Scheduling deadlock is impossible ONLY because the agent
+        # container has no hugepages request — do not add one.
+        - name: provision-hugepages
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          env:
+            - name: HUGEPAGES_2M
+              value: {{ .Values.gpuCr.bootstrap.pages2Mi | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              apk add --no-cache util-linux >/dev/null
+              target=$HUGEPAGES_2M
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -ge "$target" ]; then
+                echo "hugepage pool already provisioned ($current/$target pages), nothing to do"
+                exit 0
+              fi
+              echo "reserving $target 2Mi hugepages (currently $current)"
+              nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -lt "$target" ]; then
+                echo "short by $((target - current)) pages; compacting and retrying"
+                nsenter -t 1 -m -- sh -c 'echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+                nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+                current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              fi
+              if [ "$current" -lt "$target" ]; then
+                echo "ERROR: only $current of $target pages allocated (memory fragmented or exhausted)"
+                exit 1
+              fi
+              echo "pool ready; restarting kubelet so the node reports hugepages-2Mi (running pods unaffected)"
+              nsenter -t 1 -m -- systemctl restart kubelet
+        {{- end }}
+        # GEP-0006 control-plane tmpfs on the HOST: cr_client and the
+        # workload's vGPU.so communicate through files here instead of
+        # hugetlbfs. Must exist BEFORE workloads start (their .so writes the
+        # readiness advertisement at load time; a disk-backed dir would be
+        # shadowed by this mount — both binaries statfs-gate on tmpfs).
+        - name: mount-ctl-tmpfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.gpuCr.ctl.hostPath }}; grep -q " {{ .Values.gpuCr.ctl.hostPath }} tmpfs" /proc/mounts || mount -t tmpfs -o size={{ .Values.gpuCr.ctl.sizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.gpuCr.ctl.hostPath }}; chmod 0777 {{ .Values.gpuCr.ctl.hostPath }}' && \
+              echo "ctl tmpfs mounted at {{ .Values.gpuCr.ctl.hostPath }}"
+        # hugetlbfs at the shared checkpoint path on the HOST. GPU-CR relies
+        # on the filesystem itself being hugetlbfs; without this mount every
+        # dump silently degrades to boot-disk page cache.
+        - name: mount-hugetlbfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.gpuCr.dataDir.hostPath }}; grep -q " {{ .Values.gpuCr.dataDir.hostPath }} hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize=2M,mode=0777 nodev {{ .Values.gpuCr.dataDir.hostPath }}; chmod 0777 {{ .Values.gpuCr.dataDir.hostPath }}' && \
+              echo "hugetlbfs mounted at {{ .Values.gpuCr.dataDir.hostPath }}"
+      {{- end }}
       {{- if .Values.directMemory.enabled }}
       # GPU-CR uses a host-shared-memory control channel between the agent's
       # cr_client and the workload's vGPU preloader.
@@ -67,10 +152,14 @@ spec:
               value: {{ .Values.port | quote }}
             {{- /* Feature gates: explicit values from .Values.featureGates,
                  with directMemory.enabled implying DirectMemoryBackend=true
+                 and memoryRegions.enabled implying MemoryRegionsBackend=true
                  (deploying the GPU-CR machinery is the opt-in). */}}
             {{- $gates := dict }}
             {{- if .Values.directMemory.enabled }}
             {{- $_ := set $gates "DirectMemoryBackend" true }}
+            {{- end }}
+            {{- if .Values.memoryRegions.enabled }}
+            {{- $_ := set $gates "MemoryRegionsBackend" true }}
             {{- end }}
             {{- range $name, $enabled := .Values.featureGates }}
             {{- if not (kindIs "bool" $enabled) }}
@@ -100,6 +189,21 @@ spec:
               value: "all"
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: "compute,utility"
+            {{- if .Values.memoryRegions.enabled }}
+            - name: EXPORT_FILE_PATH
+              value: {{ .Values.gpuCr.dataDir.mountPath | quote }}
+            - name: GPU_CR_CTL_PATH
+              value: {{ .Values.gpuCr.ctl.mountPath | quote }}
+            - name: GPU_CR_OP_TIMEOUT_SEC
+              value: {{ .Values.gpuCr.opTimeoutSec | quote }}
+            {{- if .Values.memoryRegions.legacySnapshots.enabled }}
+            # LEGACY pre-GEP-0001 copy store: only GC reads it, to TTL-reap
+            # leftovers from older agents. Parked state lives in the
+            # destination group store under EXPORT_FILE_PATH.
+            - name: SNAPSHOT_DIR
+              value: {{ .Values.memoryRegions.legacySnapshots.snapshotDir | quote }}
+            {{- end }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.port }}
@@ -128,6 +232,20 @@ spec:
             - name: nvidia-devices
               mountPath: {{ .Values.nvidia.devices.mountPath }}
             {{- end }}
+            {{- if .Values.memoryRegions.enabled }}
+            - name: huge-ckpt
+              mountPath: {{ .Values.gpuCr.dataDir.mountPath }}
+              # Pick up the mounts made by the init containers even though
+              # the hostPath was bound before they ran.
+              mountPropagation: HostToContainer
+            - name: gpu-cr-ctl
+              mountPath: {{ .Values.gpuCr.ctl.mountPath }}
+              mountPropagation: HostToContainer
+            {{- if .Values.memoryRegions.legacySnapshots.enabled }}
+            - name: gcr-snapshots
+              mountPath: {{ .Values.memoryRegions.legacySnapshots.snapshotDir }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.directMemory.enabled }}
             - name: huge-ckpt
               mountPath: {{ .Values.directMemory.ctlDir }}
@@ -147,6 +265,22 @@ spec:
           hostPath:
             path: {{ .Values.nvidia.devices.hostPath }}
             type: Directory
+        {{- end }}
+        {{- if .Values.memoryRegions.enabled }}
+        - name: huge-ckpt
+          hostPath:
+            path: {{ .Values.gpuCr.dataDir.hostPath }}
+            type: DirectoryOrCreate
+        - name: gpu-cr-ctl
+          hostPath:
+            path: {{ .Values.gpuCr.ctl.hostPath }}
+            type: DirectoryOrCreate
+        {{- if .Values.memoryRegions.legacySnapshots.enabled }}
+        - name: gcr-snapshots
+          hostPath:
+            path: {{ .Values.memoryRegions.legacySnapshots.snapshotsHostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
         {{- end }}
         {{- if .Values.directMemory.enabled }}
         - name: huge-ckpt
