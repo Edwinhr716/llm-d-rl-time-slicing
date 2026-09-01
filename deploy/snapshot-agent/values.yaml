@@ -60,7 +60,38 @@ nvidia:
 # Example:
 #   featureGates:
 #     DirectMemoryBackend: true
+# directMemory.enabled implies DirectMemoryBackend: true; an explicit entry
+# here overrides that.
 featureGates: {}
+
+# GPU-CR direct_memory (full-process) backend machinery. Default disabled:
+# the chart is identical to a CUDA/app-backend deployment unless this is
+# turned on. Enabling it deploys the shared checkpoint-dir mount, hostIPC,
+# and implies the DirectMemoryBackend feature gate. The target workloads
+# must run under the GPU-CR vGPU preloader, with shm/hugepage capacity
+# sized for whole-VRAM dumps (the GPU-CR SHM_SIZE_GB build knob).
+directMemory:
+  enabled: false
+  # Shared checkpoint/control dir (EXPORT_FILE_PATH inside the agent). The
+  # agent GC only recognizes dump mappings under a path containing
+  # "huge-ckpt/" — keep that segment if you change these.
+  ctlDir: /mnt/huge-ckpt
+  # Host path backing ctlDir; also the hugetlbfs mountpoint when
+  # hugetlbfs.mount is on.
+  hostCtlPath: /var/tmp/huge-ckpt
+  hugetlbfs:
+    # Run the privileged nsenter init container that mounts hugetlbfs at
+    # hostCtlPath. Off by default: stock GPU-CR dumps into plain shm.
+    mount: false
+    pagesize: 2M
+  # Optional hugetlb cgroup headroom for the agent itself, rendered as
+  # hugepages-<pagesize>i requests/limits (plus a minimal memory request,
+  # which k8s requires alongside hugepages). Empty = none: for full-process
+  # checkpoints the dump is written by the workload's preloader, not the
+  # agent, so the agent normally needs no hugepage allowance.
+  hugepagesResource: ""
+  # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC).
+  opTimeoutSec: 120
 
 rbac:
   create: true
