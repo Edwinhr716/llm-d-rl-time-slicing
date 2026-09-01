@@ -139,6 +139,9 @@ Two contract points the suite pins, worth knowing when driving
 ctest -R cr_client_integration --output-on-failure
 ```
 
+The full per-case matrix (setup, invocation, expected exit) lives in
+[`tests/integration/README.md`](integration/README.md).
+
 ## 3. End-to-end — `tests/e2e/run_e2e.sh` (GPU node)
 
 A real CUDA workload (`pattern_workload`) under `LD_PRELOAD=vGPU-NVIDIA.so`
