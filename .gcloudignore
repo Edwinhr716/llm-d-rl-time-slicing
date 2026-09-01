@@ -1,0 +1,10 @@
+# Upload the full working tree to Cloud Build. Without this file gcloud
+# would synthesize an ignore list from .gitignore.
+.git
+.gcloudignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+coverage.out
+coverage.html
