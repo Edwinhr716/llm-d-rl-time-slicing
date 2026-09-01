@@ -1,0 +1,22 @@
+# Builds the snapshot-agent image.
+# Usage:
+#   gcloud builds submit . --config=cloudbuild-snapshot-agent.yaml \
+#     --substitutions=_TAG=taska-<shortsha>
+steps:
+  - id: build-snapshot-agent
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - docker/snapshot-agent/Dockerfile
+      - -t
+      - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:${_TAG}
+      - .
+images:
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/llm-d-rl-time-slicing/snapshot-agent:${_TAG}
+substitutions:
+  _TAG: ctl-tmpfs-mr-v1
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+timeout: 2400s
