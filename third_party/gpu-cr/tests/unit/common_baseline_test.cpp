@@ -1,6 +1,6 @@
 // Upstream-baseline pieces of common.h (inherited from upstream): the 2MB
-// rounding macro, hugepage geometry, the C/R signal numbers, and the v1
-// control-word prefix that every later extension must leave undisturbed.
+// rounding macro, hugepage geometry, the C/R signal numbers, and the
+// control-word prefix that every appended field must leave undisturbed.
 
 #include "common.h"
 
@@ -41,8 +41,8 @@ TEST(RoundUp2MBTest, LargeValuesKeepFullWidth) {
   EXPECT_EQ(ROUND_UP_2MB((25UL << 30) + 1), (25UL << 30) + (2UL << 20));
 }
 
-// The v1 control word must stay at offset 0: an upstream cr_client and a
-// current .so share the same zero-initialized mapping.
+// The upstream control word must stay at offset 0: an upstream cr_client
+// and a current .so share the same zero-initialized mapping.
 TEST(SignalControlsLayoutTest, SignalWordIsFirst) {
   EXPECT_EQ(offsetof(signal_controls, signal), 0u);
 }

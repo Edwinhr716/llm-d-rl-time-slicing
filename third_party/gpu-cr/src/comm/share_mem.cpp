@@ -24,6 +24,8 @@ ShareMemComm::ShareMemComm(pid_t pid) : Comm(pid), pid(pid) {
 }
 
 ShareMemComm::~ShareMemComm() {
+    // Also releases any flock a caller took for the op duration.
+    if (fd_control >= 0) close(fd_control);
 }
 
 void ShareMemComm::setup() {
@@ -31,7 +33,7 @@ void ShareMemComm::setup() {
     const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
     if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
     snprintf(control_name, sizeof(control_name), "%s/control-%d", ctl_dir, pid);
-    int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);
+    fd_control = open(control_name, O_CREAT | O_RDWR, 0755);
     if (fd_control < 0) {
         perror("open()");
         exit(EXIT_FAILURE);
