@@ -44,6 +44,8 @@ def _suspend_mode(mode: Union[str, int, None]) -> int:
 
 
 def _tags(tags: Optional[Sequence[str]]) -> list:
+    if isinstance(tags, str):
+        raise ValueError("tags must be a sequence of non-empty strings")
     tags = list(tags or [])
     if any(not isinstance(t, str) or not t for t in tags):
         raise ValueError(f"tags must be non-empty strings, got {tags!r}")
@@ -110,6 +112,8 @@ def app_endpoint_config(
         snapshot_agent_pb2.App.Name(app)  # raises ValueError if invalid
     if app == snapshot_agent_pb2.APP_UNSPECIFIED:
         raise ValueError(f"app must be specified; expected one of {sorted(_APPS)}")
+    if isinstance(endpoints, str):
+        raise ValueError("endpoints must be a sequence of non-empty endpoint URLs")
     endpoints = list(endpoints)
     if not endpoints or any(not isinstance(e, str) or not e for e in endpoints):
         raise ValueError("at least one non-empty endpoint URL is required")

@@ -127,6 +127,14 @@ class TestBackendConfigBuilders(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app_channel_config(mode=mode)
 
+    def test_rejects_bare_string_endpoints_and_tags(self):
+        with self.assertRaises(ValueError):
+            app_endpoint_config("vllm", "http://localhost:8000")
+        with self.assertRaises(ValueError):
+            app_endpoint_config("vllm", ["http://localhost:8000"], tags="weights")
+        with self.assertRaises(ValueError):
+            app_channel_config(tags="weights")
+
     def test_rejects_bad_tags(self):
         for tags in ([""], [123], [None]):
             with self.assertRaises(ValueError):
