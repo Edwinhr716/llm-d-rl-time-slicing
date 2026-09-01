@@ -5,6 +5,7 @@
 // Header-only and GPU-free so unit tests can exercise it directly.
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,13 +17,16 @@ namespace gpu_cr {
 
 // Parses one unsigned number occupying the WHOLE string: any strtoull
 // base-0 form (0x..., decimal), no sign, no leading space, no trailing
-// junk. The digit-lead check rejects "", "-1" (which strtoull would
-// silently negate to ULLONG_MAX), "+1" and " 1".
+// junk, no overflow. The digit-lead check rejects "", "-1" (which
+// strtoull would silently negate to ULLONG_MAX), "+1" and " 1"; the
+// ERANGE check rejects values past UINT64_MAX, which strtoull would
+// silently saturate to ULLONG_MAX.
 inline bool ParseFullUint64(const char* s, uint64_t* out) {
   if (!isdigit(static_cast<unsigned char>(s[0]))) return false;
   char* end = nullptr;
+  errno = 0;
   *out = strtoull(s, &end, 0);
-  return end != s && *end == '\0';
+  return errno != ERANGE && end != s && *end == '\0';
 }
 
 // Fills req->regions/num_regions from a comma-separated "ptr:size" list.
