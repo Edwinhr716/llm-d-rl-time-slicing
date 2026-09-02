@@ -18,8 +18,6 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
-const testCrClient = "/usr/local/bin/cr_client"
-
 func region(pid int32, addr, size uint64) *pb.MemoryRegion {
 	return &pb.MemoryRegion{Pid: pid, Address: addr, SizeBytes: size}
 }
@@ -46,7 +44,6 @@ func newMemoryRegions(t *testing.T) (*backends.MemoryRegions, string, string) {
 	t.Setenv("GPU_CR_CTL_PATH", "")
 	t.Setenv("GPU_CR_GROUP_STORE", "")
 	mr := backends.NewMemoryRegions()
-	mr.SetLookPath(func(string) (string, error) { return testCrClient, nil })
 	return mr, ctlDir, filepath.Join(ctlDir, "groups")
 }
 
@@ -185,8 +182,8 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 			writePidMap(t, ctlDir, "123", "42")
 			var calledArgs [][]string
 			mr.SetExecCommand(func(_ context.Context, name string, args ...string) ([]byte, error) {
-				if name != testCrClient {
-					t.Errorf("exec binary = %q, want %q", name, testCrClient)
+				if name != backends.CrClientPath {
+					t.Errorf("exec binary = %q, want %q", name, backends.CrClientPath)
 				}
 				calledArgs = append(calledArgs, args)
 				return nil, tt.execErr
@@ -263,8 +260,8 @@ func TestMemoryRegionsRestore(t *testing.T) {
 			}
 			var calledArgs [][]string
 			mr.SetExecCommand(func(_ context.Context, name string, args ...string) ([]byte, error) {
-				if name != testCrClient {
-					t.Errorf("exec binary = %q, want %q", name, testCrClient)
+				if name != backends.CrClientPath {
+					t.Errorf("exec binary = %q, want %q", name, backends.CrClientPath)
 				}
 				calledArgs = append(calledArgs, args)
 				return nil, tt.execErr
@@ -372,21 +369,21 @@ func TestMemoryRegionsPidResolution(t *testing.T) {
 			wantID: "77",
 		},
 		{
-			name: "CtlDirConsultedBeforeDataDir",
+			// The data dir is not a pid_map location: with the ctl tmpfs
+			// configured, a map file on the data mount — even a valid-looking
+			// one — must be ignored, not read as a fallback.
+			name: "DataDirMapIgnoredWhenCtlTmpfsSet",
 			setup: func(t *testing.T, _ *backends.MemoryRegions, ctlDir string) {
 				t.Helper()
 				tmpfsDir := t.TempDir()
 				t.Setenv("GPU_CR_CTL_PATH", tmpfsDir)
-				// Stale/empty map in the data dir, good map on the ctl tmpfs.
-				if err := os.WriteFile(filepath.Join(ctlDir, "pid_map_123"), nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
+				writePidMap(t, ctlDir, "123", "55") // stale map on the data mount
 				writePidMap(t, tmpfsDir, "123", "91")
 			},
 			wantID: "91",
 		},
 		{
-			name: "EmptyPidMapFallsBackToProcMaps", // older preloaders leave an empty file
+			name: "EmptyPidMapFallsBackToProcMaps", // lost bookkeeping, mapping is kernel truth
 			setup: func(t *testing.T, mr *backends.MemoryRegions, ctlDir string) {
 				t.Helper()
 				if err := os.WriteFile(filepath.Join(ctlDir, "pid_map_123"), nil, 0o600); err != nil {
@@ -475,17 +472,17 @@ func TestMemoryRegionsSnapshotOwnersMeta(t *testing.T) {
 func TestMemoryRegionsHealthCheck(t *testing.T) {
 	tests := []struct {
 		name        string
-		lookErr     error
+		statErr     error
 		expectedErr bool
 	}{
 		{
 			name:        "Installed",
-			lookErr:     nil,
+			statErr:     nil,
 			expectedErr: false,
 		},
 		{
 			name:        "Missing",
-			lookErr:     fmt.Errorf("not in PATH"),
+			statErr:     fmt.Errorf("no stat"),
 			expectedErr: true,
 		},
 	}
@@ -493,11 +490,14 @@ func TestMemoryRegionsHealthCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mr := backends.NewMemoryRegions()
-			mr.SetLookPath(func(string) (string, error) {
-				if tt.lookErr != nil {
-					return "", tt.lookErr
+			mr.SetStatFunc(func(path string) (os.FileInfo, error) {
+				if path != backends.CrClientPath {
+					t.Errorf("stat path = %q, want %q", path, backends.CrClientPath)
 				}
-				return testCrClient, nil
+				if tt.statErr != nil {
+					return nil, tt.statErr
+				}
+				return os.Stat(".")
 			})
 
 			err := mr.HealthCheck(context.Background())

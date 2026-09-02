@@ -82,16 +82,6 @@ func GroupStoreDir() string {
 	return filepath.Join(DataDir(), "groups")
 }
 
-// SnapshotStoreDir returns where LEGACY snapshot slot copies were kept
-// (agent-side copies made before destination-path dumps). Only GC still
-// looks here, to reap leftovers from older agents.
-func SnapshotStoreDir(ctlDir string) string {
-	if d := os.Getenv("SNAPSHOT_DIR"); d != "" {
-		return d
-	}
-	return filepath.Join(ctlDir, "snapshots")
-}
-
 // GroupMetaName is the per-slot metadata file recording the owning workload
 // processes of a slot: "pid starttime" per line. GC deletes a slot only when
 // every recorded owner is gone (dead, or its PID recycled to a different
@@ -145,8 +135,6 @@ func sweep(dataDir string) {
 	StoreMu.Lock()
 	sweepGroupStore(time.Now())
 	StoreMu.Unlock()
-
-	sweepLegacySnapshotStore(dataDir, time.Now())
 }
 
 func sweepDataDir(dir string) {
@@ -396,39 +384,6 @@ func parseGroupMeta(path string) (map[string]int64, error) {
 		owners[fields[0]] = st
 	}
 	return owners, nil
-}
-
-// sweepLegacySnapshotStore drops legacy snapshot COPY dirs untouched
-// for longer than SNAPSHOT_TTL_HOURS (default 6). Those were copies — the
-// authoritative bytes lived in the dump buffer — so a TTL is safe there.
-func sweepLegacySnapshotStore(ctlDir string, now time.Time) {
-	ttl := 6 * time.Hour
-	if v := os.Getenv("SNAPSHOT_TTL_HOURS"); v != "" {
-		if n, err := time.ParseDuration(v + "h"); err == nil && n > 0 {
-			ttl = n
-		}
-	}
-	snapDir := SnapshotStoreDir(ctlDir)
-	if snapDir == GroupStoreDir() {
-		return // misconfiguration guard: never TTL the destination store
-	}
-	entries, err := os.ReadDir(snapDir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil || now.Sub(info.ModTime()) < ttl {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(snapDir, e.Name())); err == nil {
-			slog.Info("GC: removed expired legacy snapshot copies",
-				"slot", e.Name(), "age", now.Sub(info.ModTime()).Round(time.Minute).String())
-		}
-	}
 }
 
 // procfsRoot is the procfs mount scanned for live mappings; a var so tests
