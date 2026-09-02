@@ -8,8 +8,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"gotest.tools/v3/assert"
 )
 
 // deadPID is a PID that will not exist on any test host (max pid is
@@ -21,21 +19,42 @@ func hasProcfs() bool {
 	return err == nil
 }
 
+// writeAged creates a GC-candidate file, backdated past gcMinAge when aged.
+func writeAged(t *testing.T, dir, name string, aged bool) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s): %v", name, err)
+	}
+	if aged {
+		old := time.Now().Add(-time.Hour)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("Chtimes(%s): %v", name, err)
+		}
+	}
+}
+
+func assertGone(t *testing.T, dir, name string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+		t.Errorf("%s should have been removed (stat err: %v)", name, err)
+	}
+}
+
+func assertKept(t *testing.T, dir, name string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+		t.Errorf("%s should have been kept: %v", name, err)
+	}
+}
+
 func TestGCFilePatterns(t *testing.T) {
-	type testCase struct {
+	tests := []struct {
 		name      string
 		file      string
 		dumpMatch bool
 		pidMatch  bool
-	}
-
-	run := func(t *testing.T, tc testCase) {
-		t.Helper()
-		assert.Equal(t, isDumpFile(tc.file), tc.dumpMatch, "isDumpFile")
-		assert.Equal(t, pidFileRe.MatchString(tc.file), tc.pidMatch, "pidFileRe")
-	}
-
-	testCases := []testCase{
+	}{
 		{name: "dump id", file: "123", dumpMatch: true},
 		{name: "host staging", file: "123-host", dumpMatch: true},
 		{name: "file-backend dump", file: "ckpt-123.data", dumpMatch: true},
@@ -51,31 +70,16 @@ func TestGCFilePatterns(t *testing.T) {
 		{name: "non-numeric id", file: "abc-host"},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) { run(t, tc) })
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDumpFile(tc.file); got != tc.dumpMatch {
+				t.Errorf("isDumpFile(%q) = %v, want %v", tc.file, got, tc.dumpMatch)
+			}
+			if got := pidFileRe.MatchString(tc.file); got != tc.pidMatch {
+				t.Errorf("pidFileRe.MatchString(%q) = %v, want %v", tc.file, got, tc.pidMatch)
+			}
+		})
 	}
-}
-
-func writeAged(t *testing.T, dir, name string, aged bool) {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	assert.NilError(t, os.WriteFile(path, []byte("x"), 0o600))
-	if aged {
-		old := time.Now().Add(-time.Hour)
-		assert.NilError(t, os.Chtimes(path, old, old))
-	}
-}
-
-func assertGone(t *testing.T, dir, name string) {
-	t.Helper()
-	_, err := os.Stat(filepath.Join(dir, name))
-	assert.Assert(t, os.IsNotExist(err), "%s should have been removed", name)
-}
-
-func assertKept(t *testing.T, dir, name string) {
-	t.Helper()
-	_, err := os.Stat(filepath.Join(dir, name))
-	assert.NilError(t, err, "%s should have been kept", name)
 }
 
 func TestSweep(t *testing.T) {
@@ -94,7 +98,9 @@ func TestSweep(t *testing.T) {
 	// scan must match by inode, never by name.
 	fakeProc := t.TempDir()
 	pidDir := filepath.Join(fakeProc, "1")
-	assert.NilError(t, os.MkdirAll(pidDir, 0o755))
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	oldRoot := procfsRoot
 	procfsRoot = fakeProc
 	defer func() { procfsRoot = oldRoot }()
@@ -120,7 +126,9 @@ func TestSweep(t *testing.T) {
 
 	mapsLines := mapsEntry(t, filepath.Join(ctl, "789"), "/workload/ns/buf0") +
 		mapsEntry(t, filepath.Join(ctl, "ckpt-790.data"), "/workload/ns/buf1")
-	assert.NilError(t, os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLines), 0o600))
+	if err := os.WriteFile(filepath.Join(pidDir, "maps"), []byte(mapsLines), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	sweep(ctl)
 
@@ -141,8 +149,8 @@ func TestSweep(t *testing.T) {
 	}
 }
 
-// TestSweepCtlDir covers the GEP-0006 second sweep target: per-PID control
-// plane files on the ctl tmpfs, swept with the shorter ctlMinAge.
+// TestSweepCtlDir covers the second sweep target: per-PID control-plane
+// files on the ctl tmpfs, swept with the shorter ctlMinAge.
 func TestSweepCtlDir(t *testing.T) {
 	data := t.TempDir()
 	ctl := t.TempDir()
@@ -176,39 +184,62 @@ func TestPidGoneStarttime(t *testing.T) {
 	dir := t.TempDir()
 	pid := strconv.Itoa(os.Getpid())
 	st, err := ProcStarttime(pid)
-	assert.NilError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	stale := filepath.Join(dir, "ctl-ready-"+pid)
-	assert.NilError(t, os.WriteFile(stale, []byte(fmt.Sprintf("pid=%s starttime=%d\n", pid, st+1)), 0o600))
-	assert.Assert(t, pidGone(pid, stale), "mismatched starttime must mark the advertisement stale")
+	if err := os.WriteFile(stale, []byte(fmt.Sprintf("pid=%s starttime=%d\n", pid, st+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !pidGone(pid, stale) {
+		t.Error("mismatched starttime must mark the advertisement stale")
+	}
 
 	current := filepath.Join(dir, "ctl-ready-"+pid)
-	assert.NilError(t, os.WriteFile(current, []byte(fmt.Sprintf("pid=%s starttime=%d\n", pid, st)), 0o600))
-	assert.Assert(t, !pidGone(pid, current), "matching starttime must keep the advertisement")
+	if err := os.WriteFile(current, []byte(fmt.Sprintf("pid=%s starttime=%d\n", pid, st)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if pidGone(pid, current) {
+		t.Error("matching starttime must keep the advertisement")
+	}
 
 	// Files without an advertised starttime fall back to plain liveness.
 	plain := filepath.Join(dir, "control-"+pid)
-	assert.NilError(t, os.WriteFile(plain, []byte("x"), 0o600))
-	assert.Assert(t, !pidGone(pid, plain))
-	assert.Assert(t, pidGone(deadPID, filepath.Join(dir, "control-"+deadPID)))
+	if err := os.WriteFile(plain, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if pidGone(pid, plain) {
+		t.Error("live pid without advertisement must be kept")
+	}
+	if !pidGone(deadPID, filepath.Join(dir, "control-"+deadPID)) {
+		t.Error("dead pid must be reported gone")
+	}
 }
 
 func TestAdvertisedStarttime(t *testing.T) {
 	dir := t.TempDir()
 
 	good := filepath.Join(dir, "ctl-ready-1")
-	assert.NilError(t, os.WriteFile(good, []byte("pid=1 starttime=42 uid=0\n"), 0o600))
+	if err := os.WriteFile(good, []byte("pid=1 starttime=42 uid=0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	st, ok := advertisedStarttime(good)
-	assert.Assert(t, ok)
-	assert.Equal(t, st, int64(42))
+	if !ok || st != 42 {
+		t.Errorf("advertisedStarttime() = %d, %v, want 42, true", st, ok)
+	}
 
 	bad := filepath.Join(dir, "ctl-ready-2")
-	assert.NilError(t, os.WriteFile(bad, []byte("no starttime here\n"), 0o600))
-	_, ok = advertisedStarttime(bad)
-	assert.Assert(t, !ok)
+	if err := os.WriteFile(bad, []byte("no starttime here\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := advertisedStarttime(bad); ok {
+		t.Error("file without starttime must not parse")
+	}
 
-	_, ok = advertisedStarttime(filepath.Join(dir, "missing"))
-	assert.Assert(t, !ok)
+	if _, ok := advertisedStarttime(filepath.Join(dir, "missing")); ok {
+		t.Error("missing file must not parse")
+	}
 }
 
 // TestSweepGroupStore covers the owner-liveness reap of destination slots:
@@ -225,13 +256,19 @@ func TestSweepGroupStore(t *testing.T) {
 	makeGroup := func(name, meta string, aged bool) {
 		t.Helper()
 		dir := filepath.Join(store, name)
-		assert.NilError(t, os.MkdirAll(dir, 0o755))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
 		if meta != "" {
-			assert.NilError(t, os.WriteFile(filepath.Join(dir, GroupMetaName), []byte(meta), 0o600))
+			if err := os.WriteFile(filepath.Join(dir, GroupMetaName), []byte(meta), 0o600); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if aged {
 			old := time.Now().Add(-2 * time.Hour) // default grace is 1h
-			assert.NilError(t, os.Chtimes(dir, old, old))
+			if err := os.Chtimes(dir, old, old); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 
@@ -242,7 +279,9 @@ func TestSweepGroupStore(t *testing.T) {
 	if hasProcfs() {
 		pid := strconv.Itoa(os.Getpid())
 		st, err := ProcStarttime(pid)
-		assert.NilError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		makeGroup("live-owner", fmt.Sprintf("%s %d\n", pid, st), true) // live owner -> kept
 	}
 
@@ -257,6 +296,85 @@ func TestSweepGroupStore(t *testing.T) {
 	}
 }
 
+// TestSweepGroupStoreMetaFallback: on a hugetlbfs group store the in-slot
+// .owners is an unwritable 0-byte stub and the real metadata lives on the
+// ctl tmpfs. The sweeper must read owners through the fallback, delete the
+// slot when they are all dead, drop the fallback file with it, and reap
+// orphaned fallback files whose slot is already gone.
+func TestSweepGroupStoreMetaFallback(t *testing.T) {
+	data := t.TempDir()
+	ctl := t.TempDir()
+	t.Setenv("EXPORT_FILE_PATH", data)
+	t.Setenv("GPU_CR_CTL_PATH", ctl)
+	t.Setenv("GPU_CR_GROUP_STORE", "")
+	t.Setenv("GPU_CR_GROUP_GRACE_HOURS", "")
+	store := filepath.Join(data, "groups")
+
+	makeSlot := func(name, fallbackMeta string, aged bool) string {
+		t.Helper()
+		dir := filepath.Join(store, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// 0-byte in-slot stub, as left behind by a failed write(2).
+		if err := os.WriteFile(filepath.Join(dir, GroupMetaName), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if fallbackMeta != "" {
+			if err := os.WriteFile(GroupMetaFallbackPath(dir), []byte(fallbackMeta), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if aged {
+			old := time.Now().Add(-2 * time.Hour)
+			if err := os.Chtimes(dir, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+
+	deadDir := makeSlot("dead-owner", deadPID+" 123\n", true)
+	makeSlot("stub-only", "", true) // no metadata anywhere -> kept
+	freshDir := makeSlot("fresh", deadPID+" 123\n", false)
+
+	// The reader must see the fallback owners through the empty stub.
+	owners, err := ReadGroupMeta(deadDir)
+	if err != nil {
+		t.Fatalf("ReadGroupMeta(): %v", err)
+	}
+	if len(owners) != 1 {
+		t.Fatalf("ReadGroupMeta() = %v, want the one fallback owner", owners)
+	}
+
+	orphan := filepath.Join(ctl, "owners-long-gone")
+	if err := os.WriteFile(orphan, []byte(deadPID+" 123\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(ctl, "pid_map_123")
+	if err := os.WriteFile(unrelated, []byte("42\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepGroupStore(time.Now())
+
+	assertGone(t, store, "dead-owner")
+	assertKept(t, store, "stub-only")
+	assertKept(t, store, "fresh")
+	if _, err := os.Stat(GroupMetaFallbackPath(deadDir)); !os.IsNotExist(err) {
+		t.Errorf("dead slot's fallback meta must go with it (stat err: %v)", err)
+	}
+	if _, err := os.Stat(GroupMetaFallbackPath(freshDir)); err != nil {
+		t.Errorf("kept slot's fallback meta must stay: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("orphaned fallback meta must be reaped (stat err: %v)", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("non-owners ctl files are not this sweep's business: %v", err)
+	}
+}
+
 func TestSweepLegacySnapshotStore(t *testing.T) {
 	ctl := t.TempDir()
 	snap := t.TempDir()
@@ -266,17 +384,21 @@ func TestSweepLegacySnapshotStore(t *testing.T) {
 
 	oldDir := filepath.Join(snap, "expired-slot")
 	freshDir := filepath.Join(snap, "fresh-slot")
-	assert.NilError(t, os.MkdirAll(oldDir, 0o755))
-	assert.NilError(t, os.MkdirAll(freshDir, 0o755))
+	if err := os.MkdirAll(oldDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(freshDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	stale := time.Now().Add(-7 * time.Hour) // default TTL is 6h
-	assert.NilError(t, os.Chtimes(oldDir, stale, stale))
+	if err := os.Chtimes(oldDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
 
 	sweepLegacySnapshotStore(ctl, time.Now())
 
-	_, err := os.Stat(oldDir)
-	assert.Assert(t, os.IsNotExist(err), "expired slot should be removed")
-	_, err = os.Stat(freshDir)
-	assert.NilError(t, err, "fresh slot should be kept")
+	assertGone(t, snap, "expired-slot")
+	assertKept(t, snap, "fresh-slot")
 }
 
 // TestSweepLegacySnapshotStoreMisconfigGuard: if SNAPSHOT_DIR is pointed at
@@ -290,9 +412,13 @@ func TestSweepLegacySnapshotStoreMisconfigGuard(t *testing.T) {
 	t.Setenv("SNAPSHOT_DIR", store)
 
 	dir := filepath.Join(store, "parked-group")
-	assert.NilError(t, os.MkdirAll(dir, 0o755))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	stale := time.Now().Add(-100 * time.Hour)
-	assert.NilError(t, os.Chtimes(dir, stale, stale))
+	if err := os.Chtimes(dir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
 
 	sweepLegacySnapshotStore(data, time.Now())
 
@@ -312,7 +438,9 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 
 	fakeProc := t.TempDir()
 	pidDir := filepath.Join(fakeProc, "42")
-	assert.NilError(t, os.MkdirAll(pidDir, 0o755))
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	// A self-referencing symlink makes ReadFile fail with ELOOP — neither
 	// IsNotExist nor ESRCH, so the scan must report incomplete.
 	loop := filepath.Join(pidDir, "maps")
@@ -323,8 +451,9 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 	procfsRoot = fakeProc
 	defer func() { procfsRoot = oldRoot }()
 
-	_, complete := liveMappedInodes()
-	assert.Assert(t, !complete, "scan must report incomplete on unreadable maps file")
+	if _, complete := liveMappedInodes(); complete {
+		t.Fatal("liveMappedInodes() reported a complete scan despite an unreadable maps file")
+	}
 
 	writeAged(t, ctl, "123", true)              // stale dump, but scan incomplete -> kept
 	writeAged(t, ctl, "ckpt-123.data", true)    // file-backend dump, same protection -> kept
@@ -342,13 +471,16 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 // scan stays complete.
 func TestLiveMappedInodesExitedProcess(t *testing.T) {
 	fakeProc := t.TempDir()
-	assert.NilError(t, os.MkdirAll(filepath.Join(fakeProc, "7"), 0o755))
+	if err := os.MkdirAll(filepath.Join(fakeProc, "7"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	oldRoot := procfsRoot
 	procfsRoot = fakeProc
 	defer func() { procfsRoot = oldRoot }()
 
-	_, complete := liveMappedInodes()
-	assert.Assert(t, complete, "missing maps file (exited process) must not mark the scan incomplete")
+	if _, complete := liveMappedInodes(); !complete {
+		t.Error("missing maps file (exited process) must not mark the scan incomplete")
+	}
 }
 
 // mapsEntry renders a /proc/<pid>/maps line for path from its real
@@ -356,67 +488,10 @@ func TestLiveMappedInodesExitedProcess(t *testing.T) {
 func mapsEntry(t *testing.T, path, nsPath string) string {
 	t.Helper()
 	var st syscall.Stat_t
-	assert.NilError(t, syscall.Stat(path, &st))
+	if err := syscall.Stat(path, &st); err != nil {
+		t.Fatal(err)
+	}
 	nums := devMajMin(st.Dev)
 	return fmt.Sprintf("7f0000000000-7f0000200000 rw-s 00000000 %02x:%02x %d %s\n",
 		nums.major, nums.minor, st.Ino, nsPath)
-}
-
-func TestSweepGroupStoreMetaFallback(t *testing.T) {
-	// Hugetlbfs group store: the in-slot .owners is an unwritable 0-byte
-	// stub and the real metadata lives on the ctl tmpfs. The sweeper must
-	// read owners through the fallback, delete the slot when they are all
-	// dead, drop the fallback file with it, and reap orphaned fallback
-	// files whose slot is already gone.
-	data := t.TempDir()
-	ctl := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", data)
-	t.Setenv("GPU_CR_CTL_PATH", ctl)
-	t.Setenv("GPU_CR_GROUP_STORE", "")
-	t.Setenv("GPU_CR_GROUP_GRACE_HOURS", "")
-	store := filepath.Join(data, "groups")
-
-	makeSlot := func(name, fallbackMeta string, aged bool) string {
-		t.Helper()
-		dir := filepath.Join(store, name)
-		assert.NilError(t, os.MkdirAll(dir, 0o755))
-		// 0-byte in-slot stub, as left behind by a failed write(2).
-		assert.NilError(t, os.WriteFile(filepath.Join(dir, GroupMetaName), nil, 0o600))
-		if fallbackMeta != "" {
-			assert.NilError(t, os.WriteFile(GroupMetaFallbackPath(dir), []byte(fallbackMeta), 0o600))
-		}
-		if aged {
-			old := time.Now().Add(-2 * time.Hour)
-			assert.NilError(t, os.Chtimes(dir, old, old))
-		}
-		return dir
-	}
-
-	deadDir := makeSlot("dead-owner", deadPID+" 123\n", true)
-	makeSlot("stub-only", "", true) // no metadata anywhere -> kept
-	freshDir := makeSlot("fresh", deadPID+" 123\n", false)
-
-	// The reader must see the fallback owners through the empty stub.
-	owners, err := ReadGroupMeta(deadDir)
-	assert.NilError(t, err)
-	assert.Equal(t, len(owners), 1)
-
-	orphan := filepath.Join(ctl, "owners-long-gone")
-	assert.NilError(t, os.WriteFile(orphan, []byte(deadPID+" 123\n"), 0o600))
-	unrelated := filepath.Join(ctl, "pid_map_123")
-	assert.NilError(t, os.WriteFile(unrelated, []byte("42\n"), 0o600))
-
-	sweepGroupStore(time.Now())
-
-	assertGone(t, store, "dead-owner")
-	assertKept(t, store, "stub-only")
-	assertKept(t, store, "fresh")
-	_, err = os.Stat(GroupMetaFallbackPath(deadDir))
-	assert.Assert(t, os.IsNotExist(err), "dead slot's fallback meta must go with it")
-	_, err = os.Stat(GroupMetaFallbackPath(freshDir))
-	assert.NilError(t, err, "kept slot's fallback meta must stay")
-	_, err = os.Stat(orphan)
-	assert.Assert(t, os.IsNotExist(err), "orphaned fallback meta must be reaped")
-	_, err = os.Stat(unrelated)
-	assert.NilError(t, err, "non-owners ctl files are not this sweep's business")
 }
