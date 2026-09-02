@@ -372,21 +372,21 @@ func TestMemoryRegionsPidResolution(t *testing.T) {
 			wantID: "77",
 		},
 		{
-			name: "CtlDirConsultedBeforeDataDir",
+			// The data dir is not a pid_map location: with the ctl tmpfs
+			// configured, a map file on the data mount — even a valid-looking
+			// one — must be ignored, not read as a fallback.
+			name: "DataDirMapIgnoredWhenCtlTmpfsSet",
 			setup: func(t *testing.T, _ *backends.MemoryRegions, ctlDir string) {
 				t.Helper()
 				tmpfsDir := t.TempDir()
 				t.Setenv("GPU_CR_CTL_PATH", tmpfsDir)
-				// Stale/empty map in the data dir, good map on the ctl tmpfs.
-				if err := os.WriteFile(filepath.Join(ctlDir, "pid_map_123"), nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
+				writePidMap(t, ctlDir, "123", "55") // stale map on the data mount
 				writePidMap(t, tmpfsDir, "123", "91")
 			},
 			wantID: "91",
 		},
 		{
-			name: "EmptyPidMapFallsBackToProcMaps", // older preloaders leave an empty file
+			name: "EmptyPidMapFallsBackToProcMaps", // lost bookkeeping, mapping is kernel truth
 			setup: func(t *testing.T, mr *backends.MemoryRegions, ctlDir string) {
 				t.Helper()
 				if err := os.WriteFile(filepath.Join(ctlDir, "pid_map_123"), nil, 0o600); err != nil {

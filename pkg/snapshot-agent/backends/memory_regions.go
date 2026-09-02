@@ -39,7 +39,6 @@ import (
 //	                        pid_map_<pid>, ctl-ready-<pid>); unset = legacy
 //	                        layout sharing the data dir
 //	GPU_CR_GROUP_STORE      destination store override (default <data>/groups)
-//	SNAPSHOT_DIR            LEGACY copy store; only GC reads it
 //	GPU_CR_OP_TIMEOUT_SEC   per-cr_client-invocation timeout (default 120)
 type MemoryRegions struct {
 	mu          sync.Mutex
@@ -374,17 +373,16 @@ func (g *MemoryRegions) resolveOrInit(ctx context.Context, pid string) (string, 
 
 // resolvePidToID maps a workload PID to its GPU-CR dump-buffer id.
 func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
-	// pid_map lives in the ctl dir when the control plane has its own tmpfs
-	// (and is non-empty there: the preloader writes it with write(2)). Check
-	// the legacy data dir too for workloads on the shared-dir layout.
+	// pid_map lives in the ctl dir: the supported preloaders write it there
+	// with write(2), so it is non-empty on the ctl tmpfs. When
+	// GPU_CR_CTL_PATH is unset, ctlFilesDir() already resolves to the data
+	// dir, so the shared-dir configuration needs no second lookup.
 	var lastErr error
-	for _, dir := range []string{ctlFilesDir(), utils.DataDir()} {
-		mapPath := filepath.Join(dir, fmt.Sprintf("pid_map_%s", pid))
-		data, err := os.ReadFile(mapPath)
-		if err != nil {
-			lastErr = err
-			continue
-		}
+	mapPath := filepath.Join(ctlFilesDir(), fmt.Sprintf("pid_map_%s", pid))
+	data, err := os.ReadFile(mapPath)
+	if err != nil {
+		lastErr = err
+	} else {
 		// Strip NULs as well as whitespace: an mmap-written map file is
 		// hugepage-sized with a zero-padded tail.
 		id := strings.TrimSpace(strings.TrimRight(string(data), "\x00"))
@@ -393,9 +391,9 @@ func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
 		}
 	}
 
-	// Fallback: older preloaders wrote pid_map via buffered stdio, which
-	// silently produces an empty file on hugetlbfs. The dump buffer mapping
-	// is visible in /proc/<pid>/maps and its basename IS the id.
+	// Fallback for lost or damaged bookkeeping (e.g. a ctl tmpfs recreated
+	// under live workloads): the dump buffer mapping is visible in
+	// /proc/<pid>/maps and its basename IS the id.
 	id, ferr := idFromProcMaps(g.procRoot, pid)
 	if ferr != nil {
 		readProblem := "contents are not a numeric id"
