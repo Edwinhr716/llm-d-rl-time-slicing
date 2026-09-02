@@ -43,7 +43,7 @@ import (
 type MemoryRegions struct {
 	mu          sync.Mutex
 	execCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
-	lookPath    func(string) (string, error)
+	statFunc    func(string) (os.FileInfo, error)
 	// procRoot is "/proc" in production; injectable for tests.
 	procRoot string
 }
@@ -54,7 +54,7 @@ func NewMemoryRegions() *MemoryRegions {
 		execCommand: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
-		lookPath: exec.LookPath,
+		statFunc: os.Stat,
 		procRoot: "/proc",
 	}
 }
@@ -294,34 +294,15 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 	return nil
 }
 
-// HealthCheck reports whether the cr_client binary is resolvable, so
-// grpc.health.v1.Health/Check with service "memory-regions" reflects backend
-// readiness (an agent image built without cr_client reports NOT_SERVING).
+// HealthCheck reports whether the cr_client binary is present at its fixed
+// install location, so grpc.health.v1.Health/Check with service
+// "memory-regions" reflects backend readiness (an agent image built without
+// cr_client reports NOT_SERVING).
 func (g *MemoryRegions) HealthCheck(ctx context.Context) error {
-	binaryPath := g.getCrClientPath()
-	if _, err := g.lookPath(binaryPath); err != nil {
-		return fmt.Errorf("cr_client executable not found: %w", err)
+	if _, err := g.statFunc(crClientPath); err != nil {
+		return fmt.Errorf("cr_client not found at %s: %w", crClientPath, err)
 	}
 	return nil
-}
-
-func (g *MemoryRegions) getCrClientPath() string {
-	candidates := []string{
-		"cr_client",
-		"/usr/bin/cr_client",
-		"/bin/cr_client",
-		"/opt/bin/cr_client",
-		"/usr/local/bin/cr_client",
-	}
-	for _, p := range candidates {
-		if path, err := g.lookPath(p); err == nil {
-			return path
-		}
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return "/usr/local/bin/cr_client"
 }
 
 func (g *MemoryRegions) runCommand(ctx context.Context, name string, args ...string) error {
@@ -334,8 +315,7 @@ func (g *MemoryRegions) runCommand(ctx context.Context, name string, args ...str
 func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec, dest string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
-	binaryPath := g.getCrClientPath()
-	if err := g.runCommand(ctx, binaryPath, "-c", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
+	if err := g.runCommand(ctx, crClientPath, "-c", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
 		return fmt.Errorf("cr_client checkpoint (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
@@ -344,8 +324,7 @@ func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec, 
 func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec, dest string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
-	binaryPath := g.getCrClientPath()
-	if err := g.runCommand(ctx, binaryPath, "-r", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
+	if err := g.runCommand(ctx, crClientPath, "-r", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
 		return fmt.Errorf("cr_client restore (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
@@ -366,7 +345,7 @@ func (g *MemoryRegions) ensureIDForPid(ctx context.Context, pid string) (string,
 	slog.InfoContext(ctx, "PID not resolvable yet; driving preloader init via cr_client -i", "pid", pid)
 	ictx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
-	if ierr := g.runCommand(ictx, g.getCrClientPath(), "-i", "-p", pid); ierr != nil {
+	if ierr := g.runCommand(ictx, crClientPath, "-i", "-p", pid); ierr != nil {
 		return "", fmt.Errorf("preloader init failed: %w (original resolve error: %w)", ierr, err)
 	}
 	return g.resolvePidToID(pid)

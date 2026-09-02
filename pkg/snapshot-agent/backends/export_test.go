@@ -40,8 +40,8 @@ func (g *MemoryRegions) SetExecCommand(f func(ctx context.Context, name string, 
 	g.execCommand = f
 }
 
-func (g *MemoryRegions) SetLookPath(f func(string) (string, error)) {
-	g.lookPath = f
+func (g *MemoryRegions) SetStatFunc(f func(string) (os.FileInfo, error)) {
+	g.statFunc = f
 }
 
 func (g *MemoryRegions) SetProcRoot(dir string) {
