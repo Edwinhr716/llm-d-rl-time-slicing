@@ -62,6 +62,39 @@ class TestMemoryRegionValidation(unittest.TestCase):
             with self.assertRaises(ValueError):
                 MemoryRegion(pid=1, address=1, size_bytes=size_bytes)
 
+    def test_accepts_wire_format_maxima(self):
+        """The largest representable values (int32 pid, uint64 fields) pass."""
+        region = MemoryRegion(pid=2**31 - 1, address=2**64 - 1, size_bytes=2**64 - 1)
+        self.assertEqual(region.pid, 2**31 - 1)
+        self.assertEqual(region.address, 2**64 - 1)
+        self.assertEqual(region.size_bytes, 2**64 - 1)
+
+    def test_rejects_pid_above_int32(self):
+        with self.assertRaises(ValueError):
+            MemoryRegion(pid=2**31, address=1, size_bytes=1)
+
+    def test_rejects_address_above_uint64(self):
+        with self.assertRaises(ValueError):
+            MemoryRegion(pid=1, address=2**64, size_bytes=1)
+
+    def test_rejects_size_above_uint64(self):
+        with self.assertRaises(ValueError):
+            MemoryRegion(pid=1, address=1, size_bytes=2**64)
+
+    def test_rejects_non_integer_fields(self):
+        """Non-int values (including bool, an int subclass) are a TypeError."""
+        for kwargs in (
+            {"pid": 1.5, "address": 1, "size_bytes": 1},
+            {"pid": "1", "address": 1, "size_bytes": 1},
+            {"pid": True, "address": 1, "size_bytes": 1},
+            {"pid": 1, "address": 1.0, "size_bytes": 1},
+            {"pid": 1, "address": True, "size_bytes": 1},
+            {"pid": 1, "address": 1, "size_bytes": "1024"},
+            {"pid": 1, "address": 1, "size_bytes": True},
+        ):
+            with self.assertRaises(TypeError):
+                MemoryRegion(**kwargs)
+
 
 class TestMemoryRegionsConfig(unittest.TestCase):
     def test_builds_config_from_dataclasses(self):

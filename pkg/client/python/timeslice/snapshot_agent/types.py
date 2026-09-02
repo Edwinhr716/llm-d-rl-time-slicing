@@ -1,6 +1,12 @@
 from dataclasses import dataclass
 from typing import List, Optional
 
+# Wire-format bounds: MemoryRegion.pid is an int32, address and size_bytes
+# are uint64 (see snapshot_agent.proto). Checked here so callers get a
+# clear error at construction rather than at protobuf assignment.
+_INT32_MAX = 2**31 - 1
+_UINT64_MAX = 2**64 - 1
+
 
 @dataclass(frozen=True)
 class MemoryRegion:
@@ -16,15 +22,28 @@ class MemoryRegion:
     size_bytes: int
 
     def __post_init__(self):
-        if self.pid <= 0:
-            raise ValueError(f"memory region pid must be positive, got {self.pid}")
-        if self.address < 0:
+        for name, value in (
+            ("pid", self.pid),
+            ("address", self.address),
+            ("size_bytes", self.size_bytes),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"memory region {name} must be an int, got {type(value).__name__}"
+                )
+        if not 0 < self.pid <= _INT32_MAX:
             raise ValueError(
-                f"memory region address must be non-negative, got {self.address}"
+                f"memory region pid must be positive and fit in int32, got {self.pid}"
             )
-        if self.size_bytes <= 0:
+        if not 0 <= self.address <= _UINT64_MAX:
             raise ValueError(
-                f"memory region size_bytes must be positive, got {self.size_bytes}"
+                "memory region address must be non-negative and fit in uint64, "
+                f"got {self.address}"
+            )
+        if not 0 < self.size_bytes <= _UINT64_MAX:
+            raise ValueError(
+                "memory region size_bytes must be positive and fit in uint64, "
+                f"got {self.size_bytes}"
             )
 
     @classmethod

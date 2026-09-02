@@ -178,7 +178,8 @@ def memory_regions_config(
     Accepts MemoryRegion dataclasses, (pid, address, size_bytes) tuples, or
     'pid:0xADDR:size' spec strings. Hex or decimal addresses are
     accepted; validation mirrors the agent's (non-empty regions, positive
-    pid and size).
+    pid and size) plus the wire-format bounds (int32 pid, uint64 address
+    and size).
 
     snapshot_name names the agent-side snapshot slot (defaults to the
     request's job_id server-side when empty). Use it — not the request's
