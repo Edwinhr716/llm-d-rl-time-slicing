@@ -6,6 +6,7 @@ from . import snapshot_agent_pb2
 
 
 def _process_target(pids: Sequence[int]) -> snapshot_agent_pb2.ProcessTarget:
+    """Validates pids and builds a ProcessTarget proto."""
     if not pids:
         raise ValueError("at least one PID is required")
     validated = []
@@ -52,37 +53,40 @@ def _tags(tags: Optional[Sequence[str]]) -> list:
     return tags
 
 
-def cuda_config(pids: Sequence[int]) -> snapshot_agent_pb2.BackendConfig:
-    """Builds a BackendConfig selecting the cuda (cuda-checkpoint) backend
-    with an explicit process target.
+def cuda_config(
+    pids: Optional[Sequence[int]] = None,
+) -> snapshot_agent_pb2.BackendConfig:
+    """Builds a BackendConfig selecting the cuda (cuda-checkpoint) backend.
 
-    In k8s mode the agent can discover PIDs itself from the
-    ``timeslice.io/job-id`` pod label; pass explicit PIDs for standalone
-    mode or to override discovery.
+    In k8s mode the agent discovers PIDs itself from the
+    ``timeslice.io/job-id`` pod label, so ``pids`` may be omitted. Pass
+    explicit PIDs for standalone mode or to override discovery.
     """
-    return snapshot_agent_pb2.BackendConfig(
-        cuda=snapshot_agent_pb2.CudaBackendConfig(explicit_target=_process_target(pids))
-    )
+    cuda = snapshot_agent_pb2.CudaBackendConfig()
+    if pids is not None:
+        cuda.explicit_target.CopyFrom(_process_target(pids))
+    return snapshot_agent_pb2.BackendConfig(cuda=cuda)
 
 
-def direct_memory_config(pids: Sequence[int]) -> snapshot_agent_pb2.BackendConfig:
+def direct_memory_config(
+    pids: Optional[Sequence[int]] = None,
+) -> snapshot_agent_pb2.BackendConfig:
     """Builds a BackendConfig selecting the direct_memory (GPU-CR
-    full-process) backend with an explicit process target.
+    full-process) backend.
 
     Experimental: the agent rejects this config with FAILED_PRECONDITION
     unless it runs with --feature-gates=DirectMemoryBackend=true (or the
     FEATURE_GATES env var). The target workload must run under the GPU-CR
     vGPU preloader.
 
-    In k8s mode the agent can discover PIDs itself from the
-    ``timeslice.io/job-id`` pod label; pass explicit PIDs for standalone
-    mode or to override discovery.
+    In k8s mode the agent discovers PIDs itself from the
+    ``timeslice.io/job-id`` pod label, so ``pids`` may be omitted. Pass
+    explicit PIDs for standalone mode or to override discovery.
     """
-    return snapshot_agent_pb2.BackendConfig(
-        direct_memory=snapshot_agent_pb2.DirectMemoryBackendConfig(
-            explicit_target=_process_target(pids)
-        )
-    )
+    direct_memory = snapshot_agent_pb2.DirectMemoryBackendConfig()
+    if pids is not None:
+        direct_memory.explicit_target.CopyFrom(_process_target(pids))
+    return snapshot_agent_pb2.BackendConfig(direct_memory=direct_memory)
 
 
 def app_endpoint_config(
