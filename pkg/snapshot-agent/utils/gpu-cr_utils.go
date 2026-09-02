@@ -30,10 +30,10 @@ import (
 //	<id>, <id>-host   the same pair in hugepage mode (EXPORT_FILE_PATH
 //	                  unset, hardcoded /mnt/huge-ckpt)
 //	control-<pid>     legacy control channel / v3 dual-flock lock files
-//	groups/<slot>/    destination dumps (GEP-0001) — the ONLY copy of each
+//	groups/<slot>/    destination dumps — the ONLY copy of each
 //	                  parked slot; reaped by owner-liveness, never blind TTL
 //
-// Ctl dir (tmpfs, GEP-0006; same dir as data when GPU_CR_CTL_PATH unset):
+// Ctl dir (tmpfs; same dir as data when GPU_CR_CTL_PATH unset):
 //
 //	control-<pid>, pid_map_<pid>, ctl-ready-<pid>
 var (
@@ -83,8 +83,8 @@ func GroupStoreDir() string {
 }
 
 // SnapshotStoreDir returns where LEGACY snapshot slot copies were kept
-// (pre-GEP-0001 agent-side copies). Only GC still looks here, to reap
-// leftovers from older agents.
+// (agent-side copies made before destination-path dumps). Only GC still
+// looks here, to reap leftovers from older agents.
 func SnapshotStoreDir(ctlDir string) string {
 	if d := os.Getenv("SNAPSHOT_DIR"); d != "" {
 		return d
@@ -231,7 +231,7 @@ func sweepPidFiles(dir string, minAge time.Duration) {
 // pidGone reports whether the PID a per-process file belongs to is gone.
 // For ctl-ready files the advertised starttime is compared too: a recycled
 // PID (alive, different starttime) makes the file stale even though
-// /proc/<pid> exists (GEP-0006 F3).
+// /proc/<pid> exists.
 func pidGone(pid, path string) bool {
 	cur, err := ProcStarttime(pid)
 	if err != nil {
@@ -270,7 +270,7 @@ func advertisedStarttime(path string) (int64, bool) {
 	return 0, false
 }
 
-// sweepGroupStore reaps destination-dump slots (GEP-0001). These are the
+// sweepGroupStore reaps destination-dump slots. These are the
 // SOLE copy of parked state, so deletion requires owner death, not a TTL:
 // a slot goes only when every owner recorded in .owners is dead or its PID
 // was recycled (starttime mismatch) — at that point the dump is
@@ -398,7 +398,7 @@ func parseGroupMeta(path string) (map[string]int64, error) {
 	return owners, nil
 }
 
-// sweepLegacySnapshotStore drops pre-GEP-0001 snapshot COPY dirs untouched
+// sweepLegacySnapshotStore drops legacy snapshot COPY dirs untouched
 // for longer than SNAPSHOT_TTL_HOURS (default 6). Those were copies — the
 // authoritative bytes lived in the dump buffer — so a TTL is safe there.
 func sweepLegacySnapshotStore(ctlDir string, now time.Time) {
