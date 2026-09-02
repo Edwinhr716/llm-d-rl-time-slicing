@@ -20,11 +20,11 @@ import (
 
 // MemoryRegions implements the Backend interface for selective checkpoint
 // and restore of explicit device-memory regions of a running process, using
-// the GPU-CR cr_client with destination-path dumps (GPU-CR GEP-0001/GEP-0006).
+// the GPU-CR cr_client with destination-path dumps.
 // Regions are provided by the caller through MemoryRegionsBackendConfig; the
 // backend performs no discovery.
 //
-// Since GEP-0001 GA the agent moves NO dump bytes itself: each snapshot is
+// The agent moves NO dump bytes itself: each snapshot is
 // written by the workload's preloader directly into a per-slot destination
 // file (cr_client -o), and each restore reads straight from it. The agent
 // only names files, pre-creates them (via cr_client), and garbage-collects —
@@ -35,11 +35,11 @@ import (
 //
 //	EXPORT_FILE_PATH        GPU-CR data dir: dump/staging buffers and the
 //	                        destination group store (default /mnt/huge-ckpt)
-//	GPU_CR_CTL_PATH         GEP-0006 control-plane tmpfs (control-<pid>,
+//	GPU_CR_CTL_PATH         control-plane tmpfs (control-<pid>,
 //	                        pid_map_<pid>, ctl-ready-<pid>); unset = legacy
 //	                        layout sharing the data dir
 //	GPU_CR_GROUP_STORE      destination store override (default <data>/groups)
-//	SNAPSHOT_DIR            LEGACY pre-GEP copy store; only GC reads it
+//	SNAPSHOT_DIR            LEGACY copy store; only GC reads it
 //	GPU_CR_OP_TIMEOUT_SEC   per-cr_client-invocation timeout (default 120)
 type MemoryRegions struct {
 	mu          sync.Mutex
@@ -61,7 +61,7 @@ func NewMemoryRegions() *MemoryRegions {
 }
 
 // ctlFilesDir is where the control plane lives: control-<pid>, pid_map_<pid>,
-// ctl-ready-<pid>. With GPU_CR_CTL_PATH set (GEP-0006) that's a tmpfs; unset
+// ctl-ready-<pid>. With GPU_CR_CTL_PATH set that's a tmpfs; unset
 // means the legacy layout where control files share the data dir.
 func ctlFilesDir() string {
 	if d := os.Getenv("GPU_CR_CTL_PATH"); d != "" {
@@ -374,9 +374,9 @@ func (g *MemoryRegions) resolveOrInit(ctx context.Context, pid string) (string, 
 
 // resolvePidToID maps a workload PID to its GPU-CR dump-buffer id.
 func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
-	// pid_map lives in the ctl dir since GEP-0006 (and is finally non-empty
-	// there: the preloader writes it with write(2) on tmpfs). Check the
-	// legacy data dir too for pre-GEP workloads.
+	// pid_map lives in the ctl dir when the control plane has its own tmpfs
+	// (and is non-empty there: the preloader writes it with write(2)). Check
+	// the legacy data dir too for workloads on the shared-dir layout.
 	var lastErr error
 	for _, dir := range []string{ctlFilesDir(), utils.DataDir()} {
 		mapPath := filepath.Join(dir, fmt.Sprintf("pid_map_%s", pid))
@@ -393,7 +393,7 @@ func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
 		}
 	}
 
-	// Fallback: pre-GEP preloaders wrote pid_map via buffered stdio, which
+	// Fallback: older preloaders wrote pid_map via buffered stdio, which
 	// silently produces an empty file on hugetlbfs. The dump buffer mapping
 	// is visible in /proc/<pid>/maps and its basename IS the id.
 	id, ferr := idFromProcMaps(g.procRoot, pid)
@@ -447,7 +447,7 @@ func idFromProcMaps(procRoot, pid string) (string, error) {
 // opTimeout bounds a single cr_client invocation. Without it, a workload
 // dying mid-operation leaves cr_client polling the shared-memory control file
 // forever and the job wedged in TRANSITIONING (observed in Phase 0).
-// cr_client now enforces the same deadline internally (GEP-0001); this is
+// cr_client now enforces the same deadline internally; this is
 // the outer belt to its braces.
 func opTimeout() time.Duration {
 	if v := os.Getenv("GPU_CR_OP_TIMEOUT_SEC"); v != "" {

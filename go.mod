@@ -9,7 +9,6 @@ require (
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
-	gotest.tools/v3 v3.5.2
 	k8s.io/api v0.34.10
 	k8s.io/apimachinery v0.34.10
 	k8s.io/client-go v0.34.10
