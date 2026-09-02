@@ -46,26 +46,34 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 
 	// Shared dirs; the stub cr_client reads EXPORT_FILE_PATH from env.
 	ctlDir := t.TempDir()
-	snapDir := t.TempDir()
 	t.Setenv("EXPORT_FILE_PATH", ctlDir)
-	t.Setenv("SNAPSHOT_DIR", snapDir)
 
 	// The workload's preloader would write the pid map; simulate it.
 	if err := os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// Put the stub cr_client first on PATH under the canonical name.
-	stubDir := t.TempDir()
+	// The backend execs cr_client at its fixed install location only (PATH
+	// is not consulted), so the stub must live there. The Cloud Build test
+	// step runs as root; a local run that cannot write it skips instead.
+	const pinnedCrClient = "/usr/local/bin/cr_client"
+	if _, err := os.Lstat(pinnedCrClient); err == nil {
+		t.Skipf("%s already exists; refusing to overwrite it with the stub", pinnedCrClient)
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
 	stubSrc, err := os.ReadFile(filepath.Join(root, "tests", "integration", "memory-regions", "stub_cr_client.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	//nolint:gosec // the stub must be executable
-	if err := os.WriteFile(filepath.Join(stubDir, "cr_client"), stubSrc, 0o700); err != nil {
+	if err := os.WriteFile(pinnedCrClient, stubSrc, 0o700); err != nil {
+		if os.IsPermission(err) {
+			t.Skipf("cannot install the stub at %s: %v", pinnedCrClient, err)
+		}
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Cleanup(func() { os.Remove(pinnedCrClient) })
 
 	// Standalone-mode auto-transition needs "GPU occupied"; no NVML here.
 	origHasGPU := utils.HasGPUProcesses
