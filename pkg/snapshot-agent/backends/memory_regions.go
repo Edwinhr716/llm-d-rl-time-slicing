@@ -83,14 +83,15 @@ func groupDir(slot string) (string, error) {
 	return dir, nil
 }
 
-func writeGroupMeta(dir string, owners map[string]string) error {
+func writeGroupMeta(dir string, pids []int32) error {
 	var sb strings.Builder
-	for pid := range owners {
-		st, err := utils.ProcStarttime(pid)
+	for _, pid := range pids {
+		pidStr := strconv.Itoa(int(pid))
+		st, err := utils.ProcStarttime(pidStr)
 		if err != nil {
-			return fmt.Errorf("starttime of owner pid %s: %w", pid, err)
+			return fmt.Errorf("starttime of owner pid %s: %w", pidStr, err)
 		}
-		fmt.Fprintf(&sb, "%s %d\n", pid, st)
+		fmt.Fprintf(&sb, "%s %d\n", pidStr, st)
 	}
 	return writeMetaFile(dir, []byte(sb.String()))
 }
@@ -217,8 +218,17 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 		return fmt.Errorf("failed to create slot dir %s: %w", targetDir, err)
 	}
 
+	// Slot metadata FIRST, before any checkpoint runs: GC deletes a slot
+	// only via the owners recorded here, so the metadata must exist from
+	// the moment the slot does. A checkpoint failure partway through a
+	// multi-PID request must never leave dump files in a slot the sweeper
+	// refuses to touch — with the owners already recorded, such a slot is
+	// reclaimed normally once its owners die.
+	if err := writeGroupMeta(targetDir, regionPIDs(cfg)); err != nil {
+		slog.WarnContext(ctx, "failed to write slot metadata (GC will be conservative)", "dir", targetDir, "err", err)
+	}
+
 	t0 := time.Now()
-	owners := make(map[string]string)
 	for _, pid := range regionPIDs(cfg) {
 		pidStr := strconv.Itoa(int(pid))
 		id, err := g.ensureIDForPid(ctx, pidStr)
@@ -230,16 +240,11 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 		if err := g.checkpointRegions(ctx, pid, specStr, dest); err != nil {
 			return fmt.Errorf("cr_client checkpoint failed for PID %d with specs %s: %w", pid, specStr, err)
 		}
-		owners[pidStr] = id
 	}
 	slog.InfoContext(ctx, "GPU-CR selective checkpoint (direct-to-destination) took", "duration", time.Since(t0))
 
-	// Slot metadata + explicit utimes: these files are the ONLY copy of a
-	// parked slot, so GC decisions must never ride on mmap-driven mtimes
-	// (which hugetlbfs does not reliably update) or on a blind TTL.
-	if err := writeGroupMeta(targetDir, owners); err != nil {
-		slog.WarnContext(ctx, "failed to write slot metadata (GC will be conservative)", "dir", targetDir, "err", err)
-	}
+	// Explicit utimes: GC timing must never ride on mmap-driven mtimes,
+	// which hugetlbfs does not reliably update.
 	touchGroup(targetDir)
 
 	return nil

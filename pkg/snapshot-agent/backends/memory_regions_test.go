@@ -469,6 +469,55 @@ func TestMemoryRegionsSnapshotOwnersMeta(t *testing.T) {
 	}
 }
 
+func TestMemoryRegionsSnapshotPartialFailureKeepsOwners(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no procfs on this host")
+	}
+	mr, ctlDir, storeDir := newMemoryRegions(t)
+	pidA := strconv.Itoa(os.Getpid())
+	pidB := strconv.Itoa(os.Getppid())
+	writePidMap(t, ctlDir, pidA, "42")
+	writePidMap(t, ctlDir, pidB, "43")
+	// The second PID's checkpoint fails after the first one succeeded.
+	mr.SetExecCommand(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) > 2 && args[0] == "-c" && args[2] == pidB {
+			return []byte("injected failure"), fmt.Errorf("boom")
+		}
+		return nil, nil
+	})
+
+	a, err := strconv.ParseInt(pidA, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := strconv.ParseInt(pidB, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = mr.Snapshot(context.Background(), backends.Request{
+		JobID: "test-job",
+		Config: memoryRegionsConfig("slot-partial",
+			region(int32(a), 0x1000, 64), region(int32(b), 0x2000, 64)),
+	})
+	if err == nil {
+		t.Fatal("Snapshot() must fail when a later PID's checkpoint fails")
+	}
+
+	// The slot holds PID A's dump even though the request failed. The
+	// owners metadata must already be in place — it is the sweeper's only
+	// license to reclaim the slot once the owners die; without it a failed
+	// multi-PID snapshot would pin its dump pages forever.
+	owners, rerr := utils.ReadGroupMeta(filepath.Join(storeDir, "slot-partial"))
+	if rerr != nil {
+		t.Fatalf("ReadGroupMeta() after partial failure: %v", rerr)
+	}
+	for _, pid := range []string{pidA, pidB} {
+		if _, ok := owners[pid]; !ok {
+			t.Errorf("pid %s missing from owners after partial failure: %v", pid, owners)
+		}
+	}
+}
+
 func TestMemoryRegionsHealthCheck(t *testing.T) {
 	tests := []struct {
 		name        string
