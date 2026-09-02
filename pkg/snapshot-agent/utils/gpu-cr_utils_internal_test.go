@@ -84,10 +84,9 @@ func TestGCFilePatterns(t *testing.T) {
 
 func TestSweep(t *testing.T) {
 	ctl := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", ctl)     // keep group-store sweep inside the tempdir
-	t.Setenv("GPU_CR_CTL_PATH", "")       // legacy layout: ctl files share the data dir
-	t.Setenv("GPU_CR_GROUP_STORE", "")    // default <data>/groups
-	t.Setenv("SNAPSHOT_DIR", t.TempDir()) // keep legacy snapshot sweep away from ctl
+	t.Setenv("EXPORT_FILE_PATH", ctl)  // keep group-store sweep inside the tempdir
+	t.Setenv("GPU_CR_CTL_PATH", "")    // legacy layout: ctl files share the data dir
+	t.Setenv("GPU_CR_GROUP_STORE", "") // default <data>/groups
 
 	// Deterministic maps scan: a fixture procfs whose one process maps the
 	// two "live" dumps. Scanning the real /proc would make the test depend
@@ -157,7 +156,6 @@ func TestSweepCtlDir(t *testing.T) {
 	t.Setenv("EXPORT_FILE_PATH", data)
 	t.Setenv("GPU_CR_CTL_PATH", ctl)
 	t.Setenv("GPU_CR_GROUP_STORE", "")
-	t.Setenv("SNAPSHOT_DIR", t.TempDir())
 
 	writeAged(t, ctl, "control-"+deadPID, true)   // dead pid -> removed
 	writeAged(t, ctl, "pid_map_"+deadPID, true)   // dead pid -> removed
@@ -375,56 +373,6 @@ func TestSweepGroupStoreMetaFallback(t *testing.T) {
 	}
 }
 
-func TestSweepLegacySnapshotStore(t *testing.T) {
-	ctl := t.TempDir()
-	snap := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", ctl)
-	t.Setenv("GPU_CR_GROUP_STORE", "")
-	t.Setenv("SNAPSHOT_DIR", snap)
-
-	oldDir := filepath.Join(snap, "expired-slot")
-	freshDir := filepath.Join(snap, "fresh-slot")
-	if err := os.MkdirAll(oldDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(freshDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	stale := time.Now().Add(-7 * time.Hour) // default TTL is 6h
-	if err := os.Chtimes(oldDir, stale, stale); err != nil {
-		t.Fatal(err)
-	}
-
-	sweepLegacySnapshotStore(ctl, time.Now())
-
-	assertGone(t, snap, "expired-slot")
-	assertKept(t, snap, "fresh-slot")
-}
-
-// TestSweepLegacySnapshotStoreMisconfigGuard: if SNAPSHOT_DIR is pointed at
-// the destination group store, the TTL sweep must refuse to run — those
-// files are the sole copy of parked state.
-func TestSweepLegacySnapshotStoreMisconfigGuard(t *testing.T) {
-	data := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", data)
-	t.Setenv("GPU_CR_GROUP_STORE", "")
-	store := filepath.Join(data, "groups")
-	t.Setenv("SNAPSHOT_DIR", store)
-
-	dir := filepath.Join(store, "parked-group")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	stale := time.Now().Add(-100 * time.Hour)
-	if err := os.Chtimes(dir, stale, stale); err != nil {
-		t.Fatal(err)
-	}
-
-	sweepLegacySnapshotStore(data, time.Now())
-
-	assertKept(t, store, "parked-group")
-}
-
 // TestSweepIncompleteProcScan: when a maps file is unreadable for a reason
 // other than process exit, the scan cannot prove any dump is unmapped, so
 // dump deletion is skipped; per-PID files are still reaped (their liveness
@@ -434,7 +382,6 @@ func TestSweepIncompleteProcScan(t *testing.T) {
 	t.Setenv("EXPORT_FILE_PATH", ctl)
 	t.Setenv("GPU_CR_CTL_PATH", "")
 	t.Setenv("GPU_CR_GROUP_STORE", "")
-	t.Setenv("SNAPSHOT_DIR", t.TempDir())
 
 	fakeProc := t.TempDir()
 	pidDir := filepath.Join(fakeProc, "42")

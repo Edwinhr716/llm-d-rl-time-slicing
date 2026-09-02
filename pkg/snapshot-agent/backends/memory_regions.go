@@ -39,12 +39,11 @@ import (
 //	                        pid_map_<pid>, ctl-ready-<pid>); unset = legacy
 //	                        layout sharing the data dir
 //	GPU_CR_GROUP_STORE      destination store override (default <data>/groups)
-//	SNAPSHOT_DIR            LEGACY copy store; only GC reads it
 //	GPU_CR_OP_TIMEOUT_SEC   per-cr_client-invocation timeout (default 120)
 type MemoryRegions struct {
 	mu          sync.Mutex
 	execCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
-	lookPath    func(string) (string, error)
+	statFunc    func(string) (os.FileInfo, error)
 	// procRoot is "/proc" in production; injectable for tests.
 	procRoot string
 }
@@ -55,7 +54,7 @@ func NewMemoryRegions() *MemoryRegions {
 		execCommand: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
-		lookPath: exec.LookPath,
+		statFunc: os.Stat,
 		procRoot: "/proc",
 	}
 }
@@ -222,7 +221,7 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 	owners := make(map[string]string)
 	for _, pid := range regionPIDs(cfg) {
 		pidStr := strconv.Itoa(int(pid))
-		id, err := g.resolveOrInit(ctx, pidStr)
+		id, err := g.ensureIDForPid(ctx, pidStr)
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
@@ -280,7 +279,7 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 
 	t0 := time.Now()
 	for _, pid := range regionPIDs(cfg) {
-		id, err := g.resolveOrInit(ctx, strconv.Itoa(int(pid)))
+		id, err := g.ensureIDForPid(ctx, strconv.Itoa(int(pid)))
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
@@ -295,34 +294,15 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 	return nil
 }
 
-// HealthCheck reports whether the cr_client binary is resolvable, so
-// grpc.health.v1.Health/Check with service "memory-regions" reflects backend
-// readiness (an agent image built without cr_client reports NOT_SERVING).
+// HealthCheck reports whether the cr_client binary is present at its fixed
+// install location, so grpc.health.v1.Health/Check with service
+// "memory-regions" reflects backend readiness (an agent image built without
+// cr_client reports NOT_SERVING).
 func (g *MemoryRegions) HealthCheck(ctx context.Context) error {
-	binaryPath := g.getCrClientPath()
-	if _, err := g.lookPath(binaryPath); err != nil {
-		return fmt.Errorf("cr_client executable not found: %w", err)
+	if _, err := g.statFunc(crClientPath); err != nil {
+		return fmt.Errorf("cr_client not found at %s: %w", crClientPath, err)
 	}
 	return nil
-}
-
-func (g *MemoryRegions) getCrClientPath() string {
-	candidates := []string{
-		"cr_client",
-		"/usr/bin/cr_client",
-		"/bin/cr_client",
-		"/opt/bin/cr_client",
-		"/usr/local/bin/cr_client",
-	}
-	for _, p := range candidates {
-		if path, err := g.lookPath(p); err == nil {
-			return path
-		}
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return "/usr/local/bin/cr_client"
 }
 
 func (g *MemoryRegions) runCommand(ctx context.Context, name string, args ...string) error {
@@ -335,8 +315,7 @@ func (g *MemoryRegions) runCommand(ctx context.Context, name string, args ...str
 func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec, dest string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
-	binaryPath := g.getCrClientPath()
-	if err := g.runCommand(ctx, binaryPath, "-c", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
+	if err := g.runCommand(ctx, crClientPath, "-c", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
 		return fmt.Errorf("cr_client checkpoint (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
@@ -345,20 +324,20 @@ func (g *MemoryRegions) checkpointRegions(ctx context.Context, pid int32, spec, 
 func (g *MemoryRegions) restoreRegions(ctx context.Context, pid int32, spec, dest string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
-	binaryPath := g.getCrClientPath()
-	if err := g.runCommand(ctx, binaryPath, "-r", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
+	if err := g.runCommand(ctx, crClientPath, "-r", "-p", strconv.Itoa(int(pid)), "-s", spec, "-o", dest); err != nil {
 		return fmt.Errorf("cr_client restore (timeout %s): %w", opTimeout(), err)
 	}
 	return nil
 }
 
-// resolveOrInit resolves pid→id, driving the preloader's lazy init when
-// needed. Destination-path ops must know the id BEFORE the first cr_client
-// signal (the -o file is named by it), but the preloader only writes
-// pid_map/creates the buffer inside init_CR — which historically ran lazily
-// off the first checkpoint signal. cr_client -i triggers exactly that init
-// and is idempotent for already-initialized processes.
-func (g *MemoryRegions) resolveOrInit(ctx context.Context, pid string) (string, error) {
+// ensureIDForPid returns the GPU-CR dump-buffer id for pid, driving the
+// preloader's lazy init when needed. Destination-path ops must know the id
+// BEFORE the first cr_client signal (the -o file is named by it), but the
+// preloader only writes pid_map/creates the buffer inside init_CR — which
+// historically ran lazily off the first checkpoint signal. cr_client -i
+// triggers exactly that init and is idempotent for already-initialized
+// processes.
+func (g *MemoryRegions) ensureIDForPid(ctx context.Context, pid string) (string, error) {
 	id, err := g.resolvePidToID(pid)
 	if err == nil {
 		return id, nil
@@ -366,7 +345,7 @@ func (g *MemoryRegions) resolveOrInit(ctx context.Context, pid string) (string, 
 	slog.InfoContext(ctx, "PID not resolvable yet; driving preloader init via cr_client -i", "pid", pid)
 	ictx, cancel := context.WithTimeout(ctx, opTimeout())
 	defer cancel()
-	if ierr := g.runCommand(ictx, g.getCrClientPath(), "-i", "-p", pid); ierr != nil {
+	if ierr := g.runCommand(ictx, crClientPath, "-i", "-p", pid); ierr != nil {
 		return "", fmt.Errorf("preloader init failed: %w (original resolve error: %w)", ierr, err)
 	}
 	return g.resolvePidToID(pid)
@@ -374,17 +353,16 @@ func (g *MemoryRegions) resolveOrInit(ctx context.Context, pid string) (string, 
 
 // resolvePidToID maps a workload PID to its GPU-CR dump-buffer id.
 func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
-	// pid_map lives in the ctl dir when the control plane has its own tmpfs
-	// (and is non-empty there: the preloader writes it with write(2)). Check
-	// the legacy data dir too for workloads on the shared-dir layout.
+	// pid_map lives in the ctl dir: the supported preloaders write it there
+	// with write(2), so it is non-empty on the ctl tmpfs. When
+	// GPU_CR_CTL_PATH is unset, ctlFilesDir() already resolves to the data
+	// dir, so the shared-dir configuration needs no second lookup.
 	var lastErr error
-	for _, dir := range []string{ctlFilesDir(), utils.DataDir()} {
-		mapPath := filepath.Join(dir, fmt.Sprintf("pid_map_%s", pid))
-		data, err := os.ReadFile(mapPath)
-		if err != nil {
-			lastErr = err
-			continue
-		}
+	mapPath := filepath.Join(ctlFilesDir(), fmt.Sprintf("pid_map_%s", pid))
+	data, err := os.ReadFile(mapPath)
+	if err != nil {
+		lastErr = err
+	} else {
 		// Strip NULs as well as whitespace: an mmap-written map file is
 		// hugepage-sized with a zero-padded tail.
 		id := strings.TrimSpace(strings.TrimRight(string(data), "\x00"))
@@ -393,9 +371,9 @@ func (g *MemoryRegions) resolvePidToID(pid string) (string, error) {
 		}
 	}
 
-	// Fallback: older preloaders wrote pid_map via buffered stdio, which
-	// silently produces an empty file on hugetlbfs. The dump buffer mapping
-	// is visible in /proc/<pid>/maps and its basename IS the id.
+	// Fallback for lost or damaged bookkeeping (e.g. a ctl tmpfs recreated
+	// under live workloads): the dump buffer mapping is visible in
+	// /proc/<pid>/maps and its basename IS the id.
 	id, ferr := idFromProcMaps(g.procRoot, pid)
 	if ferr != nil {
 		readProblem := "contents are not a numeric id"
