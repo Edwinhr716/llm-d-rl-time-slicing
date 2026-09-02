@@ -27,13 +27,14 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
-	"gotest.tools/v3/assert"
 )
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	_, thisFile, _, ok := runtime.Caller(0)
-	assert.Assert(t, ok)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
 	return filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", "..", ".."))
 }
 
@@ -50,14 +51,20 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 	t.Setenv("SNAPSHOT_DIR", snapDir)
 
 	// The workload's preloader would write the pid map; simulate it.
-	assert.NilError(t, os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o600))
+	if err := os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	// Put the stub cr_client first on PATH under the canonical name.
 	stubDir := t.TempDir()
 	stubSrc, err := os.ReadFile(filepath.Join(root, "tests", "integration", "memory-regions", "stub_cr_client.sh"))
-	assert.NilError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	//nolint:gosec // the stub must be executable
-	assert.NilError(t, os.WriteFile(filepath.Join(stubDir, "cr_client"), stubSrc, 0o700))
+	if err := os.WriteFile(filepath.Join(stubDir, "cr_client"), stubSrc, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	// Standalone-mode auto-transition needs "GPU occupied"; no NVML here.
@@ -71,7 +78,9 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 		backends.BackendNoop:          backends.NewNoopBackend(),
 	}
 	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
-	assert.NilError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	s := grpc.NewServer()
 	srv := server.NewServer(backendsMap, backends.BackendNoop, "standalone", backends.NewChannelRegistry(),
 		features.Gates{features.MemoryRegionsBackend: true})
@@ -100,13 +109,23 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 		"PYTHONPATH="+filepath.Join(root, "pkg", "client", "python"),
 	)
 	out, err := cmd.CombinedOutput()
-	assert.NilError(t, err, "python driver failed:\n%s", string(out))
-	assert.Assert(t, strings.Contains(string(out), "CROSS-LANG-OK"), "driver output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("python driver failed: %v\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "CROSS-LANG-OK") {
+		t.Fatalf("driver output missing CROSS-LANG-OK:\n%s", string(out))
+	}
 
 	// The stub must have been invoked with the region spec.
 	log, err := os.ReadFile(filepath.Join(ctlDir, "cr_client_calls.log"))
-	assert.NilError(t, err)
-	assert.Assert(t, strings.Contains(string(log), "-c -p 4242 -s 0x7f0000000000:64"), "calls log:\n%s", string(log))
-	assert.Assert(t, strings.Contains(string(log), "-r -p 4242 -s 0x7f0000000000:64"), "calls log:\n%s", string(log))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "-c -p 4242 -s 0x7f0000000000:64") {
+		t.Errorf("checkpoint call missing from calls log:\n%s", string(log))
+	}
+	if !strings.Contains(string(log), "-r -p 4242 -s 0x7f0000000000:64") {
+		t.Errorf("restore call missing from calls log:\n%s", string(log))
+	}
 	fmt.Println("cross-language driver output:", strings.TrimSpace(string(out)))
 }
