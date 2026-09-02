@@ -239,6 +239,20 @@ func procExists(pid string) bool {
 	return err == nil
 }
 
+// ownerGone reports whether a recorded slot owner (pid + starttime) is gone:
+// the process exited, or its pid now belongs to a different process
+// (starttime mismatch). Liveness read errors are treated conservatively,
+// mirroring pidGone: while the process may still exist, the owner counts as
+// alive — a destination slot is the sole copy of parked state, so deletion
+// requires positive evidence of death, never the absence of evidence.
+func ownerGone(pid string, recorded int64) bool {
+	cur, err := ProcStarttime(pid)
+	if err != nil {
+		return os.IsNotExist(err) || !procExists(pid)
+	}
+	return cur != recorded
+}
+
 func advertisedStarttime(path string) (int64, bool) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -292,8 +306,7 @@ func sweepGroupStore(now time.Time) {
 		}
 		allGone := true
 		for pid, st := range owners {
-			cur, err := ProcStarttime(pid)
-			if err == nil && cur == st {
+			if !ownerGone(pid, st) {
 				allGone = false
 				break
 			}

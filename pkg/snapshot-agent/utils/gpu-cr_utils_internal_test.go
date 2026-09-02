@@ -215,6 +215,26 @@ func TestPidGoneStarttime(t *testing.T) {
 	}
 }
 
+func TestOwnerGone(t *testing.T) {
+	if !hasProcfs() {
+		t.Skip("no procfs on this host")
+	}
+	pid := strconv.Itoa(os.Getpid())
+	st, err := ProcStarttime(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownerGone(pid, st) {
+		t.Error("live owner with matching starttime must count as alive")
+	}
+	if !ownerGone(pid, st+1) {
+		t.Error("recycled pid (starttime mismatch) must count as gone")
+	}
+	if !ownerGone("999999999", st) {
+		t.Error("nonexistent pid must count as gone")
+	}
+}
+
 func TestAdvertisedStarttime(t *testing.T) {
 	dir := t.TempDir()
 
