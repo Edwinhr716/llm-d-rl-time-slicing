@@ -44,6 +44,7 @@ Test cases (in script order):
 |---|---|---|---|---|
 | Happy path | init | — | `-i` | 0 |
 | Happy path | dest-path selective ckpt | — | `-c -s <regions> -o <path>` | 0; dump file created |
+| Happy path | precreated dest handed to the target | — | `-c -s -o` | dump owned by the target's uid, mode 0600 (the .so writes it; root-owned would EACCES a non-root workload) |
 | Happy path | dest-path selective restore | — | `-r -s <regions> -o <path>` | 0 |
 | Happy path | buffer selective ckpt | — | `-c -s <regions>` | 0 |
 | Happy path | full ckpt | — | `-c` | 0 |
