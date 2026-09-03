@@ -63,6 +63,11 @@ file(GLOB_RECURSE VGPU_SOURCE_FILES CONFIGURE_DEPENDS
 # Drop scratch sources.
 list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "-pre\\.cpp$")
 
+# vGPU.cpp still carries its own memcpy_multi definition; the standalone
+# TU exists so the GPU-free unit suite can exercise it, and joins this
+# library when the preloader refactor drops the in-file copy.
+list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "/memcpy_multi\\.cpp$")
+
 # Per-vendor backend exclusions.
 if(GPU_VENDOR STREQUAL "NVIDIA")
     list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "/AMD/")
