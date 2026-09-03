@@ -106,7 +106,18 @@ void SignalOrDie(pid_t target_pid, int sig) {
 // truncate matters: a recycled path holding an older valid dump could
 // otherwise false-validate a torn write whenever the new commit-marker
 // offset landed on old payload bytes that happen to spell the magic.
-bool SecurePrecreate(const char* path) {
+//
+// Ownership: the dump is written by the TARGET, not by this client — the
+// .so opens dest_path O_RDWR, never O_CREAT. cr_client runs as root in
+// the agent pod while the workload is commonly non-root, so a root-owned
+// file would turn every checkpoint into EACCES inside the target. The
+// inode is chown'd to the target's uid/gid (stat of /proc/<pid>, which
+// needs no cross-pod UID contract) rather than opened 0666: the store
+// dir is shared, and dump validation proves a commit marker, not
+// authorship — world-writable would let any co-mounted uid plant a
+// marker-valid dump that a later restore trusts. (A non-dumpable target
+// stats as root:root and keeps today's root-owned behavior.)
+bool SecurePrecreate(const char* path, pid_t target_pid) {
     if (path[0] != '/') {
         fprintf(stderr, "Error: -o path must be absolute: %s\n", path);
         return false;
@@ -143,6 +154,24 @@ bool SecurePrecreate(const char* path) {
     close(dfd);
     if (fd < 0) {
         fprintf(stderr, "Error: cannot create destination %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", target_pid);
+    struct stat pst;
+    if (stat(proc_path, &pst) != 0) {
+        fprintf(stderr, "Error: cannot stat %s: %s\n", proc_path, strerror(errno));
+        close(fd);
+        return false;
+    }
+    // fchmod after the fact, not via the open mode: the mode must not be
+    // umask-filtered, and 0600 is enough — the writer owns the file, and
+    // the validating reopen runs as root (test rigs run both sides as
+    // one uid, which owner-rw also covers).
+    if (fchown(fd, pst.st_uid, pst.st_gid) != 0 || fchmod(fd, 0600) != 0) {
+        fprintf(stderr, "Error: cannot hand %s to uid %u: %s\n", path,
+                (unsigned)pst.st_uid, strerror(errno));
+        close(fd);
         return false;
     }
     close(fd);
@@ -420,7 +449,7 @@ int main(int argc, char* argv[]) {
         // Always write the whole request (zeroed dest when -o absent) so a
         // stale dest_path from an earlier op can never survive this write.
         if (dest_path) {
-            if (!SecurePrecreate(dest_path)) exit(kExitOpFailed);
+            if (!SecurePrecreate(dest_path, pid)) exit(kExitOpFailed);
             strncpy(req.dest_path, dest_path, gpu_cr::kSelectiveCrMaxPath - 1);
         }
         comm->control->selective_req = req;

@@ -104,6 +104,19 @@ start_fake $CTL_ENV
 check "ctl: init"                    0 env $CTL_ENV "$CR_CLIENT" -i -p "$FAKE_PID"
 check "ctl: dest-path selective ckpt" 0 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/dump.bin"
 expect_file "ctl: dump created" "$WORK/dump.bin"
+# The target writes the dump (the .so opens dest_path O_RDWR, no O_CREAT),
+# and cr_client may run as root while the target does not: the precreate
+# must hand the inode to the target's owner and pin mode 0600. Without the
+# explicit fchmod a default umask would leave 644, so the mode assertion
+# alone pins the handoff.
+dump_owner=$(stat -c %u "$WORK/dump.bin")
+target_owner=$(stat -c %u "/proc/$FAKE_PID")
+dump_mode=$(stat -c %a "$WORK/dump.bin")
+if [ "$dump_owner" = "$target_owner" ] && [ "$dump_mode" = "600" ]; then
+    echo "ok:   precreated dest handed to the target (uid $dump_owner, mode $dump_mode)"; PASS=$((PASS + 1))
+else
+    echo "FAIL: precreated dest owner/mode (uid $dump_owner vs target $target_owner, mode $dump_mode)"; FAIL=$((FAIL + 1))
+fi
 check "ctl: dest-path selective restore" 0 env $CTL_ENV "$CR_CLIENT" -r -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/dump.bin"
 check "ctl: buffer selective ckpt"   0 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
 check "ctl: full ckpt"               0 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID"
