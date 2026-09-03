@@ -63,6 +63,11 @@ file(GLOB_RECURSE VGPU_SOURCE_FILES CONFIGURE_DEPENDS
 # Drop scratch sources.
 list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "-pre\\.cpp$")
 
+# vGPU.cpp still carries its own memcpy_multi definition; the standalone
+# TU exists so the GPU-free unit suite can exercise it, and joins this
+# library when the preloader refactor drops the in-file copy.
+list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "/memcpy_multi\\.cpp$")
+
 # Per-vendor backend exclusions.
 if(GPU_VENDOR STREQUAL "NVIDIA")
     list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "/AMD/")
@@ -135,10 +140,10 @@ target_compile_options(multi_cr_client PRIVATE -O3 -g)
 
 # ---------------------------------------------------------------------------
 # Tests (GPU-free; run in Dockerfile.build)
-#   gpu_cr_unit_tests        — GoogleTest unit suite for the ctl-path and
-#                              dump-format code, plus the upstream-baseline
-#                              control channel, buffer mapping, fd exchange
-#                              and wire structs
+#   gpu_cr_unit_tests        — GoogleTest unit suite for the ctl-path,
+#                              dump-format and granule-clamp code, plus the
+#                              upstream-baseline control channel, buffer
+#                              mapping, fd exchange and memcpy_multi
 # ---------------------------------------------------------------------------
 option(GPU_CR_BUILD_TESTS "Build the GPU-free unit tests" OFF)
 
@@ -159,16 +164,25 @@ if(GPU_CR_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ctl_path_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/dump_format_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ipc_fd_exchange_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/memcpy_multi_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/mmap_backend_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/share_mem_comm_test.cpp
         # GPU-free production sources under test (upstream-baseline functions)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mmap_backend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_fd_exchange.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/memcpy_multi.cpp
     )
     target_include_directories(gpu_cr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
+    # The file backend reserves the full dump-buffer size up front
+    # (posix_fallocate); pin the suite to the 1GiB minimum so the
+    # mmap-backend tests don't reserve the 25GiB production default per
+    # checkpoint id. Expressed as compile *options* (-U then -D) so the
+    # override lands after any directory-level -DSHM_SIZE_GB from the
+    # build harness in the generated compile command.
+    target_compile_options(gpu_cr_unit_tests PRIVATE -USHM_SIZE_GB -DSHM_SIZE_GB=1)
     target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)
     add_test(NAME unit COMMAND gpu_cr_unit_tests)
 endif()
