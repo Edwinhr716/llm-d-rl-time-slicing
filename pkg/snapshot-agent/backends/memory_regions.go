@@ -2,7 +2,6 @@ package backends
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
@@ -44,6 +42,10 @@ type MemoryRegions struct {
 	mu          sync.Mutex
 	execCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
 	statFunc    func(string) (os.FileInfo, error)
+	// starttime reads a pid's starttime (utils.ProcStarttime in
+	// production; injectable for tests, which use pids with no procfs
+	// entry).
+	starttime func(pid string) (int64, error)
 	// procRoot is "/proc" in production; injectable for tests.
 	procRoot string
 }
@@ -54,8 +56,9 @@ func NewMemoryRegions() *MemoryRegions {
 		execCommand: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
-		statFunc: os.Stat,
-		procRoot: "/proc",
+		statFunc:  os.Stat,
+		starttime: utils.ProcStarttime,
+		procRoot:  "/proc",
 	}
 }
 
@@ -72,7 +75,7 @@ func ctlFilesDir() string {
 // groupDir validates a snapshot slot name and returns its directory under
 // the destination store. Slots must be a single path segment: nesting is
 // rejected along with traversal because GC reaps store entries at the top
-// level only (a nested slot's .owners metadata would be invisible to it).
+// level only (a nested slot's owner directories would be invisible to it).
 func groupDir(slot string) (string, error) {
 	store := utils.GroupStoreDir()
 	dir := filepath.Join(store, filepath.Clean(slot))
@@ -83,46 +86,21 @@ func groupDir(slot string) (string, error) {
 	return dir, nil
 }
 
-func writeGroupMeta(dir string, pids []int32) error {
-	var sb strings.Builder
-	for _, pid := range pids {
-		pidStr := strconv.Itoa(int(pid))
-		st, err := utils.ProcStarttime(pidStr)
-		if err != nil {
-			return fmt.Errorf("starttime of owner pid %s: %w", pidStr, err)
-		}
-		fmt.Fprintf(&sb, "%s %d\n", pidStr, st)
+// ownerDir returns the per-owner directory inside a slot:
+// <slot>/<pid>-<starttime>. The dirname IS the slot's ownership metadata —
+// GC parses it for the owner-liveness delete decision — encoded in the path
+// because a name, unlike file contents, cannot fail to be written on a
+// hugetlbfs store (which rejects write(2)), and it exists atomically with
+// the dump destination it contains. Starttime is re-read from procfs on
+// every operation: for the process that took the snapshot it is a constant,
+// so restore recomputes the identical path, while a recycled pid computes a
+// different one and correctly finds nothing.
+func (g *MemoryRegions) ownerDir(slotDir, pid string) (string, error) {
+	st, err := g.starttime(pid)
+	if err != nil {
+		return "", fmt.Errorf("starttime of owner pid %s: %w", pid, err)
 	}
-	return writeMetaFile(dir, []byte(sb.String()))
-}
-
-// osWriteFile is a test seam: only unit tests replace it, to exercise the
-// EINVAL fallback without a hugetlbfs mount.
-var osWriteFile = os.WriteFile
-
-// writeMetaFile is os.WriteFile with a fallback for a group store that
-// rejects write(2) with EINVAL — hugetlbfs, where the store lives whenever
-// EXPORT_FILE_PATH points at the hugepage mount and GPU_CR_GROUP_STORE is
-// unset. Without the fallback the .owners stub is created empty, and the
-// group-store sweeper then keeps the dead slot forever ("no metadata: be
-// conservative"), pinning its hugepages until deleted by hand.
-//
-// The fallback writes the metadata to the control-plane tmpfs, NOT through
-// an mmap of the hugetlbfs file: a shared hugetlbfs mapping would charge a
-// hugetlb page to this pod's cgroup, and the agent deliberately runs with
-// no hugepages request (that mmap fails ENOMEM under the zero limit).
-func writeMetaFile(slotDir string, data []byte) error {
-	err := osWriteFile(filepath.Join(slotDir, utils.GroupMetaName), data, 0o600)
-	if err == nil || !errors.Is(err, syscall.EINVAL) {
-		return err
-	}
-	fallback := utils.GroupMetaFallbackPath(slotDir)
-	if fallback == "" {
-		// Legacy layout: the ctl dir shares the hugetlbfs data dir, so
-		// there is nowhere writable — surface the original error.
-		return err
-	}
-	return osWriteFile(fallback, data, 0o600)
+	return filepath.Join(slotDir, fmt.Sprintf("%s-%d", pid, st)), nil
 }
 
 // touchGroup bumps the slot dir mtime explicitly on every op.
@@ -218,16 +196,6 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 		return fmt.Errorf("failed to create slot dir %s: %w", targetDir, err)
 	}
 
-	// Slot metadata FIRST, before any checkpoint runs: GC deletes a slot
-	// only via the owners recorded here, so the metadata must exist from
-	// the moment the slot does. A checkpoint failure partway through a
-	// multi-PID request must never leave dump files in a slot the sweeper
-	// refuses to touch — with the owners already recorded, such a slot is
-	// reclaimed normally once its owners die.
-	if err := writeGroupMeta(targetDir, regionPIDs(cfg)); err != nil {
-		slog.WarnContext(ctx, "failed to write slot metadata (GC will be conservative)", "dir", targetDir, "err", err)
-	}
-
 	t0 := time.Now()
 	for _, pid := range regionPIDs(cfg) {
 		pidStr := strconv.Itoa(int(pid))
@@ -235,7 +203,19 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
-		dest := filepath.Join(targetDir, id)
+		// The owner dir doubles as the slot's ownership record, so it is
+		// created BEFORE the checkpoint runs: a dump file can never exist
+		// in a slot without its owner recorded, and a checkpoint failure
+		// partway through a multi-PID request leaves only slots the
+		// sweeper reclaims normally once the recorded owners die.
+		ownDir, err := g.ownerDir(targetDir, pidStr)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(ownDir, 0o755); err != nil {
+			return fmt.Errorf("failed to create owner dir %s: %w", ownDir, err)
+		}
+		dest := filepath.Join(ownDir, id)
 		specStr := strings.Join(specs[pid], ",")
 		if err := g.checkpointRegions(ctx, pid, specStr, dest); err != nil {
 			return fmt.Errorf("cr_client checkpoint failed for PID %d with specs %s: %w", pid, specStr, err)
@@ -284,11 +264,23 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 
 	t0 := time.Now()
 	for _, pid := range regionPIDs(cfg) {
-		id, err := g.ensureIDForPid(ctx, strconv.Itoa(int(pid)))
+		pidStr := strconv.Itoa(int(pid))
+		id, err := g.ensureIDForPid(ctx, pidStr)
 		if err != nil {
 			return fmt.Errorf("failed to resolve PID %d to ID: %w", pid, err)
 		}
-		dest := filepath.Join(targetDir, id)
+		// Same-process recomputation: the pid's current starttime yields
+		// the exact path Snapshot used, while a different (or recycled)
+		// process yields a path that does not exist.
+		ownDir, err := g.ownerDir(targetDir, pidStr)
+		if err != nil {
+			return err
+		}
+		dest := filepath.Join(ownDir, id)
+		if _, err := os.Stat(dest); err != nil {
+			return fmt.Errorf("slot %q holds no parked state for PID %d (owner dir %s): %w",
+				slot, pid, filepath.Base(ownDir), err)
+		}
 		specStr := strings.Join(specs[pid], ",")
 		if err := g.restoreRegions(ctx, pid, specStr, dest); err != nil {
 			return fmt.Errorf("cr_client restore failed for PID %d with specs %s: %w", pid, specStr, err)

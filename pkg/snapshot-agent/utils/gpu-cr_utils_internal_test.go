@@ -260,9 +260,12 @@ func TestAdvertisedStarttime(t *testing.T) {
 	}
 }
 
-// TestSweepGroupStore covers the owner-liveness reap of destination slots:
-// deletion requires every recorded owner dead (or recycled) AND the grace
-// period passed; slots without metadata are never deleted.
+// TestSweepGroupStore covers the owner-liveness reap of destination slots.
+// Ownership is path-encoded in <pid>-<starttime> subdirectory names:
+// deletion requires every so-recorded owner dead (or recycled) AND the
+// grace period passed; slots whose ownership cannot be fully parsed from
+// their subdirectories — including pre-owner-dir legacy slots with flat
+// dump files — are never deleted.
 func TestSweepGroupStore(t *testing.T) {
 	data := t.TempDir()
 	t.Setenv("EXPORT_FILE_PATH", data)
@@ -271,14 +274,25 @@ func TestSweepGroupStore(t *testing.T) {
 	t.Setenv("GPU_CR_GROUP_GRACE_HOURS", "")
 	store := filepath.Join(data, "groups")
 
-	makeGroup := func(name, meta string, aged bool) {
+	// makeGroup creates a slot whose children are owner dirs (each holding
+	// one dump file) and/or flat files, then optionally backdates the slot
+	// past the default 1h grace.
+	makeGroup := func(name string, ownerDirs, files []string, aged bool) {
 		t.Helper()
 		dir := filepath.Join(store, name)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if meta != "" {
-			if err := os.WriteFile(filepath.Join(dir, GroupMetaName), []byte(meta), 0o600); err != nil {
+		for _, od := range ownerDirs {
+			if err := os.MkdirAll(filepath.Join(dir, od), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, od, "17"), []byte("dump"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, f := range files {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -290,106 +304,65 @@ func TestSweepGroupStore(t *testing.T) {
 		}
 	}
 
-	makeGroup("dead-owner", deadPID+" 123\n", true)     // all owners gone -> removed
-	makeGroup("no-meta", "", true)                      // no metadata -> NEVER removed
-	makeGroup("fresh", deadPID+" 123\n", false)         // inside grace -> kept
-	makeGroup("garbage-meta", "not a pid line\n", true) // unparseable = no owners -> kept
+	makeGroup("dead-owner", []string{deadPID + "-123"}, nil, true) // all owners gone -> removed
+	makeGroup("two-dead-owners", []string{deadPID + "-123", deadPID + "1-99"}, nil, true)
+	makeGroup("empty", nil, nil, true)                                // no owner dirs -> NEVER removed
+	makeGroup("fresh", []string{deadPID + "-123"}, nil, false)        // inside grace -> kept
+	makeGroup("garbage-dir", []string{"not-an-owner"}, nil, true)     // unparseable dir -> kept
+	makeGroup("mixed", []string{deadPID + "-123", "junk"}, nil, true) // partial parse -> kept
+	makeGroup("legacy-flat", nil, []string{"17", ".owners"}, true)    // pre-owner-dir slot -> kept
 	if hasProcfs() {
 		pid := strconv.Itoa(os.Getpid())
 		st, err := ProcStarttime(pid)
 		if err != nil {
 			t.Fatal(err)
 		}
-		makeGroup("live-owner", fmt.Sprintf("%s %d\n", pid, st), true) // live owner -> kept
+		// live owner -> kept
+		makeGroup("live-owner", []string{fmt.Sprintf("%s-%d", pid, st)}, nil, true)
+		// pid alive but starttime mismatched = recycled -> removed
+		makeGroup("recycled-owner", []string{fmt.Sprintf("%s-%d", pid, st+1)}, nil, true)
 	}
 
 	sweepGroupStore(time.Now())
 
 	assertGone(t, store, "dead-owner")
-	assertKept(t, store, "no-meta")
+	assertGone(t, store, "two-dead-owners")
+	assertKept(t, store, "empty")
 	assertKept(t, store, "fresh")
-	assertKept(t, store, "garbage-meta")
+	assertKept(t, store, "garbage-dir")
+	assertKept(t, store, "mixed")
+	assertKept(t, store, "legacy-flat")
 	if hasProcfs() {
 		assertKept(t, store, "live-owner")
+		assertGone(t, store, "recycled-owner")
 	}
 }
 
-// TestSweepGroupStoreMetaFallback: on a hugetlbfs group store the in-slot
-// .owners is an unwritable 0-byte stub and the real metadata lives on the
-// ctl tmpfs. The sweeper must read owners through the fallback, delete the
-// slot when they are all dead, drop the fallback file with it, and reap
-// orphaned fallback files whose slot is already gone.
-func TestSweepGroupStoreMetaFallback(t *testing.T) {
-	data := t.TempDir()
-	ctl := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", data)
-	t.Setenv("GPU_CR_CTL_PATH", ctl)
-	t.Setenv("GPU_CR_GROUP_STORE", "")
-	t.Setenv("GPU_CR_GROUP_GRACE_HOURS", "")
-	store := filepath.Join(data, "groups")
-
-	makeSlot := func(name, fallbackMeta string, aged bool) string {
-		t.Helper()
-		dir := filepath.Join(store, name)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		// 0-byte in-slot stub, as left behind by a failed write(2).
-		if err := os.WriteFile(filepath.Join(dir, GroupMetaName), nil, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if fallbackMeta != "" {
-			if err := os.WriteFile(GroupMetaFallbackPath(dir), []byte(fallbackMeta), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if aged {
-			old := time.Now().Add(-2 * time.Hour)
-			if err := os.Chtimes(dir, old, old); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return dir
-	}
-
-	deadDir := makeSlot("dead-owner", deadPID+" 123\n", true)
-	makeSlot("stub-only", "", true) // no metadata anywhere -> kept
-	freshDir := makeSlot("fresh", deadPID+" 123\n", false)
-
-	// The reader must see the fallback owners through the empty stub.
-	owners, err := ReadGroupMeta(deadDir)
-	if err != nil {
-		t.Fatalf("ReadGroupMeta(): %v", err)
-	}
-	if len(owners) != 1 {
-		t.Fatalf("ReadGroupMeta() = %v, want the one fallback owner", owners)
-	}
-
-	orphan := filepath.Join(ctl, "owners-long-gone")
-	if err := os.WriteFile(orphan, []byte(deadPID+" 123\n"), 0o600); err != nil {
+func TestSlotOwners(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "123-456"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	unrelated := filepath.Join(ctl, "pid_map_123")
-	if err := os.WriteFile(unrelated, []byte("42\n"), 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "789-42"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Flat files are not ownership records and must be skipped, not fail
+	// the parse.
+	if err := os.WriteFile(filepath.Join(dir, "17"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	owners, ok := slotOwners(dir)
+	if !ok || len(owners) != 2 || owners["123"] != 456 || owners["789"] != 42 {
+		t.Errorf("slotOwners() = %v, %v; want both owners parsed", owners, ok)
+	}
 
-	sweepGroupStore(time.Now())
-
-	assertGone(t, store, "dead-owner")
-	assertKept(t, store, "stub-only")
-	assertKept(t, store, "fresh")
-	if _, err := os.Stat(GroupMetaFallbackPath(deadDir)); !os.IsNotExist(err) {
-		t.Errorf("dead slot's fallback meta must go with it (stat err: %v)", err)
+	// One unparseable SUBDIRECTORY poisons the whole slot: ownership is
+	// not fully known, so there is no license to delete.
+	if err := os.MkdirAll(filepath.Join(dir, "not-an-owner"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(GroupMetaFallbackPath(freshDir)); err != nil {
-		t.Errorf("kept slot's fallback meta must stay: %v", err)
-	}
-	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Errorf("orphaned fallback meta must be reaped (stat err: %v)", err)
-	}
-	if _, err := os.Stat(unrelated); err != nil {
-		t.Errorf("non-owners ctl files are not this sweep's business: %v", err)
+	if _, ok := slotOwners(dir); ok {
+		t.Error("slotOwners() must report unknown ownership on an unparseable subdirectory")
 	}
 }
 

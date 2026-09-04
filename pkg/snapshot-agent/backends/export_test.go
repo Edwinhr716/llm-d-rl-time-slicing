@@ -48,13 +48,8 @@ func (g *MemoryRegions) SetProcRoot(dir string) {
 	g.procRoot = dir
 }
 
-// WriteMetaFile and SetWriteFile expose the slot-metadata write path and its
-// os.WriteFile seam, so tests can exercise the hugetlbfs EINVAL fallback
-// without a hugetlbfs mount.
-var WriteMetaFile = writeMetaFile
-
-func SetWriteFile(f func(string, []byte, os.FileMode) error) func() {
-	orig := osWriteFile
-	osWriteFile = f
-	return func() { osWriteFile = orig }
+// SetStarttimeFunc replaces the pid-starttime reader, so tests can use pids
+// that have no procfs entry (and pin the starttime half of owner dirnames).
+func (g *MemoryRegions) SetStarttimeFunc(f func(pid string) (int64, error)) {
+	g.starttime = f
 }
