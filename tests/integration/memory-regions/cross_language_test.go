@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,8 +49,13 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 	ctlDir := t.TempDir()
 	t.Setenv("EXPORT_FILE_PATH", ctlDir)
 
-	// The workload's preloader would write the pid map; simulate it.
-	if err := os.WriteFile(filepath.Join(ctlDir, "pid_map_4242"), []byte("42\n"), 0o600); err != nil {
+	// The workload's preloader would write the pid map; simulate it. The
+	// workload pid must be a real live process: the backend records slot
+	// ownership as a <pid>-<starttime> owner dir and reads the starttime
+	// from procfs, so a made-up pid fails the snapshot. The test process
+	// itself is the one pid guaranteed alive for the duration.
+	workloadPID := strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(filepath.Join(ctlDir, "pid_map_"+workloadPID), []byte("42\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -114,6 +120,7 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"AGENT_ENDPOINT="+endpoint,
 		"CTL_DIR="+ctlDir,
+		"WORKLOAD_PID="+workloadPID,
 		"PYTHONPATH="+filepath.Join(root, "pkg", "client", "python"),
 	)
 	out, err := cmd.CombinedOutput()
@@ -129,10 +136,10 @@ func TestCrossLanguageMemoryRegions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(log), "-c -p 4242 -s 0x7f0000000000:64") {
+	if !strings.Contains(string(log), "-c -p "+workloadPID+" -s 0x7f0000000000:64") {
 		t.Errorf("checkpoint call missing from calls log:\n%s", string(log))
 	}
-	if !strings.Contains(string(log), "-r -p 4242 -s 0x7f0000000000:64") {
+	if !strings.Contains(string(log), "-r -p "+workloadPID+" -s 0x7f0000000000:64") {
 		t.Errorf("restore call missing from calls log:\n%s", string(log))
 	}
 	fmt.Println("cross-language driver output:", strings.TrimSpace(string(out)))
