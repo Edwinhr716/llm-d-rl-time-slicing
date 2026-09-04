@@ -19,7 +19,9 @@ from timeslice.snapshot_agent import (
     memory_regions_config,
 )
 
-PID = 4242
+# The workload pid must be a live process (ownership is recorded as a
+# <pid>-<starttime> owner dir read from procfs); the Go test passes its own.
+PID = int(os.environ.get("WORKLOAD_PID", "4242"))
 ADDRESS = 0x7F0000000000
 SIZE = 64
 
