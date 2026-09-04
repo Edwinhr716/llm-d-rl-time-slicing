@@ -2,14 +2,12 @@ package backends_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -33,8 +31,14 @@ func memoryRegionsConfig(slot string, regions ...*pb.MemoryRegion) *pb.BackendCo
 	}
 }
 
+// testStarttime is the starttime the test seam reports for every pid, so
+// expected owner dirnames (<pid>-<testStarttime>) are deterministic.
+const testStarttime = int64(555)
+
 // newMemoryRegions returns a backend pointed at a tempdir layout via env.
-// Destination-slot dumps land under the returned store dir (the -o paths).
+// Destination-slot dumps land under the returned store dir (the -o paths),
+// inside per-owner <pid>-<starttime> dirs with a pinned fake starttime
+// (test pids have no procfs entry).
 //
 //nolint:gocritic // The project configuration bans named returns, conflicting with unnamedResult
 func newMemoryRegions(t *testing.T) (*backends.MemoryRegions, string, string) {
@@ -44,6 +48,7 @@ func newMemoryRegions(t *testing.T) (*backends.MemoryRegions, string, string) {
 	t.Setenv("GPU_CR_CTL_PATH", "")
 	t.Setenv("GPU_CR_GROUP_STORE", "")
 	mr := backends.NewMemoryRegions()
+	mr.SetStarttimeFunc(func(string) (int64, error) { return testStarttime, nil })
 	return mr, ctlDir, filepath.Join(ctlDir, "groups")
 }
 
@@ -91,7 +96,7 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 			config: memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024)),
 			jobID:  "test-job",
 			expectArgs: [][]string{
-				{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/slot-a/42"},
+				{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/slot-a/123-555/42"},
 			},
 		},
 		{
@@ -99,7 +104,7 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 			config: memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024), region(123, 0x8f00, 2048)),
 			jobID:  "test-job",
 			expectArgs: [][]string{
-				{"-c", "-p", "123", "-s", "0x7f00:1024,0x8f00:2048", "-o", "<store>/slot-a/42"},
+				{"-c", "-p", "123", "-s", "0x7f00:1024,0x8f00:2048", "-o", "<store>/slot-a/123-555/42"},
 			},
 		},
 		{
@@ -107,7 +112,7 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 			config: memoryRegionsConfig("slot-a", region(123, 139637976727552, 1073741824)),
 			jobID:  "test-job",
 			expectArgs: [][]string{
-				{"-c", "-p", "123", "-s", "0x7f0000000000:1073741824", "-o", "<store>/slot-a/42"},
+				{"-c", "-p", "123", "-s", "0x7f0000000000:1073741824", "-o", "<store>/slot-a/123-555/42"},
 			},
 		},
 		{
@@ -115,7 +120,7 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 			config: memoryRegionsConfig("", region(123, 0x7f00, 1024)),
 			jobID:  "job-1",
 			expectArgs: [][]string{
-				{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/job-1/42"},
+				{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/job-1/123-555/42"},
 			},
 		},
 		{
@@ -214,7 +219,7 @@ func TestMemoryRegionsRestore(t *testing.T) {
 	tests := []struct {
 		name        string
 		config      *pb.BackendConfig
-		makeSlot    bool
+		makeSlot    string // "": no slot; "empty": bare slot dir; "owned": owner dir + dump
 		execErr     error
 		expectedErr bool
 		expectNoRun bool
@@ -223,14 +228,23 @@ func TestMemoryRegionsRestore(t *testing.T) {
 		{
 			name:     "Success",
 			config:   memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024)),
-			makeSlot: true,
+			makeSlot: "owned",
 			expectArgs: [][]string{
-				{"-r", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/slot-a/42"},
+				{"-r", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/slot-a/123-555/42"},
 			},
 		},
 		{
 			name:        "MissingSlot",
 			config:      memoryRegionsConfig("no-such-slot", region(123, 0x7f00, 1024)),
+			expectedErr: true,
+			expectNoRun: true,
+		},
+		{
+			// A slot that exists but holds nothing for this pid+starttime:
+			// a different (e.g. restarted) process must find nothing.
+			name:        "SlotWithoutThisOwner",
+			config:      memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024)),
+			makeSlot:    "empty",
 			expectedErr: true,
 			expectNoRun: true,
 		},
@@ -243,7 +257,7 @@ func TestMemoryRegionsRestore(t *testing.T) {
 		{
 			name:        "ExecFailure",
 			config:      memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024)),
-			makeSlot:    true,
+			makeSlot:    "owned",
 			execErr:     fmt.Errorf("exec error"),
 			expectedErr: true,
 		},
@@ -253,8 +267,17 @@ func TestMemoryRegionsRestore(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mr, ctlDir, storeDir := newMemoryRegions(t)
 			writePidMap(t, ctlDir, "123", "42")
-			if tt.makeSlot {
+			switch tt.makeSlot {
+			case "empty":
 				if err := os.MkdirAll(filepath.Join(storeDir, "slot-a"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			case "owned":
+				ownerDir := filepath.Join(storeDir, "slot-a", "123-555")
+				if err := os.MkdirAll(ownerDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(ownerDir, "42"), []byte("dump"), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -301,7 +324,7 @@ func TestMemoryRegionsLazyInit(t *testing.T) {
 			writeMapOnInit: true,
 			expectArgs: [][]string{
 				{"-i", "-p", "123"},
-				{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/slot-a/42"},
+				{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/slot-a/123-555/42"},
 			},
 		},
 		{
@@ -420,7 +443,7 @@ func TestMemoryRegionsPidResolution(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Snapshot() unexpected error: %v", err)
 			}
-			want := [][]string{{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", filepath.Join(storeDir, "slot-a", tt.wantID)}}
+			want := [][]string{{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", filepath.Join(storeDir, "slot-a", "123-555", tt.wantID)}}
 			if !reflect.DeepEqual(calledArgs, want) {
 				t.Errorf("Snapshot() calledArgs = %v, expected %v", calledArgs, want)
 			}
@@ -428,14 +451,17 @@ func TestMemoryRegionsPidResolution(t *testing.T) {
 	}
 }
 
-// TestMemoryRegionsSnapshotOwnersMeta verifies the .owners liveness metadata
-// (pid + starttime) that GC's owner-liveness sweep relies on. Needs a real
-// procfs, so it uses the test process itself as the owner.
-func TestMemoryRegionsSnapshotOwnersMeta(t *testing.T) {
+// TestMemoryRegionsSnapshotOwnerDir verifies the path-encoded ownership
+// record GC's owner-liveness sweep relies on: the dump lands inside a
+// <pid>-<starttime> dir whose starttime is the real procfs value. Needs a
+// real procfs, so it uses the test process itself as the owner and the
+// production starttime reader.
+func TestMemoryRegionsSnapshotOwnerDir(t *testing.T) {
 	if _, err := os.Stat("/proc/self/stat"); err != nil {
 		t.Skip("no procfs on this host")
 	}
 	mr, ctlDir, storeDir := newMemoryRegions(t)
+	mr.SetStarttimeFunc(utils.ProcStarttime)
 	mr.SetExecCommand(func(context.Context, string, ...string) ([]byte, error) { return nil, nil })
 	pid := strconv.Itoa(os.Getpid())
 	writePidMap(t, ctlDir, pid, "42")
@@ -452,20 +478,74 @@ func TestMemoryRegionsSnapshotOwnersMeta(t *testing.T) {
 		t.Fatalf("Snapshot() unexpected error: %v", err)
 	}
 
-	owners, err := utils.ReadGroupMeta(filepath.Join(storeDir, "slot-a"))
-	if err != nil {
-		t.Fatalf("ReadGroupMeta() unexpected error: %v", err)
-	}
-	st, ok := owners[pid]
-	if !ok {
-		t.Fatalf("own pid missing from %s: %v", utils.GroupMetaName, owners)
-	}
-	want, err := utils.ProcStarttime(pid)
+	st, err := utils.ProcStarttime(pid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st != want {
-		t.Errorf("recorded starttime = %d, want %d", st, want)
+	ownerDir := filepath.Join(storeDir, "slot-a", fmt.Sprintf("%s-%d", pid, st))
+	if _, err := os.Stat(ownerDir); err != nil {
+		t.Fatalf("owner dir %s not created: %v", ownerDir, err)
+	}
+}
+
+// A failed starttime read means the owner dir — the slot's ownership record
+// — cannot be named, so the snapshot must fail before any checkpoint runs.
+func TestMemoryRegionsSnapshotStarttimeFailure(t *testing.T) {
+	mr, ctlDir, _ := newMemoryRegions(t)
+	mr.SetStarttimeFunc(func(pid string) (int64, error) {
+		return 0, fmt.Errorf("no such process %s", pid)
+	})
+	writePidMap(t, ctlDir, "123", "42")
+	var calls int
+	mr.SetExecCommand(func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		return nil, nil
+	})
+
+	err := mr.Snapshot(context.Background(), backends.Request{
+		JobID:  "test-job",
+		Config: memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024)),
+	})
+	if err == nil || !strings.Contains(err.Error(), "starttime of owner pid 123") {
+		t.Fatalf("Snapshot() error = %v, want starttime failure", err)
+	}
+	if calls != 0 {
+		t.Errorf("cr_client invoked %d times despite unrecordable owner", calls)
+	}
+}
+
+func TestMemoryRegionsSnapshotPartialFailureKeepsOwners(t *testing.T) {
+	mr, ctlDir, storeDir := newMemoryRegions(t)
+	const pidA, pidB = "123", "456"
+	writePidMap(t, ctlDir, pidA, "42")
+	writePidMap(t, ctlDir, pidB, "43")
+	// The second PID's checkpoint fails after the first one succeeded.
+	mr.SetExecCommand(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) > 2 && args[0] == "-c" && args[2] == pidB {
+			return []byte("injected failure"), fmt.Errorf("boom")
+		}
+		return nil, nil
+	})
+
+	err := mr.Snapshot(context.Background(), backends.Request{
+		JobID: "test-job",
+		Config: memoryRegionsConfig("slot-partial",
+			region(123, 0x1000, 64), region(456, 0x2000, 64)),
+	})
+	if err == nil {
+		t.Fatal("Snapshot() must fail when a later PID's checkpoint fails")
+	}
+
+	// The slot holds PID A's dump even though the request failed. Every
+	// dump's owner dir is created before its checkpoint runs — it is the
+	// sweeper's only license to reclaim the slot once the owners die;
+	// without it a failed multi-PID snapshot would pin its dump pages
+	// forever.
+	for _, pid := range []string{pidA, pidB} {
+		ownerDir := filepath.Join(storeDir, "slot-partial", fmt.Sprintf("%s-%d", pid, testStarttime))
+		if _, err := os.Stat(ownerDir); err != nil {
+			t.Errorf("owner dir for pid %s missing after partial failure: %v", pid, err)
+		}
 	}
 }
 
@@ -535,77 +615,4 @@ func TestMemoryRegionsOpTimeout(t *testing.T) {
 	if err := mr.Restore(context.Background(), req); err == nil {
 		t.Fatal("Restore() expected timeout error, got nil")
 	}
-}
-
-// TestMemoryRegionsMetaFile covers the slot-metadata write path. A hugetlbfs
-// group store rejects write(2) with EINVAL (leaving a 0-byte stub), so the
-// metadata must land on the ctl tmpfs instead, where ReadGroupMeta picks it
-// up; without a ctl tmpfs the original error must surface.
-func TestMemoryRegionsMetaFile(t *testing.T) {
-	t.Run("PlainWrite", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Setenv("GPU_CR_CTL_PATH", t.TempDir())
-		if err := backends.WriteMetaFile(dir, []byte("123 456\n")); err != nil {
-			t.Fatalf("WriteMetaFile() unexpected error: %v", err)
-		}
-		data, err := os.ReadFile(filepath.Join(dir, utils.GroupMetaName))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(data) != "123 456\n" {
-			t.Errorf("meta content = %q, want %q", data, "123 456\n")
-		}
-		if _, err := os.Stat(utils.GroupMetaFallbackPath(dir)); !os.IsNotExist(err) {
-			t.Errorf("fallback file should not exist (stat err: %v)", err)
-		}
-	})
-
-	t.Run("EINVALFallsBackToCtlTmpfs", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Setenv("GPU_CR_CTL_PATH", t.TempDir())
-		restore := backends.SetWriteFile(func(name string, data []byte, perm os.FileMode) error {
-			if filepath.Dir(name) == dir {
-				// Mimic hugetlbfs: open+create succeed, write(2) EINVALs.
-				f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
-				if err != nil {
-					return err
-				}
-				f.Close()
-				return &os.PathError{Op: "write", Path: name, Err: syscall.EINVAL}
-			}
-			return os.WriteFile(name, data, perm)
-		})
-		defer restore()
-
-		if err := backends.WriteMetaFile(dir, []byte("123 456\n789 42\n")); err != nil {
-			t.Fatalf("WriteMetaFile() unexpected error: %v", err)
-		}
-		data, err := os.ReadFile(utils.GroupMetaFallbackPath(dir))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(data) != "123 456\n789 42\n" {
-			t.Errorf("fallback content = %q, want %q", data, "123 456\n789 42\n")
-		}
-		owners, err := utils.ReadGroupMeta(dir)
-		if err != nil {
-			t.Fatalf("ReadGroupMeta() unexpected error: %v", err)
-		}
-		if len(owners) != 2 || owners["123"] != int64(456) {
-			t.Errorf("ReadGroupMeta() = %v, want 2 owners with 123->456", owners)
-		}
-	})
-
-	t.Run("EINVALWithoutCtlDirSurfacesError", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Setenv("GPU_CR_CTL_PATH", "")
-		restore := backends.SetWriteFile(func(name string, _ []byte, _ os.FileMode) error {
-			return &os.PathError{Op: "write", Path: name, Err: syscall.EINVAL}
-		})
-		defer restore()
-
-		if err := backends.WriteMetaFile(dir, []byte("123 456\n")); !errors.Is(err, syscall.EINVAL) {
-			t.Errorf("WriteMetaFile() error = %v, want EINVAL", err)
-		}
-	})
 }

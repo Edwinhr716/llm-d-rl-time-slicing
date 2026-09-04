@@ -30,8 +30,10 @@ import (
 //	<id>, <id>-host   the same pair in hugepage mode (EXPORT_FILE_PATH
 //	                  unset, hardcoded /mnt/huge-ckpt)
 //	control-<pid>     legacy control channel / v3 dual-flock lock files
-//	groups/<slot>/    destination dumps — the ONLY copy of each
-//	                  parked slot; reaped by owner-liveness, never blind TTL
+//	groups/<slot>/<pid>-<starttime>/<id>
+//	                  destination dumps — the ONLY copy of each
+//	                  parked slot; owner identity is the dirname itself;
+//	                  reaped by owner-liveness, never blind TTL
 //
 // Ctl dir (tmpfs; same dir as data when GPU_CR_CTL_PATH unset):
 //
@@ -82,12 +84,14 @@ func GroupStoreDir() string {
 	return filepath.Join(DataDir(), "groups")
 }
 
-// GroupMetaName is the per-slot metadata file recording the owning workload
-// processes of a slot: "pid starttime" per line. GC deletes a slot only when
-// every recorded owner is gone (dead, or its PID recycled to a different
+// ownerDirRe matches a slot's per-owner subdirectory, <pid>-<starttime>:
+// the dirname IS the slot's ownership metadata (path-encoded so it exists
+// atomically with the dump destination and cannot fail to be written on a
+// hugetlbfs store, which rejects write(2)). GC deletes a slot only when
+// every owner so recorded is gone (dead, or its PID recycled to a different
 // starttime) — a parked slot's dump is meaningless once its process is, and
 // never expendable before that.
-const GroupMetaName = ".owners"
+var ownerDirRe = regexp.MustCompile(`^(\d+)-(\d+)$`)
 
 // ProcStarttime returns field 22 of /proc/<pid>/stat — the PID-reuse guard.
 func ProcStarttime(pid string) (int64, error) {
@@ -239,6 +243,20 @@ func procExists(pid string) bool {
 	return err == nil
 }
 
+// ownerGone reports whether a recorded slot owner (pid + starttime) is gone:
+// the process exited, or its pid now belongs to a different process
+// (starttime mismatch). Liveness read errors are treated conservatively,
+// mirroring pidGone: while the process may still exist, the owner counts as
+// alive — a destination slot is the sole copy of parked state, so deletion
+// requires positive evidence of death, never the absence of evidence.
+func ownerGone(pid string, recorded int64) bool {
+	cur, err := ProcStarttime(pid)
+	if err != nil {
+		return os.IsNotExist(err) || !procExists(pid)
+	}
+	return cur != recorded
+}
+
 func advertisedStarttime(path string) (int64, bool) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -260,10 +278,13 @@ func advertisedStarttime(path string) (int64, bool) {
 
 // sweepGroupStore reaps destination-dump slots. These are the
 // SOLE copy of parked state, so deletion requires owner death, not a TTL:
-// a slot goes only when every owner recorded in .owners is dead or its PID
-// was recycled (starttime mismatch) — at that point the dump is
-// unrestorable anyway (the buffer VAs died with the process) — and the
-// grace period after the last op has passed.
+// a slot goes only when every owner recorded in its <pid>-<starttime>
+// subdirectory names is dead or its PID was recycled (starttime mismatch) —
+// at that point the dump is unrestorable anyway (the buffer VAs died with
+// the process) — and the grace period after the last op has passed.
+// A slot with no parseable owner dirs (including a pre-owner-dir legacy
+// layout, where dumps sit flat in the slot) carries no license to delete
+// and is kept forever.
 func sweepGroupStore(now time.Time) {
 	grace := 1 * time.Hour
 	if v := os.Getenv("GPU_CR_GROUP_GRACE_HOURS"); v != "" {
@@ -285,15 +306,15 @@ func sweepGroupStore(now time.Time) {
 		if err != nil || now.Sub(info.ModTime()) < grace {
 			continue
 		}
-		owners, err := ReadGroupMeta(dir)
-		if err != nil || len(owners) == 0 {
-			// No metadata: be conservative, never delete.
+		owners, ok := slotOwners(dir)
+		if !ok || len(owners) == 0 {
+			// No (or not only) well-formed ownership dirnames: be
+			// conservative, never delete.
 			continue
 		}
 		allGone := true
 		for pid, st := range owners {
-			cur, err := ProcStarttime(pid)
-			if err == nil && cur == st {
+			if !ownerGone(pid, st) {
 				allGone = false
 				break
 			}
@@ -304,86 +325,37 @@ func sweepGroupStore(now time.Time) {
 		if err := os.RemoveAll(dir); err == nil {
 			slog.Info("GC: removed orphaned destination slot (all owners dead)",
 				"slot", entry.Name(), "idle", now.Sub(info.ModTime()).Round(time.Minute).String())
-			if fp := GroupMetaFallbackPath(dir); fp != "" {
-				_ = os.Remove(fp)
-			}
 		}
 	}
-	sweepOrphanedMetaFallbacks(store)
 }
 
-// sweepOrphanedMetaFallbacks removes ctl-tmpfs owners-<slot> files whose
-// slot directory no longer exists (e.g. a slot deleted by hand). Runs under
-// StoreMu like the rest of the group-store sweep, so it cannot race a
-// Snapshot writing metadata for a slot it just created.
-func sweepOrphanedMetaFallbacks(store string) {
-	ctl := os.Getenv("GPU_CR_CTL_PATH")
-	if ctl == "" {
-		return
-	}
-	entries, err := os.ReadDir(ctl)
+// slotOwners parses a slot's ownership out of its subdirectory names
+// (<pid>-<starttime>). The second return is false when any subdirectory
+// fails to parse: a name this sweeper cannot account for means the slot's
+// ownership is not fully known, so the caller must keep it. Non-directory
+// children (dump files of a legacy flat slot) are not ownership records and
+// are simply skipped.
+func slotOwners(dir string) (map[string]int64, bool) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		slot, ok := strings.CutPrefix(e.Name(), "owners-")
-		if !ok || e.IsDir() {
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(store, slot)); os.IsNotExist(err) {
-			_ = os.Remove(filepath.Join(ctl, e.Name()))
-		}
-	}
-}
-
-// GroupMetaFallbackPath is where a slot's metadata lives when the group
-// store itself rejects write(2) — hugetlbfs. The ctl tmpfs is the one
-// place guaranteed writable in that layout; only this agent process reads
-// and writes slot metadata, so no cross-process path contract is needed.
-// Empty when GPU_CR_CTL_PATH is unset (legacy layout, no fallback).
-func GroupMetaFallbackPath(slotDir string) string {
-	ctl := os.Getenv("GPU_CR_CTL_PATH")
-	if ctl == "" {
-		return ""
-	}
-	return filepath.Join(ctl, "owners-"+filepath.Base(slotDir))
-}
-
-// ReadGroupMeta parses a slot's GroupMetaName file into pid -> starttime.
-// A slot on a hugetlbfs store carries a 0-byte in-slot stub (creation
-// succeeds, write(2) does not), so when the in-slot file yields no owners
-// the ctl-tmpfs fallback location is consulted before giving up.
-func ReadGroupMeta(dir string) (map[string]int64, error) {
-	owners, err := parseGroupMeta(filepath.Join(dir, GroupMetaName))
-	if err == nil && len(owners) > 0 {
-		return owners, nil
-	}
-	if fp := GroupMetaFallbackPath(dir); fp != "" {
-		if fbOwners, fbErr := parseGroupMeta(fp); fbErr == nil {
-			return fbOwners, nil
-		}
-	}
-	return owners, err
-}
-
-func parseGroupMeta(path string) (map[string]int64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+		return nil, false
 	}
 	owners := make(map[string]int64)
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
+	for _, e := range entries {
+		if !e.IsDir() {
 			continue
 		}
-		st, err := strconv.ParseInt(fields[1], 10, 64)
+		m := ownerDirRe.FindStringSubmatch(e.Name())
+		if m == nil {
+			return nil, false
+		}
+		st, err := strconv.ParseInt(m[2], 10, 64)
 		if err != nil {
-			continue
+			return nil, false
 		}
-		owners[fields[0]] = st
+		owners[m[1]] = st
 	}
-	return owners, nil
+	return owners, true
 }
 
 // procfsRoot is the procfs mount scanned for live mappings; a var so tests
