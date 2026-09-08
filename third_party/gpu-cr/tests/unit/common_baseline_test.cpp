@@ -64,6 +64,17 @@ TEST(SharedMemFsTest, HeaderFitsWithinOneHugepageExtent) {
             static_cast<size_t>(HUGE_PAGE_SIZE));
 }
 
+// multi_cr_client maps only ROUND_UP_2MB(sizeof(shared_mem_fs)) of each
+// worker buffer and places the two IPC scratch blocks at the tail of that
+// window (get_my_block/get_peer_block; the .so uses the same formula).
+// The blocks must fit in the round-up slack above the header, or an
+// IPC_MAX_EXPORTS_PER_PROC bump would silently overlap the header or
+// read past the coordinator's mapping.
+TEST(SharedMemFsTest, IpcScratchBlocksFitInHeaderWindowSlack) {
+  EXPECT_LE(sizeof(shared_mem_fs) + 2 * sizeof(IpcRebuildShmBlock),
+            ROUND_UP_2MB(sizeof(shared_mem_fs)));
+}
+
 // shared_mem_file / shared_mem_fs are the persisted dump-header layout,
 // shared between cr_client and the .so through the same mapping: pin the
 // exact x86-64 offsets and sizes so an added/reordered field (or a

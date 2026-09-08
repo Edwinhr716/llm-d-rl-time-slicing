@@ -120,7 +120,7 @@ double ckpt() {
             required += ROUND_UP_2MB(entry.second);
         if (required > SHM_SIZE) {
             fprintf(stderr, "[vGPU-CKPT] Error: checkpoint needs %zu MiB but the dump buffer is "
-                            "%zu MiB (rebuild with a larger SHM_SIZE_GB); failing cleanly\n",
+                            "%zu MiB (raise GPU_CR_SHM_MB / GPU_CR_SHM_GB); failing cleanly\n",
                     required >> 20, static_cast<size_t>(SHM_SIZE) >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
@@ -490,7 +490,7 @@ double ckpt_selective(const SelectiveCrRequest* req) {
         // historical mid-loop exit(-1).
         if (dump_total > fs_capacity) {
             fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: selective checkpoint needs %zu MiB but the "
-                            "dump buffer is %zu MiB (rebuild with a larger SHM_SIZE_GB); failing cleanly\n",
+                            "dump buffer is %zu MiB (raise GPU_CR_SHM_MB / GPU_CR_SHM_GB); failing cleanly\n",
                     dump_total >> 20, fs_capacity >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
@@ -1539,6 +1539,11 @@ void cr_ipc_signal_handler(int signum) {
 // Library constructor: register all signal handlers
 // ---------------------------------------------------------------------------
 __attribute__((constructor)) void init() {
+    // Resolve buffer config FIRST — a function-local-static
+    // singleton invoked here (not a second ELF constructor, whose order vs
+    // this one would be unspecified). Signal handlers only read the cache.
+    gpu_cr::Config();
+
     fprintf(stderr, "[vGPU] Library loaded! Registering signal handlers...\n");
     fprintf(stderr, "[vGPU] Multi-GPU CR support enabled (IPC hook mode)\n");
     fflush(stderr);
