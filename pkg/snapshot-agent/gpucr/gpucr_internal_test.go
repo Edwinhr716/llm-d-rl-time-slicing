@@ -85,9 +85,9 @@ func TestGCFilePatterns(t *testing.T) {
 
 func TestSweep(t *testing.T) {
 	ctl := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", ctl)  // keep group-store sweep inside the tempdir
-	t.Setenv("GPU_CR_CTL_PATH", "")    // legacy layout: ctl files share the data dir
-	t.Setenv("GPU_CR_GROUP_STORE", "") // default <data>/groups
+	t.Setenv(EnvDataDir, ctl)   // keep group-store sweep inside the tempdir
+	t.Setenv(EnvCtlPath, "")    // legacy layout: ctl files share the data dir
+	t.Setenv(EnvGroupStore, "") // default <data>/groups
 
 	// Deterministic maps scan: a fixture procfs whose one process maps the
 	// two "live" dumps. Scanning the real /proc would make the test depend
@@ -154,9 +154,9 @@ func TestSweep(t *testing.T) {
 func TestSweepCtlDir(t *testing.T) {
 	data := t.TempDir()
 	ctl := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", data)
-	t.Setenv("GPU_CR_CTL_PATH", ctl)
-	t.Setenv("GPU_CR_GROUP_STORE", "")
+	t.Setenv(EnvDataDir, data)
+	t.Setenv(EnvCtlPath, ctl)
+	t.Setenv(EnvGroupStore, "")
 
 	writeAged(t, ctl, "control-"+deadPID, true)   // dead pid -> removed
 	writeAged(t, ctl, "pid_map_"+deadPID, true)   // dead pid -> removed
@@ -269,10 +269,10 @@ func TestAdvertisedStarttime(t *testing.T) {
 // dump files — are never deleted.
 func TestSweepGroupStore(t *testing.T) {
 	data := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", data)
-	t.Setenv("GPU_CR_CTL_PATH", "")
-	t.Setenv("GPU_CR_GROUP_STORE", "")
-	t.Setenv("GPU_CR_GROUP_GRACE_HOURS", "")
+	t.Setenv(EnvDataDir, data)
+	t.Setenv(EnvCtlPath, "")
+	t.Setenv(EnvGroupStore, "")
+	t.Setenv(EnvGroupGraceHours, "")
 	store := filepath.Join(data, "groups")
 
 	// makeGroup creates a slot whose children are owner dirs (each holding
@@ -392,9 +392,9 @@ func TestSlotOwners(t *testing.T) {
 // check does not depend on the maps scan).
 func TestSweepIncompleteProcScan(t *testing.T) {
 	ctl := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", ctl)
-	t.Setenv("GPU_CR_CTL_PATH", "")
-	t.Setenv("GPU_CR_GROUP_STORE", "")
+	t.Setenv(EnvDataDir, ctl)
+	t.Setenv(EnvCtlPath, "")
+	t.Setenv(EnvGroupStore, "")
 
 	fakeProc := t.TempDir()
 	pidDir := filepath.Join(fakeProc, "42")

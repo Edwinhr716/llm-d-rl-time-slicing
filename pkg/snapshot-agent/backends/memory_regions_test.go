@@ -44,9 +44,9 @@ const testStarttime = int64(555)
 func newMemoryRegions(t *testing.T) (*backends.MemoryRegions, string, string) {
 	t.Helper()
 	ctlDir := t.TempDir()
-	t.Setenv("EXPORT_FILE_PATH", ctlDir)
-	t.Setenv("GPU_CR_CTL_PATH", "")
-	t.Setenv("GPU_CR_GROUP_STORE", "")
+	t.Setenv(gpucr.EnvDataDir, ctlDir)
+	t.Setenv(gpucr.EnvCtlPath, "")
+	t.Setenv(gpucr.EnvGroupStore, "")
 	mr := backends.NewMemoryRegions()
 	mr.SetStarttimeFunc(func(string) (int64, error) { return testStarttime, nil })
 	return mr, ctlDir, filepath.Join(ctlDir, "groups")
@@ -416,7 +416,7 @@ func TestMemoryRegionsPidResolution(t *testing.T) {
 			setup: func(t *testing.T, _ *backends.MemoryRegions, ctlDir string) {
 				t.Helper()
 				tmpfsDir := t.TempDir()
-				t.Setenv("GPU_CR_CTL_PATH", tmpfsDir)
+				t.Setenv(gpucr.EnvCtlPath, tmpfsDir)
 				writePidMap(t, ctlDir, "123", "55") // stale map on the data mount
 				writePidMap(t, tmpfsDir, "123", "91")
 			},
@@ -606,7 +606,7 @@ func TestMemoryRegionsHealthCheck(t *testing.T) {
 }
 
 func TestMemoryRegionsOpTimeout(t *testing.T) {
-	t.Setenv("GPU_CR_OP_TIMEOUT_SEC", "1")
+	t.Setenv(gpucr.EnvOpTimeoutSec, "1")
 
 	mr, ctlDir, storeDir := newMemoryRegions(t)
 	writePidMap(t, ctlDir, "123", "42")
