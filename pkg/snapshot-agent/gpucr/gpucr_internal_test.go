@@ -1,9 +1,10 @@
-package utils
+package gpucr
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"syscall"
 	"testing"
@@ -321,6 +322,12 @@ func TestSweepGroupStore(t *testing.T) {
 		makeGroup("live-owner", []string{fmt.Sprintf("%s-%d", pid, st)}, nil, true)
 		// pid alive but starttime mismatched = recycled -> removed
 		makeGroup("recycled-owner", []string{fmt.Sprintf("%s-%d", pid, st+1)}, nil, true)
+		// Dead record AND live record for the SAME pid: the dead dirname
+		// sorts after the live one (leading '9'), so pid-keyed ownership
+		// would retain only the stale starttime and delete the slot out
+		// from under the live owner. Must be kept.
+		makeGroup("recycled-duplicate",
+			[]string{fmt.Sprintf("%s-%d", pid, st), fmt.Sprintf("%s-9%d", pid, st)}, nil, true)
 	}
 
 	sweepGroupStore(time.Now())
@@ -335,6 +342,7 @@ func TestSweepGroupStore(t *testing.T) {
 	if hasProcfs() {
 		assertKept(t, store, "live-owner")
 		assertGone(t, store, "recycled-owner")
+		assertKept(t, store, "recycled-duplicate")
 	}
 }
 
@@ -352,8 +360,20 @@ func TestSlotOwners(t *testing.T) {
 		t.Fatal(err)
 	}
 	owners, ok := slotOwners(dir)
-	if !ok || len(owners) != 2 || owners["123"] != 456 || owners["789"] != 42 {
-		t.Errorf("slotOwners() = %v, %v; want both owners parsed", owners, ok)
+	want := []ownerRec{{pid: "123", starttime: 456}, {pid: "789", starttime: 42}}
+	if !ok || !reflect.DeepEqual(owners, want) {
+		t.Errorf("slotOwners() = %v, %v; want %v, true", owners, ok, want)
+	}
+
+	// Same pid under two starttimes (a dead owner plus a recycled-pid
+	// successor) must stay two distinct records — collapsing them onto
+	// the pid is what could delete a live owner's dump.
+	if err := os.MkdirAll(filepath.Join(dir, "123-999"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	owners, ok = slotOwners(dir)
+	if !ok || len(owners) != 3 {
+		t.Errorf("slotOwners() with recycled-pid pair = %v, %v; want 3 records", owners, ok)
 	}
 
 	// One unparseable SUBDIRECTORY poisons the whole slot: ownership is
