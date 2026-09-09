@@ -22,10 +22,8 @@ external projects: see `third_party/forked/` in kubernetes/kubernetes,
 
 ## Local changes
 
-This copy carries the consolidated changes from
-[Edwinhr716/GPU-CR@`experiments-e1-e16`](https://github.com/Edwinhr716/GPU-CR/tree/experiments-e1-e16)
-(head `08ec862`), which is upstream `e9bbb52` plus everything the E1–E16
-time-slicing experiments required, cleaned up and tested:
+This copy carries upstream `e9bbb52` plus the changes GPU time-slicing
+required, cleaned up and tested:
 
 - memory-address (selective) checkpoint backend, unrounded allocation-size
   dumps, and granule-chunked copies

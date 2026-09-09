@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <vector>
+#include <atomic>
 #include <mutex>
 #include <set>
 
@@ -23,8 +24,9 @@ std::mutex gpu_mem_mutex;
 static std::map<void*, CUmemGenericAllocationHandle> global_handle_map;
 // The application's CUDA context, captured at first allocation (PyTorch's,
 // in our deployments). External linkage is intentional: the IPC hooks
-// consume this via extern.
-CUcontext g_application_context = nullptr;
+// consume this via extern. Atomic because the kernel-launch interposers read
+// it on every launch without taking gpu_mem_mutex, while allocations write it.
+std::atomic<CUcontext> g_application_context{nullptr};
 
 namespace {
 
@@ -352,16 +354,17 @@ int nv::externalRestore(int pid) {
 
 int nv::pushContext() {
     ensureCudaInitialized();
-    // Snapshot under the allocation lock: the hooks write g_application_context
-    // while application threads may still be allocating. Release before the
-    // driver call. The signal guard also covers handler context: a handler
+    // Snapshot under the allocation lock: the load is atomic, but taking the
+    // lock also orders this against an allocation that is mid-publish, so the
+    // park path never pushes a half-set-up context. Release before the driver
+    // call. The signal guard also covers handler context: a handler
     // only auto-blocks its own signum, so a different CR signal nesting here
     // would otherwise deadlock on the same mutex.
     CUcontext captured = nullptr;
     {
         ScopedBlockCrSignals signal_block;
         std::lock_guard<std::mutex> lock(gpu_mem_mutex);
-        captured = g_application_context;
+        captured = g_application_context.load(std::memory_order_acquire);
     }
     CUcontext target_context = context_;
     if (captured != nullptr) {
@@ -417,9 +420,9 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
     fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu, current ctx=%p\n", size, curr_ctx);
     fflush(stderr);
 
-    if (g_application_context == nullptr && curr_ctx != nullptr) {
-        g_application_context = curr_ctx;
-        fprintf(stderr, "[HOOK] Captured application CUDA context (fallback): %p\n", g_application_context);
+    if (g_application_context.load(std::memory_order_relaxed) == nullptr && curr_ctx != nullptr) {
+        g_application_context.store(curr_ctx, std::memory_order_release);
+        fprintf(stderr, "[HOOK] Captured application CUDA context (fallback): %p\n", curr_ctx);
         fflush(stderr);
     }
 
@@ -463,7 +466,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return cudaErrorInitializationError;
             }
             fprintf(stderr, "[HOOK] Using existing context, device=%d\n", device);
-            g_application_context = context;
+            g_application_context.store(context, std::memory_order_release);
         } else {
             res = cuDeviceGet(&device, 0);
             if (res != CUDA_SUCCESS) {
@@ -480,7 +483,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return cudaErrorInitializationError;
             }
             fprintf(stderr, "[HOOK] Created new context, device=%d\n", device);
-            g_application_context = context;
+            g_application_context.store(context, std::memory_order_release);
         }
     }
     

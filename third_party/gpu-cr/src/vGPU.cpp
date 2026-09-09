@@ -121,7 +121,7 @@ double ckpt() {
             required += ROUND_UP_2MB(entry.second);
         if (required > SHM_SIZE) {
             fprintf(stderr, "[vGPU-CKPT] Error: checkpoint needs %zu MiB but the dump buffer is "
-                            "%zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
+                            "%zu MiB (raise GPU_CR_SHM_MB / GPU_CR_SHM_GB); failing cleanly\n",
                     required >> 20, static_cast<size_t>(SHM_SIZE) >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
@@ -492,7 +492,7 @@ double ckpt_selective(const SelectiveCrRequest* req) {
         // mid-loop exit(-1).
         if (dump_total > fs_capacity) {
             fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: selective checkpoint needs %zu MiB but the "
-                            "dump buffer is %zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
+                            "dump buffer is %zu MiB (raise GPU_CR_SHM_MB / GPU_CR_SHM_GB); failing cleanly\n",
                     dump_total >> 20, fs_capacity >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
@@ -917,6 +917,21 @@ double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
     for (uint64_t i = 0; i < file_num; i++) {
         void* ptr = fs->files[i].ptr;
         uint64_t size = fs->files[i].size;
+        // The request cross-check above only proves the requested regions are
+        // in the dump; this loop walks every dump entry, so a stale or extra
+        // entry in a caller-writable dump would otherwise be remapped and
+        // written on trust. Reject anything that is not a live allocation of
+        // at least that size before touching GPU state.
+        if (dest_path) {
+            auto it = allocated_memory.find(ptr);
+            if (it == allocated_memory.end() || it->second < size) {
+                fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] dump entry %p (size %lu) is not a live "
+                                "allocation of that size; rejecting\n", ptr, size);
+                g_op_status = EINVAL;
+                DestClose(&dm);
+                return -1;
+            }
+        }
         if (gpu->remapPhysicalMemory(ptr, size) != 0) {
             fprintf(stderr, "Error: Failed to remap physical memory for ptr %p\n", ptr);
             if (dest_path) {
@@ -1190,7 +1205,10 @@ void cr_signal_handler(int signum) {
     }
 
     uint32_t msg = comm->recv_msg();
-    gpu->pushContext();
+    // Pair the pop below with this handler's own push: pushContext leaves the
+    // stack untouched when it fails, and an unconditional pop would then
+    // consume a context an earlier handler pushed and failed to pop.
+    const bool context_pushed = gpu->pushContext() == 0;
     if(msg == SELECTIVE_CKPT_MSG) {
         ShareMemComm* scomm = static_cast<ShareMemComm*>(comm);
         const SelectiveCrRequest* req = &scomm->control->selective_req;
@@ -1279,7 +1297,7 @@ void cr_signal_handler(int signum) {
         }
         FinishOp(static_cast<ShareMemComm*>(comm));
     }
-    gpu->popContext();
+    if (context_pushed) gpu->popContext();
     comm->send_msg(FINISH_MSG);
 }
 
