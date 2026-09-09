@@ -965,14 +965,20 @@ bool TraceLaunches() {
     return enabled;
 }
 
-// Shared body for the kernel-launch hooks: The application issues launches from a
-// context captured at cudaMalloc time (g_application_context); when the calling
-// thread's current context differs, the launch is bracketed by a push/pop
-// of the captured context so the kernel lands where the allocations live.
+// Shared body for the kernel-launch hooks: a thread with no current CUDA
+// context borrows the application's context (captured at first allocation) for
+// the duration of the launch, so the kernel lands where the allocations live.
+//
+// A thread that already has a context current keeps it. g_application_context
+// is process-global and records only the first allocation's context, so it is
+// no evidence that some other live context is the wrong one — the launch's
+// function and stream handles belong to the caller's context, and overriding
+// it is what would break the launch. Filling in an absent context is safe
+// because there is nothing to contradict.
 template <typename Fn>
 auto LaunchInCapturedContext(const char* name, Fn&& call) -> decltype(call()) {
     CUcontext ctx = nullptr;
-    cuCtxGetCurrent(&ctx);  // feeds the mismatch check below, not just tracing
+    cuCtxGetCurrent(&ctx);  // feeds the check below, not just tracing
     if (TraceLaunches()) {
         fprintf(stderr, "[HOOK] %s: current ctx=%p\n", name, ctx);
         fflush(stderr);
@@ -982,10 +988,10 @@ auto LaunchInCapturedContext(const char* name, Fn&& call) -> decltype(call()) {
     // allocation on another thread may publish a context between them.
     const CUcontext captured = g_application_context.load(std::memory_order_acquire);
     bool pushed = false;
-    if (captured != nullptr && ctx != captured) {
+    if (ctx == nullptr && captured != nullptr) {
         if (TraceLaunches()) {
-            fprintf(stderr, "[HOOK] %s: context mismatch (current=%p, captured=%p), pushing captured\n",
-                    name, ctx, captured);
+            fprintf(stderr, "[HOOK] %s: no current context, pushing captured %p\n",
+                    name, captured);
         }
         if (cuCtxPushCurrent(captured) == CUDA_SUCCESS) {
             pushed = true;
