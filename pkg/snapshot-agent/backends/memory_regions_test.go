@@ -13,7 +13,7 @@ import (
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
-	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/gpucr"
 )
 
 func region(pid int32, addr, size uint64) *pb.MemoryRegion {
@@ -159,6 +159,22 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 			expectNoRun: true,
 		},
 		{
+			name:        "DuplicateRegionSamePidAndAddress",
+			config:      memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024), region(123, 0x7f00, 2048)),
+			jobID:       "test-job",
+			expectedErr: true,
+			expectNoRun: true,
+		},
+		{
+			name:   "SameAddressDifferentPidsAllowed",
+			config: memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024), region(456, 0x7f00, 1024)),
+			jobID:  "test-job",
+			expectArgs: [][]string{
+				{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/slot-a/123-555/42"},
+				{"-c", "-p", "456", "-s", "0x7f00:1024", "-o", "<store>/slot-a/456-555/42"},
+			},
+		},
+		{
 			name:        "PathTraversalSnapshotName",
 			config:      memoryRegionsConfig("../../etc", region(123, 0x7f00, 1024)),
 			jobID:       "test-job",
@@ -185,6 +201,7 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mr, ctlDir, storeDir := newMemoryRegions(t)
 			writePidMap(t, ctlDir, "123", "42")
+			writePidMap(t, ctlDir, "456", "42") // second pid of multi-pid cases
 			var calledArgs [][]string
 			mr.SetExecCommand(func(_ context.Context, name string, args ...string) ([]byte, error) {
 				if name != backends.CrClientPath {
@@ -461,7 +478,7 @@ func TestMemoryRegionsSnapshotOwnerDir(t *testing.T) {
 		t.Skip("no procfs on this host")
 	}
 	mr, ctlDir, storeDir := newMemoryRegions(t)
-	mr.SetStarttimeFunc(utils.ProcStarttime)
+	mr.SetStarttimeFunc(gpucr.ProcStarttime)
 	mr.SetExecCommand(func(context.Context, string, ...string) ([]byte, error) { return nil, nil })
 	pid := strconv.Itoa(os.Getpid())
 	writePidMap(t, ctlDir, pid, "42")
@@ -478,7 +495,7 @@ func TestMemoryRegionsSnapshotOwnerDir(t *testing.T) {
 		t.Fatalf("Snapshot() unexpected error: %v", err)
 	}
 
-	st, err := utils.ProcStarttime(pid)
+	st, err := gpucr.ProcStarttime(pid)
 	if err != nil {
 		t.Fatal(err)
 	}
