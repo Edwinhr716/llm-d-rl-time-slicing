@@ -159,6 +159,22 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 			expectNoRun: true,
 		},
 		{
+			name:        "DuplicateRegionSamePidAndAddress",
+			config:      memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024), region(123, 0x7f00, 2048)),
+			jobID:       "test-job",
+			expectedErr: true,
+			expectNoRun: true,
+		},
+		{
+			name:   "SameAddressDifferentPidsAllowed",
+			config: memoryRegionsConfig("slot-a", region(123, 0x7f00, 1024), region(456, 0x7f00, 1024)),
+			jobID:  "test-job",
+			expectArgs: [][]string{
+				{"-c", "-p", "123", "-s", "0x7f00:1024", "-o", "<store>/slot-a/123-555/42"},
+				{"-c", "-p", "456", "-s", "0x7f00:1024", "-o", "<store>/slot-a/456-555/42"},
+			},
+		},
+		{
 			name:        "PathTraversalSnapshotName",
 			config:      memoryRegionsConfig("../../etc", region(123, 0x7f00, 1024)),
 			jobID:       "test-job",
@@ -185,6 +201,7 @@ func TestMemoryRegionsSnapshot(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mr, ctlDir, storeDir := newMemoryRegions(t)
 			writePidMap(t, ctlDir, "123", "42")
+			writePidMap(t, ctlDir, "456", "42") // second pid of multi-pid cases
 			var calledArgs [][]string
 			mr.SetExecCommand(func(_ context.Context, name string, args ...string) ([]byte, error) {
 				if name != backends.CrClientPath {

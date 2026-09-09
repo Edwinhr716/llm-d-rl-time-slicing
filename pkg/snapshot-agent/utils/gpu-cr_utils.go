@@ -64,9 +64,26 @@ const gcMinAge = 5 * time.Minute
 // sweep.
 const ctlMinAge = time.Minute
 
+// Environment variables of the GPU-CR deployment surface, shared between
+// the backends and this sweeper so a rename happens in one place.
+const (
+	// EnvDataDir overrides the GPU-CR data dir (dump/staging buffers and
+	// the parent of the destination store).
+	EnvDataDir = "EXPORT_FILE_PATH"
+	// EnvGroupStore overrides the destination store location.
+	EnvGroupStore = "GPU_CR_GROUP_STORE"
+	// EnvCtlPath points at the control-plane tmpfs; unset means the
+	// legacy layout where control files share the data dir.
+	EnvCtlPath = "GPU_CR_CTL_PATH"
+	// EnvGroupGraceHours overrides the store sweep grace period.
+	EnvGroupGraceHours = "GPU_CR_GROUP_GRACE_HOURS"
+	// EnvOpTimeoutSec bounds a single cr_client invocation.
+	EnvOpTimeoutSec = "GPU_CR_OP_TIMEOUT_SEC"
+)
+
 // DataDir is where GPU-CR keeps dump/staging DATA files (hugetlbfs mount).
 func DataDir() string {
-	if d := os.Getenv("EXPORT_FILE_PATH"); d != "" {
+	if d := os.Getenv(EnvDataDir); d != "" {
 		return d
 	}
 	return "/mnt/huge-ckpt"
@@ -78,7 +95,7 @@ func DataDir() string {
 // identically in the agent and workload mount namespaces (both mount the
 // same hostPath at the same in-container path).
 func GroupStoreDir() string {
-	if d := os.Getenv("GPU_CR_GROUP_STORE"); d != "" {
+	if d := os.Getenv(EnvGroupStore); d != "" {
 		return d
 	}
 	return filepath.Join(DataDir(), "groups")
@@ -93,23 +110,31 @@ func GroupStoreDir() string {
 // never expendable before that.
 var ownerDirRe = regexp.MustCompile(`^(\d+)-(\d+)$`)
 
-// ProcStarttime returns field 22 of /proc/<pid>/stat — the PID-reuse guard.
+// /proc/<pid>/stat layout, per proc(5): fields are 1-indexed, and comm
+// (field 2) may contain spaces and parens, so parsing starts after the
+// LAST ')' — which leaves index 0 of the split holding field 3 (state).
+const (
+	statStarttimeField      = 22
+	statFirstFieldAfterComm = 3
+)
+
+// ProcStarttime returns the starttime field of /proc/<pid>/stat — the
+// PID-reuse guard.
 func ProcStarttime(pid string) (int64, error) {
 	data, err := os.ReadFile("/proc/" + pid + "/stat")
 	if err != nil {
 		return 0, err
 	}
-	// comm may contain spaces/parens: parse after the LAST ')'.
 	idx := strings.LastIndexByte(string(data), ')')
-	if idx < 0 || idx+2 >= len(data) {
+	if idx < 0 || idx+len(") ") >= len(data) {
 		return 0, fmt.Errorf("malformed /proc/%s/stat", pid)
 	}
-	fields := strings.Fields(string(data[idx+2:]))
-	// fields[0] is field 3 (state); starttime is field 22.
-	if len(fields) < 20 {
+	fields := strings.Fields(string(data[idx+len(") "):]))
+	starttimeIdx := statStarttimeField - statFirstFieldAfterComm
+	if len(fields) <= starttimeIdx {
 		return 0, fmt.Errorf("short /proc/%s/stat", pid)
 	}
-	return strconv.ParseInt(fields[19], 10, 64)
+	return strconv.ParseInt(fields[starttimeIdx], 10, 64)
 }
 
 // StartGPUCRSweeper sweeps stale GPU-CR artifacts at startup and every
@@ -132,13 +157,11 @@ func StartGPUCRSweeper(ctx context.Context, ctlDir string, interval time.Duratio
 
 func sweep(dataDir string) {
 	sweepDataDir(dataDir)
-	if ctl := os.Getenv("GPU_CR_CTL_PATH"); ctl != "" && ctl != dataDir {
+	if ctl := os.Getenv(EnvCtlPath); ctl != "" && ctl != dataDir {
 		sweepPidFiles(ctl, ctlMinAge)
 	}
 
-	StoreMu.Lock()
 	sweepGroupStore(time.Now())
-	StoreMu.Unlock()
 }
 
 func sweepDataDir(dir string) {
@@ -245,14 +268,20 @@ func procExists(pid string) bool {
 
 // ownerGone reports whether a recorded slot owner (pid + starttime) is gone:
 // the process exited, or its pid now belongs to a different process
-// (starttime mismatch). Liveness read errors are treated conservatively,
-// mirroring pidGone: while the process may still exist, the owner counts as
-// alive — a destination slot is the sole copy of parked state, so deletion
-// requires positive evidence of death, never the absence of evidence.
+// (starttime mismatch). A destination slot is the sole copy of parked state
+// and its deletion is irreversible, so this demands POSITIVE evidence of
+// death: when the starttime cannot be read, the owner counts as gone only if
+// /proc/<pid> is confirmed absent. A malformed stat, or a permission/I/O
+// error on either read, keeps the owner alive — stricter than pidGone,
+// whose ctl-file deletions are recoverable.
 func ownerGone(pid string, recorded int64) bool {
 	cur, err := ProcStarttime(pid)
 	if err != nil {
-		return os.IsNotExist(err) || !procExists(pid)
+		if os.IsNotExist(err) {
+			return true
+		}
+		_, serr := os.Stat("/proc/" + pid)
+		return os.IsNotExist(serr)
 	}
 	return cur != recorded
 }
@@ -286,8 +315,13 @@ func advertisedStarttime(path string) (int64, bool) {
 // layout, where dumps sit flat in the slot) carries no license to delete
 // and is kept forever.
 func sweepGroupStore(now time.Time) {
+	// The whole pass runs under StoreMu — the mutex the C/R path holds —
+	// deferred so no code added below can leave the store locked.
+	StoreMu.Lock()
+	defer StoreMu.Unlock()
+
 	grace := 1 * time.Hour
-	if v := os.Getenv("GPU_CR_GROUP_GRACE_HOURS"); v != "" {
+	if v := os.Getenv(EnvGroupGraceHours); v != "" {
 		if n, err := time.ParseDuration(v + "h"); err == nil && n > 0 {
 			grace = n
 		}
@@ -313,8 +347,8 @@ func sweepGroupStore(now time.Time) {
 			continue
 		}
 		allGone := true
-		for pid, st := range owners {
-			if !ownerGone(pid, st) {
+		for _, o := range owners {
+			if !ownerGone(o.pid, o.starttime) {
 				allGone = false
 				break
 			}
@@ -329,18 +363,30 @@ func sweepGroupStore(now time.Time) {
 	}
 }
 
+// ownerRec is one parsed <pid>-<starttime> ownership record.
+type ownerRec struct {
+	pid       string
+	starttime int64
+}
+
 // slotOwners parses a slot's ownership out of its subdirectory names
 // (<pid>-<starttime>). The second return is false when any subdirectory
 // fails to parse: a name this sweeper cannot account for means the slot's
 // ownership is not fully known, so the caller must keep it. Non-directory
 // children (dump files of a legacy flat slot) are not ownership records and
 // are simply skipped.
-func slotOwners(dir string) (map[string]int64, bool) {
+//
+// Every parsed pair is preserved as its own record — never keyed by pid:
+// a slot can hold both a dead owner's directory and a recycled-pid
+// successor's (same pid, different starttime), and collapsing them onto
+// the pid could let the dead record's mismatch delete the live owner's
+// dump.
+func slotOwners(dir string) ([]ownerRec, bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, false
 	}
-	owners := make(map[string]int64)
+	var owners []ownerRec
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -353,7 +399,7 @@ func slotOwners(dir string) (map[string]int64, bool) {
 		if err != nil {
 			return nil, false
 		}
-		owners[m[1]] = st
+		owners = append(owners, ownerRec{pid: m[1], starttime: st})
 	}
 	return owners, true
 }
