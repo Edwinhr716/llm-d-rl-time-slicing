@@ -13,7 +13,7 @@ import (
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
-	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/gpucr"
 )
 
 func region(pid int32, addr, size uint64) *pb.MemoryRegion {
@@ -478,7 +478,7 @@ func TestMemoryRegionsSnapshotOwnerDir(t *testing.T) {
 		t.Skip("no procfs on this host")
 	}
 	mr, ctlDir, storeDir := newMemoryRegions(t)
-	mr.SetStarttimeFunc(utils.ProcStarttime)
+	mr.SetStarttimeFunc(gpucr.ProcStarttime)
 	mr.SetExecCommand(func(context.Context, string, ...string) ([]byte, error) { return nil, nil })
 	pid := strconv.Itoa(os.Getpid())
 	writePidMap(t, ctlDir, pid, "42")
@@ -495,7 +495,7 @@ func TestMemoryRegionsSnapshotOwnerDir(t *testing.T) {
 		t.Fatalf("Snapshot() unexpected error: %v", err)
 	}
 
-	st, err := utils.ProcStarttime(pid)
+	st, err := gpucr.ProcStarttime(pid)
 	if err != nil {
 		t.Fatal(err)
 	}

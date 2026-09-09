@@ -13,7 +13,7 @@ import (
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
-	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/gpucr"
 )
 
 // MemoryRegions implements the Backend interface for selective checkpoint
@@ -42,7 +42,7 @@ type MemoryRegions struct {
 	mu          sync.Mutex
 	execCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
 	statFunc    func(string) (os.FileInfo, error)
-	// starttime reads a pid's starttime (utils.ProcStarttime in
+	// starttime reads a pid's starttime (gpucr.ProcStarttime in
 	// production; injectable for tests, which use pids with no procfs
 	// entry).
 	starttime func(pid string) (int64, error)
@@ -57,7 +57,7 @@ func NewMemoryRegions() *MemoryRegions {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
 		statFunc:  os.Stat,
-		starttime: utils.ProcStarttime,
+		starttime: gpucr.ProcStarttime,
 		procRoot:  "/proc",
 	}
 }
@@ -66,10 +66,10 @@ func NewMemoryRegions() *MemoryRegions {
 // ctl-ready-<pid>. With GPU_CR_CTL_PATH set that's a tmpfs; unset
 // means the legacy layout where control files share the data dir.
 func ctlFilesDir() string {
-	if d := os.Getenv(utils.EnvCtlPath); d != "" {
+	if d := os.Getenv(gpucr.EnvCtlPath); d != "" {
 		return d
 	}
-	return utils.DataDir()
+	return gpucr.DataDir()
 }
 
 // groupDir validates a snapshot slot name and returns its directory under
@@ -77,7 +77,7 @@ func ctlFilesDir() string {
 // rejected along with traversal because GC reaps store entries at the top
 // level only (a nested slot's owner directories would be invisible to it).
 func groupDir(slot string) (string, error) {
-	store := utils.GroupStoreDir()
+	store := gpucr.GroupStoreDir()
 	dir := filepath.Join(store, filepath.Clean(slot))
 	rel, err := filepath.Rel(store, dir)
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || strings.ContainsRune(rel, os.PathSeparator) {
@@ -195,8 +195,8 @@ func (g *MemoryRegions) Snapshot(ctx context.Context, req Request) error {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	utils.StoreMu.Lock()
-	defer utils.StoreMu.Unlock()
+	gpucr.StoreMu.Lock()
+	defer gpucr.StoreMu.Unlock()
 
 	slog.InfoContext(ctx, "Snapshotting memory regions using GPU-CR",
 		"jobID", req.JobID, "slot", slot, "pids", regionPIDs(cfg), "regions", len(cfg.GetRegions()))
@@ -261,8 +261,8 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	utils.StoreMu.Lock()
-	defer utils.StoreMu.Unlock()
+	gpucr.StoreMu.Lock()
+	defer gpucr.StoreMu.Unlock()
 
 	slog.InfoContext(ctx, "Restoring memory regions using GPU-CR",
 		"jobID", req.JobID, "slot", slot, "pids", regionPIDs(cfg), "regions", len(cfg.GetRegions()))
@@ -272,7 +272,7 @@ func (g *MemoryRegions) Restore(ctx context.Context, req Request) error {
 		return err
 	}
 	if _, err := os.Stat(targetDir); err != nil {
-		return fmt.Errorf("snapshot slot %q not found in group store %s: %w", slot, utils.GroupStoreDir(), err)
+		return fmt.Errorf("snapshot slot %q not found in group store %s: %w", slot, gpucr.GroupStoreDir(), err)
 	}
 
 	t0 := time.Now()
@@ -438,7 +438,7 @@ func idFromProcMaps(procRoot, pid string) (string, error) {
 // cr_client now enforces the same deadline internally; this is
 // the outer belt to its braces.
 func opTimeout() time.Duration {
-	if v := os.Getenv(utils.EnvOpTimeoutSec); v != "" {
+	if v := os.Getenv(gpucr.EnvOpTimeoutSec); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return time.Duration(n) * time.Second
 		}

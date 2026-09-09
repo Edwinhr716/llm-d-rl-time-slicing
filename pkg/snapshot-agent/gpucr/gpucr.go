@@ -1,4 +1,4 @@
-package utils
+package gpucr
 
 import (
 	"bufio"
@@ -137,9 +137,9 @@ func ProcStarttime(pid string) (int64, error) {
 	return strconv.ParseInt(fields[starttimeIdx], 10, 64)
 }
 
-// StartGPUCRSweeper sweeps stale GPU-CR artifacts at startup and every
+// StartSweeper sweeps stale GPU-CR artifacts at startup and every
 // interval.
-func StartGPUCRSweeper(ctx context.Context, ctlDir string, interval time.Duration) {
+func StartSweeper(ctx context.Context, ctlDir string, interval time.Duration) {
 	go func() {
 		sweep(ctlDir)
 		t := time.NewTicker(interval)
