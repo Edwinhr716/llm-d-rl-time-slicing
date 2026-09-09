@@ -1,5 +1,6 @@
 #include "nv.h"
 #include "../../common.h"
+#include "../../cr_signal_guard.h"
 #include <dlfcn.h>
 #include <pthread.h>
 #include <csignal>
@@ -28,39 +29,9 @@ static std::map<void*, CUmemGenericAllocationHandle> global_handle_map;
 // it on every launch without taking gpu_mem_mutex, while allocations write it.
 std::atomic<CUcontext> g_application_context{nullptr};
 
-namespace {
-
-// Blocks the CR control signals for the guard's lifetime. The CR signal
-// handlers take gpu_mem_mutex, so a process-directed CR signal delivered to
-// a thread holding the mutex would self-deadlock; masking the holding thread
-// routes delivery to a non-holding thread instead. Construct immediately
-// before the lock so reverse destruction unlocks before unmasking.
-class ScopedBlockCrSignals {
-public:
-    ScopedBlockCrSignals() {
-        sigset_t block;
-        sigemptyset(&block);
-        sigaddset(&block, CR_INIT_SIGNAL);
-        sigaddset(&block, CR_CKPT_SIGNAL);
-        sigaddset(&block, CR_RESTORE_SIGNAL);
-        sigaddset(&block, CR_IPC_TEARDOWN_SIGNAL);
-        sigaddset(&block, CR_IPC_REBUILD_SIGNAL);
-        sigaddset(&block, CR_IPC_VALIDATE_SIGNAL);
-        pthread_sigmask(SIG_BLOCK, &block, &old_mask_);
-    }
-    ~ScopedBlockCrSignals() {
-        // SIG_SETMASK with the saved set: SIG_UNBLOCK would wrongly unmask
-        // signals the caller had already blocked.
-        pthread_sigmask(SIG_SETMASK, &old_mask_, nullptr);
-    }
-    ScopedBlockCrSignals(const ScopedBlockCrSignals&) = delete;
-    ScopedBlockCrSignals& operator=(const ScopedBlockCrSignals&) = delete;
-
-private:
-    sigset_t old_mask_;
-};
-
-}  // namespace
+// ScopedBlockCrSignals now lives in src/cr_signal_guard.h: the signal handler
+// in vGPU.cpp needs the same mask to cover a whole CR operation.
+using gpu_cr::ScopedBlockCrSignals;
 
 // P2P peer access hooks and helpers live in src/ipc_hooks.cpp (canonical).
 
