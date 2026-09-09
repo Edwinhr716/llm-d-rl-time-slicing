@@ -50,8 +50,10 @@ hex and decimal addresses are both accepted.
 
 `snapshot_name` names the agent-side snapshot slot (it defaults to the
 `job_id` when empty). Distinct names let multiple snapshots of the same
-process coexist and be swapped on demand. Use `snapshot_name` — not the
-request's `group` — for slot naming; `group` is orchestrator-owned.
+process coexist and be swapped on demand. The name becomes a directory
+on the agent, so it may only contain letters, digits, `-` and `_`. Use
+`snapshot_name` — not the request's `group` — for slot naming; `group`
+is orchestrator-owned.
 
 ```python
 from timeslice.snapshot_agent import (

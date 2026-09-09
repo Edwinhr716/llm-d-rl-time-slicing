@@ -142,6 +142,35 @@ class TestMemoryRegionsConfig(unittest.TestCase):
         cfg = memory_regions_config([(1, 0x10, 16)])
         self.assertEqual(cfg.memory_regions.snapshot_name, "")
 
+    def test_accepts_safe_snapshot_names(self):
+        """Letters, digits, '-' and '_' are the allowed slot-name charset."""
+        for name in ("slot-a", "Slot_B", "0", "a-b_c-42"):
+            cfg = memory_regions_config([(1, 0x10, 16)], snapshot_name=name)
+            self.assertEqual(cfg.memory_regions.snapshot_name, name)
+
+    def test_rejects_unsafe_snapshot_names(self):
+        """snapshot_name becomes a directory on the agent: path separators,
+        traversal, and shell-hostile characters are rejected client-side."""
+        for name in (
+            "slot/a",  # forward slash (nested path)
+            "slot\\a",  # backslash
+            "slot:a",  # colon
+            "slot a",  # whitespace
+            " slot-a",
+            "slot-a\n",
+            "..",  # traversal
+            ".",
+            "../../etc",
+            "slot.a",  # dot
+        ):
+            with self.assertRaisesRegex(ValueError, "snapshot_name"):
+                memory_regions_config([(1, 0x10, 16)], snapshot_name=name)
+
+    def test_rejects_non_string_snapshot_name(self):
+        for name in (123, None, b"slot-a"):
+            with self.assertRaises(TypeError):
+                memory_regions_config([(1, 0x10, 16)], snapshot_name=name)
+
     def test_large_address_round_trips(self):
         """Addresses above 2**32 survive serialization (uint64 on the wire)."""
         addr = 139637976727552

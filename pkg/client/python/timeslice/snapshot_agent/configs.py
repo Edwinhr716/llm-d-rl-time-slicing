@@ -1,11 +1,18 @@
 """Helpers for building BackendConfig protos."""
 
+import re
 from typing import Optional, Sequence, Tuple, Union
 
 from . import snapshot_agent_pb2
 from .types import MemoryRegion
 
 RegionLike = Union[MemoryRegion, Tuple[int, int, int], str]
+
+# The agent uses the snapshot slot name as a directory name under its
+# store, so restrict it to characters that are safe as a single path
+# segment on any filesystem. Matched with fullmatch: unlike "$", it does
+# not tolerate a trailing newline.
+_SNAPSHOT_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def _process_target(pids: Sequence[int]) -> snapshot_agent_pb2.ProcessTarget:
@@ -182,10 +189,21 @@ def memory_regions_config(
     and size).
 
     snapshot_name names the agent-side snapshot slot (defaults to the
-    request's job_id server-side when empty). Use it — not the request's
-    `group` — for slot naming: group identifies a set of related jobs for
-    the orchestrator and does not name agent-side storage.
+    request's job_id server-side when empty). It becomes a directory name
+    under the agent's store, so it is restricted to letters, digits, "-"
+    and "_". Use it — not the request's `group` — for slot naming: group
+    identifies a set of related jobs for the orchestrator and does not
+    name agent-side storage.
     """
+    if not isinstance(snapshot_name, str):
+        raise TypeError(
+            f"snapshot_name must be a string, got {type(snapshot_name).__name__}"
+        )
+    if snapshot_name and not _SNAPSHOT_NAME_RE.fullmatch(snapshot_name):
+        raise ValueError(
+            "snapshot_name names a directory on the agent and may only "
+            f"contain letters, digits, '-' and '_', got {snapshot_name!r}"
+        )
     if not regions:
         raise ValueError("at least one memory region is required")
 
