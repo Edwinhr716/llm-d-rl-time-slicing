@@ -155,9 +155,17 @@ class TestMemoryRegionsConfig(unittest.TestCase):
             "slot/a",  # forward slash (nested path)
             "slot\\a",  # backslash
             "slot:a",  # colon
-            "slot a",  # whitespace
-            " slot-a",
-            "slot-a\n",
+            "slot a",  # interior whitespace
+            " slot-a",  # leading whitespace
+            "slot-a ",  # trailing whitespace
+            "\tslot-a",
+            "slot-a\t",
+            "slot-a\n",  # trailing newline (the $-anchor blind spot)
+            " ",  # all-whitespace
+            "   ",
+            "\t",
+            "\n",
+            "\r\n",
             "..",  # traversal
             ".",
             "../../etc",
