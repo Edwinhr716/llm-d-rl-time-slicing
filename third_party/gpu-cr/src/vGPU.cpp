@@ -1154,11 +1154,16 @@ int get_id() {
     bool ctl_mode = false;
     const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
     snprintf(id_name, sizeof(id_name), "%s/control", ctl_dir);
-    int fd_id = open(id_name, O_CREAT | O_RDWR, 0755);
+    // Same cross-UID policy as the per-PID control files: the counter is
+    // shared by every workload on this ctl dir, and a 0755 first-creator
+    // mode would refuse O_RDWR to a later workload under a different uid.
+    // fchmod bypasses the umask; best-effort (non-owners cannot chmod).
+    int fd_id = open(id_name, O_CREAT | O_RDWR, 0777);
     if (fd_id < 0) {
         perror("open()");
         exit(EXIT_FAILURE);
     }
+    fchmod(fd_id, 0777);
     // The counter is a single atomic int: on the ctl tmpfs one 4KiB page
     // suffices (and frees the hugepage the legacy layout pinned); on
     // hugetlbfs the historical 2MiB sizing is kept.

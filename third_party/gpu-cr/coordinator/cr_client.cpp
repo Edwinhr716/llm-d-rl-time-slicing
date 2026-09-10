@@ -198,7 +198,10 @@ bool ValidateDestDump(const char* path) {
 // a readiness advertisement into OUR ctl dir. Presence in this dir proves
 // shared backing (the only way the file got here); proto proves the
 // library level; starttime kills the PID-reuse case, where the signal
-// would terminate an innocent recycled PID. Path equality is a warning
+// would terminate an innocent recycled PID; the file's owner uid must
+// match the target process's uid — on a shared ctl dir a co-tenant under
+// another uid cannot vouch for a victim PID (and the sticky bit keeps it
+// from replacing the victim's real advert). Path equality is a warning
 // only (same tmpfs may be mounted at different container paths).
 bool CheckAdvertisement(const char* ctl_dir, int pid) {
     char path[512];
@@ -207,6 +210,25 @@ bool CheckAdvertisement(const char* ctl_dir, int pid) {
     if (!f) {
         fprintf(stderr, "Error: no readiness advertisement at %s — vGPU.so not loaded in PID %d, "
                         "GPU_CR_CTL_PATH mismatch, or a library without ctl support\n", path, pid);
+        return false;
+    }
+    // fstat the OPEN file (no rename/replace TOCTOU) against /proc/<pid>,
+    // whose st_uid is the target's effective uid.
+    struct stat adv_st, proc_st;
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+    if (fstat(fileno(f), &adv_st) != 0 || stat(proc_path, &proc_st) != 0) {
+        fclose(f);
+        fprintf(stderr, "Error: cannot stat advertisement %s or %s (%s)\n",
+                path, proc_path, strerror(errno));
+        return false;
+    }
+    if (adv_st.st_uid != proc_st.st_uid) {
+        fclose(f);
+        fprintf(stderr, "Error: advertisement %s owned by uid %u but PID %d runs as uid %u — "
+                        "forged or stale advert, refusing to signal\n",
+                path, static_cast<unsigned>(adv_st.st_uid), pid,
+                static_cast<unsigned>(proc_st.st_uid));
         return false;
     }
     char buf[600] = "";

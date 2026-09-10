@@ -79,6 +79,7 @@ Ctl-plane, discovery, and legacy-mode cases (this tree only):
 |---|---|---|---|---|
 | Advertisement gate | no advertisement → refused | `FAKE_NOT_READY=1` (nothing advertised) | `-c -s` | 3 |
 | Advertisement gate | starttime mismatch (PID reuse) → refused | advert edited to `starttime=1` | `-c -s` | 3 |
+| Advertisement gate | owner uid mismatch (forged advert) → refused | advert `chown`ed to 65534 (root-only; skipped elsewhere) | `-c -s` | 3 |
 | Broken ctl path | non-tmpfs `GPU_CR_CTL_PATH` refused | `GPU_CR_CTL_PATH` on disk-backed fs | `-c -s` | 3 |
 | Broken ctl path | missing `GPU_CR_CTL_PATH` dir refused | `GPU_CR_CTL_PATH=/nonexistent-ctl` | `-c -s` | 3 |
 | Discovery | advert + control channel land on `<data>/ctl` | no ctl env at all (tmpfs data dir) | `-i` | 0; both files under `<data>/ctl` |
