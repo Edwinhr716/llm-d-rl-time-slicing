@@ -27,6 +27,8 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/gpucr"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/tpu"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
 func main() {
@@ -39,11 +41,21 @@ func main() {
 	deploymentMode := flag.String("deployment-mode", "standalone", "Deployment mode ('standalone' or 'k8s')")
 	featureGatesSpec := flag.String("feature-gates", "",
 		"Comma-separated list of Name=bool pairs selecting experimental features, e.g. 'DirectMemoryBackend=true'")
+	defaultBackend := flag.String("default-backend", string(backends.BackendCuda),
+		"Backend used when a request carries no backend_config (the orchestrator never sends one, "+
+			"so this selects the backend for orchestrator-driven snapshots/restores)")
 	flag.Parse()
 
 	depMode := *deploymentMode
 	if envDepMode := os.Getenv("DEPLOYMENT_MODE"); envDepMode != "" {
 		depMode = envDepMode
+	}
+
+	// DEFAULT_BACKEND overrides the flag, mirroring DEPLOYMENT_MODE: the Helm
+	// chart configures the agent through env vars, not flags.
+	defBackend := backends.BackendType(*defaultBackend)
+	if envBackend := os.Getenv("DEFAULT_BACKEND"); envBackend != "" {
+		defBackend = backends.BackendType(envBackend)
 	}
 
 	// AGENT_PORT overrides the flag, mirroring DEPLOYMENT_MODE: the Helm
@@ -89,6 +101,39 @@ func main() {
 		backends.BackendMemoryRegions: backends.NewMemoryRegions(),
 	}
 
+	// The TPU backend is only registered on TPU nodes: it depends on TPU
+	// process discovery, and registering it elsewhere would let an explicit
+	// BackendConfig.tpu request reach NVML-based PID discovery on a GPU
+	// node. Requests selecting it on other nodes fail with NotFound before
+	// any PID lookup.
+	accelType := os.Getenv("ACCELERATOR_TYPE")
+	if accelType == "tpu" {
+		registeredBackends[backends.BackendTpu] = backends.NewTpuCheckpoint()
+	}
+
+	if _, ok := registeredBackends[defBackend]; !ok {
+		slog.Error("Invalid default backend for this node", "backend", defBackend, "acceleratorType", accelType)
+		os.Exit(1)
+	}
+
+	// ACCELERATOR_TYPE and the default backend are configured independently
+	// but must agree: the GPU-memory backends cannot run on TPU nodes. (The
+	// reverse mismatch — a tpu default without ACCELERATOR_TYPE=tpu — is
+	// caught above, since the TPU backend is not registered.)
+	if accelType == "tpu" && (defBackend == backends.BackendCuda || defBackend == backends.BackendDirectMemory) {
+		slog.Error("ACCELERATOR_TYPE=tpu is incompatible with a GPU default backend; set DEFAULT_BACKEND=tpu",
+			"backend", defBackend, "acceleratorType", accelType)
+		os.Exit(1)
+	}
+
+	// On TPU nodes there is no NVML: swap in TPU process discovery (libtpu
+	// control threads + /dev/vfio fds) for the watcher and PID resolution.
+	if accelType == "tpu" {
+		utils.GetPodPIDs = tpu.GetPodPIDs
+		utils.HasGPUProcesses = tpu.HasProcesses
+		slog.InfoContext(ctx, "Using TPU process discovery", "acceleratorType", accelType)
+	}
+
 	// GPU-CR housekeeping runs only when the shared checkpoint dir is
 	// configured, keeping CUDA/app-only deployments untouched.
 	if ctlDir := os.Getenv("EXPORT_FILE_PATH"); ctlDir != "" {
@@ -111,9 +156,10 @@ func main() {
 	}
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
-		"port", listenPort, "deploymentMode", depMode, "featureGates", featureGates.String())
+		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
+		"featureGates", featureGates.String())
 	err = server.StartServer(
-		ctx, listenPort, registeredBackends, backends.BackendCuda, depMode, channelRegistry, featureGates)
+		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)
