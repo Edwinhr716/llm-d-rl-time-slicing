@@ -363,10 +363,14 @@ Requirements:
   compiled-in constants and are version-locked.
 * Agent and workload share the GPU-CR checkpoint/control directory (the
   agent's `EXPORT_FILE_PATH`; in Kubernetes, the `directMemory` block in
-  the Helm chart under `deploy/snapshot-agent` renders the shared mount,
-  `hostIPC`, and an optional hugetlbfs init container).
+  the Helm chart under `deploy/snapshot-agent` renders the shared mount and
+  `hostIPC`, plus — when `hugetlbfs.mount` is on — init containers that
+  mount hugetlbfs and provision the node's 2Mi hugepage pool at deploy
+  time, so no special node image or pre-sized nodepool is needed).
 * Node capacity for whole-VRAM dumps: shared-memory or hugepage headroom
-  sized to the GPU-CR build's dump extent.
+  sized to the GPU-CR build's dump extent (with `hugetlbfs.mount` on, the
+  chart's bootstrap provisions this; size it via
+  `directMemory.hugetlbfs.bootstrap.pages2Mi`).
 
 The backend is experimental and gated off by default: requests fail with
 `FAILED_PRECONDITION` unless the agent runs with
