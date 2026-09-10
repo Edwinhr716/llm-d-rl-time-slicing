@@ -365,8 +365,11 @@ Requirements:
   agent's `EXPORT_FILE_PATH`; in Kubernetes, the `directMemory` block in
   the Helm chart under `deploy/snapshot-agent` renders the shared mount and
   `hostIPC`, plus — when `hugetlbfs.mount` is on — init containers that
-  mount hugetlbfs and provision the node's 2Mi hugepage pool at deploy
-  time, so no special node image or pre-sized nodepool is needed).
+  mount hugetlbfs, mount the GPU-CR control-plane tmpfs nested at
+  `<store>/ctl` (discovered by both sides with no configuration; it keeps
+  the agent free of hugepage requests), and provision the node's 2Mi
+  hugepage pool at deploy time, so no special node image or pre-sized
+  nodepool is needed).
 * Node capacity for whole-VRAM dumps: shared-memory or hugepage headroom
   sized to the GPU-CR build's dump extent (with `hugetlbfs.mount` on, the
   chart's bootstrap provisions this; size it via
