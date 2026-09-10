@@ -152,6 +152,7 @@ The Snapshot Agent supports multiple backends for different GPU memory managemen
 | CUDA Checkpoint | `cuda` | Process-level CUDA state save/restore via `cuda-checkpoint` | ~100% | ~1-3s |
 | Application-Aware | `app_endpoint` | Suspend/resume through the application's own HTTP API (vLLM, SGLang) | ~96% | ~50-100ms |
 | Application-Aware | `app_channel` | Suspend/resume pushed over a channel the workload registered (Python-API workloads, no HTTP server) | ~96% | ~50-100ms |
+| Direct Memory | `direct_memory` | Full-process park/resume via GPU-CR `cr_client`: the workload's preloader dumps device state to node shared memory and the process stays alive | ~100% | ~0.5-2s |
 
 The VRAM Freed and Resume Time figures are illustrative, measured with a small model (Qwen2.5-0.5B) on an H100; actual numbers depend on the model size, hardware, and engine version.
 
@@ -344,6 +345,61 @@ A request for a job with no registered channel fails fast with
 `no workload channel registered for job "..."`. If the workload's suspend
 raises, the operation fails with the workload's error text.
 
+### Direct Memory (direct_memory)
+
+Full-process GPU park/resume driven by GPU-CR's `cr_client`. Like the CUDA
+Checkpoint backend it saves and restores the process's entire device state,
+but the mechanism differs: the dump is written by the *workload's* GPU-CR
+preloader into shared memory (or hugetlbfs) on the node, the process itself
+stays alive throughout, and resume maps the parked state straight back —
+no CUDA context teardown/rebuild. This makes park and resume markedly
+faster than `cuda-checkpoint` for large-VRAM workloads.
+
+Requirements:
+
+* The target workload runs under the GPU-CR vGPU preloader
+  (`LD_PRELOAD=vGPU-NVIDIA.so`), built from the same `third_party/gpu-cr`
+  tree as the `cr_client` shipped in the agent image — the two share
+  compiled-in constants and are version-locked.
+* Agent and workload share the GPU-CR checkpoint/control directory (the
+  agent's `EXPORT_FILE_PATH`; in Kubernetes, the `directMemory` block in
+  the Helm chart under `deploy/snapshot-agent` renders the shared mount,
+  `hostIPC`, and an optional hugetlbfs init container).
+* Node capacity for whole-VRAM dumps: shared-memory or hugepage headroom
+  sized to the GPU-CR build's dump extent.
+
+The backend is experimental and gated off by default: requests fail with
+`FAILED_PRECONDITION` unless the agent runs with
+`--feature-gates=DirectMemoryBackend=true` (or the `FEATURE_GATES` env
+var). The Helm chart sets the gate automatically when
+`directMemory.enabled=true`.
+
+```python
+from timeslice.snapshot_agent import SnapshotAgentClient, direct_memory_config
+
+with SnapshotAgentClient("localhost:9001") as client:
+    # Park: device state is dumped node-locally, VRAM is freed,
+    # the process stays alive.
+    client.snapshot_and_wait(
+        job_id="my-job",
+        backend_config=direct_memory_config(pids=[1234]),
+    )
+    # Resume: parked state is mapped back and execution continues.
+    client.restore_and_wait(
+        job_id="my-job",
+        backend_config=direct_memory_config(pids=[1234]),
+    )
+```
+
+In Kubernetes mode PIDs are discovered from the `timeslice.io/job-id` pod
+label — omit `pids` (i.e. `direct_memory_config()`).
+
+Each `cr_client` invocation runs under a per-operation deadline
+(`DIRECT_MEMORY_OP_TIMEOUT_SEC`, default 120 s): a workload that dies
+mid-operation fails that operation instead of wedging the job in
+TRANSITIONING. Health: `grpc.health.v1.Health/Check` with
+`service: "direct-memory"` reports whether `cr_client` is available.
+
 ### Composing Backends
 
 Application-aware suspend (either transport) and CUDA checkpoint are separate operations that compose. Suspend first, then checkpoint; restore in reverse order:
@@ -423,3 +479,5 @@ grpcurl -plaintext \
 - **GPU Not Found:** Check that the `nvidia.driver.hostPath` in the agent's configuration matches your node's setup.
 - **Garbage inference after resume (vLLM):** The workload was suspended with `SUSPEND_MODE_DISCARD`, which drops weights. Suspend with `SUSPEND_MODE_OFFLOAD` (vLLM's default when the mode is unspecified), or have the application push new weights after resume.
 - **Garbage inference after SGLang resume:** The SGLang server was started without `--enable-weights-cpu-backup`. Restart with this flag.
+- **`cr_client not found at /usr/local/bin/cr_client` (direct_memory):** The agent image was built without the GPU-CR builder stage. Deploy the standard snapshot-agent image; there is no path override.
+- **direct_memory operation times out:** `cr_client` talks to the workload's preloader over a shared-memory control channel; a timeout usually means the workload is not running under `LD_PRELOAD=vGPU-NVIDIA.so`, the preloader and `cr_client` were built from different GPU-CR trees, or the target process died mid-operation. The deadline is `DIRECT_MEMORY_OP_TIMEOUT_SEC` (default 120 s).
