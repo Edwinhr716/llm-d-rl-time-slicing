@@ -108,16 +108,18 @@ directMemory:
       # 12288 x 2Mi = 24Gi, sized for two GPU-CR processes built with
       # SHM_SIZE_GB=8; use 30720 (60Gi) for two stock 25GiB builds.
       pages2Mi: 12288
-  # COMPAT ONLY — hugetlb cgroup headroom for the agent itself, rendered as
+  # Optional hugepage headroom for the agent pod itself, rendered as
   # hugepages-<pagesize>i requests/limits (plus a minimal memory request,
-  # which k8s requires alongside hugepages). With the ctl tmpfs the agent
-  # faults no hugetlb page at all (dumps are written by the workload's
-  # preloader; cr_client validates them via read(2) and keeps its control
-  # channel on the ctl tmpfs), so leave this empty. Set it only for
-  # pre-ctl-plane GPU-CR builds on pre-provisioned nodes; mutually
-  # exclusive with hugetlbfs.bootstrap (a pod that requests hugepages
-  # cannot schedule before its own bootstrap publishes capacity — the
-  # combination fails at render time).
+  # which Kubernetes requires alongside hugepages). Normally leave this
+  # empty: the agent never touches hugepage memory — dump bytes are written
+  # by the workload's own process, and the agent's helper keeps its control
+  # files on the tmpfs above — and the empty (zero-request) form is what
+  # lets this DaemonSet schedule on nodes before hugepage capacity exists.
+  # Set it only when running an older GPU-CR build that predates the
+  # control-file tmpfs, on nodes whose hugepage pool is already
+  # provisioned. Mutually exclusive with hugetlbfs.bootstrap (a pod that
+  # requests hugepages cannot schedule before its own bootstrap publishes
+  # capacity — the combination fails at render time).
   hugepagesResource: ""
   # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC).
   opTimeoutSec: 120
