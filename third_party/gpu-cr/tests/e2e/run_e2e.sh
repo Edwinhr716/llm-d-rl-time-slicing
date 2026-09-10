@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# End-to-end test for the GPU-CR stack on a GPU node.
+# End-to-end test for the consolidated GPU-CR stack on a GPU node.
 #
-# Drives a real CUDA workload under LD_PRELOAD through the checkpoint/
-# restore surface, gating on byte-identical GPU memory after every restore:
+# Drives a real CUDA workload under LD_PRELOAD through the full
+# checkpoint/restore surface, gating on byte-identical GPU memory after
+# every restore:
 #   G0  runtime buffer config honored: provenance line printed at library
 #       load (before any CR signal exists) + the dump buffer's physical
 #       extent matches the env-requested size
 #   G1  baseline pattern verify
-#   G2  full checkpoint/restore data plane + verify (stubbed toggle unless
+#   G2  destination-path selective checkpoint (-o) succeeds
+#   G3  destination-path selective restore succeeds
+#   G4  pattern verify after dest-path restore (byte-identical)
+#   G5  buffer-path selective checkpoint/restore + verify
+#   G6  full checkpoint/restore data plane + verify (stubbed toggle unless
 #       E2E_FULL_TOGGLE=1 and a real cuda-checkpoint is on PATH)
-#   G3  below-floor GPU_CR_SHM_MB warns at load and falls back to the
+#   G7  below-floor GPU_CR_SHM_MB warns at load and falls back to the
 #       build default; the workload stays healthy
 #
 # Required env: CR_CLIENT, WORKLOAD, VGPU_SO, STORE.
@@ -85,7 +90,7 @@ if [ "${E2E_FULL_TOGGLE:-0}" != "1" ]; then stub_cuda_checkpoint; fi
 start_workload "$VGPU_SO" \
     E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" \
     GPU_CR_SHM_MB="$SHM_MB" || exit 1
-echo "workload up: pid=$WL_PID (run dir $RUN)"
+echo "workload up: pid=$WL_PID regions=$WL_REGIONS (run dir $RUN)"
 
 # G0a runs BEFORE any cr_client call on purpose: the provenance line must
 # come from library load, not from the first CR signal.
@@ -99,11 +104,24 @@ cr -i -p "$WL_PID" || { echo "FATAL: init failed ($?)"; exit 1; }
 gate "G0b dump buffer extent matches env" dump_extent_ok
 gate "G1 baseline verify" wl_cmd verify
 
-gate "G2a full ckpt" cr -c -p "$WL_PID"
-gate "G2b full restore" cr -r -p "$WL_PID"
-gate "G2c verify after full restore" wl_cmd verify
+DUMP="$STORE/e2e-dump.bin"
+rm -f "$DUMP"
+gate "G2 dest-path selective ckpt" cr -c -p "$WL_PID" -s "$WL_REGIONS" -o "$DUMP"
+gate "G3 dest-path selective restore" cr -r -p "$WL_PID" -s "$WL_REGIONS" -o "$DUMP"
+gate "G4 verify after dest-path restore" wl_cmd verify
+# G4 was the dump's last consumer; on a hugetlbfs STORE the file pins its
+# pages until removed.
+rm -f "$DUMP"
 
-# G3: a below-floor value must warn and fall back at library load. No CR
+gate "G5a buffer-path selective ckpt" cr -c -p "$WL_PID" -s "$WL_REGIONS"
+gate "G5b buffer-path selective restore" cr -r -p "$WL_PID" -s "$WL_REGIONS"
+gate "G5c verify after buffer-path restore" wl_cmd verify
+
+gate "G6a full ckpt" cr -c -p "$WL_PID"
+gate "G6b full restore" cr -r -p "$WL_PID"
+gate "G6c verify after full restore" wl_cmd verify
+
+# G7: a below-floor value must warn and fall back at library load. No CR
 # signal is ever sent to this workload, so a parse deferred to the signal
 # path would produce neither line — and since init never runs, the
 # build-default-sized buffer is never allocated (the banner alone is
@@ -112,11 +130,11 @@ stop_workload
 start_workload "$VGPU_SO" \
     E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" \
     GPU_CR_SHM_MB=10 || exit 1
-gate "G3a below-floor value warns" \
+gate "G7a below-floor value warns" \
     grep -qF "WARNING: GPU_CR_SHM below the 64MiB floor (10)" "$RUN/workload.stderr"
-gate "G3b falls back to build default" \
+gate "G7b falls back to build default" \
     grep -qF "MiB (build default)" "$RUN/workload.stderr"
-gate "G3c workload healthy after fallback" wl_cmd verify
+gate "G7c workload healthy after fallback" wl_cmd verify
 
 stop_workload
 echo
