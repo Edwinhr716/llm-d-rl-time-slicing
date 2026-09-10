@@ -93,7 +93,7 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 		return nil, status.Errorf(codes.NotFound, "backend %s not found", backendType)
 	}
 
-	s.ensureJobRunningIfGPUOccupied(ctx, req.GetJobId(), req.GetGroup())
+	s.ensureJobRunningIfOccupied(ctx, req.GetJobId(), req.GetGroup())
 
 	bgCtx := context.WithoutCancel(ctx)
 	config := req.GetBackendConfig()
@@ -132,37 +132,43 @@ func (s *Server) getSnapshotBackendType(config *pb.BackendConfig) backends.Backe
 	if config.GetMemoryRegions() != nil {
 		return backends.BackendMemoryRegions
 	}
+	if config.GetTpu() != nil {
+		return backends.BackendTpu
+	}
 	return s.defaultBackend
 }
 
-// ensureJobRunningIfGPUOccupied registers the job and, if it is IDLE while
-// the GPU has running compute processes, transitions it to RUNNING.
+// ensureJobRunningIfOccupied registers the job and, if it is IDLE while the
+// accelerator has running processes, transitions it to RUNNING. Occupancy is
+// node-appropriate: podutils.HasGPUProcesses is swapped to the TPU variant at
+// startup when ACCELERATOR_TYPE=tpu (NVML does not exist on TPU nodes).
 //
 // Standalone mode only: in k8s mode the watcher is the single source of
 // state-machine transitions (and additionally binds jobs to their targets,
 // e.g. PIDs for the CUDA backend — a backend-specific concern that a future
 // discovery interface will own per backend).
-func (s *Server) ensureJobRunningIfGPUOccupied(ctx context.Context, jobID, group string) {
+func (s *Server) ensureJobRunningIfOccupied(ctx context.Context, jobID, group string) {
 	if s.deploymentMode != "standalone" {
 		return
 	}
 	s.state.RegisterJob(jobID, group)
-	statuses := s.state.GetJobStatus()
-	for _, js := range statuses {
-		if js.JobId == jobID && js.State == pb.JobState_JOB_STATE_IDLE {
-			occupied, err := podutils.HasGPUProcesses(ctx)
-			if err != nil {
-				slog.WarnContext(ctx, "NVML check failed, skipping auto-transition", "error", err)
-				return
-			}
-			if occupied {
-				slog.InfoContext(ctx, "GPU occupied, transitioning job to RUNNING", "jobID", jobID)
-				if err := s.state.TransitionToRunning(jobID, nil); err != nil {
-					slog.WarnContext(ctx, "Failed to auto-transition job", "jobID", jobID, "error", err)
-				}
-			}
-			break
+	for _, js := range s.state.GetJobStatus() {
+		if js.JobId != jobID || js.State != pb.JobState_JOB_STATE_IDLE {
+			continue
 		}
+		occupied, err := podutils.HasGPUProcesses(ctx)
+		if err != nil {
+			slog.WarnContext(ctx, "occupancy check failed, skipping auto-transition", "error", err)
+			return
+		}
+		if !occupied {
+			return
+		}
+		slog.InfoContext(ctx, "Accelerator occupied, transitioning job to RUNNING", "jobID", jobID)
+		if err := s.state.TransitionToRunning(jobID, nil); err != nil {
+			slog.WarnContext(ctx, "Failed to auto-transition job", "jobID", jobID, "error", err)
+		}
+		return
 	}
 }
 
@@ -208,6 +214,21 @@ func (s *Server) buildSnapshotFn(
 				}
 				req := backends.Request{JobID: jobID, Config: reqConfig}
 				if err := backend.Snapshot(bgCtx, req); err != nil {
+					return fmt.Errorf("failed to snapshot job %s: %w", jobID, err)
+				}
+				s.state.UpdateJobPIDs(jobID, allPIDs)
+				return nil
+			}, nil
+		case backends.BackendTpu:
+			explicitPIDs := extractExplicitTpuPIDs(config)
+			return func() error {
+				slog.InfoContext(bgCtx, "Background: Starting snapshot", "backend", backendType)
+				allPIDs, allPIDStrings, pidErr := resolvePIDs(bgCtx, jobID, explicitPIDs)
+				if pidErr != nil {
+					return pidErr
+				}
+				tpuReq := backends.Request{JobID: jobID, Config: backends.BuildTpuConfig(allPIDStrings)}
+				if err := backend.Snapshot(bgCtx, tpuReq); err != nil {
 					return fmt.Errorf("failed to snapshot job %s: %w", jobID, err)
 				}
 				s.state.UpdateJobPIDs(jobID, allPIDs)
@@ -290,6 +311,23 @@ func extractExplicitPIDs(config *pb.BackendConfig) []int32 {
 	return nil
 }
 
+// extractExplicitTpuPIDs returns the explicitly targeted PIDs from a TPU
+// BackendConfig, or nil if none were provided.
+func extractExplicitTpuPIDs(config *pb.BackendConfig) []int32 {
+	if config == nil {
+		return nil
+	}
+	tpu := config.GetTpu()
+	if tpu == nil {
+		return nil
+	}
+	target := tpu.GetExplicitTarget()
+	if target == nil {
+		return nil
+	}
+	return target.GetPids()
+}
+
 // buildRestoreFn returns the background restore function for the given
 // deployment mode and backend. In standalone mode the caller-provided
 // BackendConfig is passed through as-is. In k8s mode, the CUDA backend
@@ -335,6 +373,23 @@ func (s *Server) buildRestoreFn(
 					return fmt.Errorf("failed to build backend config for job %s: %w", jobID, cfgErr)
 				}
 				return backend.Restore(bgCtx, backends.Request{JobID: jobID, Config: reqConfig})
+			}, nil
+		case backends.BackendTpu:
+			return func() error {
+				slog.InfoContext(bgCtx, "Background: Starting restore", "backend", backendType)
+				pids, pidErr := s.state.GetJobPIDs(jobID)
+				if pidErr != nil {
+					return fmt.Errorf("failed to get PIDs for job %s: %w", jobID, pidErr)
+				}
+				// No NVML occupancy gate here: on TPU nodes the backend
+				// itself gates on the previous occupant releasing its vfio
+				// iommu groups before issuing any RESTORE.
+				var pidStrings []string
+				for _, pid := range pids {
+					pidStrings = append(pidStrings, strconv.Itoa(pid))
+				}
+				slog.InfoContext(bgCtx, "Restoring PIDs", "pids", pidStrings, "backend", backendType)
+				return backend.Restore(bgCtx, backends.Request{JobID: jobID, Config: backends.BuildTpuConfig(pidStrings)})
 			}, nil
 		case backends.BackendAppEndpoint, backends.BackendAppChannel, backends.BackendMemoryRegions:
 			// App backends resolve their own targets; the memory-regions
