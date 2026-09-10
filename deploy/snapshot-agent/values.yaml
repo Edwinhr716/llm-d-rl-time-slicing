@@ -84,6 +84,17 @@ directMemory:
     # hostCtlPath. Off by default: stock GPU-CR dumps into plain shm.
     mount: false
     pagesize: 2M
+    # Runtime hugepage provisioning (initContainer, takes effect only when
+    # mount is on): writes nr_hugepages and restarts the kubelet once per
+    # node boot so the node publishes hugepages-2Mi capacity for WORKLOAD
+    # pods. Validated: the restart does not disturb running pods, and the
+    # agent's zero-hugepage request is what lets this DaemonSet schedule on
+    # a fresh vanilla node BEFORE capacity exists. 2Mi pages only.
+    bootstrap:
+      enabled: true
+      # 12288 x 2Mi = 24Gi, sized for two GPU-CR processes built with
+      # SHM_SIZE_GB=8; use 30720 (60Gi) for two stock 25GiB builds.
+      pages2Mi: 12288
   # Optional hugetlb cgroup headroom for the agent itself, rendered as
   # hugepages-<pagesize>i requests/limits (plus a minimal memory request,
   # which k8s requires alongside hugepages). Empty = none: for full-process
@@ -92,6 +103,14 @@ directMemory:
   hugepagesResource: ""
   # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC).
   opTimeoutSec: 120
+
+priorityClass:
+  # The bootstrap initContainer must win node placement over GPU workloads.
+  # Created (and referenced) only when the hugetlbfs bootstrap is active
+  # (directMemory.enabled + hugetlbfs.mount + hugetlbfs.bootstrap.enabled).
+  create: true
+  name: timeslice-snapshot-agent
+  value: 900000000
 
 rbac:
   create: true

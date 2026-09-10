@@ -25,12 +25,65 @@ spec:
       serviceAccountName: {{ include "snapshot-agent.serviceAccountName" . }}
       hostNetwork: true
       hostPID: true
+      {{- $bootstrap := and .Values.directMemory.enabled .Values.directMemory.hugetlbfs.mount .Values.directMemory.hugetlbfs.bootstrap.enabled }}
+      {{- if and $bootstrap (ne .Values.directMemory.hugetlbfs.pagesize "2M") }}
+      {{- fail "directMemory.hugetlbfs.bootstrap provisions 2Mi pages only; disable it or set pagesize: 2M" }}
+      {{- end }}
       {{- if .Values.directMemory.enabled }}
+      {{- if and $bootstrap .Values.priorityClass.name }}
+      # Referenced only when the PriorityClass is also created (see
+      # templates/priorityclass.yaml): the bootstrap must win node placement.
+      priorityClassName: {{ .Values.priorityClass.name }}
+      {{- end }}
       # GPU-CR uses a host-shared-memory control channel between the agent's
       # cr_client and the workload's vGPU preloader.
       hostIPC: true
       {{- if .Values.directMemory.hugetlbfs.mount }}
       initContainers:
+        {{- if .Values.directMemory.hugetlbfs.bootstrap.enabled }}
+        # Runtime hugepage provisioning for WORKLOAD pods (the agent itself
+        # requests none unless hugepagesResource is set). Once per node boot:
+        # allocate the 2Mi pool, then restart the kubelet so the node
+        # publishes hugepages-2Mi capacity. On shortfall it exits 1 WITHOUT
+        # restarting the kubelet, so an undersized pool surfaces as this pod
+        # CrashLooping, not as workload SIGBUS. Scheduling deadlock is
+        # impossible ONLY while the agent container carries no hugepages
+        # request — hugepagesResource opts back into pre-provisioned nodes.
+        - name: provision-hugepages
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          env:
+            - name: HUGEPAGES_2M
+              value: {{ .Values.directMemory.hugetlbfs.bootstrap.pages2Mi | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              apk add --no-cache util-linux >/dev/null
+              target=$HUGEPAGES_2M
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -ge "$target" ]; then
+                echo "hugepage pool already provisioned ($current/$target pages), nothing to do"
+                exit 0
+              fi
+              echo "reserving $target 2Mi hugepages (currently $current)"
+              nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+              current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              if [ "$current" -lt "$target" ]; then
+                echo "short by $((target - current)) pages; compacting and retrying"
+                nsenter -t 1 -m -- sh -c 'echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'
+                nsenter -t 1 -m -- sh -c "echo $target > /proc/sys/vm/nr_hugepages"
+                current=$(nsenter -t 1 -m -- cat /proc/sys/vm/nr_hugepages)
+              fi
+              if [ "$current" -lt "$target" ]; then
+                echo "ERROR: only $current of $target pages allocated (memory fragmented or exhausted)"
+                exit 1
+              fi
+              echo "pool ready; restarting kubelet so the node reports hugepages-2Mi (running pods unaffected)"
+              nsenter -t 1 -m -- systemctl restart kubelet
+        {{- end }}
         # Mount hugetlbfs at the shared checkpoint path on the HOST. GPU-CR
         # relies on the filesystem itself being hugetlbfs (it does not pass
         # MAP_HUGETLB); without this mount dumps land in boot-disk page
