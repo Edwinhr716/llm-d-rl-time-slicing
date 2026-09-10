@@ -459,7 +459,17 @@ double ckpt_selective(const SelectiveCrRequest* req) {
         if (FindContainingAllocation(d, &base_ptr, &alloc_size)) {
             blocks_to_snapshot.insert(base_ptr);
         } else {
-            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] WARNING: ptr %p not in any allocated memory block, skipping\n", d);
+            // Reject, as the restore path does for the same condition: the
+            // region list is caller input, so an unresolvable pointer means
+            // the caller's view of the process is stale. Skipping it would
+            // release less than the caller asked for -- or nothing at all --
+            // and still report success, which reads at the scheduler as VRAM
+            // that is free when it is not. Nothing is open or released yet.
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: region ptr %p not in any live "
+                            "allocation; rejecting\n", d);
+            g_op_status = EINVAL;
+            fs_mutex.unlock();
+            return -1;
         }
     }
 
