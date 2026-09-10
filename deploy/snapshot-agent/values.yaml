@@ -80,8 +80,10 @@ memoryRegions:
 # the chart is identical to a CUDA/app-backend deployment unless this is
 # turned on. Enabling it deploys the checkpoint-dir mount shared with
 # workloads and implies the DirectMemoryBackend feature gate. The target
-# workloads must run under the GPU-CR vGPU preloader, with hugepage
-# capacity sized for whole-VRAM dumps.
+# workloads must run under the GPU-CR vGPU preloader (vGPU-NVIDIA.so from
+# the released gpu-cr package, same tag as image.tag above — the agent's
+# cr_client ships from that package too and the pair is version-locked),
+# with hugepage capacity sized for whole-VRAM dumps.
 directMemory:
   enabled: false
   # Shared checkpoint/control dir (EXPORT_FILE_PATH inside the agent). Any

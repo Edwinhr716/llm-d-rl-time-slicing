@@ -180,11 +180,42 @@ Node prerequisites:
     `mountPropagation: HostToContainer`), and `hugepages-2Mi` resources
     sized for their dump buffers plus destination-group headroom.
 
-There is no `cr_client` install step: the binary ships inside the agent image
-at `/usr/local/bin/cr_client`, so the agent and `cr_client` versions always
-roll together. `grpc.health.v1.Health/Check` with `service: "direct-memory"`
-or `service: "memory-regions"` reports `NOT_SERVING` if the binary is
-missing.
+### Where the GPU-CR binaries come from
+
+CI publishes `cr_client` and `vGPU-NVIDIA.so` as the released `gpu-cr`
+package (`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/gpu-cr`), built as
+a version-locked pair from `third_party/gpu-cr` — the two share compiled-in
+constants and the control-channel protocol, and a mismatch makes
+checkpoints silently no-op, so always take both from the **same tag**, and
+keep that tag in lock-step with `image.tag` (releases publish all packages
+together under one tag).
+
+There is no `cr_client` install step: the agent image copies it from the
+package to `/usr/local/bin/cr_client`, so the agent and `cr_client` versions
+always roll together. `grpc.health.v1.Health/Check` with
+`service: "direct-memory"` or `service: "memory-regions"` reports
+`NOT_SERVING` if the binary is missing.
+
+Workload images get the preloader the same way:
+
+```dockerfile
+COPY --from=ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/gpu-cr:latest \
+    /opt/gpu-cr/vGPU-NVIDIA.so /opt/gpu-cr/vGPU-NVIDIA.so
+ENV LD_PRELOAD=/opt/gpu-cr/vGPU-NVIDIA.so
+```
+
+or, for pods whose image can't be rebuilt, run the package image as an init
+container and copy the `.so` into a shared volume:
+
+```yaml
+initContainers:
+  - name: fetch-gpu-cr
+    image: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/gpu-cr:latest
+    command: ["cp", "/opt/gpu-cr/vGPU-NVIDIA.so", "/gpu-cr/vGPU-NVIDIA.so"]
+    volumeMounts:
+      - name: gpu-cr
+        mountPath: /gpu-cr
+```
 
 ## Development Workflow: Custom Images
 

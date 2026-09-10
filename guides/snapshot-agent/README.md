@@ -358,9 +358,20 @@ faster than `cuda-checkpoint` for large-VRAM workloads.
 Requirements:
 
 * The target workload runs under the GPU-CR vGPU preloader
-  (`LD_PRELOAD=vGPU-NVIDIA.so`), built from the same `third_party/gpu-cr`
-  tree as the `cr_client` shipped in the agent image — the two share
-  compiled-in constants and are version-locked.
+  (`LD_PRELOAD=vGPU-NVIDIA.so`). Take the `.so` from the released `gpu-cr`
+  package (`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/gpu-cr`) at the
+  SAME tag as the agent image, whose `cr_client` ships from that package —
+  the two share compiled-in constants and are version-locked. E.g. in the
+  workload image:
+
+  ```dockerfile
+  COPY --from=ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/gpu-cr:latest \
+      /opt/gpu-cr/vGPU-NVIDIA.so /opt/gpu-cr/vGPU-NVIDIA.so
+  ENV LD_PRELOAD=/opt/gpu-cr/vGPU-NVIDIA.so
+  ```
+
+  (or run that image as an init container and `cp /opt/gpu-cr/vGPU-NVIDIA.so`
+  into a shared volume; see `deploy/snapshot-agent/README.md`).
 * Agent and workload share the GPU-CR checkpoint/control directory (the
   agent's `EXPORT_FILE_PATH`; in Kubernetes, the `directMemory` block in
   the Helm chart under `deploy/snapshot-agent` renders the shared mount
@@ -484,5 +495,5 @@ grpcurl -plaintext \
 - **GPU Not Found:** Check that the `nvidia.driver.hostPath` in the agent's configuration matches your node's setup.
 - **Garbage inference after resume (vLLM):** The workload was suspended with `SUSPEND_MODE_DISCARD`, which drops weights. Suspend with `SUSPEND_MODE_OFFLOAD` (vLLM's default when the mode is unspecified), or have the application push new weights after resume.
 - **Garbage inference after SGLang resume:** The SGLang server was started without `--enable-weights-cpu-backup`. Restart with this flag.
-- **`cr_client not found at /usr/local/bin/cr_client` (direct_memory):** The agent image was built without the GPU-CR builder stage. Deploy the standard snapshot-agent image; there is no path override.
-- **direct_memory operation times out:** `cr_client` talks to the workload's preloader over a shared-memory control channel; a timeout usually means the workload is not running under `LD_PRELOAD=vGPU-NVIDIA.so`, the preloader and `cr_client` were built from different GPU-CR trees, or the target process died mid-operation. The deadline is `DIRECT_MEMORY_OP_TIMEOUT_SEC` (default 120 s).
+- **`cr_client not found at /usr/local/bin/cr_client` (direct_memory):** The agent image was built without the released `gpu-cr` package stage. Deploy the standard snapshot-agent image; there is no path override.
+- **direct_memory operation times out:** `cr_client` talks to the workload's preloader over a shared-memory control channel; a timeout usually means the workload is not running under `LD_PRELOAD=vGPU-NVIDIA.so`, the preloader and `cr_client` came from different `gpu-cr` package tags (they are version-locked — take both from the same tag), or the target process died mid-operation. The deadline is `DIRECT_MEMORY_OP_TIMEOUT_SEC` (default 120 s).
