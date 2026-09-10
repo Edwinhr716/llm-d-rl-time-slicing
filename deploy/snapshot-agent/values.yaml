@@ -60,9 +60,21 @@ nvidia:
 # Example:
 #   featureGates:
 #     DirectMemoryBackend: true
-# directMemory.enabled implies DirectMemoryBackend: true; an explicit entry
-# here overrides that.
+# directMemory.enabled implies DirectMemoryBackend: true and
+# memoryRegions.enabled implies MemoryRegionsBackend: true; explicit
+# entries here override those.
 featureGates: {}
+
+# GPU-CR memory_regions (selective device-memory ranges) backend. It rides
+# the SAME node machinery as direct_memory below — shared checkpoint dir,
+# hugetlbfs dump store, nested ctl tmpfs, hugepage bootstrap — so every
+# directMemory.* setting except `enabled` applies to it too; enabling
+# either backend (or both) deploys that machinery once. Implies the
+# MemoryRegionsBackend feature gate.
+memoryRegions:
+  enabled: false
+  # Per-cr_client-invocation timeout (GPU_CR_OP_TIMEOUT_SEC).
+  opTimeoutSec: 120
 
 # GPU-CR direct_memory (full-process) backend machinery. Default disabled:
 # the chart is identical to a CUDA/app-backend deployment unless this is

@@ -121,6 +121,71 @@ helm install snapshot-agent ./snapshot-agent \
   --set tolerations[0].effect=NoSchedule
 ```
 
+## GPU-CR Backends (`directMemory.*` / `memoryRegions.*`)
+
+The `direct_memory` (full-process park/resume) and `memory_regions`
+(selective checkpoint/restore of explicit device-memory ranges) backends are
+both driven by GPU-CR's `cr_client` and need node-level machinery that the
+CUDA/app backends do not. They share one machinery block, configured under
+`directMemory.*` and deployed when **either** backend is enabled; each
+backend's `enabled` flag also implies its feature gate (`DirectMemoryBackend`
+/ `MemoryRegionsBackend`). Both are **disabled by default** — with both flags
+off the rendered chart is identical to a plain CUDA/app deployment.
+
+```bash
+helm install snapshot-agent ./snapshot-agent \
+  --namespace timeslice-system \
+  --create-namespace \
+  --set directMemory.enabled=true    # and/or memoryRegions.enabled=true
+```
+
+Since GPU-CR GEP-0001 (destination-path checkpoints) + GEP-0006 (ctl tmpfs),
+the agent moves **no dump bytes**: dumps are written by the workload's own
+preloader into the shared store and the control files live on a nested
+tmpfs. The agent therefore requests **no hugepages-2Mi** at all, which is
+what lets it schedule on fresh nodes before hugepage capacity exists and
+absorb the hugepage bootstrap as an init container.
+
+Enabling either backend adds:
+
+*   A `PriorityClass` (`priorityClass.*`, with the hugepage bootstrap) so
+    the agent wins node placement over GPU workloads.
+*   Privileged init containers that `nsenter` the host mount namespace,
+    idempotent per node boot:
+    *   `provision-hugepages` (`directMemory.hugetlbfs.bootstrap.*`) —
+        writes `vm.nr_hugepages` (`pages2Mi`, default 12288 = 24 Gi) and
+        restarts the kubelet so the node publishes `hugepages-2Mi`
+        capacity for WORKLOAD pods.
+    *   `mount-hugetlbfs` — mounts hugetlbfs at
+        `directMemory.hostCtlPath` (default `/var/tmp/huge-ckpt`,
+        `pagesize=2M,mode=0777`); without it every dump silently degrades
+        to boot-disk page cache.
+    *   `mount-ctl-tmpfs` — mounts the GEP-0006 control-plane tmpfs nested
+        at `<hostCtlPath>/ctl`; both sides discover it through the store
+        mount they already share, so neither needs any configuration.
+*   Env for the agent: `EXPORT_FILE_PATH` (= `directMemory.ctlDir`), plus
+    the per-invocation deadlines `DIRECT_MEMORY_OP_TIMEOUT_SEC`
+    (`directMemory.opTimeoutSec`) and `GPU_CR_OP_TIMEOUT_SEC`
+    (`memoryRegions.opTimeoutSec`) for whichever backends are enabled.
+    Setting `EXPORT_FILE_PATH` also switches on the agent's GPU-CR
+    artifact GC and the 0777 chmod of the checkpoint dir at startup.
+*   Volumes: `huge-ckpt` at `directMemory.ctlDir`
+    (`mountPropagation: HostToContainer` so the init containers' mounts
+    are visible).
+
+Node prerequisites:
+
+*   Workload pods need the GPU-CR preloader (`LD_PRELOAD=vGPU-NVIDIA.so`),
+    the `huge-ckpt` hostPath mounted at the same in-container path (with
+    `mountPropagation: HostToContainer`), and `hugepages-2Mi` resources
+    sized for their dump buffers plus destination-group headroom.
+
+There is no `cr_client` install step: the binary ships inside the agent image
+at `/usr/local/bin/cr_client`, so the agent and `cr_client` versions always
+roll together. `grpc.health.v1.Health/Check` with `service: "direct-memory"`
+or `service: "memory-regions"` reports `NOT_SERVING` if the binary is
+missing.
+
 ## Development Workflow: Custom Images
 
 During development, you will need to build your own container image containing your changes and push it to a custom registry.
