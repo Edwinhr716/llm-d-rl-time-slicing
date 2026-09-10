@@ -2732,7 +2732,19 @@ extern "C" CUresult CUDAAPI hook_cuCtxDestroy(CUcontext ctx) {
     ResolveReal(&real_cuCtxDestroy, "cuCtxDestroy_v2");
     ResolveReal(&real_cuCtxDestroy, "cuCtxDestroy");
     if (!real_cuCtxDestroy) return CUDA_ERROR_UNKNOWN;
-    return real_cuCtxDestroy(ctx);
+    CUresult res = real_cuCtxDestroy(ctx);
+    if (res == CUDA_SUCCESS) {
+        // Drop the capture if this was it. The allocation path only fills
+        // g_application_context in when it is null, so a destroyed context
+        // would otherwise stay there for the rest of the process and get
+        // pushed by the launch bracket. The driver is free to hand the same
+        // handle back for a later context, so this is not merely a push that
+        // fails -- it can silently name the wrong context.
+        CUcontext expected = ctx;
+        g_application_context.compare_exchange_strong(
+            expected, nullptr, std::memory_order_acq_rel, std::memory_order_relaxed);
+    }
+    return res;
 }
 
 extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
@@ -2754,5 +2766,23 @@ extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRelease(CUdevice dev) {
     fflush(stderr);
     ResolveReal(&real_cuDevicePrimaryCtxRelease, "cuDevicePrimaryCtxRelease");
     if (!real_cuDevicePrimaryCtxRelease) return CUDA_ERROR_UNKNOWN;
-    return real_cuDevicePrimaryCtxRelease(dev);
+    CUresult res = real_cuDevicePrimaryCtxRelease(dev);
+    // Same stale-capture hazard as cuCtxDestroy, and the likelier one: the
+    // runtime API hands out the primary context, so that is usually what got
+    // captured, and it is torn down by the last release rather than by
+    // cuCtxDestroy. Release only destroys it once the refcount reaches zero,
+    // so ask. There is no dev->context map to consult, but the library is
+    // documented single-process/single-GPU, and clearing a capture that is
+    // still live is harmless -- a context-less thread just loses the bracket
+    // and behaves as it did before anything was captured.
+    if (res == CUDA_SUCCESS && g_application_context.load(std::memory_order_acquire) != nullptr) {
+        unsigned int flags = 0;
+        int active = 0;
+        if (cuDevicePrimaryCtxGetState(dev, &flags, &active) == CUDA_SUCCESS && !active) {
+            g_application_context.store(nullptr, std::memory_order_release);
+            fprintf(stderr, "[HOOK] primary context for dev=%d destroyed; dropped capture\n", dev);
+            fflush(stderr);
+        }
+    }
+    return res;
 }
