@@ -1,8 +1,18 @@
 """Helpers for building BackendConfig protos."""
 
-from typing import Optional, Sequence, Union
+import re
+from typing import Optional, Sequence, Tuple, Union
 
 from . import snapshot_agent_pb2
+from .types import MemoryRegion
+
+RegionLike = Union[MemoryRegion, Tuple[int, int, int], str]
+
+# The agent uses the snapshot slot name as a directory name under its
+# store, so restrict it to characters that are safe as a single path
+# segment on any filesystem. Matched with fullmatch: unlike "$", it does
+# not tolerate a trailing newline.
+_SNAPSHOT_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def _process_target(pids: Sequence[int]) -> snapshot_agent_pb2.ProcessTarget:
@@ -162,5 +172,67 @@ def app_channel_config(
     return snapshot_agent_pb2.BackendConfig(
         app_channel=snapshot_agent_pb2.AppChannelConfig(
             mode=_suspend_mode(mode), tags=_tags(tags)
+        )
+    )
+
+
+def memory_regions_config(
+    regions: Sequence[RegionLike],
+    snapshot_name: str = "",
+) -> snapshot_agent_pb2.BackendConfig:
+    """Builds a BackendConfig selecting the memory-regions backend.
+
+    Accepts MemoryRegion dataclasses, (pid, address, size_bytes) tuples, or
+    'pid:0xADDR:size' spec strings. Hex or decimal addresses are
+    accepted; validation mirrors the agent's (non-empty regions, positive
+    pid and size) plus the wire-format bounds (int32 pid, uint64 address
+    and size).
+
+    snapshot_name names the agent-side snapshot slot (defaults to the
+    request's job_id server-side when empty). It becomes a directory name
+    under the agent's store, so it is restricted to letters, digits, "-"
+    and "_". Use it — not the request's `group` — for slot naming: group
+    identifies a set of related jobs for the orchestrator and does not
+    name agent-side storage.
+    """
+    if not isinstance(snapshot_name, str):
+        raise TypeError(
+            f"snapshot_name must be a string, got {type(snapshot_name).__name__}"
+        )
+    if snapshot_name and not _SNAPSHOT_NAME_RE.fullmatch(snapshot_name):
+        raise ValueError(
+            "snapshot_name names a directory on the agent and may only "
+            f"contain letters, digits, '-' and '_', got {snapshot_name!r}"
+        )
+    if not regions:
+        raise ValueError("at least one memory region is required")
+
+    pb_regions = []
+    for region in regions:
+        if isinstance(region, MemoryRegion):
+            r = region
+        elif isinstance(region, str):
+            r = MemoryRegion.from_spec(region)
+        elif isinstance(region, tuple):
+            if len(region) != 3:
+                raise ValueError(
+                    f"memory region tuple must be (pid, address, size_bytes), got {region!r}"
+                )
+            r = MemoryRegion(pid=region[0], address=region[1], size_bytes=region[2])
+        else:
+            raise TypeError(
+                "memory region must be a MemoryRegion, (pid, address, size_bytes) "
+                f"tuple, or 'pid:0xADDR:size' string, got {type(region).__name__}"
+            )
+        pb_regions.append(
+            snapshot_agent_pb2.MemoryRegion(
+                pid=r.pid, address=r.address, size_bytes=r.size_bytes
+            )
+        )
+
+    return snapshot_agent_pb2.BackendConfig(
+        memory_regions=snapshot_agent_pb2.MemoryRegionsBackendConfig(
+            regions=pb_regions,
+            snapshot_name=snapshot_name,
         )
     )
