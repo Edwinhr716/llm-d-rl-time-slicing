@@ -107,6 +107,9 @@ target_link_options(vGPU PRIVATE -shared -fPIC)
 # ---------------------------------------------------------------------------
 set(_COORD_COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
+    # multi_cr_client maps worker buffers at SHM_SIZE, a runtime value
+    # read from gpu_cr::Config().
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
 )
 
 add_executable(cr_client
@@ -135,12 +138,18 @@ target_compile_options(multi_cr_client PRIVATE -O3 -g)
 
 # ---------------------------------------------------------------------------
 # Tests (GPU-free; run in Dockerfile.build)
-#   gpu_cr_unit_tests        — GoogleTest unit suite for the dump-format
-#                              code, plus the upstream-baseline control
-#                              channel, buffer mapping, fd exchange and
-#                              wire structs
+#   gpu_cr_unit_tests        — GoogleTest unit suite for the ctl-path,
+#                              dump-format, granule-clamp, region-spec and
+#                              runtime-config code, plus the
+#                              upstream-baseline control channel, buffer
+#                              mapping, fd exchange and memcpy_multi
+#   fake_workload            — GPU-free stand-in for the vGPU.so side of the
+#                              control channel
+#   cr_client_integration    — drives the real cr_client binary against
+#                              fake_workload, asserting protocol behavior and
+#                              the documented exit codes
 # ---------------------------------------------------------------------------
-option(GPU_CR_BUILD_TESTS "Build the GPU-free unit tests" OFF)
+option(GPU_CR_BUILD_TESTS "Build the GPU-free unit and integration tests" OFF)
 
 if(GPU_CR_BUILD_TESTS)
     include(FetchContent)
@@ -156,20 +165,49 @@ if(GPU_CR_BUILD_TESTS)
     add_executable(gpu_cr_unit_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/common_baseline_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/common_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ctl_path_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/dump_format_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/gpu_cr_config_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ipc_fd_exchange_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/memcpy_multi_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/mmap_backend_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/selective_spec_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/share_mem_comm_test.cpp
         # GPU-free production sources under test (upstream-baseline functions)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mmap_backend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_fd_exchange.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/memcpy_multi.cpp
     )
     target_include_directories(gpu_cr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        # selective_spec_test includes coordinator/selective_spec.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/coordinator
     )
+    # The file backend reserves the full dump-buffer size up front
+    # (posix_fallocate); pin the suite to the 1GiB minimum so the
+    # mmap-backend tests don't reserve the 25GiB production default per
+    # checkpoint id. Expressed as compile *options* (-U then -D) so the
+    # override lands after any directory-level -DSHM_SIZE_GB from the
+    # build harness in the generated compile command.
+    target_compile_options(gpu_cr_unit_tests PRIVATE -USHM_SIZE_GB -DSHM_SIZE_GB=1)
     target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)
     add_test(NAME unit COMMAND gpu_cr_unit_tests)
+
+    add_executable(fake_workload
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/fake_workload.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
+    )
+    target_include_directories(fake_workload PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+
+    add_test(NAME cr_client_integration
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/cr_client_integration_test.sh
+                $<TARGET_FILE:cr_client> $<TARGET_FILE:fake_workload>
+    )
+    set_tests_properties(cr_client_integration PROPERTIES TIMEOUT 300)
 endif()
 
 # ---------------------------------------------------------------------------
