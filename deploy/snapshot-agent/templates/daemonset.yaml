@@ -29,6 +29,9 @@ spec:
       {{- if and $bootstrap (ne .Values.directMemory.hugetlbfs.pagesize "2M") }}
       {{- fail "directMemory.hugetlbfs.bootstrap provisions 2Mi pages only; disable it or set pagesize: 2M" }}
       {{- end }}
+      {{- if and $bootstrap .Values.directMemory.hugepagesResource }}
+      {{- fail "directMemory.hugepagesResource cannot be combined with hugetlbfs.bootstrap: a pod that requests hugepages cannot schedule before its own bootstrap publishes capacity. On pre-provisioned nodes set hugetlbfs.bootstrap.enabled=false; otherwise drop hugepagesResource (the ctl tmpfs keeps the agent hugetlb-free)" }}
+      {{- end }}
       {{- if .Values.directMemory.enabled }}
       {{- if and $bootstrap .Values.priorityClass.name }}
       # Referenced only when the PriorityClass is also created (see
@@ -48,7 +51,8 @@ spec:
         # restarting the kubelet, so an undersized pool surfaces as this pod
         # CrashLooping, not as workload SIGBUS. Scheduling deadlock is
         # impossible ONLY while the agent container carries no hugepages
-        # request — hugepagesResource opts back into pre-provisioned nodes.
+        # request (combining hugepagesResource with this bootstrap is
+        # rejected at render time).
         - name: provision-hugepages
           image: alpine:latest
           securityContext:
@@ -99,6 +103,26 @@ spec:
               apk add --no-cache util-linux >/dev/null && \
               nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.directMemory.hostCtlPath }}; grep -q " {{ .Values.directMemory.hostCtlPath }} hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize={{ .Values.directMemory.hugetlbfs.pagesize }},mode=0777 nodev {{ .Values.directMemory.hostCtlPath }}; chmod 0777 {{ .Values.directMemory.hostCtlPath }}' && \
               echo "hugetlbfs mounted at {{ .Values.directMemory.hostCtlPath }}"
+        # GEP-0006 control-plane tmpfs, nested INSIDE the hugetlbfs store at
+        # <hostCtlPath>/ctl so cr_client and the workload's vGPU.so discover
+        # it zero-config through the dump-store mount they already share
+        # (both statfs-gate on tmpfs; no env on either side). Ordered after
+        # mount-hugetlbfs: the subdir must live on the real store, and the
+        # .so refuses mixed mount orders. Without this, GPU-CR runs legacy
+        # mode (ctl dir == data dir), the mmap'd control channel lands ON
+        # hugetlbfs, and a zero-hugepage agent SIGBUSes on its first
+        # control-file fault.
+        - name: mount-ctl-tmpfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.directMemory.hostCtlPath }}/ctl; grep -q " {{ .Values.directMemory.hostCtlPath }}/ctl tmpfs" /proc/mounts || mount -t tmpfs -o size={{ .Values.directMemory.hugetlbfs.ctlTmpfsSizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.directMemory.hostCtlPath }}/ctl; chmod 0777 {{ .Values.directMemory.hostCtlPath }}/ctl' && \
+              echo "ctl tmpfs mounted at {{ .Values.directMemory.hostCtlPath }}/ctl"
       {{- end }}
       {{- end }}
       containers:

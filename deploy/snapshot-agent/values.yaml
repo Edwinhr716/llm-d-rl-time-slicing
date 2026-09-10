@@ -84,6 +84,14 @@ directMemory:
     # hostCtlPath. Off by default: stock GPU-CR dumps into plain shm.
     mount: false
     pagesize: 2M
+    # GEP-0006 control-plane tmpfs, mounted (with the hugetlbfs mount)
+    # nested at <hostCtlPath>/ctl. Zero-config: cr_client and the
+    # workload's vGPU.so statfs-discover it through the dump-store mount
+    # they already share — no env var on either side. This is what keeps
+    # the agent hugetlb-free on a hugetlbfs store: without it GPU-CR runs
+    # legacy mode (ctl dir == data dir) and cr_client's mmap'd control
+    # channel faults hugetlb pages from this pod's cgroup.
+    ctlTmpfsSizeMi: 64
     # Runtime hugepage provisioning (initContainer, takes effect only when
     # mount is on): writes nr_hugepages and restarts the kubelet once per
     # node boot so the node publishes hugepages-2Mi capacity for WORKLOAD
@@ -95,11 +103,16 @@ directMemory:
       # 12288 x 2Mi = 24Gi, sized for two GPU-CR processes built with
       # SHM_SIZE_GB=8; use 30720 (60Gi) for two stock 25GiB builds.
       pages2Mi: 12288
-  # Optional hugetlb cgroup headroom for the agent itself, rendered as
+  # COMPAT ONLY — hugetlb cgroup headroom for the agent itself, rendered as
   # hugepages-<pagesize>i requests/limits (plus a minimal memory request,
-  # which k8s requires alongside hugepages). Empty = none: for full-process
-  # checkpoints the dump is written by the workload's preloader, not the
-  # agent, so the agent normally needs no hugepage allowance.
+  # which k8s requires alongside hugepages). With the ctl tmpfs the agent
+  # faults no hugetlb page at all (dumps are written by the workload's
+  # preloader; cr_client validates them via read(2) and keeps its control
+  # channel on the ctl tmpfs), so leave this empty. Set it only for
+  # pre-ctl-plane GPU-CR builds on pre-provisioned nodes; mutually
+  # exclusive with hugetlbfs.bootstrap (a pod that requests hugepages
+  # cannot schedule before its own bootstrap publishes capacity — the
+  # combination fails at render time).
   hugepagesResource: ""
   # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC).
   opTimeoutSec: 120
