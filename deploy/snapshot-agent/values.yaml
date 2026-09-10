@@ -66,10 +66,10 @@ featureGates: {}
 
 # GPU-CR direct_memory (full-process) backend machinery. Default disabled:
 # the chart is identical to a CUDA/app-backend deployment unless this is
-# turned on. Enabling it deploys the shared checkpoint-dir mount, hostIPC,
-# and implies the DirectMemoryBackend feature gate. The target workloads
-# must run under the GPU-CR vGPU preloader, with shm/hugepage capacity
-# sized for whole-VRAM dumps (the GPU-CR SHM_SIZE_GB build knob).
+# turned on. Enabling it deploys the checkpoint-dir mount shared with
+# workloads and implies the DirectMemoryBackend feature gate. The target
+# workloads must run under the GPU-CR vGPU preloader, with hugepage
+# capacity sized for whole-VRAM dumps.
 directMemory:
   enabled: false
   # Shared checkpoint/control dir (EXPORT_FILE_PATH inside the agent). Any
@@ -80,17 +80,22 @@ directMemory:
   # hugetlbfs.mount is on.
   hostCtlPath: /var/tmp/huge-ckpt
   hugetlbfs:
-    # Run the privileged nsenter init container that mounts hugetlbfs at
-    # hostCtlPath. Off by default: stock GPU-CR dumps into plain shm.
-    mount: false
+    # Mount hugetlbfs at hostCtlPath (privileged nsenter init container).
+    # On by default: GPU-CR pins its dump and staging files for DMA, which
+    # requires hugepage-backed files — this is where its checkpoint speed
+    # comes from. With this off, dumps land through this chart's hostPath
+    # in ordinary boot-disk page cache: unpinned, slow, and a disk-pressure
+    # risk at whole-VRAM sizes. Turn it off only if hostCtlPath already IS
+    # a hugetlbfs (the mount here is idempotent, so leaving it on is safe
+    # too) or you accept the degraded mode.
+    mount: true
     pagesize: 2M
-    # GEP-0006 control-plane tmpfs, mounted (with the hugetlbfs mount)
-    # nested at <hostCtlPath>/ctl. Zero-config: cr_client and the
-    # workload's vGPU.so statfs-discover it through the dump-store mount
-    # they already share — no env var on either side. This is what keeps
-    # the agent hugetlb-free on a hugetlbfs store: without it GPU-CR runs
-    # legacy mode (ctl dir == data dir) and cr_client's mmap'd control
-    # channel faults hugetlb pages from this pod's cgroup.
+    # Control-plane tmpfs, mounted (with the hugetlbfs mount) nested at
+    # <hostCtlPath>/ctl. The agent's cr_client and the workload's preloader
+    # coordinate through small control files here; both discover the dir
+    # through the dump-store mount they already share — no env var on
+    # either side. Keeping control files on tmpfs instead of the hugetlbfs
+    # store is what lets this pod run with no hugepage request at all.
     ctlTmpfsSizeMi: 64
     # Runtime hugepage provisioning (initContainer, takes effect only when
     # mount is on): writes nr_hugepages and restarts the kubelet once per

@@ -38,9 +38,6 @@ spec:
       # templates/priorityclass.yaml): the bootstrap must win node placement.
       priorityClassName: {{ .Values.priorityClass.name }}
       {{- end }}
-      # GPU-CR uses a host-shared-memory control channel between the agent's
-      # cr_client and the workload's vGPU preloader.
-      hostIPC: true
       {{- if .Values.directMemory.hugetlbfs.mount }}
       initContainers:
         {{- if .Values.directMemory.hugetlbfs.bootstrap.enabled }}
@@ -103,15 +100,16 @@ spec:
               apk add --no-cache util-linux >/dev/null && \
               nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.directMemory.hostCtlPath }}; grep -q " {{ .Values.directMemory.hostCtlPath }} hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize={{ .Values.directMemory.hugetlbfs.pagesize }},mode=0777 nodev {{ .Values.directMemory.hostCtlPath }}; chmod 0777 {{ .Values.directMemory.hostCtlPath }}' && \
               echo "hugetlbfs mounted at {{ .Values.directMemory.hostCtlPath }}"
-        # GEP-0006 control-plane tmpfs, nested INSIDE the hugetlbfs store at
-        # <hostCtlPath>/ctl so cr_client and the workload's vGPU.so discover
-        # it zero-config through the dump-store mount they already share
-        # (both statfs-gate on tmpfs; no env on either side). Ordered after
-        # mount-hugetlbfs: the subdir must live on the real store, and the
-        # .so refuses mixed mount orders. Without this, GPU-CR runs legacy
-        # mode (ctl dir == data dir), the mmap'd control channel lands ON
-        # hugetlbfs, and a zero-hugepage agent SIGBUSes on its first
-        # control-file fault.
+        # The agent's cr_client and the workload's preloader coordinate
+        # through small control files. This tmpfs, nested INSIDE the dump
+        # store at <hostCtlPath>/ctl, is where GPU-CR puts them: both sides
+        # discover it through the store mount they already share, so neither
+        # needs any extra configuration. Ordered after mount-hugetlbfs (the
+        # subdir must live on the real store; GPU-CR refuses mixed mount
+        # orders). Without it GPU-CR falls back to keeping control files on
+        # the dump store itself — on hugetlbfs that would charge hugetlb
+        # pages to THIS pod's cgroup, and this pod deliberately requests
+        # none, so the agent would fault on first use.
         - name: mount-ctl-tmpfs
           image: alpine:latest
           securityContext:
