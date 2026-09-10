@@ -32,6 +32,12 @@ jobs:
           - component: snapshot-agent
             dockerfile: docker/snapshot-agent/Dockerfile
             platforms: linux/amd64
+          # GPU-CR artifact package: cr_client + vGPU-NVIDIA.so built as a
+          # version-locked pair from third_party/gpu-cr (see the Dockerfile).
+          # x86_64-only, matching the snapshot-agent that consumes cr_client.
+          - component: gpu-cr
+            dockerfile: docker/gpu-cr/Dockerfile
+            platforms: linux/amd64
     steps:
       - name: Checkout source
         uses: actions/checkout@v7
