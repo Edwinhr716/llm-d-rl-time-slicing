@@ -558,7 +558,7 @@ func resolvePIDs(ctx context.Context, jobID string, reqPIDs []int32) (allPIDs []
 	}
 
 	if len(pods) == 0 {
-		return nil, nil, fmt.Errorf("no pods found for job %s", jobID)
+		return nil, nil, fmt.Errorf("no pods found for job %s: %w", jobID, sm.ErrNoLiveProcesses)
 	}
 
 	allPIDs, allPIDStrings, errPIDs := getPIDsFromPods(ctx, pods)
@@ -567,7 +567,7 @@ func resolvePIDs(ctx context.Context, jobID string, reqPIDs []int32) (allPIDs []
 	}
 
 	if len(allPIDStrings) == 0 {
-		return nil, nil, fmt.Errorf("no GPU PIDs found for job %s", jobID)
+		return nil, nil, fmt.Errorf("no GPU PIDs found for job %s: %w", jobID, sm.ErrNoLiveProcesses)
 	}
 
 	return allPIDs, allPIDStrings, nil
