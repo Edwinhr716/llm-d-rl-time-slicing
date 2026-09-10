@@ -990,6 +990,19 @@ double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
             g_op_status = ENOMEM;
             return -1;
         }
+        // DestOpenForRestore bounds the header on the dest path; the per-PID
+        // buffer needs the same before anything indexes files[], which the
+        // extent walk below does using the header's own file_num. SHM_SIZE is
+        // the runtime buffer size, so this also catches an offset past a
+        // buffer shrunk by GPU_CR_SHM_MB.
+        if (!gpu_cr::DumpHeaderPlausible(fs->file_num, fs->current_offset,
+                                         static_cast<uint64_t>(SHM_SIZE))) {
+            fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: implausible dump header in the per-PID "
+                            "buffer (file_num=%lu current_offset=%lu); rejecting\n",
+                    (unsigned long)fs->file_num, (unsigned long)fs->current_offset);
+            g_op_status = EINVAL;
+            return -1;
+        }
     }
 
     uint64_t file_num = fs->file_num;
