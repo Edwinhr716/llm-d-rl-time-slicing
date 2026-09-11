@@ -25,29 +25,38 @@ spec:
       serviceAccountName: {{ include "snapshot-agent.serviceAccountName" . }}
       hostNetwork: true
       hostPID: true
-      {{- if .Values.memoryRegions.enabled }}
-      {{- if .Values.priorityClass.name }}
+      {{- $bootstrap := and .Values.directMemory.enabled .Values.directMemory.hugetlbfs.mount .Values.directMemory.hugetlbfs.bootstrap.enabled }}
+      {{- if and $bootstrap (ne .Values.directMemory.hugetlbfs.pagesize "2M") }}
+      {{- fail "directMemory.hugetlbfs.bootstrap provisions 2Mi pages only; disable it or set pagesize: 2M" }}
+      {{- end }}
+      {{- if and $bootstrap .Values.directMemory.hugepagesResource }}
+      {{- fail "directMemory.hugepagesResource cannot be combined with hugetlbfs.bootstrap: a pod that requests hugepages cannot schedule before its own bootstrap publishes capacity. On pre-provisioned nodes set hugetlbfs.bootstrap.enabled=false; otherwise drop hugepagesResource (the ctl tmpfs keeps the agent hugetlb-free)" }}
+      {{- end }}
+      {{- if .Values.directMemory.enabled }}
+      {{- if and $bootstrap .Values.priorityClass.name }}
+      # Referenced only when the PriorityClass is also created (see
+      # templates/priorityclass.yaml): the bootstrap must win node placement.
       priorityClassName: {{ .Values.priorityClass.name }}
       {{- end }}
-      # GPU-CR uses a host-shared-memory control channel between the agent's
-      # cr_client and the workload's preloader.
-      hostIPC: true
+      {{- if .Values.directMemory.hugetlbfs.mount }}
       initContainers:
-        {{- if .Values.gpuCr.bootstrap.enabled }}
+        {{- if .Values.directMemory.hugetlbfs.bootstrap.enabled }}
         # Runtime hugepage provisioning for WORKLOAD pods (the agent itself
-        # requests none). Once per node boot: allocate the 2Mi pool, then
-        # restart the kubelet so the node publishes hugepages-2Mi capacity.
-        # On shortfall it exits 1 WITHOUT restarting the kubelet, so an
-        # undersized pool surfaces as this pod CrashLooping, not as workload
-        # SIGBUS. Scheduling deadlock is impossible ONLY because the agent
-        # container has no hugepages request — do not add one.
+        # requests none unless hugepagesResource is set). Once per node boot:
+        # allocate the 2Mi pool, then restart the kubelet so the node
+        # publishes hugepages-2Mi capacity. On shortfall it exits 1 WITHOUT
+        # restarting the kubelet, so an undersized pool surfaces as this pod
+        # CrashLooping, not as workload SIGBUS. Scheduling deadlock is
+        # impossible ONLY while the agent container carries no hugepages
+        # request (combining hugepagesResource with this bootstrap is
+        # rejected at render time).
         - name: provision-hugepages
           image: alpine:latest
           securityContext:
             privileged: true
           env:
             - name: HUGEPAGES_2M
-              value: {{ .Values.gpuCr.bootstrap.pages2Mi | quote }}
+              value: {{ .Values.directMemory.hugetlbfs.bootstrap.pages2Mi | quote }}
           command:
             - sh
             - -c
@@ -76,25 +85,10 @@ spec:
               echo "pool ready; restarting kubelet so the node reports hugepages-2Mi (running pods unaffected)"
               nsenter -t 1 -m -- systemctl restart kubelet
         {{- end }}
-        # GEP-0006 control-plane tmpfs on the HOST: cr_client and the
-        # workload's vGPU.so communicate through files here instead of
-        # hugetlbfs. Must exist BEFORE workloads start (their .so writes the
-        # readiness advertisement at load time; a disk-backed dir would be
-        # shadowed by this mount — both binaries statfs-gate on tmpfs).
-        - name: mount-ctl-tmpfs
-          image: alpine:latest
-          securityContext:
-            privileged: true
-          command:
-            - sh
-            - -c
-            - |
-              apk add --no-cache util-linux >/dev/null && \
-              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.gpuCr.ctl.hostPath }}; grep -q " {{ .Values.gpuCr.ctl.hostPath }} tmpfs" /proc/mounts || mount -t tmpfs -o size={{ .Values.gpuCr.ctl.sizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.gpuCr.ctl.hostPath }}; chmod 0777 {{ .Values.gpuCr.ctl.hostPath }}' && \
-              echo "ctl tmpfs mounted at {{ .Values.gpuCr.ctl.hostPath }}"
-        # hugetlbfs at the shared checkpoint path on the HOST. GPU-CR relies
-        # on the filesystem itself being hugetlbfs; without this mount every
-        # dump silently degrades to boot-disk page cache.
+        # Mount hugetlbfs at the shared checkpoint path on the HOST. GPU-CR
+        # relies on the filesystem itself being hugetlbfs (it does not pass
+        # MAP_HUGETLB); without this mount dumps land in boot-disk page
+        # cache and the node's hugepage pool goes unused.
         - name: mount-hugetlbfs
           image: alpine:latest
           securityContext:
@@ -104,8 +98,30 @@ spec:
             - -c
             - |
               apk add --no-cache util-linux >/dev/null && \
-              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.gpuCr.dataDir.hostPath }}; grep -q " {{ .Values.gpuCr.dataDir.hostPath }} hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize=2M,mode=0777 nodev {{ .Values.gpuCr.dataDir.hostPath }}; chmod 0777 {{ .Values.gpuCr.dataDir.hostPath }}' && \
-              echo "hugetlbfs mounted at {{ .Values.gpuCr.dataDir.hostPath }}"
+              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.directMemory.hostCtlPath }}; grep -q " {{ .Values.directMemory.hostCtlPath }} hugetlbfs" /proc/mounts || mount -t hugetlbfs -o pagesize={{ .Values.directMemory.hugetlbfs.pagesize }},mode=0777 nodev {{ .Values.directMemory.hostCtlPath }}; chmod 0777 {{ .Values.directMemory.hostCtlPath }}' && \
+              echo "hugetlbfs mounted at {{ .Values.directMemory.hostCtlPath }}"
+        # The agent's cr_client and the workload's preloader coordinate
+        # through small control files. This tmpfs, nested INSIDE the dump
+        # store at <hostCtlPath>/ctl, is where GPU-CR puts them: both sides
+        # discover it through the store mount they already share, so neither
+        # needs any extra configuration. Ordered after mount-hugetlbfs (the
+        # subdir must live on the real store; GPU-CR refuses mixed mount
+        # orders). Without it GPU-CR falls back to keeping control files on
+        # the dump store itself — on hugetlbfs that would charge hugetlb
+        # pages to THIS pod's cgroup, and this pod deliberately requests
+        # none, so the agent would fault on first use.
+        - name: mount-ctl-tmpfs
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache util-linux >/dev/null && \
+              nsenter -t 1 -m -- sh -c 'mkdir -p {{ .Values.directMemory.hostCtlPath }}/ctl; grep -q " {{ .Values.directMemory.hostCtlPath }}/ctl tmpfs" /proc/mounts || mount -t tmpfs -o size={{ .Values.directMemory.hugetlbfs.ctlTmpfsSizeMi }}m,mode=0777 gpu-cr-ctl {{ .Values.directMemory.hostCtlPath }}/ctl; chmod 0777 {{ .Values.directMemory.hostCtlPath }}/ctl' && \
+              echo "ctl tmpfs mounted at {{ .Values.directMemory.hostCtlPath }}/ctl"
+      {{- end }}
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
@@ -125,11 +141,11 @@ spec:
             - name: AGENT_PORT
               value: {{ .Values.port | quote }}
             {{- /* Feature gates: explicit values from .Values.featureGates,
-                 with memoryRegions.enabled implying MemoryRegionsBackend=true
+                 with directMemory.enabled implying DirectMemoryBackend=true
                  (deploying the GPU-CR machinery is the opt-in). */}}
             {{- $gates := dict }}
-            {{- if .Values.memoryRegions.enabled }}
-            {{- $_ := set $gates "MemoryRegionsBackend" true }}
+            {{- if .Values.directMemory.enabled }}
+            {{- $_ := set $gates "DirectMemoryBackend" true }}
             {{- end }}
             {{- range $name, $enabled := .Values.featureGates }}
             {{- if not (kindIs "bool" $enabled) }}
@@ -145,6 +161,12 @@ spec:
             - name: FEATURE_GATES
               value: {{ join "," $pairs | quote }}
             {{- end }}
+            {{- if .Values.directMemory.enabled }}
+            - name: EXPORT_FILE_PATH
+              value: {{ .Values.directMemory.ctlDir | quote }}
+            - name: DIRECT_MEMORY_OP_TIMEOUT_SEC
+              value: {{ .Values.directMemory.opTimeoutSec | quote }}
+            {{- end }}
             {{- if .Values.nvidia.driver.enabled }}
             - name: LD_LIBRARY_PATH
               value: {{ join ":" .Values.nvidia.driver.libraryPaths }}
@@ -153,27 +175,24 @@ spec:
               value: "all"
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: "compute,utility"
-            {{- if .Values.memoryRegions.enabled }}
-            - name: EXPORT_FILE_PATH
-              value: {{ .Values.gpuCr.dataDir.mountPath | quote }}
-            - name: GPU_CR_CTL_PATH
-              value: {{ .Values.gpuCr.ctl.mountPath | quote }}
-            - name: GPU_CR_OP_TIMEOUT_SEC
-              value: {{ .Values.gpuCr.opTimeoutSec | quote }}
-            {{- if .Values.memoryRegions.legacySnapshots.enabled }}
-            # LEGACY pre-GEP-0001 copy store: only GC reads it, to TTL-reap
-            # leftovers from older agents. Parked state lives in the
-            # destination group store under EXPORT_FILE_PATH.
-            - name: SNAPSHOT_DIR
-              value: {{ .Values.memoryRegions.legacySnapshots.snapshotDir | quote }}
-            {{- end }}
-            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.port }}
               protocol: TCP
           resources:
+            {{- if and .Values.directMemory.enabled .Values.directMemory.hugepagesResource }}
+            {{- /* Merge hugepages headroom into the configured resources
+                   (k8s requires a memory request alongside hugepages). */}}
+            {{- $hpKey := printf "hugepages-%si" .Values.directMemory.hugetlbfs.pagesize }}
+            {{- $req := deepCopy (default (dict) .Values.resources.requests) }}
+            {{- $lim := deepCopy (default (dict) .Values.resources.limits) }}
+            {{- $_ := set $req $hpKey .Values.directMemory.hugepagesResource }}
+            {{- $_ := set $lim $hpKey .Values.directMemory.hugepagesResource }}
+            {{- if not (hasKey $req "memory") }}{{- $_ := set $req "memory" "256Mi" }}{{- end }}
+            {{- toYaml (dict "requests" $req "limits" $lim) | nindent 12 }}
+            {{- else }}
             {{- toYaml .Values.resources | nindent 12 }}
+            {{- end }}
           volumeMounts:
             {{- if .Values.nvidia.driver.enabled }}
             - name: nvidia-driver
@@ -184,19 +203,12 @@ spec:
             - name: nvidia-devices
               mountPath: {{ .Values.nvidia.devices.mountPath }}
             {{- end }}
-            {{- if .Values.memoryRegions.enabled }}
+            {{- if .Values.directMemory.enabled }}
             - name: huge-ckpt
-              mountPath: {{ .Values.gpuCr.dataDir.mountPath }}
-              # Pick up the mounts made by the init containers even though
-              # the hostPath was bound before they ran.
+              mountPath: {{ .Values.directMemory.ctlDir }}
+              # Pick up the hugetlbfs mount made by the init container even
+              # though the hostPath was captured before it ran.
               mountPropagation: HostToContainer
-            - name: gpu-cr-ctl
-              mountPath: {{ .Values.gpuCr.ctl.mountPath }}
-              mountPropagation: HostToContainer
-            {{- if .Values.memoryRegions.legacySnapshots.enabled }}
-            - name: gcr-snapshots
-              mountPath: {{ .Values.memoryRegions.legacySnapshots.snapshotDir }}
-            {{- end }}
             {{- end }}
       volumes:
         {{- if .Values.nvidia.driver.enabled }}
@@ -211,21 +223,11 @@ spec:
             path: {{ .Values.nvidia.devices.hostPath }}
             type: Directory
         {{- end }}
-        {{- if .Values.memoryRegions.enabled }}
+        {{- if .Values.directMemory.enabled }}
         - name: huge-ckpt
           hostPath:
-            path: {{ .Values.gpuCr.dataDir.hostPath }}
+            path: {{ .Values.directMemory.hostCtlPath }}
             type: DirectoryOrCreate
-        - name: gpu-cr-ctl
-          hostPath:
-            path: {{ .Values.gpuCr.ctl.hostPath }}
-            type: DirectoryOrCreate
-        {{- if .Values.memoryRegions.legacySnapshots.enabled }}
-        - name: gcr-snapshots
-          hostPath:
-            path: {{ .Values.memoryRegions.legacySnapshots.snapshotsHostPath }}
-            type: DirectoryOrCreate
-        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

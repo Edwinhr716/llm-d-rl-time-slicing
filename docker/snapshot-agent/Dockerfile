@@ -31,18 +31,17 @@ FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS gpucr-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake build-essential && rm -rf /var/lib/apt/lists/*
 COPY third_party/gpu-cr /tmp/GPU-CR
-# Build-time patches, kept byte-in-sync with third_party/gpu-cr/Dockerfile.build
-# (which builds the deployed .so):
-#   - remap checkpoint/restore signals off SIGUSR1/2 (taken by NCCL/vLLM)
-#   - create the shared-memory control file world-writable so unprivileged
-#     workloads can open it
-# The constants compile into both binaries; a mismatch makes checkpoints
-# silently no-op. A sed no-ops once its change is source truth in-tree; the
-# greps assert the end state either way.
+# Build-time patch, kept byte-in-sync with third_party/gpu-cr/Dockerfile.build
+# (which builds the deployed .so): remap checkpoint/restore signals off
+# SIGUSR1/2 (taken by NCCL/vLLM). The constants compile into both binaries;
+# a mismatch makes checkpoints silently no-op. The sed no-ops once the remap
+# becomes source truth in-tree (then this block and Dockerfile.build's twin
+# can both be deleted); the greps assert the end state either way, and the
+# 0777 grep pins the control-file mode that is already source truth in
+# share_mem.cpp.
 RUN cd /tmp/GPU-CR && \
     sed -i 's/#define CR_CKPT_SIGNAL     SIGUSR1/#define CR_CKPT_SIGNAL     (SIGRTMAX - 8)/' src/common.h && \
     sed -i 's/#define CR_RESTORE_SIGNAL  SIGUSR2/#define CR_RESTORE_SIGNAL  (SIGRTMAX - 7)/' src/common.h && \
-    sed -i 's/int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/int fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
     grep -q "SIGRTMAX - 8" src/common.h && \
     grep -q "SIGRTMAX - 7" src/common.h && \
     grep -q "0777" src/comm/share_mem.cpp && \

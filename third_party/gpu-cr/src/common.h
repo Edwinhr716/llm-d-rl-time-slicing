@@ -18,18 +18,51 @@
 #include <map>
 #include <utility>
 #include <atomic>
+#include <mutex>
+
+#include "gpu_cr_config.h"
 
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 #define ROUND_UP_2MB(x) (((x) + (2 * 1024 * 1024 - 1)) & ~(2 * 1024 * 1024 - 1))
 
+namespace gpu_cr {
+// CUDA VMM mapping granularity: every hooked allocation is reserved/mapped in
+// units of this size (see ROUND_UP_2MB uses in the cudaMalloc hook).
+inline constexpr size_t kVmmGranuleSize = 2UL * 1024 * 1024;
+
+// The driver rejects a cudaMemcpyAsync on a hooked VMM mapping
+// when the copy crosses a 2MB granule boundary with an unrounded length.
+// Clamps a device copy so it ends at the next granule boundary or at the
+// region end: every issued copy is <=2MB and granule-aligned at its start
+// or its end — the copy shapes validated at scale. Applies to the selective
+// (unrounded) paths only; the full-checkpoint paths copy rounded extents
+// and never hit this boundary.
+constexpr size_t GranuleClampLen(uintptr_t dev_addr, size_t len) {
+  size_t to_boundary = kVmmGranuleSize - (dev_addr & (kVmmGranuleSize - 1));
+  return len < to_boundary ? len : to_boundary;
+}
+}  // namespace gpu_cr
+
 // SHM_SIZE: Per-GPU checkpoint buffer on hugepages.
 // Each GPU process allocates SHM_SIZE + STAGING_BUF_SIZE*STAGING_BUF_NUM.
-// For TP=N, total hugepage needed = N * (SHM_SIZE + 2GB) + overhead.
-// Override at compile time: cmake .. -DSHM_SIZE_GB=40
+// For TP=N, total hugepage needed = N * (SHM_SIZE + 2*staging) + overhead.
+//
+// These are runtime values now. The compile-time SHM_SIZE_GB
+// (cmake -DSHM_SIZE_GB=40) sets the DEFAULT; GPU_CR_SHM_GB / GPU_CR_SHM_MB
+// / GPU_CR_STAGING_MB env vars override it at library load. The macros
+// below keep every historical use site source-compatible while reading
+// the cached runtime config.
 #ifndef SHM_SIZE_GB
 #define SHM_SIZE_GB 25
 #endif
-#define SHM_SIZE ((unsigned long)SHM_SIZE_GB << 30)
+
+namespace gpu_cr {
+inline constexpr size_t kShmDefaultBytes =
+    static_cast<size_t>(SHM_SIZE_GB) << 30;
+inline constexpr size_t kStagingDefaultBytes = 1UL << 30;
+}  // namespace gpu_cr
+
+#define SHM_SIZE (gpu_cr::Config().shm_size)
 
 #define MAX_FILE_NUM 4096
 #define COPY_THRESHOLD (1UL << 29) // 0.5GB, when to copy from host_buf to shm
@@ -51,7 +84,7 @@
 // Maximum number of processes in multi-GPU checkpoint
 #define MAX_MULTI_GPU_PROCS 32
 
-#define STAGING_BUF_SIZE (1UL << 30) // 1GB staging buffer
+#define STAGING_BUF_SIZE (gpu_cr::Config().staging_size) // default 1GB, env-overridable
 #define STAGING_BUF_NUM 2
 
 typedef void (*sighandler_t)(int);
@@ -62,6 +95,8 @@ extern std::map<void*, size_t> allocated_memory;
 
 // Global memory type tracking: ptr -> type (0=runtime Malloc, 1=VMM)
 extern std::map<void*, int> allocated_memory_type;
+
+extern std::mutex gpu_mem_mutex;
 
 // Helper function declarations
 void memcpy_multi(void* dest, void* src, size_t size);

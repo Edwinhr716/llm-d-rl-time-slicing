@@ -1,9 +1,7 @@
 // Upstream-baseline ShareMem backend (mmap_backend.cpp): setup() maps the
 // dump buffer and the two-slot host staging buffer, get_tmp_buf() /
 // get_host_buffer() hand them out. Exercised through the file backend
-// (EXPORT_FILE_PATH) so no hugepages are needed; the backing files are
-// sparse, so the compile-time SHM_SIZE costs address space, not disk.
-// Linux-only.
+// (EXPORT_FILE_PATH) so no hugepages are needed. Linux-only.
 
 #include "backend/backend.h"
 
@@ -147,14 +145,14 @@ TEST_F(MmapBackendTest, SetupResetsStaleHeaderOnExistingFile) {
   EXPECT_EQ(fs->current_offset, ROUND_UP_2MB(sizeof(shared_mem_fs)));
 }
 
-// setup() keeps the historical fatal-exit contract when the data dir is
-// unusable.
+// Eager setup keeps the historical fatal-exit contract when the data dir
+// is unusable.
 TEST_F(MmapBackendTest, MissingDataDirExitsFatally) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   setenv("EXPORT_FILE_PATH", "/nonexistent-gpu-cr-unit-dir", 1);
   ShareMem backend(9);
   EXPECT_EXIT(backend.setup(), ::testing::ExitedWithCode(EXIT_FAILURE),
-              "open");
+              "dump buffer");
 }
 
 }  // namespace

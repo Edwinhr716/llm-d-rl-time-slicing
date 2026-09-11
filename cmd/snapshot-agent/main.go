@@ -25,8 +25,8 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/gpucr"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
-	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
 func main() {
@@ -81,11 +81,12 @@ func main() {
 	// server's WorkloadChannel RPC handler.
 	channelRegistry := backends.NewChannelRegistry()
 	registeredBackends := map[backends.BackendType]backends.Backend{
-		backends.BackendCuda:         backends.NewCudaCheckpoint(),
-		backends.BackendNoop:         backends.NewNoopBackend(),
-		backends.BackendAppEndpoint:  backends.NewAppEndpointBackend(),
-		backends.BackendAppChannel:   backends.NewAppChannelBackend(channelRegistry),
-		backends.BackendDirectMemory: backends.NewDirectMemory(),
+		backends.BackendCuda:          backends.NewCudaCheckpoint(),
+		backends.BackendNoop:          backends.NewNoopBackend(),
+		backends.BackendAppEndpoint:   backends.NewAppEndpointBackend(),
+		backends.BackendAppChannel:    backends.NewAppChannelBackend(channelRegistry),
+		backends.BackendDirectMemory:  backends.NewDirectMemory(),
+		backends.BackendMemoryRegions: backends.NewMemoryRegions(),
 	}
 
 	// GPU-CR housekeeping runs only when the shared checkpoint dir is
@@ -106,7 +107,7 @@ func main() {
 		}
 		// Sweep stale GPU-CR artifacts: a leaked dump pins its full extent
 		// in shm/hugetlbfs even after the owning process dies.
-		utils.StartGPUCRSweeper(ctx, ctlDir, 10*time.Minute)
+		gpucr.StartSweeper(ctx, ctlDir, 10*time.Minute)
 	}
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
