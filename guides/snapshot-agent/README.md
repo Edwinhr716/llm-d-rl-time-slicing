@@ -438,8 +438,10 @@ spec:
     securityContext:
       runAsUser: 0
     env:
-    # Required: inject the preloader and point it at the shared dump store
-    # (must equal the chart's directMemory.ctlDir).
+    # Required: inject the preloader and point it at the dump-store ROOT
+    # (the chart's directMemory.ctlDir value — /mnt/huge-ckpt by default).
+    # GPU-CR discovers the control directory at <root>/ctl on its own;
+    # never set EXPORT_FILE_PATH to the nested ctl path itself.
     - name: LD_PRELOAD
       value: "/usr/local/lib/vGPU-NVIDIA.so"
     - name: GPU_VENDOR
