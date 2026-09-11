@@ -349,11 +349,16 @@ raises, the operation fails with the workload's error text.
 
 Full-process GPU park/resume driven by GPU-CR's `cr_client`. Like the CUDA
 Checkpoint backend it saves and restores the process's entire device state,
-but the mechanism differs: the dump is written by the *workload's* GPU-CR
-preloader into shared memory (or hugetlbfs) on the node, the process itself
-stays alive throughout, and resume maps the parked state straight back —
-no CUDA context teardown/rebuild. This makes park and resume markedly
-faster than `cuda-checkpoint` for large-VRAM workloads.
+and it uses the same `cuda-checkpoint` toggle for the CUDA context — the
+difference is who moves the bytes. Plain `cuda-checkpoint` copies all
+device memory through the driver into the process's own pageable host RAM.
+Here, the workload's GPU-CR preloader first drains the device memory it
+tracked into hugepage-backed files on the node through a pinned DMA
+pipeline and frees it; the context toggle then freezes what is by that
+point a nearly empty context. The bulk bytes never cross the slow pageable
+path — which is why park and resume are several times faster for
+large-VRAM workloads — and the parked state lives in node-local files that
+survive independently of the process's memory.
 
 Requirements:
 
