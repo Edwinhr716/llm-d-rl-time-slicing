@@ -399,6 +399,87 @@ with SnapshotAgentClient("localhost:9001") as client:
 In Kubernetes mode PIDs are discovered from the `timeslice.io/job-id` pod
 label — omit `pids` (i.e. `direct_memory_config()`).
 
+#### Setting up a workload pod
+
+Bake the preloader into your workload image, copied from the artifact image
+that `third_party/gpu-cr/Dockerfile.build` produces (building both it and
+the agent's `cr_client` from the same tree is what keeps them compatible):
+
+```dockerfile
+FROM <registry>/gpucr-so:<tag> AS gpucr
+FROM vllm/vllm-openai:v0.22.0
+COPY --from=gpucr /vGPU-NVIDIA.so /usr/local/lib/vGPU-NVIDIA.so
+RUN chmod 755 /usr/local/lib/vGPU-NVIDIA.so
+```
+
+Then the pod needs the job-id label, the shared checkpoint-dir mount, a
+hugepage allowance for its dumps, and a handful of env vars:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-sampler
+  labels:
+    timeslice.io/job-id: "my-job"   # how the agent finds this pod's PIDs
+spec:
+  # The preloader names its control file after the process's own PID; the
+  # agent signals the HOST PID it discovered. These only match in the host
+  # PID namespace.
+  hostPID: true
+  containers:
+  - name: workload
+    image: <your image with vGPU-NVIDIA.so baked in>
+    securityContext:
+      runAsUser: 0
+    env:
+    # Required: inject the preloader and point it at the shared dump store
+    # (must equal the chart's directMemory.ctlDir).
+    - name: LD_PRELOAD
+      value: "/usr/local/lib/vGPU-NVIDIA.so"
+    - name: GPU_VENDOR
+      value: "NVIDIA"
+    - name: EXPORT_FILE_PATH
+      value: "/mnt/huge-ckpt"
+    # Dump-buffer size in GiB. Unset = the build default (25). Size it to
+    # the VRAM working set you actually park.
+    - name: GPU_CR_SHM_GB
+      value: "8"
+    # Part of the configuration all published direct_memory results were
+    # measured with (vLLM in eager mode, caching allocator off); running
+    # without them is untested.
+    - name: PYTORCH_NO_CUDA_MEMORY_CACHING
+      value: "1"
+    - name: CUDA_LAUNCH_BLOCKING
+      value: "1"
+    resources:
+      requests:
+        nvidia.com/gpu: "1"
+        memory: "6Gi"
+        # The dump buffer plus headroom: ~12Gi for GPU_CR_SHM_GB=8,
+        # ~28Gi for the unset (25 GiB) default. Kubernetes requires a
+        # memory request alongside hugepages.
+        hugepages-2Mi: "12Gi"
+      limits:
+        nvidia.com/gpu: "1"
+        memory: "6Gi"
+        hugepages-2Mi: "12Gi"
+    volumeMounts:
+    - name: huge-ckpt
+      mountPath: /mnt/huge-ckpt
+      # Pick up the hugetlbfs + control-tmpfs mounts the agent's init
+      # containers made on the host, even if this pod started first.
+      mountPropagation: HostToContainer
+  volumes:
+  - name: huge-ckpt
+    hostPath:
+      path: /var/tmp/huge-ckpt   # the chart's directMemory.hostCtlPath
+      type: DirectoryOrCreate
+```
+
+No control-plane configuration is needed: the preloader discovers the
+control-file tmpfs at `<store>/ctl` through this same mount.
+
 Each `cr_client` invocation runs under a per-operation deadline
 (`DIRECT_MEMORY_OP_TIMEOUT_SEC`, default 120 s): a workload that dies
 mid-operation fails that operation instead of wedging the job in
