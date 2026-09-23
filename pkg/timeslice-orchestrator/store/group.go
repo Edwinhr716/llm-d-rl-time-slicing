@@ -22,7 +22,12 @@ type GroupSpec struct {
 	lockStore GroupLockStore
 	// lockingJob is job we want to hold the lock.
 	lockingJob string
-	queue      *WaitingJobQueue
+	// lockedAt is when lockingJob was granted the lock. Zero when unlocked,
+	// and also zero for a lock recovered from the lock store at startup,
+	// because the store persists only the holder's identity. Consumers must
+	// treat a zero value as "unknown, assume long held".
+	lockedAt time.Time
+	queue    *WaitingJobQueue
 	// activeJob is job for which we want context loaded on nodes.
 	// This can be non-empty when lockingJob is empty as an optimization
 	// when there is no one waiting to be the locking job.
@@ -40,6 +45,10 @@ type GroupStatus struct {
 	// the snapshotted context for on the nodes. Context for all
 	// other jobs will have been offloaded as well.
 	loadedJob string
+	// loadedAt is when loadedJob last changed, i.e. when the current job's
+	// context finished being restored on the nodes. Zero when nothing is
+	// loaded.
+	loadedAt time.Time
 }
 
 func (s *GroupStatus) Nodes() []string {
@@ -79,7 +88,15 @@ func (s *GroupStatus) LoadedJob() string {
 func (s *GroupStatus) SetLoadedJob(jobID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.loadedJob == jobID {
+		return
+	}
 	s.loadedJob = jobID
+	if jobID == "" {
+		s.loadedAt = time.Time{}
+		return
+	}
+	s.loadedAt = time.Now()
 }
 
 // Group represents the in-memory and persistent state of a time-slice group.
@@ -178,6 +195,7 @@ func (s *GroupSpec) lock(ctx context.Context, jobID string) error {
 		}
 	}
 	s.lockingJob = jobID
+	s.lockedAt = time.Now()
 	s.activeJob = jobID
 	return nil
 }
@@ -190,6 +208,7 @@ func (s *GroupSpec) unlock(ctx context.Context, jobID string) error {
 		}
 	}
 	s.lockingJob = ""
+	s.lockedAt = time.Time{}
 	// Notice we do not clear the active job. This is because
 	// we actually want to leave the context on the machines until
 	// there is a new job that wants to lock the group.
@@ -203,9 +222,33 @@ type GroupSnapshot struct {
 	State            pb.GroupStatus_State
 	StateTimestamp   time.Time
 	LockingJob       string
+	LockedAt         time.Time
 	ActiveJob        string
 	WaiterQueueDepth int
 	LoadedJob        string
+	LoadedAt         time.Time
+}
+
+// ServingSince reports when the current lock holder became able to actually use
+// the accelerator: it holds the lock AND its context is loaded on the nodes. It
+// returns the zero time when no job is in that state, which includes the window
+// between a grant and the completion of the context restore, and any holder
+// recovered from the lock store at startup (whose grant time is not persisted).
+//
+// The minimum serving quantum is measured from this instant rather than from the
+// grant, because the grant is followed by a multi-second cuda-checkpoint restore
+// during which the holder cannot serve anything.
+func (s *GroupSnapshot) ServingSince() time.Time {
+	if s.LockingJob == "" || s.LockingJob != s.LoadedJob {
+		return time.Time{}
+	}
+	if s.LockedAt.IsZero() || s.LoadedAt.IsZero() {
+		return time.Time{}
+	}
+	if s.LoadedAt.After(s.LockedAt) {
+		return s.LoadedAt
+	}
+	return s.LockedAt
 }
 
 // Snapshot returns a consistent, point-in-time snapshot of the group's state.
@@ -218,6 +261,7 @@ func (g *Group) Snapshot() *GroupSnapshot {
 	copy(nodes, g.status.nodes)
 
 	loadedJob := g.status.loadedJob
+	loadedAt := g.status.loadedAt
 
 	g.spec.mu.RLock()
 	defer g.spec.mu.RUnlock()
@@ -228,9 +272,11 @@ func (g *Group) Snapshot() *GroupSnapshot {
 		State:            g.status.state,
 		StateTimestamp:   g.status.stateTimestamp,
 		LockingJob:       g.spec.lockingJob,
+		LockedAt:         g.spec.lockedAt,
 		ActiveJob:        g.spec.activeJob,
 		WaiterQueueDepth: g.spec.queue.Len(),
 		LoadedJob:        loadedJob,
+		LoadedAt:         loadedAt,
 	}
 }
 

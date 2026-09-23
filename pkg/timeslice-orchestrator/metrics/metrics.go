@@ -46,6 +46,61 @@ var (
 		},
 		[]string{"group_id"},
 	)
+
+	// QuantumSuppressedPollsTotal tracks GetGroupStatus polls whose waiter queue depth was
+	// reported as zero because the lock holder was still inside its minimum serving quantum.
+	QuantumSuppressedPollsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "timeslice_orchestrator_quantum_suppressed_polls_total",
+			Help: "Number of GetGroupStatus polls whose waiter queue depth was withheld by the minimum serving quantum.",
+		},
+		[]string{"group_id"},
+	)
+
+	// DispatchBudget is the last dispatch budget successfully published for the
+	// batch tenant: 1 when it can serve, 0 when it cannot. Unlabeled because a
+	// publisher drives exactly one key for exactly one batch tenant.
+	DispatchBudget = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "timeslice_orchestrator_dispatch_budget",
+			Help: "Last dispatch budget published for the batch tenant (1 = can serve, 0 = cannot).",
+		},
+	)
+
+	// DispatchBudgetWritesTotal counts attempts to publish the dispatch budget,
+	// by outcome. A rising "error" rate means the gate is running on a stale
+	// key, which is only safe while the stale value is 0.
+	DispatchBudgetWritesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "timeslice_orchestrator_dispatch_budget_writes_total",
+			Help: "Number of dispatch budget publish attempts, by outcome.",
+		},
+		[]string{"result"},
+	)
+
+	// DispatchBudgetHeldTotal counts evaluations that wanted to publish 1 but
+	// published 0 because the rising-edge hold-down had not elapsed. Divided by
+	// the publish interval this is roughly the seconds of serving time given up
+	// to avoid opening the gate before the tenant's endpoint is routable.
+	DispatchBudgetHeldTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "timeslice_orchestrator_dispatch_budget_held_total",
+			Help: "Number of dispatch budget evaluations held at 0 by the rising-edge open delay.",
+		},
+	)
+
+	// DispatchBudgetRisingEdgeSkippedTotal counts evaluations that computed 1 but
+	// wrote nothing because the rising edge was delegated to an external
+	// publisher. Nothing is wrong when this climbs; it is the mode working. It is
+	// how the mode's one failure is diagnosed, though: if this is rising and the
+	// batch tenant is still getting no traffic, then nothing is publishing the 1,
+	// and the gate is wedged closed rather than merely late.
+	DispatchBudgetRisingEdgeSkippedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "timeslice_orchestrator_dispatch_budget_rising_edge_skipped_total",
+			Help: "Number of dispatch budget evaluations that computed 1 but were not written, because the rising edge is published externally.",
+		},
+	)
 )
 
 // CleanupGroup removes gauge series labeled with the given group so stale
@@ -63,5 +118,10 @@ func Register() {
 		AcquireWaitDuration,
 		AgentOperationDuration,
 		DeferredSnapshotsTotal,
+		QuantumSuppressedPollsTotal,
+		DispatchBudget,
+		DispatchBudgetWritesTotal,
+		DispatchBudgetHeldTotal,
+		DispatchBudgetRisingEdgeSkippedTotal,
 	)
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/budget"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
@@ -44,10 +45,47 @@ type Server struct {
 	jobStore            JobStore
 	acquirePollInterval time.Duration
 	checkAcquire        checkAcquireFunc
+	servingQuantum      time.Duration
+	budget              *budget.Publisher
+}
+
+// budgetPublishInterval is how often the dispatch budget is republished when
+// nothing is polling GetGroupStatus. It also bounds how long an evicted key
+// stays absent, which matters because the consuming gate fails open on one.
+const budgetPublishInterval = 1 * time.Second
+
+// heldBudgetPublishInterval replaces it when a rising-edge open delay is
+// configured. The hold-down can only be honoured to the resolution of the
+// loop that evaluates it, and the delay being calibrated against is on the
+// order of a second, so a 1 s loop would double it in the worst case.
+const heldBudgetPublishInterval = 250 * time.Millisecond
+
+// Option configures a Server.
+type Option func(*Server)
+
+// WithServingQuantum sets the minimum serving quantum: the shortest time a job
+// that has just been granted the lock and had its context restored is allowed
+// to run before the orchestrator advertises pre-emption pressure to it. Zero
+// (the default) disables the quantum and preserves the previous behaviour.
+func WithServingQuantum(d time.Duration) Option {
+	return func(s *Server) {
+		if d > 0 {
+			s.servingQuantum = d
+		}
+	}
+}
+
+// WithDispatchBudgetPublisher makes the server publish the batch tenant's
+// dispatch budget through p. Nil (the default) disables publishing entirely and
+// preserves the previous behaviour.
+func WithDispatchBudgetPublisher(p *budget.Publisher) Option {
+	return func(s *Server) {
+		s.budget = p
+	}
 }
 
 // NewServer creates a new Server instance.
-func NewServer(ctrl *controller.Controller, groupStore GroupStore, jobStore JobStore) *Server {
+func NewServer(ctrl *controller.Controller, groupStore GroupStore, jobStore JobStore, opts ...Option) *Server {
 	s := &Server{
 		ctrl:                ctrl,
 		groupStore:          groupStore,
@@ -55,6 +93,9 @@ func NewServer(ctrl *controller.Controller, groupStore GroupStore, jobStore JobS
 		acquirePollInterval: 1 * time.Second,
 	}
 	s.checkAcquire = s.defaultCheckAcquire
+	for _, opt := range opts {
+		opt(s)
+	}
 	return s
 }
 
@@ -240,9 +281,15 @@ func (s *Server) GetGroupStatus(ctx context.Context, req *pb.GetGroupStatusReque
 		StateTimestamp:   timestamppb.New(snap.StateTimestamp),
 		LockingJob:       snap.LockingJob,
 		ActiveJob:        snap.ActiveJob,
-		WaiterQueueDepth: int64(snap.WaiterQueueDepth),
+		WaiterQueueDepth: int64(s.advertisedWaiterDepth(ctx, snap)),
 		LoadedJob:        snap.LoadedJob,
 	}
+
+	// Write the dispatch budget through before returning. This response is what
+	// makes a cooperative tenant drain and yield the accelerator, so publishing
+	// here — rather than reacting to the outage afterwards — is what puts the
+	// signal ahead of the outage instead of behind it.
+	s.publishDispatchBudget(ctx)
 
 	jobs, err := s.jobStore.ListByGroup(ctx, group.ID())
 	if err != nil {
@@ -266,6 +313,130 @@ func (s *Server) GetGroupStatus(ctx context.Context, req *pb.GetGroupStatusReque
 	}, nil
 }
 
+// advertisedWaiterDepth returns the waiter queue depth to report in
+// GetGroupStatus. Cooperative tenants poll this field and yield the lock as
+// soon as it is non-zero, so reporting it truthfully the instant a waiter
+// queues lets a tenant be pre-empted before it has served anything: the lock is
+// handed back and forth with nothing but cuda-checkpoint traffic in between.
+//
+// The minimum serving quantum fixes that by withholding only the advertisement
+// of pre-emption pressure. Waiters stay enqueued and are promoted by the
+// controller exactly as before, so nothing is starved and no client has to
+// cooperate: a holder that releases early, crashes, or is deleted still frees
+// the lock immediately, and the withholding is bounded by the quantum measured
+// from the moment the holder could first actually serve.
+func (s *Server) advertisedWaiterDepth(ctx context.Context, snap *store.GroupSnapshot) int {
+	served, withheld := s.quantumWithholding(snap)
+	if !withheld {
+		return snap.WaiterQueueDepth
+	}
+
+	slog.InfoContext(ctx, "Withholding pre-emption pressure for minimum serving quantum",
+		"holder", snap.LockingJob,
+		"served", served,
+		"quantum", s.servingQuantum,
+		"suppressedWaiters", snap.WaiterQueueDepth,
+	)
+	metrics.QuantumSuppressedPollsTotal.WithLabelValues(snap.ID).Inc()
+	return 0
+}
+
+// quantumWithholding reports whether the minimum serving quantum is currently
+// withholding pre-emption pressure from the holder, and for how long the holder
+// has been able to serve. It is the side-effect-free half of
+// advertisedWaiterDepth, so callers that are not answering a poll (the dispatch
+// budget publisher) do not inflate the suppressed-poll counter or the log.
+func (s *Server) quantumWithholding(snap *store.GroupSnapshot) (time.Duration, bool) {
+	if s.servingQuantum <= 0 || snap.WaiterQueueDepth == 0 {
+		return 0, false
+	}
+
+	servingSince := snap.ServingSince()
+	if servingSince.IsZero() {
+		// Not serving (no holder, or a grant whose context is still being
+		// restored, or a holder recovered from the lock store). Fail open.
+		return 0, false
+	}
+
+	served := time.Since(servingSince)
+	if served >= s.servingQuantum {
+		return served, false
+	}
+	return served, true
+}
+
+// quietAdvertisedWaiterDepth is advertisedWaiterDepth without the logging and
+// the counter.
+func (s *Server) quietAdvertisedWaiterDepth(snap *store.GroupSnapshot) int {
+	if _, withheld := s.quantumWithholding(snap); withheld {
+		return 0
+	}
+	return snap.WaiterQueueDepth
+}
+
+// publishDispatchBudget evaluates every group and publishes whether the batch
+// tenant can currently serve.
+//
+// The batch tenant is a single job and can hold at most one group's lock, so
+// the aggregate across groups is an OR: the budget is Available if any group
+// has it serving. Every failure path publishes Blocked rather than skipping the
+// write, because the consuming gate reads a missing or stale-open key as full
+// capacity — the safe direction for this signal is always "do not dispatch".
+func (s *Server) publishDispatchBudget(ctx context.Context) {
+	if s.budget == nil {
+		return
+	}
+
+	value := budget.Blocked
+	groups, err := s.groupStore.List(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to list groups for dispatch budget; publishing blocked", "error", err)
+	}
+	for _, g := range groups {
+		snap := g.Snapshot()
+		if budget.For(snap, s.budget.BatchJob(), s.quietAdvertisedWaiterDepth(snap)) == budget.Available {
+			value = budget.Available
+			break
+		}
+	}
+
+	if err := s.budget.Publish(ctx, value); err != nil {
+		slog.ErrorContext(ctx, "Failed to publish dispatch budget", "error", err)
+	}
+}
+
+// runBudgetPublisher republishes the dispatch budget on a fixed interval until
+// ctx is done. GetGroupStatus already writes through on every poll, which is
+// what gets the signal out ahead of a yield; this loop exists for the edges no
+// poll covers — process start (the key must exist before the gate first reads
+// it), a tenant that stops polling, and recreating a key that was evicted.
+func (s *Server) runBudgetPublisher(ctx context.Context) {
+	interval := budgetPublishInterval
+	if s.budget.OpenDelay() > 0 {
+		interval = heldBudgetPublishInterval
+	}
+	slog.InfoContext(ctx, "Starting dispatch budget publisher",
+		"key", s.budget.Key(),
+		"batchJob", s.budget.BatchJob(),
+		"interval", interval,
+		"openDelay", s.budget.OpenDelay(),
+		"externalRisingEdge", s.budget.ExternalRisingEdge(),
+	)
+	s.publishDispatchBudget(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			slog.InfoContext(ctx, "Stopping dispatch budget publisher")
+			return
+		case <-ticker.C:
+			s.publishDispatchBudget(ctx)
+		}
+	}
+}
+
 // StartServer starts the gRPC server on the specified port and handles graceful shutdown when the context is canceled.
 // It also starts the controller in the background.
 func StartServer(
@@ -276,6 +447,7 @@ func StartServer(
 	groupStore GroupStore,
 	jobStore JobStore,
 	workers int,
+	opts ...Option,
 ) error {
 	lis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -309,7 +481,11 @@ func StartServer(
 	}()
 
 	s := grpc.NewServer()
-	pb.RegisterTimeSliceOrchestratorServiceServer(s, NewServer(ctrl, groupStore, jobStore))
+	orchServer := NewServer(ctrl, groupStore, jobStore, opts...)
+	if orchServer.budget != nil {
+		go orchServer.runBudgetPublisher(ctx)
+	}
+	pb.RegisterTimeSliceOrchestratorServiceServer(s, orchServer)
 
 	errChan := make(chan error, 1)
 	go func() {

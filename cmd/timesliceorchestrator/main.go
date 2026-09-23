@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/budget"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/infrastructure"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
@@ -43,7 +45,53 @@ func run() error {
 	controllerWorkers := flag.Int("controller-workers", 1, "The number of workers for the controller")
 	snapshotAgentPort := flag.Int("snapshot-agent-port", 9001, "The default port for snapshot agents")
 	resyncPeriod := flag.Duration("resync-period", 30*time.Second, "The period for periodic resync of agent states")
+	servingQuantum := flag.Duration("serving-quantum", envDuration("TIMESLICE_SERVING_QUANTUM", 0),
+		"Minimum time a job that has just acquired the lock and had its context restored is allowed to run "+
+			"before GetGroupStatus advertises waiting jobs to it. 0 disables the quantum. "+
+			"Overridable with the TIMESLICE_SERVING_QUANTUM environment variable.")
+	budgetRedisAddr := flag.String("dispatch-budget-redis-addr", os.Getenv("TIMESLICE_DISPATCH_BUDGET_REDIS_ADDR"),
+		"host:port of the Redis to publish the batch tenant's dispatch budget to. "+
+			"Empty (the default) disables publishing. "+
+			"Overridable with the TIMESLICE_DISPATCH_BUDGET_REDIS_ADDR environment variable.")
+	budgetKey := flag.String("dispatch-budget-key", envString("TIMESLICE_DISPATCH_BUDGET_KEY", budget.DefaultKey),
+		"Redis key to publish the batch tenant's dispatch budget to: \"1\" when it can serve, \"0\" when it "+
+			"cannot. Must match the consuming gate's budget_key. "+
+			"Overridable with the TIMESLICE_DISPATCH_BUDGET_KEY environment variable.")
+	budgetJob := flag.String("dispatch-budget-job", os.Getenv("TIMESLICE_DISPATCH_BUDGET_JOB"),
+		"job ID of the batch tenant whose availability is published. Required when "+
+			"--dispatch-budget-redis-addr is set; a group held by any other job publishes \"0\". "+
+			"Overridable with the TIMESLICE_DISPATCH_BUDGET_JOB environment variable.")
+	budgetOpenDelay := flag.Duration("dispatch-budget-open-delay", envDuration("TIMESLICE_DISPATCH_BUDGET_OPEN_DELAY", 0),
+		"How long to hold the dispatch budget at \"0\" after the batch tenant becomes servable, to cover the "+
+			"gap between its context being restored and its Service endpoint being routable again. 0 (the "+
+			"default) publishes the rising edge immediately, which measurably admits traffic to an endpoint "+
+			"that is not yet accepting connections. The falling edge is never delayed. "+
+			"Overridable with the TIMESLICE_DISPATCH_BUDGET_OPEN_DELAY environment variable.")
+	budgetExternalRisingEdge := flag.Bool("dispatch-budget-external-rising-edge",
+		envBool("TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE", false),
+		"Publish only \"0\", never \"1\", leaving the rising edge to an external publisher that can observe "+
+			"when the batch tenant's endpoint is actually routable — something this process cannot see, which "+
+			"is why the unmitigated rising edge opens the gate 0.74-1.84 s early. \"0\" is still written on "+
+			"every evaluation, so an evicted key is still recreated closed. WARNING: if nothing else writes "+
+			"\"1\" to the key, the gate stays shut forever and the batch tenant never serves; watch "+
+			"timeslice_orchestrator_dispatch_budget_rising_edge_skipped_total to see the orchestrator "+
+			"declining to open it. Supersedes --dispatch-budget-open-delay. "+
+			"Overridable with the TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE environment variable.")
 	flag.Parse()
+
+	if *budgetRedisAddr != "" && *budgetJob == "" {
+		// Defaulting here would silently publish "0" forever and stall the
+		// batch tenant, so fail fast instead.
+		return fmt.Errorf("--dispatch-budget-job is required when --dispatch-budget-redis-addr is set")
+	}
+	if *budgetExternalRisingEdge && *budgetOpenDelay > 0 {
+		// Not fatal: the combination is harmless, just incoherent. The hold-down
+		// only ever delays a "1", and in this mode no "1" is written at all, so
+		// an operator who configured both is expecting a mitigation that will
+		// never fire.
+		slog.Warn("--dispatch-budget-open-delay is ignored when --dispatch-budget-external-rising-edge is set",
+			"openDelay", *budgetOpenDelay)
+	}
 
 	metrics.Register()
 
@@ -102,8 +150,67 @@ func run() error {
 	nodeInformerFactory.Start(ctx.Done())
 	podInformerFactory.Start(ctx.Done())
 
-	slog.InfoContext(ctx, "Starting TimeSlice Orchestrator server")
-	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers)
+	opts := []server.Option{server.WithServingQuantum(*servingQuantum)}
+	if *budgetRedisAddr != "" {
+		publisher := budget.NewPublisher(budget.NewRedisWriter(*budgetRedisAddr), *budgetKey, *budgetJob).
+			WithOpenDelay(*budgetOpenDelay).
+			WithExternalRisingEdge(*budgetExternalRisingEdge)
+		defer func() {
+			if err := publisher.Close(); err != nil {
+				slog.Error("Failed to close dispatch budget publisher", "error", err)
+			}
+		}()
+		opts = append(opts, server.WithDispatchBudgetPublisher(publisher))
+	}
+
+	slog.InfoContext(ctx, "Starting TimeSlice Orchestrator server",
+		"servingQuantum", *servingQuantum,
+		"dispatchBudgetRedisAddr", *budgetRedisAddr,
+		"dispatchBudgetKey", *budgetKey,
+		"dispatchBudgetJob", *budgetJob,
+		"dispatchBudgetOpenDelay", *budgetOpenDelay,
+		"dispatchBudgetExternalRisingEdge", *budgetExternalRisingEdge,
+	)
+	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
+}
+
+// envString returns the value of the named environment variable, or def if it
+// is unset or empty.
+func envString(name, def string) string {
+	if raw, ok := os.LookupEnv(name); ok && raw != "" {
+		return raw
+	}
+	return def
+}
+
+// envDuration returns the duration parsed from the named environment variable,
+// or def if it is unset or unparseable.
+func envDuration(name string, def time.Duration) time.Duration {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("Ignoring unparseable duration environment variable", "name", name, "value", raw, "error", err)
+		return def
+	}
+	return d
+}
+
+// envBool returns the boolean parsed from the named environment variable, or
+// def if it is unset or unparseable.
+func envBool(name string, def bool) bool {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("Ignoring unparseable boolean environment variable", "name", name, "value", raw, "error", err)
+		return def
+	}
+	return b
 }
 
 func buildKubeConfig(kubeconfigPath string) (*rest.Config, error) {

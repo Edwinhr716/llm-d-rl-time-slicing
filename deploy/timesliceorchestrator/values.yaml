@@ -11,6 +11,59 @@ service:
 
 snapshotAgentPort: 9001
 
+# Minimum serving quantum: the shortest time a job that has just acquired the
+# group lock and had its context restored is allowed to run before
+# GetGroupStatus advertises waiting jobs to it. Cooperative tenants poll that
+# field and yield as soon as it is non-zero, so without a quantum a tenant can
+# be pre-empted before it serves anything. "0s" disables it (default: previous
+# behaviour is unchanged).
+servingQuantum: "0s"
+
+# Dispatch budget: publish an explicit "the batch tenant can serve now" signal
+# to a Redis key, for a dispatcher in front of the batch tenant to gate on
+# (llm-d-async's `redis` gate). "1" is written only while the batch tenant holds
+# the group lock, its context is restored, and no pre-emption is being
+# advertised to it; "0" is written otherwise, and is written BEFORE the tenant
+# is told to yield rather than after it goes offline.
+#
+# redisAddr empty (default) disables publishing entirely: previous behaviour is
+# unchanged. When it is set, job is REQUIRED — the orchestrator refuses to start
+# without it, because publishing "0" forever would silently stall the tenant.
+#
+# key must match the consuming gate's budget_key. Note that the gate reads an
+# ABSENT key as full capacity (fails open), so the orchestrator writes the key
+# at startup and rewrites it every second rather than only on change.
+#
+# openDelay holds the RISING edge back. The two edges are not symmetric:
+#   falling ("0")  is written inside GetGroupStatus, before the response that
+#                  makes the tenant drain, so it is early for free.
+#   rising  ("1")  is derived from ServingSince(), which becomes non-zero when
+#                  the context is restored — measurably 0.74-1.84 s BEFORE the
+#                  tenant's Service endpoint is routable again. Opening then
+#                  dumps the whole accumulated backlog into a socket that is
+#                  still refusing connections.
+# Measured in results/redis-signal-gate: 0s cost 59/140 requests; every one of
+# them failed within 1.67 s of the key going to 1. Set this to comfortably
+# exceed the readiness-probe + Endpoints-propagation delay of your tenant; "2s"
+# covered 59/59 on an L4 with vLLM 0.5B. The cost is openDelay of serving time
+# per cycle.
+#
+# externalRisingEdge is the alternative to guessing at that constant: the
+# orchestrator writes only "0" and never "1", and something that can actually
+# observe the tenant — a node-level supervisor probing vLLM — writes the "1"
+# when it is genuinely reachable. "0" is still rewritten every second, so an
+# evicted key is still recreated closed. Supersedes openDelay, which is ignored
+# when this is true. DANGER: with nothing publishing the "1" the gate stays shut
+# forever and the batch tenant never serves; alert on
+# timeslice_orchestrator_dispatch_budget_rising_edge_skipped_total rising while
+# the tenant gets no traffic.
+dispatchBudget:
+  redisAddr: ""
+  key: "dispatch-gate-budget"
+  job: ""
+  openDelay: "0s"
+  externalRisingEdge: false
+
 resources: {}
   # limits:
   #   cpu: 100m

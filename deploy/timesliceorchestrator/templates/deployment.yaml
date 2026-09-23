@@ -22,6 +22,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--snapshot-agent-port={{ .Values.snapshotAgentPort }}"
+            - "--serving-quantum={{ .Values.servingQuantum }}"
+            - "--dispatch-budget-redis-addr={{ .Values.dispatchBudget.redisAddr }}"
+            - "--dispatch-budget-key={{ .Values.dispatchBudget.key }}"
+            - "--dispatch-budget-job={{ .Values.dispatchBudget.job }}"
+            - "--dispatch-budget-open-delay={{ .Values.dispatchBudget.openDelay | default "0s" }}"
+            - "--dispatch-budget-external-rising-edge={{ .Values.dispatchBudget.externalRisingEdge | default false }}"
           ports:
             - name: grpc
               containerPort: 50051
