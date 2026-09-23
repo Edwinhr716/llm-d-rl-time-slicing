@@ -5,8 +5,11 @@ dependencies:
 - name: snapshot-agent
   repository: file://./snapshot-agent
   version: 0.1.0
+- name: node-supervisor
+  repository: file://./node-supervisor
+  version: 0.1.0
 - name: nvidia-dra-driver-gpu
   repository: https://helm.ngc.nvidia.com/nvidia
   version: 25.8.0
-digest: sha256:214a3d207f4c37e369123c235b02ce9cb5ea27619ac5ac01bdc1c187e205d0c2
-generated: "2026-07-29T21:14:17.56060342-07:00"
+digest: sha256:205658731089ce8cf586feb3dfacae850b41e470c8f19b3ec16833a4b4ef8777
+generated: "2026-09-22T20:49:25.590009-07:00"

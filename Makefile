@@ -7,6 +7,8 @@ ORCHESTRATOR_IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)/timesliceorchestrator
 ORCHESTRATOR_DOCKERFILE ?= docker/timesliceorchestrator/Dockerfile
 SNAPSHOT_AGENT_IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)/snapshot-agent
 SNAPSHOT_AGENT_DOCKERFILE ?= docker/snapshot-agent/Dockerfile
+NODE_SUPERVISOR_IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)/node-supervisor
+NODE_SUPERVISOR_DOCKERFILE ?= docker/node-supervisor/Dockerfile
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 # amd64-only, same as CI: the snapshot-agent needs the x86_64 cuda-checkpoint
 # binary and a CGO build; the platform is adopted as a unit.
@@ -135,6 +137,27 @@ snapshot-agent-image-push: ## Build and push snapshot-agent container image
 		--tag $(SNAPSHOT_AGENT_IMAGE):$(VERSION) \
 		--tag $(SNAPSHOT_AGENT_IMAGE):latest \
 		-f $(SNAPSHOT_AGENT_DOCKERFILE) \
+		.
+
+.PHONY: node-supervisor-image-build
+node-supervisor-image-build: ## Build node-supervisor container image (local only)
+	docker buildx build \
+		--platform $(PLATFORMS) \
+		--tag $(NODE_SUPERVISOR_IMAGE):$(VERSION) \
+		--tag $(NODE_SUPERVISOR_IMAGE):latest \
+		-f $(NODE_SUPERVISOR_DOCKERFILE) \
+		.
+
+.PHONY: node-supervisor-image-push
+node-supervisor-image-push: ## Build and push node-supervisor container image
+	docker buildx build \
+		--platform $(PLATFORMS) \
+		--push \
+		--annotation "index:org.opencontainers.image.source=https://github.com/llm-d-incubation/$(PROJECT_NAME)" \
+		--annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
+		--tag $(NODE_SUPERVISOR_IMAGE):$(VERSION) \
+		--tag $(NODE_SUPERVISOR_IMAGE):latest \
+		-f $(NODE_SUPERVISOR_DOCKERFILE) \
 		.
 
 

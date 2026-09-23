@@ -1,0 +1,30 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "node-supervisor.fullname" . }}
+  labels:
+    {{- include "node-supervisor.labels" . | nindent 4 }}
+rules:
+  # pods get/list/watch: discovery (field-selected to spec.nodeName=$NODE_NAME,
+  # label-selected on timeslice.io/group) plus reading status.podIP and
+  # status.conditions. `watch` is granted although the current loop polls — the
+  # production form of the discovery loop is a watch and the grant should not
+  # have to change when that lands.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # pods/status patch: the readiness gate. `patch` ALONE and deliberately — a
+  # strategic merge patch keyed on conditions[].type is the correct mechanism
+  # and never needs to send a whole PodStatus, so `update` would only widen the
+  # grant to "can overwrite any field of any pod's status" for no gain.
+  #
+  # This is also the whole RBAC argument for the DaemonSet form: patching
+  # pods/status lets you make any pod in the cluster an endpoint or not an
+  # endpoint. Granting it ONCE to a platform-owned ServiceAccount on a workload
+  # the tenant does not control is a very different blast radius from granting
+  # the same verb to a sidecar in every tenant-authored pod spec, forever.
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["patch"]
+{{- end }}

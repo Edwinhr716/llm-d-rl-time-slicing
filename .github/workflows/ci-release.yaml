@@ -22,15 +22,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Single-platform (amd64) for both components: the platform is adopted
+          # Single-platform (amd64) for every component: the platform is adopted
           # as a unit, and the snapshot-agent is x86_64-only today (cuda-checkpoint
-          # binary + CGO build). Revisit both together when an aarch64
-          # cuda-checkpoint is available.
+          # binary + CGO build). Revisit together when an aarch64
+          # cuda-checkpoint is available. node-supervisor is pure Python and
+          # would build anywhere, but is kept on the same platform set so the
+          # components stay installable as one unit.
           - component: timesliceorchestrator
             dockerfile: docker/timesliceorchestrator/Dockerfile
             platforms: linux/amd64
           - component: snapshot-agent
             dockerfile: docker/snapshot-agent/Dockerfile
+            platforms: linux/amd64
+          - component: node-supervisor
+            dockerfile: docker/node-supervisor/Dockerfile
             platforms: linux/amd64
     steps:
       - name: Checkout source

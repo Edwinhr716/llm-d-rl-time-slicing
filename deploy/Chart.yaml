@@ -11,6 +11,14 @@ dependencies:
   - name: snapshot-agent
     version: 0.1.0
     repository: "file://./snapshot-agent"
+  # Gated off by default: the node supervisor is only correct when the
+  # orchestrator runs with dispatchBudget.externalRisingEdge=true, and a
+  # mismatch is silent (the gate opens early exactly as before while this
+  # component's logs still report success). Opt in explicitly.
+  - name: node-supervisor
+    version: 0.1.0
+    repository: "file://./node-supervisor"
+    condition: node-supervisor.enabled
   - name: nvidia-dra-driver-gpu
     version: 25.8.0
     repository: "https://helm.ngc.nvidia.com/nvidia"

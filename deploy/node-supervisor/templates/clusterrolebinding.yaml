@@ -1,0 +1,16 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "node-supervisor.fullname" . }}
+  labels:
+    {{- include "node-supervisor.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "node-supervisor.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "node-supervisor.serviceAccountName" . }}
+    namespace: {{ include "node-supervisor.namespace" . }}
+{{- end }}

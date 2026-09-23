@@ -1,0 +1,128 @@
+# Default values for node-supervisor.
+image:
+  repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/node-supervisor
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+podAnnotations: {}
+
+# The namespace the supervised tenant pods live in. Every object in this chart
+# (ServiceAccount, DaemonSet, and the ClusterRoleBinding subject) is placed
+# here — NOT in timeslice-system — because the supervisor's identity should sit
+# alongside the workloads it patches.
+tenantNamespace: default
+
+# This pod holds no CUDA context and is never snapshotted; it shares a node
+# with tenants fighting over a single GPU and must not take a byte of it.
+# There is deliberately no `claims:` block and no nvidia.com/gpu request.
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    memory: "256Mi"
+
+# Same nodeSelector the tenant uses, so the DaemonSet lands on exactly the
+# time-slicing nodes and nowhere else.
+nodeSelector:
+  group.timeslice.io/trainers: "true"
+
+tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  - key: "timeslice.io/shared"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+
+affinity: {}
+
+# The supervisor launches nothing, signals nothing and mounts no device: it
+# needs no privilege inside the container. Left empty on purpose.
+securityContext: {}
+
+# hostNetwork: the ClusterIP self-probe is the load-bearing observation in this
+# component, and in the host netns it is DNAT'd by the same host iptables/IPVS
+# chains a dispatch arriving at this node would hit. It also makes
+# <hostIP>:<agent.port> (the snapshot agent, itself hostNetwork) a literal
+# node-local address.
+hostNetwork: true
+# MANDATORY with hostNetwork. Without it the pod inherits the node's
+# resolv.conf, cluster DNS names do not resolve, the self-probe silently
+# becomes a permanent timeout and the budget never opens.
+dnsPolicy: ClusterFirstWithHostNet
+
+# hostPID is deliberately NOT exposed as a value and never set. The in-pod
+# supervisor needed PID 1 because it fork/exec'd `vllm serve` and reaped it;
+# this one launches nothing (every engine interaction is HTTP to the pod IP,
+# every CUDA-state interaction goes through the snapshot agent), so a node-wide
+# process view would be privilege for its own sake.
+
+orchestrator:
+  # gRPC address of the timeslice orchestrator.
+  address: "timeslice-timesliceorchestrator.timeslice-system.svc:50051"
+
+agent:
+  # The snapshot agent is a hostNetwork DaemonSet, so it is reachable at the
+  # node's own IP. NODE_IP comes from a fieldRef and is interpolated into
+  # TIMESLICE_AGENT_ADDR by the kubelet.
+  port: 9001
+
+# --- llm-d-async dispatch budget (RISING EDGE ONLY) ---
+# This process writes "1" to this key and nothing else, ever. The orchestrator
+# owns "0" and writes it synchronously inside GetGroupStatus, ahead of the
+# drain. Two writers, opposite monotone directions, no overlap. `key` must be
+# identical to AP's gate_params.budget_key and the orchestrator's
+# --dispatch-budget-key.
+dispatchBudget:
+  redisAddr: "redis.default.svc.cluster.local:6379"
+  key: "dispatch-gate-budget"
+
+# The URL a batch dispatch actually uses (AP's igw_base_url). Probing this exact
+# ClusterIP is what proves the route is programmed before the budget opens — the
+# measured 0.74-1.84 s between CUDA context restore and a routable Service is
+# what destroyed 59 of 140 requests when the orchestrator published the rising
+# edge itself.
+serviceProbe:
+  url: "http://shadow-vllm.default.svc.cluster.local:8000/health"
+  timeoutSeconds: "30.0"
+
+readinessGate:
+  # Must equal the tenant's spec.readinessGates[].conditionType.
+  conditionType: "timeslice.io/serving"
+
+tenant:
+  # Port the tenant's vLLM listens on, probed on the pod IP.
+  vllmPort: 8000
+
+supervisor:
+  waiterPollSeconds: "0.5"
+  discoveryPollSeconds: "1.0"
+  # LOCAL_SLEEP=0: let the snapshot agent's cuda backend be the ONLY freeze
+  # mechanism. vLLM sleep + cuda-checkpoint on the same process conflict; the
+  # engine dies during the agent's cuda-checkpoint RESTORE of an already-slept
+  # process. Set to "1" only when the agent resolves this job to the
+  # app-channel backend.
+  localSleep: "0"
+
+# Additional environment variables appended verbatim to the container.
+# Useful for the knobs the supervisor reads but the manifest leaves defaulted:
+# TIMESLICE_GROUP_LABEL, TIMESLICE_JOB_ID_LABEL, NOTREADY_TIMEOUT_SECONDS.
+extraEnv: []
+
+rbac:
+  create: true
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""

@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "node-supervisor.fullname" . }}
+  namespace: {{ include "node-supervisor.namespace" . }}
+  labels:
+    {{- include "node-supervisor.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "node-supervisor.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "node-supervisor.selectorLabels" . | nindent 8 }}
+        # NO timeslice.io/group or timeslice.io/job-id label: this pod must
+        # never be selected for snapshot, and must never discover itself as a
+        # tenant.
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "node-supervisor.serviceAccountName" . }}
+      # hostNetwork: the ClusterIP self-probe is the load-bearing observation
+      # in this component, and in the host netns it is DNAT'd by the same
+      # host iptables/IPVS chains a dispatch arriving at this node would hit —
+      # a failure is unambiguously "kube-proxy has not programmed the route"
+      # rather than "the CNI is not ready". It also makes status.hostIP:9001
+      # (the snapshot agent, itself hostNetwork) a literal node-local address.
+      hostNetwork: {{ .Values.hostNetwork }}
+      # MANDATORY with hostNetwork: without it the pod inherits the node's
+      # resolv.conf and the tenant Service's cluster DNS name does not resolve,
+      # which would silently turn the self-probe into a permanent timeout and
+      # the budget would never open.
+      dnsPolicy: {{ .Values.dnsPolicy }}
+      # hostPID is deliberately NOT set. The in-pod supervisor needed PID 1
+      # because it fork/exec'd `vllm serve` and reaped it; this one launches
+      # nothing and signals nothing (every engine interaction is HTTP to the
+      # pod IP, every CUDA-state interaction goes through the snapshot agent),
+      # so a node-wide process view would be privilege for its own sake.
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: TENANT_NAMESPACE
+              value: {{ include "node-supervisor.namespace" . | quote }}
+            - name: TIMESLICE_ORCH_ADDR
+              value: {{ .Values.orchestrator.address | quote }}
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # snapshot agent is hostNetwork on :{{ .Values.agent.port }}
+            - name: TIMESLICE_AGENT_ADDR
+              value: "$(NODE_IP):{{ .Values.agent.port }}"
+            # --- llm-d-async dispatch budget (RISING EDGE ONLY) ---
+            # This process writes "1" to this key and nothing else, ever. The
+            # orchestrator owns "0" and writes it synchronously inside
+            # GetGroupStatus, ahead of the drain. Two writers, opposite
+            # monotone directions, no overlap. Must name the identical key as
+            # AP's gate_params.budget_key and the orchestrator's
+            # --dispatch-budget-key.
+            - name: DISPATCH_BUDGET_REDIS_ADDR
+              value: {{ .Values.dispatchBudget.redisAddr | quote }}
+            - name: DISPATCH_BUDGET_KEY
+              value: {{ .Values.dispatchBudget.key | quote }}
+            # The URL a dispatch actually goes to (AP's igw_base_url). Probing
+            # this exact ClusterIP is what proves the route is programmed
+            # before the budget opens — the measured 0.74-1.84 s between CUDA
+            # context restore and a routable Service is what destroyed 59 of
+            # 140 requests when the orchestrator published the rising edge
+            # itself.
+            - name: TIMESLICE_SERVICE_PROBE_URL
+              value: {{ .Values.serviceProbe.url | quote }}
+            - name: TIMESLICE_SERVICE_PROBE_TIMEOUT_SECONDS
+              value: {{ .Values.serviceProbe.timeoutSeconds | quote }}
+            # Must equal the tenant's spec.readinessGates[].conditionType.
+            - name: READINESS_GATE_CONDITION
+              value: {{ .Values.readinessGate.conditionType | quote }}
+            - name: VLLM_PORT
+              value: {{ .Values.tenant.vllmPort | quote }}
+            - name: WAITER_POLL_SECONDS
+              value: {{ .Values.supervisor.waiterPollSeconds | quote }}
+            - name: DISCOVERY_POLL_SECONDS
+              value: {{ .Values.supervisor.discoveryPollSeconds | quote }}
+            # LOCAL_SLEEP=0: let the snapshot agent's cuda backend be the ONLY
+            # freeze mechanism. vLLM sleep + cuda-checkpoint on the same
+            # process conflict; the engine dies during the agent's
+            # cuda-checkpoint RESTORE of an already-slept process. Set to 1
+            # only when the agent resolves this job to the app-channel backend.
+            - name: LOCAL_SLEEP
+              value: {{ .Values.supervisor.localSleep | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # NO claims: block and no nvidia.com/gpu. This pod shares a node with
+          # the tenants that are fighting over one GPU and must not take a byte
+          # of it — it holds no CUDA context and is never snapshotted.
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      # Same nodeSelector the tenant uses, so the DaemonSet lands on exactly
+      # the time-slicing nodes and nowhere else.
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -23,6 +23,30 @@ snapshot-agent:
       value: "true"
       effect: "NoSchedule"
 
+# Override values for the node-supervisor subchart
+#
+# Disabled by default. HARD PRECONDITION before enabling: the orchestrator must
+# run with timesliceorchestrator.dispatchBudget.externalRisingEdge: true, so
+# that it writes only "0" to the dispatch budget key and the supervisor is the
+# sole writer of "1". Without it the orchestrator republishes its own rising
+# edge 0.74-1.84 s before the Service route exists and races this component —
+# invisibly, since the supervisor still logs clusterip_probe_ok.
+node-supervisor:
+  enabled: false
+  image:
+    tag: latest
+  # The supervisor is installed into the TENANT namespace, not
+  # timeslice-system: that is where the pods it patches live.
+  tenantNamespace: default
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "timeslice.io/shared"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+
 # Override values for the nvidia-dra-driver-gpu subchart
 nvidia-dra-driver-gpu:
   enabled: true
