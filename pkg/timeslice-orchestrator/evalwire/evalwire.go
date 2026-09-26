@@ -97,6 +97,11 @@ type flagValues struct {
 	noticeWindow             time.Duration
 	killBudget               time.Duration
 	hostCommandPort          int
+	agentRPCTimeout          time.Duration
+	retryBaseDelay           time.Duration
+	retryMaxDelay            time.Duration
+	holderWaitRequeue        time.Duration
+	killPollInterval         time.Duration
 }
 
 // newFlagSet declares the flags of cmd/timesliceorchestrator/main.go with the
@@ -107,7 +112,7 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.IntVar(&fv.port, "port", 50051, "The server port (ignored: Start picks a free port)")
 	fs.IntVar(&fv.metricsPort, "metrics-port", 8080, "The metrics server port (ignored: Start picks a free port)")
 	fs.StringVar(&fv.kubeconfig, "kubeconfig", "", "Ignored: the clientset comes from Config")
-	fs.IntVar(&fv.controllerWorkers, "controller-workers", 1, "The number of workers for the controller")
+	fs.IntVar(&fv.controllerWorkers, "controller-workers", controller.DefaultWorkers, "The number of workers for the controller")
 	fs.IntVar(&fv.snapshotAgentPort, "snapshot-agent-port", 9001, "The default port for snapshot agents")
 	fs.DurationVar(&fv.resyncPeriod, "resync-period", 30*time.Second, "The period for periodic resync of agent states")
 	fs.DurationVar(&fv.servingQuantum, "serving-quantum", envDuration("TIMESLICE_SERVING_QUANTUM", 0),
@@ -131,6 +136,11 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.DurationVar(&fv.noticeWindow, "notice-window", server.DefaultNoticeWindow, "Notice window N")
 	fs.DurationVar(&fv.killBudget, "kill-budget", server.DefaultKillBudget, "Kill budget K")
 	fs.IntVar(&fv.hostCommandPort, "host-command-port", 0, "Port of the per-host command endpoint; 0 disables host commands")
+	fs.DurationVar(&fv.agentRPCTimeout, "agent-rpc-timeout", 5*time.Second, "Bound on every call to a snapshot agent")
+	fs.DurationVar(&fv.retryBaseDelay, "retry-base-delay", 1*time.Second, "First retry delay after a failed reconcile")
+	fs.DurationVar(&fv.retryMaxDelay, "retry-max-delay", 30*time.Second, "Cap on the retry delay")
+	fs.DurationVar(&fv.holderWaitRequeue, "holder-wait-requeue", 1*time.Second, "Requeue while the lock holder is not loaded")
+	fs.DurationVar(&fv.killPollInterval, "kill-poll-interval", controller.DefaultKillPollInterval, "How often a kill operation is polled")
 	return fs, fv
 }
 
@@ -208,9 +218,9 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	lockStore := store.NewConfigMapLockStore(clientset)
 	groupStore := store.NewGroupStore(lockStore)
 	jobStore := store.NewJobStore()
-	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, fv.snapshotAgentPort)
+	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, fv.snapshotAgentPort).WithRPCTimeout(fv.agentRPCTimeout)
 	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
-		workqueue.DefaultTypedControllerRateLimiter[string](),
+		controller.NewRateLimiter(fv.retryBaseDelay, fv.retryMaxDelay),
 		workqueue.TypedRateLimitingQueueConfig[string]{
 			Name: "groups",
 		},
@@ -236,7 +246,9 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		snapshotAgentStore,
 	)
 	ctrl.ResyncPeriod = fv.resyncPeriod
+	ctrl.HolderWaitRequeue = fv.holderWaitRequeue
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
+	ctrl.KillPollInterval = fv.killPollInterval
 
 	nodeInformerFactory.Start(ctx.Done())
 	podInformerFactory.Start(ctx.Done())
@@ -277,6 +289,11 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"noticeWindow", fv.noticeWindow,
 		"killBudget", fv.killBudget,
 		"hostCommandPort", fv.hostCommandPort,
+		"agentRPCTimeout", fv.agentRPCTimeout,
+		"retryBaseDelay", fv.retryBaseDelay,
+		"retryMaxDelay", fv.retryMaxDelay,
+		"holderWaitRequeue", fv.holderWaitRequeue,
+		"killPollInterval", fv.killPollInterval,
 	)
 
 	// serveErr is written before exited is closed and read only after.
