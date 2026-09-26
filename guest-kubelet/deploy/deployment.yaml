@@ -1,0 +1,43 @@
+# One replica, pinned to the trainer node, host network, no privileges.
+# `make deploy` replaces IMAGE with the Artifact Registry image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guest-kubelet
+  namespace: guest-kubelet-proto
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # never two kubelets for one Node
+  selector:
+    matchLabels: {app: guest-kubelet}
+  template:
+    metadata:
+      labels: {app: guest-kubelet}
+    spec:
+      serviceAccountName: guest-kubelet
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: YOUR_GPU_NODE
+      tolerations:
+        - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: guest-kubelet
+          image: IMAGE
+          args: ["--node-name=vk-abcd"]
+          env:
+            - name: HOST_IP
+              valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
