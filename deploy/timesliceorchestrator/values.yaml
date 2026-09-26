@@ -1,5 +1,36 @@
 replicaCount: 1
 
+# Namespace for the Deployment, Service, ServiceAccount and bindings. Keep the
+# default unless you run a second, independent orchestrator install.
+namespace: timeslice-system
+
+# Recreate stops the old pod before the new one starts, so two orchestrator
+# replicas never run at once and never both act on the lock ConfigMap during
+# an upgrade. A RollingUpdate would briefly run two.
+strategy:
+  type: Recreate
+
+# Where group lock holders are persisted. Each orchestrator install in a
+# cluster needs its own ConfigMap; two installs sharing one fight over the same
+# groups. namespace "" = the chart namespace above. configMap "" = the
+# orchestrator's default name (timeslice-orchestrator-locks). The chart grants
+# ConfigMap access in the lock namespace.
+lock:
+  namespace: ""
+  configMap: ""
+
+# What this orchestrator watches. Defaults watch everything, as before.
+#   watchNamespaces: pods are watched only in these namespaces; pods elsewhere
+#     join no group. [] = all namespaces.
+#   nodeSelector: label selector (kubectl syntax, e.g. "pool=demo") limiting the
+#     nodes this orchestrator sees; nodes outside it contribute to no group and
+#     pods bound to them are ignored. Group membership still comes from the
+#     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
+#     with the pod-scheduling nodeSelector further down.
+scope:
+  watchNamespaces: []
+  nodeSelector: ""
+
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator
   pullPolicy: Always
@@ -72,6 +103,7 @@ resources: {}
   #   cpu: 100m
   #   memory: 128Mi
 
+# Scheduling of the orchestrator pod itself.
 nodeSelector: {}
 tolerations: []
 affinity: {}
