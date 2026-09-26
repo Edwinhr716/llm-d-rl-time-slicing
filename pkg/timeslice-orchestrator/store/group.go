@@ -32,6 +32,41 @@ type GroupSpec struct {
 	// This can be non-empty when lockingJob is empty as an optimization
 	// when there is no one waiting to be the locking job.
 	activeJob string
+
+	// The fields below are the background participant state. They live in
+	// memory only and are never written to the lock store: the group states
+	// derived from them (BACKGROUND, VACATING) are computed on read.
+	//
+	// lend records that the last foreground Yield carried an expected_idle
+	// hint of at least the server's minimum bubble. It is only a hint; the
+	// reconcile loop decides whether the accelerator is actually lent.
+	lend bool
+	// participants holds the background participant of each node, keyed by
+	// node name.
+	participants map[string]*participant
+	// noticeAt is when the current notice to the background started. Zero
+	// when no notice runs.
+	noticeAt time.Time
+}
+
+// participant is the in-memory record of a node's background participant.
+type participant struct {
+	id       string
+	lastSeen time.Time
+	// blocked is true while the participant waits in Acquire(ROLE_BACKGROUND).
+	blocked bool
+	// granted is true while the node is lent to the participant.
+	granted bool
+	// claimed is true when the participant was first seen through a status
+	// poll rather than an Acquire (for example after an orchestrator
+	// restart), so it may still hold a grant from an earlier process. A claim
+	// keeps the node busy like a grant (fail closed) but never satisfies a
+	// background Acquire.
+	claimed bool
+}
+
+func (p *participant) holds() bool {
+	return p.granted || p.claimed
 }
 
 // GroupStatus represents the current status of a time-slice group.
@@ -111,8 +146,9 @@ func NewGroup(ctx context.Context, id string, lockStore GroupLockStore) (*Group,
 	group := &Group{
 		id: id,
 		spec: &GroupSpec{
-			lockStore: lockStore,
-			queue:     NewWaitingJobQueue(),
+			lockStore:    lockStore,
+			queue:        NewWaitingJobQueue(),
+			participants: make(map[string]*participant),
 		},
 		status: &GroupStatus{
 			state:          pb.GroupStatus_STATE_UNSPECIFIED,
@@ -227,6 +263,27 @@ type GroupSnapshot struct {
 	WaiterQueueDepth int
 	LoadedJob        string
 	LoadedAt         time.Time
+	// BackgroundHeld is true when any node's background participant holds a
+	// grant or a claim.
+	BackgroundHeld bool
+	// NoticeAt is when the current notice to the background started, or zero.
+	NoticeAt time.Time
+}
+
+// EffectiveState returns the group state to report to callers. It overlays
+// the two background states, which are never stored, on the state the
+// reconcile loop last recorded: VACATING while a notice runs, BACKGROUND while
+// a background participant holds a grant or a claim. With no background
+// participant it is exactly the recorded state.
+func (s *GroupSnapshot) EffectiveState() pb.GroupStatus_State {
+	switch {
+	case !s.NoticeAt.IsZero():
+		return pb.GroupStatus_STATE_VACATING
+	case s.BackgroundHeld:
+		return pb.GroupStatus_STATE_BACKGROUND
+	default:
+		return s.State
+	}
 }
 
 // ServingSince reports when the current lock holder became able to actually use
@@ -277,6 +334,8 @@ func (g *Group) Snapshot() *GroupSnapshot {
 		WaiterQueueDepth: g.spec.queue.Len(),
 		LoadedJob:        loadedJob,
 		LoadedAt:         loadedAt,
+		BackgroundHeld:   g.spec.backgroundHeldLocked(),
+		NoticeAt:         g.spec.noticeAt,
 	}
 }
 
@@ -322,11 +381,161 @@ func (s *GroupSpec) RequestLock(jobID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// A foreground job asking for the lock ends any pending lend hint.
+	s.lend = false
+
 	if s.lockingJob == jobID {
 		return
 	}
 
 	s.queue.Enqueue(jobID)
+}
+
+// SetLend records (or clears) the foreground lend hint. It decides nothing by
+// itself; the reconcile loop reads it.
+func (s *GroupSpec) SetLend(lend bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lend = lend
+}
+
+// Lend reports the foreground lend hint.
+func (s *GroupSpec) Lend() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lend
+}
+
+// RegisterParticipant records that the background participant id of node is
+// blocked in Acquire(ROLE_BACKGROUND). It never touches the foreground queue.
+func (s *GroupSpec) RegisterParticipant(node, id string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.participants[node]
+	if !ok {
+		p = &participant{}
+		s.participants[node] = p
+	}
+	p.id = id
+	p.lastSeen = now
+	p.blocked = true
+}
+
+// UnregisterParticipant records that node's participant stopped waiting in
+// Acquire. A participant that holds a grant or a claim is kept (fail closed):
+// only a background Yield, or the reconcile loop, clears those.
+func (s *GroupSpec) UnregisterParticipant(node string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.participants[node]
+	if !ok {
+		return
+	}
+	if p.holds() {
+		p.blocked = false
+		return
+	}
+	delete(s.participants, node)
+}
+
+// Touch refreshes the last-seen time of node's participant. An unknown
+// participant is registered with a claim, because the orchestrator cannot
+// tell whether it holds a grant from an earlier process. It reports whether
+// the participant was unknown.
+func (s *GroupSpec) Touch(node, id string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, ok := s.participants[node]; ok {
+		p.id = id
+		p.lastSeen = now
+		return false
+	}
+	s.participants[node] = &participant{id: id, lastSeen: now, claimed: true}
+	return true
+}
+
+// Grant lends node to its participant. It replaces a claim with a grant and
+// reports false if node has no participant.
+func (s *GroupSpec) Grant(node string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.participants[node]
+	if !ok {
+		return false
+	}
+	p.granted = true
+	p.claimed = false
+	return true
+}
+
+// ClearGrant takes back node's grant or claim. A participant that is not
+// waiting in Acquire is forgotten. It reports whether anything was held.
+func (s *GroupSpec) ClearGrant(node string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.participants[node]
+	if !ok {
+		return false
+	}
+	held := p.holds()
+	p.granted = false
+	p.claimed = false
+	if !p.blocked {
+		delete(s.participants, node)
+	}
+	return held
+}
+
+// Granted reports whether node is lent to its participant. A claim is not a
+// grant.
+func (s *GroupSpec) Granted(node string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.participants[node]
+	return ok && p.granted
+}
+
+// BackgroundHeld reports whether any node's participant holds a grant or a
+// claim, i.e. whether background guests may be on the accelerator.
+func (s *GroupSpec) BackgroundHeld() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.backgroundHeldLocked()
+}
+
+// backgroundHeldLocked assumes s.mu is held.
+func (s *GroupSpec) backgroundHeldLocked() bool {
+	for _, p := range s.participants {
+		if p.holds() {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureNotice starts a notice at now unless one already runs, and returns
+// the notice start time.
+func (s *GroupSpec) EnsureNotice(now time.Time) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.noticeAt.IsZero() {
+		s.noticeAt = now
+	}
+	return s.noticeAt
+}
+
+// ClearNotice ends the current notice, if any.
+func (s *GroupSpec) ClearNotice() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noticeAt = time.Time{}
+}
+
+// NoticeAt returns when the current notice started, or zero.
+func (s *GroupSpec) NoticeAt() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.noticeAt
 }
 
 // SetActiveJob sets the active job.

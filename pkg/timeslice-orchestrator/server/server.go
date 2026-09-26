@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -47,7 +48,28 @@ type Server struct {
 	checkAcquire        checkAcquireFunc
 	servingQuantum      time.Duration
 	budget              *budget.Publisher
+
+	// Background participant protocol (roles). See WithBackgroundRole.
+	backgroundRole bool
+	minBubble      time.Duration
+	noticeWindow   time.Duration
+	killBudget     time.Duration
 }
+
+// BackgroundProtocolVersion is the value of GroupStatus.background_protocol
+// on a server that speaks the background participant protocol.
+const BackgroundProtocolVersion = 1
+
+// backgroundParticipantPrefix prefixes a background participant's job_id:
+// "vk/<node name>".
+const backgroundParticipantPrefix = "vk/"
+
+// Defaults for the notice timing. Both are PENDING LEAD DECISION values; the
+// command line sets them through --notice-window and --kill-budget.
+const (
+	DefaultNoticeWindow = 30 * time.Second
+	DefaultKillBudget   = 3 * time.Second
+)
 
 // budgetPublishInterval is how often the dispatch budget is republished when
 // nothing is polling GetGroupStatus. It also bounds how long an evicted key
@@ -84,6 +106,43 @@ func WithDispatchBudgetPublisher(p *budget.Publisher) Option {
 	}
 }
 
+// WithBackgroundRole enables the background participant protocol: Acquire and
+// Yield accept ROLE_BACKGROUND, GetGroupStatus accepts participant_id and
+// reports background_protocol = 1. Disabled (the default) the server reports
+// background_protocol = 0, so a background participant never calls Acquire,
+// and refuses ROLE_BACKGROUND with FailedPrecondition. Foreground callers are
+// unaffected either way.
+func WithBackgroundRole(enabled bool) Option {
+	return func(s *Server) {
+		s.backgroundRole = enabled
+	}
+}
+
+// WithMinBubble sets the minimum expected_idle for which a foreground Yield
+// records a lend hint. Zero (the default) never records one, so the
+// accelerator is never lent and the group goes IDLE_YIELDED as before.
+func WithMinBubble(d time.Duration) Option {
+	return func(s *Server) {
+		if d > 0 {
+			s.minBubble = d
+		}
+	}
+}
+
+// WithNoticeTiming sets the notice window N and the kill budget K used to
+// compute vacate_within = notice + N - K - now. Non-positive values keep the
+// defaults.
+func WithNoticeTiming(noticeWindow, killBudget time.Duration) Option {
+	return func(s *Server) {
+		if noticeWindow > 0 {
+			s.noticeWindow = noticeWindow
+		}
+		if killBudget > 0 {
+			s.killBudget = killBudget
+		}
+	}
+}
+
 // NewServer creates a new Server instance.
 func NewServer(ctrl *controller.Controller, groupStore GroupStore, jobStore JobStore, opts ...Option) *Server {
 	s := &Server{
@@ -91,6 +150,8 @@ func NewServer(ctrl *controller.Controller, groupStore GroupStore, jobStore JobS
 		groupStore:          groupStore,
 		jobStore:            jobStore,
 		acquirePollInterval: 1 * time.Second,
+		noticeWindow:        DefaultNoticeWindow,
+		killBudget:          DefaultKillBudget,
 	}
 	s.checkAcquire = s.defaultCheckAcquire
 	for _, opt := range opts {
@@ -110,6 +171,11 @@ func (s *Server) Acquire(ctx context.Context, req *pb.AcquireRequest) (*pb.Acqui
 	jobID := req.GetJobId()
 	startTime := time.Now()
 
+	role, err := effectiveRole(req.GetRole())
+	if err != nil {
+		return nil, err
+	}
+
 	// 1. Get Group
 	group, err := s.groupStore.Get(ctx, groupID)
 	if err != nil {
@@ -119,8 +185,16 @@ func (s *Server) Acquire(ctx context.Context, req *pb.AcquireRequest) (*pb.Acqui
 		return nil, status.Errorf(codes.Internal, "failed to get group: %v", err)
 	}
 
+	if role == pb.Role_ROLE_BACKGROUND {
+		return s.acquireBackground(ctx, group, jobID, req.GetNodeName(), startTime)
+	}
+
 	// 2. Request Lock
 	group.Spec().RequestLock(jobID)
+	// Foreground wait, option A: a foreground Acquire while background guests
+	// hold the accelerator starts the notice and keeps blocking below until
+	// they are gone (see defaultCheckAcquire).
+	s.startNoticeIfBackgroundHeld(ctx, group)
 	if s.ctrl != nil {
 		s.ctrl.EnqueueWork(groupID)
 	}
@@ -163,9 +237,18 @@ func (s *Server) defaultCheckAcquire(
 		return nil, status.Errorf(codes.Unavailable, "group %s is faulted", groupID), true
 	}
 
+	// Fail closed: never hand the accelerator to a foreground job while a
+	// background participant holds a grant or a claim. Keep the notice
+	// running and wait (foreground wait option A).
+	if s.startNoticeIfBackgroundHeld(ctx, group) {
+		return nil, nil, false //nolint:nilnil // returning nil, nil is intended when done is false
+	}
+
 	// Check if we are the lock holder AND the context is loaded
 	// (fixes premature success bug)
 	if group.Spec().LockingJob() == jobID && group.Status().LoadedJob() == jobID {
+		// The accelerator is back with the foreground: any notice is over.
+		group.Spec().ClearNotice()
 		slog.InfoContext(ctx, "Acquire succeeded, job loaded and lock held")
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
@@ -203,6 +286,25 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 	groupID := req.GetGroupId()
 	jobID := req.GetJobId()
 
+	role, err := effectiveRole(req.GetRole())
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate the hint before anything changes, so a bad request is refused
+	// without yielding.
+	lendHint := false
+	if req.ExpectedIdle != nil {
+		if err := req.GetExpectedIdle().CheckValid(); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid expected_idle: %v", err)
+		}
+		idle := req.GetExpectedIdle().AsDuration()
+		if idle < 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "expected_idle must not be negative, got %v", idle)
+		}
+		lendHint = s.minBubble > 0 && idle >= s.minBubble
+	}
+
 	// 1. Get Group
 	group, err := s.groupStore.Get(ctx, groupID)
 	if err != nil {
@@ -210,6 +312,10 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 			return nil, status.Errorf(codes.NotFound, "group %s not found", groupID)
 		}
 		return nil, status.Errorf(codes.Internal, "failed to get group: %v", err)
+	}
+
+	if role == pb.Role_ROLE_BACKGROUND {
+		return s.yieldBackground(ctx, group, jobID)
 	}
 
 	// 2. Take Snapshot BEFORE Yield
@@ -223,6 +329,10 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 		}
 		return nil, status.Errorf(codes.Internal, "failed to yield: %v", err)
 	}
+
+	// Record the lend hint only. The handler can run before the informers
+	// have synced, so it decides nothing; the reconcile loop does.
+	group.Spec().SetLend(lendHint)
 
 	if s.ctrl != nil {
 		s.ctrl.EnqueueWork(groupID)
@@ -269,6 +379,12 @@ func (s *Server) GetGroupStatus(ctx context.Context, req *pb.GetGroupStatusReque
 		return nil, status.Errorf(codes.Internal, "failed to get group: %v", err)
 	}
 
+	if participantID := req.GetParticipantId(); participantID != "" {
+		if err := s.touchParticipant(ctx, group, participantID); err != nil {
+			return nil, err
+		}
+	}
+
 	snap := group.Snapshot()
 
 	if snap.State == pb.GroupStatus_STATE_UNKNOWN {
@@ -277,12 +393,18 @@ func (s *Server) GetGroupStatus(ctx context.Context, req *pb.GetGroupStatusReque
 
 	groupStatus := &pb.GroupStatus{
 		GroupId:          snap.ID,
-		GroupState:       snap.State,
+		GroupState:       snap.EffectiveState(),
 		StateTimestamp:   timestamppb.New(snap.StateTimestamp),
 		LockingJob:       snap.LockingJob,
 		ActiveJob:        snap.ActiveJob,
 		WaiterQueueDepth: int64(s.advertisedWaiterDepth(ctx, snap)),
 		LoadedJob:        snap.LoadedJob,
+	}
+	if s.backgroundRole {
+		groupStatus.BackgroundProtocol = BackgroundProtocolVersion
+	}
+	if !snap.NoticeAt.IsZero() {
+		groupStatus.VacateWithin = durationpb.New(s.vacateWithin(snap.NoticeAt, time.Now()))
 	}
 
 	// Write the dispatch budget through before returning. This response is what

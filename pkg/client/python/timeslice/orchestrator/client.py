@@ -1,8 +1,10 @@
 import contextlib
+import datetime
 import json
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import grpc
+from google.protobuf import duration_pb2
 
 from timeslice.orchestrator._generated import pb2, pb2_grpc
 from timeslice.orchestrator.exceptions import wrap_grpc_error
@@ -43,6 +45,21 @@ DEFAULT_SERVICE_CONFIG = json.dumps(
 DEFAULT_CHANNEL_OPTIONS: List[Tuple[str, Any]] = [
     ("grpc.service_config", DEFAULT_SERVICE_CONFIG),
 ]
+
+# An expected_idle hint: seconds as a number, or a timedelta.
+ExpectedIdle = Union[float, int, datetime.timedelta]
+
+
+def _to_duration(expected_idle: ExpectedIdle) -> duration_pb2.Duration:
+    if isinstance(expected_idle, datetime.timedelta):
+        delta = expected_idle
+    else:
+        delta = datetime.timedelta(seconds=expected_idle)
+    if delta < datetime.timedelta(0):
+        raise ValueError("expected_idle must not be negative.")
+    duration = duration_pb2.Duration()
+    duration.FromTimedelta(delta)
+    return duration
 
 
 class TimeSliceOrchestratorClient:
@@ -122,6 +139,7 @@ class TimeSliceOrchestratorClient:
                 success=response.success,
                 waited_ms=response.waited_ms,
                 context_restored=response.context_restored,
+                vram_unconfirmed=response.vram_unconfirmed,
             )
         except grpc.RpcError as e:
             raise wrap_grpc_error(e) from e
@@ -131,6 +149,7 @@ class TimeSliceOrchestratorClient:
         job_id: Optional[str] = None,
         group_id: Optional[str] = None,
         timeout_sec: Optional[float] = None,
+        expected_idle: Optional[ExpectedIdle] = None,
     ) -> YieldResult:
         """Releases exclusive access to the time-slice group.
 
@@ -140,18 +159,26 @@ class TimeSliceOrchestratorClient:
             job_id: Optional job_id to override the constructor value.
             group_id: Optional group_id to override the constructor value.
             timeout_sec: Optional timeout in seconds for the RPC call.
+            expected_idle: Optional hint of how long the job expects to leave the
+                accelerator idle before it acquires again, in seconds or as a
+                timedelta. The server may lend the accelerator to background
+                guests for bubbles of at least its minimum. Omitted means no hint,
+                and the accelerator is never lent.
 
         Returns:
             YieldResult containing success, pending_waiters, and snapshot_deferred.
 
         Raises:
-            ValueError: If job_id or group_id is not provided either here or in the constructor.
+            ValueError: If job_id or group_id is not provided either here or in the
+                constructor, or if expected_idle is negative.
             OrchestratorError: If the RPC fails.
         """
         resolved_job_id = self._resolve_job_id(job_id)
         resolved_group_id = self._resolve_group_id(group_id)
 
         request = pb2.YieldRequest(job_id=resolved_job_id, group_id=resolved_group_id)
+        if expected_idle is not None:
+            request.expected_idle.CopyFrom(_to_duration(expected_idle))
         try:
             response = self._stub.Yield(request, timeout=timeout_sec)
             return YieldResult(
@@ -161,6 +188,25 @@ class TimeSliceOrchestratorClient:
             )
         except grpc.RpcError as e:
             raise wrap_grpc_error(e) from e
+
+    def yield_(
+        self,
+        job_id: Optional[str] = None,
+        group_id: Optional[str] = None,
+        timeout_sec: Optional[float] = None,
+        expected_idle: Optional[ExpectedIdle] = None,
+    ) -> YieldResult:
+        """Yields the time-slice group; same as release(), named after the Yield RPC.
+
+        Pass expected_idle to tell the orchestrator how long the accelerator will
+        stay idle (see release()).
+        """
+        return self.release(
+            job_id=job_id,
+            group_id=group_id,
+            timeout_sec=timeout_sec,
+            expected_idle=expected_idle,
+        )
 
     def get_status(
         self, group_id: Optional[str] = None, timeout_sec: Optional[float] = None
@@ -203,6 +249,12 @@ class TimeSliceOrchestratorClient:
                 active_job=proto_group.active_job,
                 waiter_queue_depth=proto_group.waiter_queue_depth,
                 loaded_job=proto_group.loaded_job,
+                background_protocol=proto_group.background_protocol,
+                vacate_within=(
+                    proto_group.vacate_within.ToTimedelta()
+                    if proto_group.HasField("vacate_within")
+                    else None
+                ),
             )
 
             # Map Agent States

@@ -4,6 +4,7 @@ package timeslice_orchestrator.v1alpha1;
 
 option go_package = "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1;v1alpha1";
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
 
@@ -15,6 +16,8 @@ service TimeSliceOrchestratorService {
   // If the group is idle and the job's context is already RUNNING on the accelerator,
   // it returns immediately. Otherwise, it queues the job and waits for the current
   // locking_job to yield, then drives the snapshot/restore cycle.
+  // With ROLE_BACKGROUND it never queues: it blocks until the node is lent to
+  // the background participant and no notice is running.
   rpc Acquire(AcquireRequest) returns (AcquireResponse);
 
   // Yield releases exclusive access to a time-slice group.
@@ -32,15 +35,38 @@ service TimeSliceOrchestratorService {
   rpc GetGroupStatus(GetGroupStatusRequest) returns (GetGroupStatusResponse);
 }
 
+// Role is the part a lock participant plays in a time-slice group.
+enum Role {
+  // ROLE_UNSPECIFIED is treated as ROLE_FOREGROUND, so every client written
+  // before roles existed keeps its behaviour.
+  ROLE_UNSPECIFIED = 0;
+  // ROLE_FOREGROUND is a job that owns the group: it uses Acquire and Yield in
+  // FIFO order.
+  ROLE_FOREGROUND = 1;
+  // ROLE_BACKGROUND is the single per-node participant that borrows the
+  // accelerator while no foreground job holds it or waits for it. It is never
+  // in the foreground queue. Its job_id is "vk/<node name>".
+  ROLE_BACKGROUND = 2;
+}
+
 // AcquireRequest is the request to acquire exclusive access to a group.
 message AcquireRequest {
   // job_id is the unique identifier of the job requesting access.
   // Must match the timeslice.io/job-id annotation on the pod.
+  // For ROLE_BACKGROUND it is the participant ID, "vk/<node_name>".
   string job_id = 1;
 
   // group_id is the unique identifier of the time-slice group.
   // Must match the timeslice.io/group annotation on the pod.
   string group_id = 2;
+
+  // role is the caller's role. Unset means ROLE_FOREGROUND.
+  Role role = 3;
+
+  // node_name is the node the background participant runs its guests on.
+  // Required for ROLE_BACKGROUND and must be a node of the group. Ignored for
+  // foreground callers.
+  string node_name = 4;
 }
 
 // AcquireResponse is the response after acquiring access.
@@ -53,7 +79,12 @@ message AcquireResponse {
 
   // context_restored indicates whether the job's accelerator context was physically
   // restored from host memory. If false, it means the context was already live (e.g., zero-overhead path).
-  bool context_restored = 3; 
+  bool context_restored = 3;
+
+  // vram_unconfirmed is true only when the accelerator was handed back after a
+  // background guest kill that did not confirm within the kill budget, so
+  // device memory may still be held.
+  bool vram_unconfirmed = 4;
 }
 
 // YieldRequest is the request to release access to a group.
@@ -63,6 +94,16 @@ message YieldRequest {
 
   // group_id is the unique identifier of the time-slice group being yielded.
   string group_id = 2;
+
+  // role is the caller's role. Unset means ROLE_FOREGROUND. A ROLE_BACKGROUND
+  // Yield hands the node's grant back ("start nothing more here, check my
+  // guests now"); it is idempotent and succeeds even if nothing was held.
+  Role role = 3;
+
+  // expected_idle is an optional foreground hint: how long the job expects to
+  // leave the accelerator idle before it calls Acquire again. Unset or below
+  // the server's minimum bubble means the accelerator is never lent.
+  google.protobuf.Duration expected_idle = 4;
 }
 
 // YieldResponse is the response after yielding access.
@@ -91,6 +132,10 @@ message ListGroupsResponse {
 message GetGroupStatusRequest {
   // group_id is the unique identifier of the group to query.
   string group_id = 1;
+
+  // participant_id is set by a background participant ("vk/<node name>") on
+  // every poll and serves as its heartbeat. Foreground callers leave it empty.
+  string participant_id = 2;
 }
 
 // GetGroupStatusResponse is the response containing group status.
@@ -122,6 +167,13 @@ message GroupStatus {
     STATE_LOCKED = 4;
     // STATE_SWITCHING indicates a transition is in progress.
     STATE_SWITCHING = 5;
+    // STATE_BACKGROUND indicates background guests hold the accelerator.
+    // Computed on read, never persisted.
+    STATE_BACKGROUND = 6;
+    // STATE_VACATING indicates a foreground job wants the accelerator and a
+    // notice to the background guests is running. Computed on read, never
+    // persisted.
+    STATE_VACATING = 7;
   }
 
   // group_state is the current state of the group lock.
@@ -147,6 +199,18 @@ message GroupStatus {
   // Controller will reconcile loaded_job towards active_job.
   // Empty if no job context is loaded.
   string loaded_job = 7;
+
+  // background_protocol is 1 when the server speaks the background
+  // participant protocol (roles, participant_id, vacate_within), 0 otherwise.
+  // A background participant must see 1 before it calls Acquire with
+  // ROLE_BACKGROUND: an older server would queue it as a foreground job.
+  int32 background_protocol = 8;
+
+  // vacate_within is the time left, on the orchestrator's clock, until the
+  // background guests must have vacated the accelerator (T - now, where
+  // T = notice time + notice window - kill budget). Set only while a notice
+  // runs; never negative.
+  google.protobuf.Duration vacate_within = 9;
 }
 
 // SnapshotAgentJobState represents the state of a job's accelerator context
@@ -169,6 +233,9 @@ message SnapshotAgentJobState {
     STATE_SAVED = 4;
     // STATE_FAULTED indicates the last operation failed and requires operator intervention.
     STATE_FAULTED = 5;
+    // STATE_SUSPENDED indicates a background guest is checkpointed, frozen and
+    // verified to hold no device memory.
+    STATE_SUSPENDED = 6;
   }
 
   // job_state is the current state of the job's context on this agent.
@@ -176,4 +243,8 @@ message SnapshotAgentJobState {
 
   // job_id is the unique identifier of the job.
   string job_id = 3;
+
+  // role is the job's role, from its pod's timeslice.io/role label. Unset
+  // means ROLE_FOREGROUND.
+  Role role = 4;
 }
