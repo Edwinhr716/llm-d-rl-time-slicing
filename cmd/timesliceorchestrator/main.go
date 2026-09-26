@@ -20,8 +20,6 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -121,6 +119,18 @@ func run() error {
 			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
 	killPollInterval := flag.Duration("kill-poll-interval", controller.DefaultKillPollInterval,
 		"How often a kill operation is polled. PENDING LEAD DECISION.")
+	lockNamespace := flag.String("lock-namespace", store.Namespace,
+		"Namespace of the ConfigMap that persists group lock holders. Give each orchestrator install in a "+
+			"cluster its own lock ConfigMap; two installs sharing one fight over the same groups.")
+	lockConfigMap := flag.String("lock-configmap", store.ConfigMapName,
+		"Name of the ConfigMap that persists group lock holders.")
+	watchNamespaces := flag.String("watch-namespaces", "",
+		"Comma-separated namespaces whose pods are watched. Pods elsewhere are invisible to this "+
+			"orchestrator and join no group. Empty (the default) watches all namespaces.")
+	nodeSelector := flag.String("node-selector", "",
+		"Label selector (kubectl syntax, e.g. pool=demo) limiting the nodes this orchestrator sees. "+
+			"Nodes outside it contribute to no group, and pods bound to them are ignored. Group membership "+
+			"still comes from the group.timeslice.io/<group> node label. Empty (the default) watches all nodes.")
 	flag.Parse()
 
 	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {
@@ -139,6 +149,11 @@ func run() error {
 
 	if *hostCommandPort < 0 || *hostCommandPort > 65535 {
 		return fmt.Errorf("--host-command-port must be 0 or a port number, got %d", *hostCommandPort)
+	}
+
+	scope, err := infrastructure.ParseScope(*watchNamespaces, *nodeSelector)
+	if err != nil {
+		return err
 	}
 
 	if *budgetRedisAddr != "" && *budgetJob == "" {
@@ -170,14 +185,9 @@ func run() error {
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	nodeInformerFactory := informers.NewSharedInformerFactory(clientset, time.Minute*30)
-	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Minute*30,
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = "timeslice.io/group"
-		}),
-	)
+	informerFactories := scope.NewInformerFactories(clientset, time.Minute*30)
 
-	lockStore := store.NewConfigMapLockStore(clientset)
+	lockStore := store.NewConfigMapLockStore(clientset, store.WithConfigMap(*lockNamespace, *lockConfigMap))
 	groupStore := store.NewGroupStore(lockStore)
 	jobStore := store.NewJobStore()
 	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, *snapshotAgentPort).WithRPCTimeout(*agentRPCTimeout)
@@ -188,12 +198,20 @@ func run() error {
 		},
 	)
 
+	infraOpts := make([]infrastructure.Option, 0, len(informerFactories.Pods))
+	for _, f := range informerFactories.Pods[1:] {
+		infraOpts = append(infraOpts, infrastructure.WithPodInformers(f.Core().V1().Pods()))
+	}
+	if !scope.AllNodes() {
+		infraOpts = append(infraOpts, infrastructure.WithNodeScopedPods())
+	}
 	infraOrch := infrastructure.NewKubernetesOrchestrator(
-		nodeInformerFactory.Core().V1().Nodes(),
-		podInformerFactory.Core().V1().Pods(),
+		informerFactories.Nodes.Core().V1().Nodes(),
+		informerFactories.Pods[0].Core().V1().Pods(),
 		groupStore,
 		jobStore,
 		snapshotAgentStore,
+		infraOpts...,
 	)
 	if err := infraOrch.Start(ctx, queue); err != nil {
 		return fmt.Errorf("failed to start infrastructure orchestrator: %w", err)
@@ -212,8 +230,10 @@ func run() error {
 	ctrl.KillPollInterval = *killPollInterval
 
 	// Start informers
-	nodeInformerFactory.Start(ctx.Done())
-	podInformerFactory.Start(ctx.Done())
+	informerFactories.Nodes.Start(ctx.Done())
+	for _, f := range informerFactories.Pods {
+		f.Start(ctx.Done())
+	}
 
 	opts := []server.Option{
 		server.WithServingQuantum(*servingQuantum),
@@ -267,6 +287,9 @@ func run() error {
 		"retryMaxDelay", *retryMaxDelay,
 		"holderWaitRequeue", *holderWaitRequeue,
 		"killPollInterval", *killPollInterval,
+		"lockConfigMap", lockStore.ConfigMapRef(),
+		"watchNamespaces", scope.Namespaces,
+		"nodeSelector", scope.NodeSelector,
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
 }

@@ -41,8 +41,6 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -102,6 +100,10 @@ type flagValues struct {
 	retryMaxDelay            time.Duration
 	holderWaitRequeue        time.Duration
 	killPollInterval         time.Duration
+	lockNamespace            string
+	lockConfigMap            string
+	watchNamespaces          string
+	nodeSelector             string
 }
 
 // newFlagSet declares the flags of cmd/timesliceorchestrator/main.go with the
@@ -141,6 +143,10 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.DurationVar(&fv.retryMaxDelay, "retry-max-delay", 30*time.Second, "Cap on the retry delay")
 	fs.DurationVar(&fv.holderWaitRequeue, "holder-wait-requeue", 1*time.Second, "Requeue while the lock holder is not loaded")
 	fs.DurationVar(&fv.killPollInterval, "kill-poll-interval", controller.DefaultKillPollInterval, "How often a kill operation is polled")
+	fs.StringVar(&fv.lockNamespace, "lock-namespace", store.Namespace, "Namespace of the lock ConfigMap")
+	fs.StringVar(&fv.lockConfigMap, "lock-configmap", store.ConfigMapName, "Name of the lock ConfigMap")
+	fs.StringVar(&fv.watchNamespaces, "watch-namespaces", "", "Comma-separated namespaces whose pods are watched; empty watches all")
+	fs.StringVar(&fv.nodeSelector, "node-selector", "", "Label selector limiting the nodes this orchestrator sees; empty watches all")
 	return fs, fv
 }
 
@@ -192,6 +198,10 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	if err := fv.validate(); err != nil {
 		return nil, fmt.Errorf("evalwire: %w", err)
 	}
+	scope, err := infrastructure.ParseScope(fv.watchNamespaces, fv.nodeSelector)
+	if err != nil {
+		return nil, fmt.Errorf("evalwire: %w", err)
+	}
 
 	grpcPort, err := freePort(ctx)
 	if err != nil {
@@ -208,14 +218,9 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	clientset := cfg.Clientset
 
 	// From here on this mirrors run() in cmd/timesliceorchestrator/main.go.
-	nodeInformerFactory := informers.NewSharedInformerFactory(clientset, time.Minute*30)
-	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Minute*30,
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = "timeslice.io/group"
-		}),
-	)
+	informerFactories := scope.NewInformerFactories(clientset, time.Minute*30)
 
-	lockStore := store.NewConfigMapLockStore(clientset)
+	lockStore := store.NewConfigMapLockStore(clientset, store.WithConfigMap(fv.lockNamespace, fv.lockConfigMap))
 	groupStore := store.NewGroupStore(lockStore)
 	jobStore := store.NewJobStore()
 	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, fv.snapshotAgentPort).WithRPCTimeout(fv.agentRPCTimeout)
@@ -226,12 +231,20 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		},
 	)
 
+	infraOpts := make([]infrastructure.Option, 0, len(informerFactories.Pods))
+	for _, f := range informerFactories.Pods[1:] {
+		infraOpts = append(infraOpts, infrastructure.WithPodInformers(f.Core().V1().Pods()))
+	}
+	if !scope.AllNodes() {
+		infraOpts = append(infraOpts, infrastructure.WithNodeScopedPods())
+	}
 	infraOrch := infrastructure.NewKubernetesOrchestrator(
-		nodeInformerFactory.Core().V1().Nodes(),
-		podInformerFactory.Core().V1().Pods(),
+		informerFactories.Nodes.Core().V1().Nodes(),
+		informerFactories.Pods[0].Core().V1().Pods(),
 		groupStore,
 		jobStore,
 		snapshotAgentStore,
+		infraOpts...,
 	)
 	if err := infraOrch.Start(ctx, queue); err != nil {
 		cancel()
@@ -250,8 +263,10 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
 	ctrl.KillPollInterval = fv.killPollInterval
 
-	nodeInformerFactory.Start(ctx.Done())
-	podInformerFactory.Start(ctx.Done())
+	informerFactories.Nodes.Start(ctx.Done())
+	for _, f := range informerFactories.Pods {
+		f.Start(ctx.Done())
+	}
 
 	opts := []server.Option{
 		server.WithServingQuantum(fv.servingQuantum),
@@ -294,6 +309,9 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"retryMaxDelay", fv.retryMaxDelay,
 		"holderWaitRequeue", fv.holderWaitRequeue,
 		"killPollInterval", fv.killPollInterval,
+		"lockConfigMap", lockStore.ConfigMapRef(),
+		"watchNamespaces", scope.Namespaces,
+		"nodeSelector", scope.NodeSelector,
 	)
 
 	// serveErr is written before exited is closed and read only after.
