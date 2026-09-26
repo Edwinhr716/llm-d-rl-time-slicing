@@ -1,0 +1,38 @@
+# Copy of the approach-7 claim (the approach-7 resource-claims manifest,
+# shared-trainers-gpu-claim), in the guest namespace. A shared claim must live in the namespace
+# of every pod that uses it, so the mirror (same namespace as its guest) can reference it.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: shared-m1-gpu-claim
+  namespace: guest-kubelet-proto
+spec:
+  devices:
+    requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          allocationMode: ExactCount
+          count: 1
+---
+# Stand-in for the trainer: an ordinary pod that the scheduler places on the host, which makes
+# the DRA plugin allocate the claim to that node's L4. Mirrors skip the scheduler, so they can
+# only share a claim that someone else already got allocated.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trainer-standin
+  namespace: guest-kubelet-proto
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: __HOST__
+  tolerations:
+    - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+  resourceClaims:
+    - {name: gpu, resourceClaimName: shared-m1-gpu-claim}
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        claims: [{name: gpu}]

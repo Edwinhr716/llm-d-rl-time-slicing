@@ -5,28 +5,34 @@ TAG     ?= $(shell git rev-parse --short HEAD)
 IMAGE   := $(REGION)-docker.pkg.dev/$(PROJECT)/guest-kubelet/guest-kubelet:$(TAG)
 CONTEXT ?= YOUR_KUBE_CONTEXT
 KUBECTL := kubectl --context $(CONTEXT)
+HOST    ?= YOUR_GPU_NODE
+VNODE   ?= vk-$(lastword $(subst -, ,$(HOST)))
+SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|'
 
-.PHONY: build deploy test-guest status undeploy
+.PHONY: build deploy test-guest gpu-guest status undeploy
 
 build: ## vet, test, build and push the image remotely
-	gcloud builds submit --project $(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
+	gcloud builds submit --project=$(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
 
 deploy: ## namespace, RBAC, Deployment (image tag = TAG)
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
-	sed 's|IMAGE|$(IMAGE)|' deploy/deployment.yaml | $(KUBECTL) apply -f -
+	$(SUBST) deploy/deployment.yaml | $(KUBECTL) apply -f -
 
-test-guest: ## a guest pod and a Service selecting it
-	$(KUBECTL) apply -f deploy/test-guest.yaml
+test-guest: ## step one: CPU-only guest and a Service selecting it
+	$(SUBST) deploy/test-guest.yaml | $(KUBECTL) apply -f -
+
+gpu-guest: ## step two: claim + trainer stand-in, then the vLLM guest
+	$(SUBST) deploy/m1/claim.yaml | $(KUBECTL) apply -f -
+	$(SUBST) deploy/m1/vllm-guest.yaml | $(KUBECTL) apply -f -
 
 status:
-	$(KUBECTL) get node vk-abcd -o wide
-	$(KUBECTL) -n kube-node-lease get lease vk-abcd -o jsonpath='{.spec.renewTime}{"\n"}'
+	$(KUBECTL) get node $(VNODE) -o wide
 	$(KUBECTL) -n guest-kubelet-proto get pods -o wide
-	$(KUBECTL) -n guest-kubelet-proto get endpointslices
+	$(KUBECTL) -n guest-kubelet-proto get lease
 
-undeploy: ## teardown in the order from the prototype plan (section 8)
-	-$(KUBECTL) delete -f deploy/test-guest.yaml --wait=true
+undeploy: ## namespace first (guests, then mirrors via ownerRef), then cluster-scoped objects
 	-$(KUBECTL) delete ns guest-kubelet-proto --wait=true
-	-$(KUBECTL) delete node vk-abcd
-	-$(KUBECTL) -n kube-node-lease delete lease vk-abcd
-	-$(KUBECTL) delete -f deploy/rbac.yaml
+	-$(KUBECTL) delete node $(VNODE)
+	-$(KUBECTL) -n kube-node-lease delete lease $(VNODE)
+	-$(KUBECTL) delete clusterrole,clusterrolebinding guest-kubelet-proto
+	-$(KUBECTL) -n kube-node-lease delete role,rolebinding guest-kubelet-proto

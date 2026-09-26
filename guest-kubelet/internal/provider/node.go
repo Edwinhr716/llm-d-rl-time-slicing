@@ -27,6 +27,12 @@ type NodeConfig struct {
 	Memory         resource.Quantity
 	Pods           resource.Quantity
 	GPUs           int64
+	// ProviderID, if set, is the real host's spec.providerID (gce://project/zone/instance).
+	// The cloud node lifecycle controller deletes a NotReady Node whose instance it cannot
+	// find; with the host's ID it would find the host's VM and leave the Node alone (M0 risk).
+	// GKE denies it: the validate-node-providerid admission policy requires the providerID to
+	// end in "/<node name>". Empty on GKE.
+	ProviderID string
 }
 
 // NewNodeSpec builds the Node object that the library registers once at startup.
@@ -47,20 +53,27 @@ func NewNodeSpec(cfg NodeConfig) corev1.Node {
 	return corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: cfg.Name,
+			// Tells the cluster autoscaler never to pick this Node for scale-down. It matters
+			// if the Node ever carries the host's providerID (the autoscaler would then map it
+			// to the host's instance group); harmless otherwise.
+			Annotations: map[string]string{"cluster-autoscaler.kubernetes.io/scale-down-disabled": "true"},
 			// No cloud.google.com/gke-nodepool label: the fake node must belong to no node pool,
 			// so the autoscaler and auto-repair leave it alone.
+			// No kubernetes.io/os label either: every GKE system DaemonSet that landed on the
+			// M0 node (collector, fluentbit-gke, gcsfusecsi-node, gke-metrics-agent, pdcsi-node)
+			// requires kubernetes.io/os=linux, so without it none of them is scheduled here.
 			Labels: map[string]string{
 				"type":                   "virtual-kubelet",
 				VirtualNodeLabel:         "true",
 				"kubernetes.io/role":     "agent",
 				"kubernetes.io/hostname": cfg.Name,
-				"kubernetes.io/os":       "linux",
 				"kubernetes.io/arch":     "amd64",
 				"node.kubernetes.io/exclude-from-external-load-balancers": "true",
 			},
 		},
 		Spec: corev1.NodeSpec{
-			Taints: []corev1.Taint{{Key: GuestTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule}},
+			ProviderID: cfg.ProviderID,
+			Taints:     []corev1.Taint{{Key: GuestTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule}},
 		},
 		Status: corev1.NodeStatus{
 			Phase:       corev1.NodeRunning,

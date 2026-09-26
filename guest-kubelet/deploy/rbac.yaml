@@ -1,4 +1,4 @@
-# What the virtual-kubelet library calls, and nothing more (M0 creates no pods).
+# What the virtual-kubelet library and the mirror backend call, and nothing more.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -11,8 +11,9 @@ rules:
     resources: ["nodes/status"]
     verbs: ["patch", "update"]
   - apiGroups: [""]
+    # create/update/delete: mirror pods (M1). Update is only used to re-adopt a mirror.
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
   - apiGroups: [""]
     resources: ["pods/status"]
     verbs: ["update", "patch"]
@@ -20,6 +21,14 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps", "secrets", "services"]
     verbs: ["list", "watch"]
+  # M1: only for --reserve-claim=true (kube-controller-manager already reserves claims for
+  # pods created with spec.nodeName).
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["get"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims/status"]
+    verbs: ["update"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
@@ -57,6 +66,31 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: guest-kubelet-proto
+subjects:
+  - kind: ServiceAccount
+    name: guest-kubelet
+    namespace: guest-kubelet-proto
+---
+# M1: leader election between the replicas, on a Lease in the VK's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: guest-kubelet-leader
+  namespace: guest-kubelet-proto
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: guest-kubelet-leader
+  namespace: guest-kubelet-proto
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: guest-kubelet-leader
 subjects:
   - kind: ServiceAccount
     name: guest-kubelet

@@ -1,5 +1,5 @@
 # Runs every check remotely: nothing is built or tested on a laptop.
-#   gcloud builds submit --config cloudbuild.yaml --substitutions=_TAG=$(git rev-parse --short HEAD)
+#   gcloud builds submit --project=YOUR_PROJECT --config cloudbuild.yaml --substitutions=_TAG=$(git rev-parse --short HEAD)
 # First build only (no go.sum yet): add _ALLOW_TIDY=true, then commit the go.mod/go.sum
 # that the build uploads to gs://${PROJECT_ID}_cloudbuild/guest-kubelet/${BUILD_ID}/.
 substitutions:

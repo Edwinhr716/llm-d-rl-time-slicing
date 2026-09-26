@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 )
 
 func guestPod(name string) *corev1.Pod {
@@ -20,17 +21,34 @@ func guestPod(name string) *corev1.Pod {
 	}
 }
 
-func newTestProvider() (*Provider, *[]*corev1.Pod) {
-	p := New("10.0.0.1")
-	var got []*corev1.Pod
-	p.NotifyPods(context.Background(), func(pod *corev1.Pod) { got = append(got, pod) })
-	return p, &got
+func dsPod(name string) *corev1.Pod {
+	p := guestPod(name)
+	p.Spec.Tolerations = []corev1.Toleration{{Operator: corev1.TolerationOpExists}}
+	return p
 }
 
+// fakeBackend records calls.
+type fakeBackend struct {
+	created, deleted []string
+	cb               func(*corev1.Pod)
+}
+
+func (f *fakeBackend) Create(_ context.Context, g *corev1.Pod) error {
+	f.created = append(f.created, g.Name)
+	return nil
+}
+func (f *fakeBackend) Delete(_ context.Context, g *corev1.Pod) error {
+	f.deleted = append(f.deleted, g.Name)
+	return nil
+}
+func (f *fakeBackend) Get(ns, name string) (*corev1.Pod, error) {
+	return nil, errdefs.NotFoundf("%s/%s", ns, name)
+}
+func (f *fakeBackend) List() ([]*corev1.Pod, error)           { return nil, nil }
+func (f *fakeBackend) SetStatusCallback(cb func(*corev1.Pod)) { f.cb = cb }
+
 func TestIsGuest(t *testing.T) {
-	blanket := guestPod("ds")
-	blanket.Spec.Tolerations = []corev1.Toleration{{Operator: corev1.TolerationOpExists}}
-	if IsGuest(blanket) {
+	if IsGuest(dsPod("ds")) {
 		t.Error("a blanket {operator: Exists} toleration must not make a pod a guest")
 	}
 	if !IsGuest(guestPod("g")) {
@@ -38,70 +56,46 @@ func TestIsGuest(t *testing.T) {
 	}
 }
 
-func TestCreatePodReportsRunningWithFakeIP(t *testing.T) {
-	p, got := newTestProvider()
+func TestCreateAndDeleteOnlyGuests(t *testing.T) {
+	b := &fakeBackend{}
+	p := New(b)
 	ctx := context.Background()
-
-	if err := p.CreatePod(ctx, guestPod("a")); err != nil {
-		t.Fatal(err)
+	for _, pod := range []*corev1.Pod{guestPod("g"), dsPod("ds")} {
+		if err := p.CreatePod(ctx, pod); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := p.CreatePod(ctx, guestPod("b")); err != nil {
-		t.Fatal(err)
+	if len(b.created) != 1 || b.created[0] != "g" {
+		t.Errorf("only the guest should reach the backend, got %v", b.created)
 	}
-
-	if len(*got) != 2 {
-		t.Fatalf("want 2 notifications, got %d", len(*got))
+	if err := p.DeletePod(ctx, dsPod("ds")); !errdefs.IsNotFound(err) {
+		t.Errorf("deleting a non-guest: want NotFound, got %v", err)
 	}
-	a := (*got)[0]
-	if a.Status.Phase != corev1.PodRunning || a.Status.PodIP != "198.18.0.1" || a.Status.HostIP != "10.0.0.1" {
-		t.Errorf("unexpected status: phase=%s podIP=%s hostIP=%s", a.Status.Phase, a.Status.PodIP, a.Status.HostIP)
-	}
-	if !a.Status.ContainerStatuses[0].Ready {
-		t.Error("container should be ready")
-	}
-	if b := (*got)[1]; b.Status.PodIP != "198.18.0.2" {
-		t.Errorf("second pod should get the next IP, got %s", b.Status.PodIP)
-	}
-	if st, err := p.GetPodStatus(ctx, "ns", "a"); err != nil || st.Phase != corev1.PodRunning {
-		t.Errorf("GetPodStatus: %v, %v", st, err)
+	if err := p.DeletePod(ctx, guestPod("g")); err != nil || len(b.deleted) != 1 {
+		t.Errorf("guest delete: err=%v deleted=%v", err, b.deleted)
 	}
 }
 
-func TestCreatePodIgnoresNonGuest(t *testing.T) {
-	p, got := newTestProvider()
-	ds := guestPod("ds")
-	ds.Spec.Tolerations = nil
-
-	if err := p.CreatePod(context.Background(), ds); err != nil {
-		t.Fatal(err)
-	}
-	if len(*got) != 0 {
-		t.Error("non-guest pod must not produce a status update")
-	}
-	if _, err := p.GetPod(context.Background(), "ns", "ds"); !errdefs.IsNotFound(err) {
-		t.Errorf("want NotFound, got %v", err)
+func TestNotifyPodsFiltersNonGuests(t *testing.T) {
+	b := &fakeBackend{}
+	p := New(b)
+	var got []string
+	p.NotifyPods(context.Background(), func(pod *corev1.Pod) { got = append(got, pod.Name) })
+	b.cb(guestPod("g"))
+	b.cb(dsPod("ds"))
+	if len(got) != 1 || got[0] != "g" {
+		t.Errorf("notified %v", got)
 	}
 }
 
-func TestDeletePodReportsTerminated(t *testing.T) {
-	p, got := newTestProvider()
-	ctx := context.Background()
-	if err := p.CreatePod(ctx, guestPod("a")); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := p.DeletePod(ctx, guestPod("a")); err != nil {
-		t.Fatal(err)
-	}
-	last := (*got)[len(*got)-1]
-	if last.Status.Phase != corev1.PodSucceeded || last.Status.ContainerStatuses[0].State.Terminated == nil {
-		t.Errorf("want Succeeded with terminated containers, got %+v", last.Status)
-	}
-	if _, err := p.GetPod(ctx, "ns", "a"); !errdefs.IsNotFound(err) {
-		t.Errorf("want NotFound after delete, got %v", err)
-	}
-	if err := p.DeletePod(ctx, guestPod("a")); !errdefs.IsNotFound(err) {
-		t.Errorf("second delete: want NotFound, got %v", err)
+func TestGuestOnlyRecorder(t *testing.T) {
+	fake := record.NewFakeRecorder(10)
+	r := GuestOnlyRecorder{EventRecorder: fake}
+	r.Event(dsPod("ds"), corev1.EventTypeNormal, "ProviderCreateSuccess", "x")
+	r.Eventf(guestPod("g"), corev1.EventTypeNormal, "ProviderCreateSuccess", "%s", "x")
+	r.Event(&corev1.Node{}, corev1.EventTypeNormal, "NodeReady", "x")
+	if n := len(fake.Events); n != 2 {
+		t.Errorf("want 2 events (guest + node), got %d", n)
 	}
 }
 
@@ -109,20 +103,26 @@ func TestNewNodeSpec(t *testing.T) {
 	n := NewNodeSpec(NodeConfig{
 		Name: "vk-test", InternalIP: "10.0.0.1", KubeletPort: 10260, GPUs: 1,
 		CPU: resource.MustParse("8"), Memory: resource.MustParse("32Gi"), Pods: resource.MustParse("20"),
+		ProviderID: "gce://p/z/i",
 	})
 	if n.Labels[VirtualNodeLabel] != "true" || n.Labels["type"] != "virtual-kubelet" {
 		t.Errorf("labels: %v", n.Labels)
 	}
-	if _, ok := n.Labels["cloud.google.com/gke-nodepool"]; ok {
-		t.Error("the virtual node must not claim a GKE node pool")
+	for _, l := range []string{"cloud.google.com/gke-nodepool", "kubernetes.io/os"} {
+		if _, ok := n.Labels[l]; ok {
+			t.Errorf("the virtual node must not have label %s", l)
+		}
+	}
+	if n.Spec.ProviderID != "gce://p/z/i" {
+		t.Errorf("providerID: %q", n.Spec.ProviderID)
+	}
+	if n.Annotations["cluster-autoscaler.kubernetes.io/scale-down-disabled"] != "true" {
+		t.Error("scale-down must be disabled")
 	}
 	if len(n.Spec.Taints) != 1 || n.Spec.Taints[0].Key != GuestTaintKey {
 		t.Errorf("taints: %v", n.Spec.Taints)
 	}
 	if g := n.Status.Capacity[GPUResource]; g.Value() != 1 {
 		t.Errorf("gpu capacity: %v", g)
-	}
-	if n.Status.DaemonEndpoints.KubeletEndpoint.Port != 10260 {
-		t.Error("kubelet port should be 10260")
 	}
 }

@@ -1,14 +1,17 @@
-# One replica, pinned to the trainer node, host network, no privileges.
-# `make deploy` replaces IMAGE with the Artifact Registry image.
+# M1: two replicas on the host node with leader election; only the Lease holder is the kubelet.
+# `make deploy` replaces __IMAGE__ with the Artifact Registry image and __HOST__ with the host node.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: guest-kubelet
   namespace: guest-kubelet-proto
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate # never two kubelets for one Node
+    # Leader election, not Recreate, keeps it to one kubelet per Node, so a rollout can
+    # start the new pod before the old one stops (the old leader releases the Lease on exit).
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
   selector:
     matchLabels: {app: guest-kubelet}
   template:
@@ -18,8 +21,9 @@ spec:
       serviceAccountName: guest-kubelet
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 10
       nodeSelector:
-        kubernetes.io/hostname: YOUR_GPU_NODE
+        kubernetes.io/hostname: __HOST__
       tolerations:
         - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
         - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
@@ -29,14 +33,26 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: guest-kubelet
-          image: IMAGE
-          args: ["--node-name=vk-abcd"]
+          image: __IMAGE__
+          args:
+            - --leader-elect=true
+            - --gpu-claim=shared-m1-gpu-claim
+            - --mirror-cpu-headroom=1
+            - --mirror-memory-headroom=4Gi
+            - --mirror-owner-ref=true
           env:
             - name: HOST_IP
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          # Guaranteed QoS: the last thing evicted under node pressure.
           resources:
-            requests: {cpu: 50m, memory: 64Mi}
-            limits: {memory: 256Mi}
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 100m, memory: 256Mi}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
