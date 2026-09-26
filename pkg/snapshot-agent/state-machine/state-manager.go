@@ -1,6 +1,7 @@
 package statemachine
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"sync"
@@ -20,13 +21,21 @@ import (
 // FAULTED — a FAULTED ghost would block every other job in the group.
 var ErrNoLiveProcesses = errors.New("no live workload processes for job")
 
-// OpType represents the type of operation (Snapshot or Restore).
+// OpType represents the type of operation.
 type OpType string
 
 const (
 	OpTypeSnapshot OpType = "Snapshot"
 	OpTypeRestore  OpType = "Restore"
+	OpTypeSuspend  OpType = "Suspend"
+	OpTypeResume   OpType = "Resume"
+	OpTypeKill     OpType = "Kill"
 )
+
+// OperationTTL is how long a finished operation stays readable through
+// GetOperation. It is also how long a guest call can be re-issued with the
+// same epoch and get the same operation back.
+const OperationTTL = 10 * time.Minute
 
 // Job represents a per-workload state.
 type Job struct {
@@ -38,10 +47,38 @@ type Job struct {
 	// with named snapshot slots (memory-regions). Empty for backends without
 	// slot semantics.
 	Slot string
-	mu   sync.Mutex
+
+	// LastOutcome is the outcome of the job's last completed guest operation
+	// (OUTCOME_KILLED after a confirmed Kill).
+	LastOutcome pb.Outcome
+	// DeviceBytes is the device memory released by the last suspend.
+	DeviceBytes int64
+	// HostBytesPinned is the host memory the job holds after its last
+	// guest operation.
+	HostBytesPinned int64
+	// LastEpoch is the highest epoch seen for the job, from a Suspend or
+	// Resume call or from the mirror pod's guest-epoch annotation.
+	LastEpoch int64
+
+	// current is the job's running operation, nil when none runs. Only the
+	// current operation may write the job's state when it finishes.
+	current *runningOp
+	// lastGuestOp is the job's most recent Suspend or Resume operation, used
+	// to answer a re-issued call with the same epoch.
+	lastGuestOp *Operation
+
+	mu sync.Mutex
 }
 
-// Operation represents a long-running snapshot or restore task.
+// runningOp is a job's in-flight operation.
+type runningOp struct {
+	op *Operation
+	// cancel cancels the operation's context. Nil for operations whose
+	// worker takes no context (Snapshot, Restore).
+	cancel context.CancelFunc
+}
+
+// Operation represents a long-running task on a job.
 type Operation struct {
 	ID                  string
 	JobID               string
@@ -52,6 +89,17 @@ type Operation struct {
 	Error               string
 	StorageBytes        int64
 	SnapshotDeviceBytes int64
+
+	// Outcome is set on COMPLETE for Suspend, Resume and Kill.
+	Outcome pb.Outcome
+	// ErrorReason is set on FAILED for Suspend, Resume and Kill.
+	ErrorReason pb.ErrorReason
+	// HostBytesPinned is the host memory the job holds after the operation.
+	HostBytesPinned int64
+	// Epoch is the epoch of a Suspend or Resume call.
+	Epoch int64
+	// Deadline is the absolute deadline of a Suspend, Resume or Kill.
+	Deadline time.Time
 }
 
 // StateManager handles thread-safe job transitions and operation tracking.
@@ -62,14 +110,40 @@ type StateManager struct {
 	// mu guards jobs and operations.
 	// Lock order: mu → Job.mu. The reverse order deadlocks.
 	mu sync.RWMutex
+
+	// now is the clock; replaced in tests.
+	now func() time.Time
+	// reportResumed selects the outcome of a successful Resume:
+	// OUTCOME_RESUMED when true, OUTCOME_UNSPECIFIED when false.
+	reportResumed bool
+}
+
+// Option configures a StateManager.
+type Option func(*StateManager)
+
+// WithReportResumedOutcome selects whether a successful Resume completes
+// with OUTCOME_RESUMED (true, the default) or with no outcome (false).
+//
+// PENDING LEAD DECISION ("drop RESUMED" scope): the default keeps
+// OUTCOME_RESUMED; false is the wider "drop RESUMED" reading.
+func WithReportResumedOutcome(report bool) Option {
+	return func(sm *StateManager) {
+		sm.reportResumed = report
+	}
 }
 
 // NewStateManager creates a new StateManager instance.
-func NewStateManager() *StateManager {
-	return &StateManager{
-		jobs:       make(map[string]*Job),
-		operations: make(map[string]*Operation),
+func NewStateManager(opts ...Option) *StateManager {
+	sm := &StateManager{
+		jobs:          make(map[string]*Job),
+		operations:    make(map[string]*Operation),
+		now:           time.Now,
+		reportResumed: true,
 	}
+	for _, opt := range opts {
+		opt(sm)
+	}
+	return sm
 }
 
 // getOrCreateJob returns an existing job or creates a new one.
@@ -133,10 +207,12 @@ func (sm *StateManager) StartSnapshotSlot(jobID, group, slot string, worker func
 		JobID:     jobID,
 		Status:    pb.OperationStatus_OPERATION_STATUS_PENDING,
 		Type:      OpTypeSnapshot,
-		StartedAt: time.Now(),
+		StartedAt: sm.now(),
 	}
 
+	sm.gcLocked()
 	sm.operations[opID] = op
+	job.current = &runningOp{op: op}
 
 	// Update job state to TRANSITIONING
 	job.State = pb.JobState_JOB_STATE_TRANSITIONING
@@ -151,7 +227,11 @@ func (sm *StateManager) StartSnapshotSlot(jobID, group, slot string, worker func
 		job.mu.Lock()
 		defer job.mu.Unlock()
 
-		op.FinishedAt = time.Now()
+		if !sm.finishCurrentLocked(job, op) {
+			// Superseded (for example by a Kill): the superseding call owns
+			// the job, and the operation already records its failure.
+			return
+		}
 		switch {
 		case errors.Is(err, ErrNoLiveProcesses):
 			// The workload exited before this (lazily deferred) snapshot ran.
@@ -223,10 +303,12 @@ func (sm *StateManager) StartRestoreSlot(jobID, group, slot string, worker func(
 		JobID:     jobID,
 		Status:    pb.OperationStatus_OPERATION_STATUS_PENDING,
 		Type:      OpTypeRestore,
-		StartedAt: time.Now(),
+		StartedAt: sm.now(),
 	}
 
+	sm.gcLocked()
 	sm.operations[opID] = op
+	job.current = &runningOp{op: op}
 
 	// Update job state to TRANSITIONING
 	job.State = pb.JobState_JOB_STATE_TRANSITIONING
@@ -241,7 +323,11 @@ func (sm *StateManager) StartRestoreSlot(jobID, group, slot string, worker func(
 		job.mu.Lock()
 		defer job.mu.Unlock()
 
-		op.FinishedAt = time.Now()
+		if !sm.finishCurrentLocked(job, op) {
+			// Superseded (for example by a Kill): the superseding call owns
+			// the job, and the operation already records its failure.
+			return
+		}
 		if err != nil {
 			op.Status = pb.OperationStatus_OPERATION_STATUS_FAILED
 			op.Error = err.Error()
@@ -262,7 +348,7 @@ func (sm *StateManager) GetOperation(opID string) (*Operation, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	op, ok := sm.operations[opID]
-	if !ok {
+	if !ok || sm.expired(op) {
 		return nil, false
 	}
 	// Return a copy to avoid race conditions
@@ -279,8 +365,12 @@ func (sm *StateManager) GetJobStatus() []*pb.JobStatus {
 	for id, job := range sm.jobs {
 		job.mu.Lock()
 		statuses = append(statuses, &pb.JobStatus{
-			JobId: id,
-			State: job.State,
+			JobId:           id,
+			State:           job.State,
+			LastOutcome:     job.LastOutcome,
+			DeviceBytes:     job.DeviceBytes,
+			HostBytesPinned: job.HostBytesPinned,
+			Epoch:           job.LastEpoch,
 		})
 		job.mu.Unlock()
 	}
@@ -340,5 +430,8 @@ func (sm *StateManager) TransitionToRunning(jobID string, pids []int) error {
 
 	job.State = pb.JobState_JOB_STATE_RUNNING
 	job.PIDs = pids
+	// A running job must not keep reporting a KILLED or RELEASED outcome:
+	// readers count that as vacated.
+	job.LastOutcome = pb.Outcome_OUTCOME_UNSPECIFIED
 	return nil
 }

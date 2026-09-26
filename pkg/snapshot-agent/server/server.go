@@ -36,16 +36,18 @@ type Server struct {
 // the app-channel backend so workloads registered through the
 // WorkloadChannel RPC are reachable by Snapshot/Restore. featureGates
 // selects which experimental capabilities are enabled; nil means every
-// gate at its default (experimental capabilities off).
+// gate at its default (experimental capabilities off). stateOpts configure
+// the server's StateManager.
 func NewServer(
 	backendMap map[backends.BackendType]backends.Backend,
 	defaultBackend backends.BackendType,
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
 	featureGates features.Gates,
+	stateOpts ...sm.Option,
 ) *Server {
 	return &Server{
-		state:           sm.NewStateManager(),
+		state:           sm.NewStateManager(stateOpts...),
 		backendMap:      backendMap,
 		defaultBackend:  defaultBackend,
 		deploymentMode:  deploymentMode,
@@ -458,8 +460,11 @@ func (s *Server) GetOperation(ctx context.Context, req *pb.GetOperationRequest) 
 	}
 
 	resp := &pb.GetOperationResponse{
-		Status:    op.Status,
-		ElapsedMs: elapsed,
+		Status:          op.Status,
+		ElapsedMs:       elapsed,
+		Outcome:         op.Outcome,
+		ErrorReason:     op.ErrorReason,
+		HostBytesPinned: op.HostBytesPinned,
 	}
 
 	if op.Status == pb.OperationStatus_OPERATION_STATUS_COMPLETE {
@@ -534,7 +539,8 @@ func (h *HealthServer) Watch(req *grpc_health_v1.HealthCheckRequest, stream grpc
 }
 
 // StartServer starts the gRPC server on the specified port. featureGates
-// may be nil, which leaves every gate at its default.
+// may be nil, which leaves every gate at its default. stateOpts configure
+// the StateManager.
 func StartServer(
 	ctx context.Context,
 	port int,
@@ -543,6 +549,7 @@ func StartServer(
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
 	featureGates features.Gates,
+	stateOpts ...sm.Option,
 ) error {
 	lc := net.ListenConfig{}
 	lis, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
@@ -557,7 +564,7 @@ func StartServer(
 	}
 
 	// 2. Create Server (which creates StateManager internally)
-	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry, featureGates)
+	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry, featureGates, stateOpts...)
 
 	// 3. Start the Watcher internally
 	watcher, err := NewWatcher(k8sClient, srv.state)

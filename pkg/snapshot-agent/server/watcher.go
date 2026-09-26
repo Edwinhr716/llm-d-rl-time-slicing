@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -113,6 +114,24 @@ func (w *Watcher) registerPodJob(pod *corev1.Pod) {
 
 	slog.Info("Detected pod for job", "pod", pod.Name, "jobID", jobID, "group", group)
 	w.state.RegisterJob(jobID, group)
+	w.seedGuestEpoch(pod, jobID)
+}
+
+// seedGuestEpoch raises the job's epoch fence to the mirror pod's
+// guest-epoch annotation. The epoch fence then holds across agent restarts,
+// and a late call is refused even if it arrives before the call that
+// replaced it. An invalid value is logged and ignored.
+func (w *Watcher) seedGuestEpoch(pod *corev1.Pod, jobID string) {
+	value, ok := pod.Annotations[podutils.GuestEpochAnnotation]
+	if !ok {
+		return
+	}
+	epoch, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		slog.Warn("Ignoring invalid guest-epoch annotation", "pod", pod.Name, "jobID", jobID, "value", value, "error", err)
+		return
+	}
+	w.state.SeedEpoch(jobID, epoch)
 }
 
 func (w *Watcher) detectionLoop(ctx context.Context) {
