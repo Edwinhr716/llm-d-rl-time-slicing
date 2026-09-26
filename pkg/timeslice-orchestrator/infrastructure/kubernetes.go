@@ -38,10 +38,18 @@ const (
 	JobLabelKey     = "timeslice.io/job-id"
 )
 
+// Pod role label, written by the virtual kubelet on guest mirror pods. Only
+// RoleBackground has a meaning; any other value, or no label, is a foreground job.
+const (
+	RoleLabelKey   = "timeslice.io/role"
+	RoleBackground = "background"
+)
+
 // PodInfo contains simplified information about a pod.
 type PodInfo struct {
-	UID   string
-	JobID string
+	UID        string
+	JobID      string
+	Background bool
 }
 
 // KubernetesOrchestrator implements controller.InfrastructureOrchestrator for Kubernetes.
@@ -114,8 +122,9 @@ func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, err
 			continue
 		}
 		podInfos = append(podInfos, PodInfo{
-			UID:   string(pod.UID),
-			JobID: jobID,
+			UID:        string(pod.UID),
+			JobID:      jobID,
+			Background: pod.Labels[RoleLabelKey] == RoleBackground,
 		})
 	}
 	return podInfos, nil
@@ -180,8 +189,14 @@ func (k *KubernetesOrchestrator) updateGroupNodes(ctx context.Context, groupID s
 
 func (k *KubernetesOrchestrator) updateJobsAndPods(ctx context.Context, groupID string, pods []PodInfo) error {
 	jobPods := make(map[string][]string)
+	// A job is background only if every one of its pods says so. A foreground
+	// job mistaken for a guest would have its faults ignored, so any doubt
+	// resolves to foreground.
+	jobBackground := make(map[string]bool)
 	for _, pod := range pods {
 		jobPods[pod.JobID] = append(jobPods[pod.JobID], pod.UID)
+		background, seen := jobBackground[pod.JobID]
+		jobBackground[pod.JobID] = pod.Background && (background || !seen)
 	}
 
 	// Update or create jobs
@@ -195,6 +210,11 @@ func (k *KubernetesOrchestrator) updateJobsAndPods(ctx context.Context, groupID 
 			}
 		}
 		job.SetPods(uids)
+		role := store.RoleForeground
+		if jobBackground[jobID] {
+			role = store.RoleBackground
+		}
+		job.SetRole(role)
 		if err := k.jobStore.Put(ctx, job); err != nil {
 			return err
 		}

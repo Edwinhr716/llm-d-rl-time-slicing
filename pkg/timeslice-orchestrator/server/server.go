@@ -125,6 +125,16 @@ func (s *Server) Acquire(ctx context.Context, req *pb.AcquireRequest) (*pb.Acqui
 		s.ctrl.EnqueueWork(groupID)
 	}
 
+	// Every return other than a grant withdraws the request. A waiter left in
+	// the queue after its caller has gone is promoted on the next Yield, and
+	// the controller then evicts the running job for nobody.
+	granted := false
+	defer func() {
+		if !granted {
+			s.dropWaiter(ctx, group, jobID)
+		}
+	}()
+
 	// 3. Wait Loop
 	ticker := time.NewTicker(s.acquirePollInterval)
 	defer ticker.Stop()
@@ -137,9 +147,18 @@ func (s *Server) Acquire(ctx context.Context, req *pb.AcquireRequest) (*pb.Acqui
 		case <-ticker.C:
 			resp, err, done := s.checkAcquire(ctx, groupID, jobID, startTime)
 			if done {
+				granted = err == nil
 				return resp, err
 			}
 		}
+	}
+}
+
+// dropWaiter removes a failed Acquire's job from the group's waiting queue.
+func (s *Server) dropWaiter(ctx context.Context, group *store.Group, jobID string) {
+	if group.Spec().CancelRequest(jobID) {
+		slog.InfoContext(ctx, "Removed waiter from the queue after a failed Acquire")
+		metrics.QueueDepth.WithLabelValues(group.ID()).Set(float64(group.Spec().GetWaitingJobQueue().Len()))
 	}
 }
 
@@ -154,13 +173,23 @@ func (s *Server) defaultCheckAcquire(
 		return nil, status.Errorf(codes.Internal, "failed to get group: %v", err), true
 	}
 
-	// Check if group is faulted
-	faulted, err := s.isGroupFaulted(ctx, groupID)
+	// Check the jobs' agent states. Only a foreground job can fault the group.
+	faults, err := s.groupFaults(ctx, groupID, jobID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to check if group is faulted: %v", err), true
 	}
-	if faulted {
+	if faults.foreground {
 		return nil, status.Errorf(codes.Unavailable, "group %s is faulted", groupID), true
+	}
+	if faults.caller {
+		return nil, status.Errorf(codes.Unavailable, "job %s is faulted in group %s", jobID, groupID), true
+	}
+	if faults.guest != "" {
+		// A FAULTED guest may still hold accelerator memory, so the grant waits
+		// (fails closed) until the guest is cleared, instead of failing the
+		// caller. Only the guest's own Acquire fails; the group does not fault.
+		slog.InfoContext(ctx, "Acquire waiting: a background job is FAULTED", "guestJob", faults.guest)
+		return nil, nil, false //nolint:nilnil // returning nil, nil is intended when done is false
 	}
 
 	// Check if we are the lock holder AND the context is loaded
@@ -178,19 +207,48 @@ func (s *Server) defaultCheckAcquire(
 	return nil, nil, false //nolint:nilnil // returning nil, nil is intended when done is false
 }
 
-func (s *Server) isGroupFaulted(ctx context.Context, groupID string) (bool, error) {
+// groupFaultState is what the jobs' agent states say about a group.
+type groupFaultState struct {
+	// foreground is true when a foreground job is FAULTED on any node. That
+	// faults the whole group.
+	foreground bool
+	// guest is the ID of a FAULTED background job, or empty. It never faults
+	// the group.
+	guest string
+	// caller is true when the job asking for the lock is itself a FAULTED
+	// background job.
+	caller bool
+}
+
+// groupFaults reports which of the group's jobs are FAULTED, split by role.
+func (s *Server) groupFaults(ctx context.Context, groupID, callerID string) (groupFaultState, error) {
+	var faults groupFaultState
 	jobs, err := s.jobStore.ListByGroup(ctx, groupID)
 	if err != nil {
-		return false, err
+		return faults, err
 	}
 	for _, job := range jobs {
-		for _, state := range job.ContextState() {
-			if state == pb.SnapshotAgentJobState_STATE_FAULTED {
-				return true, nil
-			}
+		if !jobFaulted(job) {
+			continue
+		}
+		if job.Role() == store.RoleBackground {
+			faults.guest = job.JobID()
+			faults.caller = faults.caller || job.JobID() == callerID
+			continue
+		}
+		faults.foreground = true
+	}
+	return faults, nil
+}
+
+// jobFaulted reports whether the job is FAULTED on any node.
+func jobFaulted(job *store.Job) bool {
+	for _, state := range job.ContextState() {
+		if state == pb.SnapshotAgentJobState_STATE_FAULTED {
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // Yield implements TimeSliceOrchestratorService.Yield.

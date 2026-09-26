@@ -329,6 +329,17 @@ func (s *GroupSpec) RequestLock(jobID string) {
 	s.queue.Enqueue(jobID)
 }
 
+// CancelRequest withdraws a queued lock request, so a job whose Acquire failed
+// is never promoted. It returns false if the job was not queued, including when
+// it was promoted before the cancel: a granted lock is released only by Yield.
+// It takes the spec lock, so it cannot interleave with TryPromote.
+func (s *GroupSpec) CancelRequest(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.queue.Remove(jobID)
+}
+
 // SetActiveJob sets the active job.
 // Primarily used for testing.
 func (s *GroupSpec) SetActiveJob(jobID string) {

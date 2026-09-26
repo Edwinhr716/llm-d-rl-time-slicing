@@ -14,11 +14,28 @@ import (
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
+	"k8s.io/client-go/util/workqueue"
 )
 
 const (
 	operationPollInterval = 1 * time.Second
+
+	// DefaultWorkers is the number of reconcile workers. With one worker, a
+	// single hung agent call stalls every group and the periodic resync.
+	DefaultWorkers = 4
+
+	// DefaultKillPollInterval is how often WaitForKillOperation polls a kill
+	// operation. It matches the snapshot and restore poll.
+	DefaultKillPollInterval = 1 * time.Second
 )
+
+// NewRateLimiter returns a per-group exponential backoff limiter from
+// baseDelay to maxDelay. The orchestrator uses client-go's default controller
+// rate limiter; this is for callers, such as tests, that need a different
+// retry pace.
+func NewRateLimiter(baseDelay, maxDelay time.Duration) workqueue.TypedRateLimiter[string] {
+	return workqueue.NewTypedItemExponentialFailureRateLimiter[string](baseDelay, maxDelay)
+}
 
 // handleCrash is a helper that recovers from panics, logs the panic and stack trace.
 // It is intended to be used in `defer` statements in goroutines.
@@ -102,6 +119,14 @@ type Controller struct {
 	// observed RUNNING). See waitForGrantSettlement.
 	SettleTimeout time.Duration
 
+	// ForegroundOpTimeout bounds how long a reconcile waits for one agent
+	// snapshot or restore operation. Zero leaves the wait bounded only by the
+	// context.
+	ForegroundOpTimeout time.Duration
+
+	// KillPollInterval is how often WaitForKillOperation polls.
+	KillPollInterval time.Duration
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
 }
@@ -129,6 +154,7 @@ func NewController(
 		agentStore:        agentStore,
 		ResyncPeriod:      30 * time.Second,
 		SettleTimeout:     30 * time.Second,
+		KillPollInterval:  DefaultKillPollInterval,
 		settleSince:       make(map[string]settleEntry),
 	}
 }
@@ -664,15 +690,48 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 	}
 }
 
-// waitForOperation blocks until the given operation on the node completes or fails.
+// waitForOperation blocks until the given snapshot or restore operation on the
+// node completes or fails, or until ForegroundOpTimeout passes.
 func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
+	if c.ForegroundOpTimeout <= 0 {
+		return c.pollOperation(ctx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
+	}
+	opCtx, cancel := context.WithTimeout(ctx, c.ForegroundOpTimeout)
+	defer cancel()
+	err := c.pollOperation(opCtx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
+	if err != nil && ctx.Err() == nil && errors.Is(opCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%s operation %s did not finish within the foreground operation timeout %s: %w",
+			operationType, operationID, c.ForegroundOpTimeout, err)
+	}
+	return err
+}
+
+// WaitForKillOperation blocks until the given kill operation on the node
+// completes or fails. It polls every KillPollInterval, which can be set apart
+// from the snapshot and restore poll because the lock handoff waits on it. The
+// caller bounds it with ctx.
+func (c *Controller) WaitForKillOperation(ctx context.Context, groupID, jobID, nodeName, operationID string) error {
+	interval := c.KillPollInterval
+	if interval <= 0 {
+		interval = DefaultKillPollInterval
+	}
+	return c.pollOperation(ctx, interval, groupID, jobID, nodeName, operationID, "kill")
+}
+
+// pollOperation polls the operation every interval until it completes, fails,
+// or ctx is done. A failed poll is retried at the next tick.
+func (c *Controller) pollOperation(
+	ctx context.Context,
+	interval time.Duration,
+	groupID, jobID, nodeName, operationID, operationType string,
+) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
 	ctx = logging.WithOperationID(ctx, operationID)
 
-	ticker := time.NewTicker(operationPollInterval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	slog.InfoContext(ctx, "Waiting for agent operation to complete")
+	slog.InfoContext(ctx, "Waiting for agent operation to complete", "type", operationType)
 
 	for {
 		select {
