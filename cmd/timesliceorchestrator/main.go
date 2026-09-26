@@ -77,7 +77,41 @@ func run() error {
 			"timeslice_orchestrator_dispatch_budget_rising_edge_skipped_total to see the orchestrator "+
 			"declining to open it. Supersedes --dispatch-budget-open-delay. "+
 			"Overridable with the TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE environment variable.")
+	foregroundWait := flag.String("foreground-wait", controller.ForegroundWaitBlocking,
+		"How reconcile waits on a foreground snapshot or restore. \"blocking\" (option A, the default and the "+
+			"only mode implemented) blocks on the agent operation, bounded by --foreground-op-timeout. "+
+			"PENDING LEAD DECISION: option B (\"async\") is refused until decided.")
+	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
+		"Upper bound on each blocking wait for a foreground snapshot or restore operation. On expiry the "+
+			"reconcile is retried. 0 means unbounded.")
+	backgroundRole := flag.Bool("background-role", false,
+		"Enable the background participant protocol: Acquire/Yield with ROLE_BACKGROUND, participant_id "+
+			"heartbeats and GroupStatus.background_protocol = 1. Off (the default) reports "+
+			"background_protocol = 0 and refuses ROLE_BACKGROUND; foreground callers are unaffected.")
+	minBubble := flag.Duration("min-bubble", 0,
+		"Smallest Yield expected_idle that records a lend hint. 0 (the default) never lends: the group goes "+
+			"IDLE_YIELDED as before. PENDING LEAD DECISION: suggested demo value 30s.")
+	noticeWindow := flag.Duration("notice-window", server.DefaultNoticeWindow,
+		"Notice window N: time from a foreground Acquire to the foreground getting the accelerator back while "+
+			"background guests hold it. PENDING LEAD DECISION.")
+	killBudget := flag.Duration("kill-budget", server.DefaultKillBudget,
+		"Kill budget K reserved at the end of the notice window; guests must vacate by T = notice + N - K. "+
+			"PENDING LEAD DECISION.")
 	flag.Parse()
+
+	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {
+		return fmt.Errorf("--foreground-wait: %w", err)
+	}
+	if *foregroundOpTimeout < 0 {
+		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", *foregroundOpTimeout)
+	}
+	if *minBubble < 0 {
+		return fmt.Errorf("--min-bubble must not be negative, got %v", *minBubble)
+	}
+	if *noticeWindow <= 0 || *killBudget <= 0 || *killBudget >= *noticeWindow {
+		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
+			*killBudget, *noticeWindow)
+	}
 
 	if *budgetRedisAddr != "" && *budgetJob == "" {
 		// Defaulting here would silently publish "0" forever and stall the
@@ -145,12 +179,18 @@ func run() error {
 		snapshotAgentStore,
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
+	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 
 	// Start informers
 	nodeInformerFactory.Start(ctx.Done())
 	podInformerFactory.Start(ctx.Done())
 
-	opts := []server.Option{server.WithServingQuantum(*servingQuantum)}
+	opts := []server.Option{
+		server.WithServingQuantum(*servingQuantum),
+		server.WithBackgroundRole(*backgroundRole),
+		server.WithMinBubble(*minBubble),
+		server.WithNoticeTiming(*noticeWindow, *killBudget),
+	}
 	if *budgetRedisAddr != "" {
 		publisher := budget.NewPublisher(budget.NewRedisWriter(*budgetRedisAddr), *budgetKey, *budgetJob).
 			WithOpenDelay(*budgetOpenDelay).
@@ -170,6 +210,12 @@ func run() error {
 		"dispatchBudgetJob", *budgetJob,
 		"dispatchBudgetOpenDelay", *budgetOpenDelay,
 		"dispatchBudgetExternalRisingEdge", *budgetExternalRisingEdge,
+		"foregroundWait", *foregroundWait,
+		"foregroundOpTimeout", *foregroundOpTimeout,
+		"backgroundRole", *backgroundRole,
+		"minBubble", *minBubble,
+		"noticeWindow", *noticeWindow,
+		"killBudget", *killBudget,
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
 }

@@ -37,6 +37,8 @@ type TimeSliceOrchestratorServiceClient interface {
 	// If the group is idle and the job's context is already RUNNING on the accelerator,
 	// it returns immediately. Otherwise, it queues the job and waits for the current
 	// locking_job to yield, then drives the snapshot/restore cycle.
+	// With ROLE_BACKGROUND it never queues: it blocks until the node is lent to
+	// the background participant and no notice is running.
 	Acquire(ctx context.Context, in *AcquireRequest, opts ...grpc.CallOption) (*AcquireResponse, error)
 	// Yield releases exclusive access to a time-slice group.
 	// It returns immediately to the caller once recorded, allowing the job to continue CPU-bound work
@@ -111,6 +113,8 @@ type TimeSliceOrchestratorServiceServer interface {
 	// If the group is idle and the job's context is already RUNNING on the accelerator,
 	// it returns immediately. Otherwise, it queues the job and waits for the current
 	// locking_job to yield, then drives the snapshot/restore cycle.
+	// With ROLE_BACKGROUND it never queues: it blocks until the node is lent to
+	// the background participant and no notice is running.
 	Acquire(context.Context, *AcquireRequest) (*AcquireResponse, error)
 	// Yield releases exclusive access to a time-slice group.
 	// It returns immediately to the caller once recorded, allowing the job to continue CPU-bound work

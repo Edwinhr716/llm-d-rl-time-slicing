@@ -9,6 +9,7 @@ package v1alpha1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
@@ -21,6 +22,63 @@ const (
 	// Verify that runtime/protoimpl is sufficiently up-to-date.
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
+
+// Role is the part a lock participant plays in a time-slice group.
+type Role int32
+
+const (
+	// ROLE_UNSPECIFIED is treated as ROLE_FOREGROUND, so every client written
+	// before roles existed keeps its behaviour.
+	Role_ROLE_UNSPECIFIED Role = 0
+	// ROLE_FOREGROUND is a job that owns the group: it uses Acquire and Yield in
+	// FIFO order.
+	Role_ROLE_FOREGROUND Role = 1
+	// ROLE_BACKGROUND is the single per-node participant that borrows the
+	// accelerator while no foreground job holds it or waits for it. It is never
+	// in the foreground queue. Its job_id is "vk/<node name>".
+	Role_ROLE_BACKGROUND Role = 2
+)
+
+// Enum value maps for Role.
+var (
+	Role_name = map[int32]string{
+		0: "ROLE_UNSPECIFIED",
+		1: "ROLE_FOREGROUND",
+		2: "ROLE_BACKGROUND",
+	}
+	Role_value = map[string]int32{
+		"ROLE_UNSPECIFIED": 0,
+		"ROLE_FOREGROUND":  1,
+		"ROLE_BACKGROUND":  2,
+	}
+)
+
+func (x Role) Enum() *Role {
+	p := new(Role)
+	*p = x
+	return p
+}
+
+func (x Role) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Role) Descriptor() protoreflect.EnumDescriptor {
+	return file_timeslice_orchestrator_proto_enumTypes[0].Descriptor()
+}
+
+func (Role) Type() protoreflect.EnumType {
+	return &file_timeslice_orchestrator_proto_enumTypes[0]
+}
+
+func (x Role) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Role.Descriptor instead.
+func (Role) EnumDescriptor() ([]byte, []int) {
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{0}
+}
 
 // State defines the possible states of a group lock.
 type GroupStatus_State int32
@@ -38,6 +96,13 @@ const (
 	GroupStatus_STATE_LOCKED GroupStatus_State = 4
 	// STATE_SWITCHING indicates a transition is in progress.
 	GroupStatus_STATE_SWITCHING GroupStatus_State = 5
+	// STATE_BACKGROUND indicates background guests hold the accelerator.
+	// Computed on read, never persisted.
+	GroupStatus_STATE_BACKGROUND GroupStatus_State = 6
+	// STATE_VACATING indicates a foreground job wants the accelerator and a
+	// notice to the background guests is running. Computed on read, never
+	// persisted.
+	GroupStatus_STATE_VACATING GroupStatus_State = 7
 )
 
 // Enum value maps for GroupStatus_State.
@@ -49,6 +114,8 @@ var (
 		3: "STATE_IDLE_YIELDED",
 		4: "STATE_LOCKED",
 		5: "STATE_SWITCHING",
+		6: "STATE_BACKGROUND",
+		7: "STATE_VACATING",
 	}
 	GroupStatus_State_value = map[string]int32{
 		"STATE_UNSPECIFIED":  0,
@@ -57,6 +124,8 @@ var (
 		"STATE_IDLE_YIELDED": 3,
 		"STATE_LOCKED":       4,
 		"STATE_SWITCHING":    5,
+		"STATE_BACKGROUND":   6,
+		"STATE_VACATING":     7,
 	}
 )
 
@@ -71,11 +140,11 @@ func (x GroupStatus_State) String() string {
 }
 
 func (GroupStatus_State) Descriptor() protoreflect.EnumDescriptor {
-	return file_timeslice_orchestrator_proto_enumTypes[0].Descriptor()
+	return file_timeslice_orchestrator_proto_enumTypes[1].Descriptor()
 }
 
 func (GroupStatus_State) Type() protoreflect.EnumType {
-	return &file_timeslice_orchestrator_proto_enumTypes[0]
+	return &file_timeslice_orchestrator_proto_enumTypes[1]
 }
 
 func (x GroupStatus_State) Number() protoreflect.EnumNumber {
@@ -103,6 +172,9 @@ const (
 	SnapshotAgentJobState_STATE_SAVED SnapshotAgentJobState_State = 4
 	// STATE_FAULTED indicates the last operation failed and requires operator intervention.
 	SnapshotAgentJobState_STATE_FAULTED SnapshotAgentJobState_State = 5
+	// STATE_SUSPENDED indicates a background guest is checkpointed, frozen and
+	// verified to hold no device memory.
+	SnapshotAgentJobState_STATE_SUSPENDED SnapshotAgentJobState_State = 6
 )
 
 // Enum value maps for SnapshotAgentJobState_State.
@@ -114,6 +186,7 @@ var (
 		3: "STATE_TRANSITIONING",
 		4: "STATE_SAVED",
 		5: "STATE_FAULTED",
+		6: "STATE_SUSPENDED",
 	}
 	SnapshotAgentJobState_State_value = map[string]int32{
 		"STATE_UNSPECIFIED":   0,
@@ -122,6 +195,7 @@ var (
 		"STATE_TRANSITIONING": 3,
 		"STATE_SAVED":         4,
 		"STATE_FAULTED":       5,
+		"STATE_SUSPENDED":     6,
 	}
 )
 
@@ -136,11 +210,11 @@ func (x SnapshotAgentJobState_State) String() string {
 }
 
 func (SnapshotAgentJobState_State) Descriptor() protoreflect.EnumDescriptor {
-	return file_timeslice_orchestrator_proto_enumTypes[1].Descriptor()
+	return file_timeslice_orchestrator_proto_enumTypes[2].Descriptor()
 }
 
 func (SnapshotAgentJobState_State) Type() protoreflect.EnumType {
-	return &file_timeslice_orchestrator_proto_enumTypes[1]
+	return &file_timeslice_orchestrator_proto_enumTypes[2]
 }
 
 func (x SnapshotAgentJobState_State) Number() protoreflect.EnumNumber {
@@ -157,10 +231,17 @@ type AcquireRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// job_id is the unique identifier of the job requesting access.
 	// Must match the timeslice.io/job-id annotation on the pod.
+	// For ROLE_BACKGROUND it is the participant ID, "vk/<node_name>".
 	JobId string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	// group_id is the unique identifier of the time-slice group.
 	// Must match the timeslice.io/group annotation on the pod.
-	GroupId       string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	GroupId string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	// role is the caller's role. Unset means ROLE_FOREGROUND.
+	Role Role `protobuf:"varint,3,opt,name=role,proto3,enum=timeslice_orchestrator.v1alpha1.Role" json:"role,omitempty"`
+	// node_name is the node the background participant runs its guests on.
+	// Required for ROLE_BACKGROUND and must be a node of the group. Ignored for
+	// foreground callers.
+	NodeName      string `protobuf:"bytes,4,opt,name=node_name,json=nodeName,proto3" json:"node_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -209,6 +290,20 @@ func (x *AcquireRequest) GetGroupId() string {
 	return ""
 }
 
+func (x *AcquireRequest) GetRole() Role {
+	if x != nil {
+		return x.Role
+	}
+	return Role_ROLE_UNSPECIFIED
+}
+
+func (x *AcquireRequest) GetNodeName() string {
+	if x != nil {
+		return x.NodeName
+	}
+	return ""
+}
+
 // AcquireResponse is the response after acquiring access.
 type AcquireResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -219,6 +314,10 @@ type AcquireResponse struct {
 	// context_restored indicates whether the job's accelerator context was physically
 	// restored from host memory. If false, it means the context was already live (e.g., zero-overhead path).
 	ContextRestored bool `protobuf:"varint,3,opt,name=context_restored,json=contextRestored,proto3" json:"context_restored,omitempty"`
+	// vram_unconfirmed is true only when the accelerator was handed back after a
+	// background guest kill that did not confirm within the kill budget, so
+	// device memory may still be held.
+	VramUnconfirmed bool `protobuf:"varint,4,opt,name=vram_unconfirmed,json=vramUnconfirmed,proto3" json:"vram_unconfirmed,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -274,13 +373,28 @@ func (x *AcquireResponse) GetContextRestored() bool {
 	return false
 }
 
+func (x *AcquireResponse) GetVramUnconfirmed() bool {
+	if x != nil {
+		return x.VramUnconfirmed
+	}
+	return false
+}
+
 // YieldRequest is the request to release access to a group.
 type YieldRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// job_id is the unique identifier of the job yielding access.
 	JobId string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	// group_id is the unique identifier of the time-slice group being yielded.
-	GroupId       string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	GroupId string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	// role is the caller's role. Unset means ROLE_FOREGROUND. A ROLE_BACKGROUND
+	// Yield hands the node's grant back ("start nothing more here, check my
+	// guests now"); it is idempotent and succeeds even if nothing was held.
+	Role Role `protobuf:"varint,3,opt,name=role,proto3,enum=timeslice_orchestrator.v1alpha1.Role" json:"role,omitempty"`
+	// expected_idle is an optional foreground hint: how long the job expects to
+	// leave the accelerator idle before it calls Acquire again. Unset or below
+	// the server's minimum bubble means the accelerator is never lent.
+	ExpectedIdle  *durationpb.Duration `protobuf:"bytes,4,opt,name=expected_idle,json=expectedIdle,proto3" json:"expected_idle,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -327,6 +441,20 @@ func (x *YieldRequest) GetGroupId() string {
 		return x.GroupId
 	}
 	return ""
+}
+
+func (x *YieldRequest) GetRole() Role {
+	if x != nil {
+		return x.Role
+	}
+	return Role_ROLE_UNSPECIFIED
+}
+
+func (x *YieldRequest) GetExpectedIdle() *durationpb.Duration {
+	if x != nil {
+		return x.ExpectedIdle
+	}
+	return nil
 }
 
 // YieldResponse is the response after yielding access.
@@ -481,7 +609,10 @@ func (x *ListGroupsResponse) GetGroupIds() []string {
 type GetGroupStatusRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// group_id is the unique identifier of the group to query.
-	GroupId       string `protobuf:"bytes,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	GroupId string `protobuf:"bytes,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	// participant_id is set by a background participant ("vk/<node name>") on
+	// every poll and serves as its heartbeat. Foreground callers leave it empty.
+	ParticipantId string `protobuf:"bytes,2,opt,name=participant_id,json=participantId,proto3" json:"participant_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -519,6 +650,13 @@ func (*GetGroupStatusRequest) Descriptor() ([]byte, []int) {
 func (x *GetGroupStatusRequest) GetGroupId() string {
 	if x != nil {
 		return x.GroupId
+	}
+	return ""
+}
+
+func (x *GetGroupStatusRequest) GetParticipantId() string {
+	if x != nil {
+		return x.ParticipantId
 	}
 	return ""
 }
@@ -601,7 +739,17 @@ type GroupStatus struct {
 	// loaded_job is the job_id of the job for which the controller has ensured the context has been loaded for.
 	// Controller will reconcile loaded_job towards active_job.
 	// Empty if no job context is loaded.
-	LoadedJob     string `protobuf:"bytes,7,opt,name=loaded_job,json=loadedJob,proto3" json:"loaded_job,omitempty"`
+	LoadedJob string `protobuf:"bytes,7,opt,name=loaded_job,json=loadedJob,proto3" json:"loaded_job,omitempty"`
+	// background_protocol is 1 when the server speaks the background
+	// participant protocol (roles, participant_id, vacate_within), 0 otherwise.
+	// A background participant must see 1 before it calls Acquire with
+	// ROLE_BACKGROUND: an older server would queue it as a foreground job.
+	BackgroundProtocol int32 `protobuf:"varint,8,opt,name=background_protocol,json=backgroundProtocol,proto3" json:"background_protocol,omitempty"`
+	// vacate_within is the time left, on the orchestrator's clock, until the
+	// background guests must have vacated the accelerator (T - now, where
+	// T = notice time + notice window - kill budget). Set only while a notice
+	// runs; never negative.
+	VacateWithin  *durationpb.Duration `protobuf:"bytes,9,opt,name=vacate_within,json=vacateWithin,proto3" json:"vacate_within,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -685,6 +833,20 @@ func (x *GroupStatus) GetLoadedJob() string {
 	return ""
 }
 
+func (x *GroupStatus) GetBackgroundProtocol() int32 {
+	if x != nil {
+		return x.BackgroundProtocol
+	}
+	return 0
+}
+
+func (x *GroupStatus) GetVacateWithin() *durationpb.Duration {
+	if x != nil {
+		return x.VacateWithin
+	}
+	return nil
+}
+
 // SnapshotAgentJobState represents the state of a job's accelerator context
 // on a specific node-local Snapshot Agent.
 type SnapshotAgentJobState struct {
@@ -694,7 +856,10 @@ type SnapshotAgentJobState struct {
 	// job_state is the current state of the job's context on this agent.
 	JobState SnapshotAgentJobState_State `protobuf:"varint,2,opt,name=job_state,json=jobState,proto3,enum=timeslice_orchestrator.v1alpha1.SnapshotAgentJobState_State" json:"job_state,omitempty"`
 	// job_id is the unique identifier of the job.
-	JobId         string `protobuf:"bytes,3,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	JobId string `protobuf:"bytes,3,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	// role is the job's role, from its pod's timeslice.io/role label. Unset
+	// means ROLE_FOREGROUND.
+	Role          Role `protobuf:"varint,4,opt,name=role,proto3,enum=timeslice_orchestrator.v1alpha1.Role" json:"role,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -750,33 +915,46 @@ func (x *SnapshotAgentJobState) GetJobId() string {
 	return ""
 }
 
+func (x *SnapshotAgentJobState) GetRole() Role {
+	if x != nil {
+		return x.Role
+	}
+	return Role_ROLE_UNSPECIFIED
+}
+
 var File_timeslice_orchestrator_proto protoreflect.FileDescriptor
 
 const file_timeslice_orchestrator_proto_rawDesc = "" +
 	"\n" +
-	"\x1ctimeslice_orchestrator.proto\x12\x1ftimeslice_orchestrator.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"B\n" +
+	"\x1ctimeslice_orchestrator.proto\x12\x1ftimeslice_orchestrator.v1alpha1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x9a\x01\n" +
 	"\x0eAcquireRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x19\n" +
-	"\bgroup_id\x18\x02 \x01(\tR\agroupId\"s\n" +
+	"\bgroup_id\x18\x02 \x01(\tR\agroupId\x129\n" +
+	"\x04role\x18\x03 \x01(\x0e2%.timeslice_orchestrator.v1alpha1.RoleR\x04role\x12\x1b\n" +
+	"\tnode_name\x18\x04 \x01(\tR\bnodeName\"\x9e\x01\n" +
 	"\x0fAcquireResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1b\n" +
 	"\twaited_ms\x18\x02 \x01(\x03R\bwaitedMs\x12)\n" +
-	"\x10context_restored\x18\x03 \x01(\bR\x0fcontextRestored\"@\n" +
+	"\x10context_restored\x18\x03 \x01(\bR\x0fcontextRestored\x12)\n" +
+	"\x10vram_unconfirmed\x18\x04 \x01(\bR\x0fvramUnconfirmed\"\xbb\x01\n" +
 	"\fYieldRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x19\n" +
-	"\bgroup_id\x18\x02 \x01(\tR\agroupId\"\x7f\n" +
+	"\bgroup_id\x18\x02 \x01(\tR\agroupId\x129\n" +
+	"\x04role\x18\x03 \x01(\x0e2%.timeslice_orchestrator.v1alpha1.RoleR\x04role\x12>\n" +
+	"\rexpected_idle\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\fexpectedIdle\"\x7f\n" +
 	"\rYieldResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12'\n" +
 	"\x0fpending_waiters\x18\x02 \x01(\x03R\x0ependingWaiters\x12+\n" +
 	"\x11snapshot_deferred\x18\x03 \x01(\bR\x10snapshotDeferred\"\x13\n" +
 	"\x11ListGroupsRequest\"1\n" +
 	"\x12ListGroupsResponse\x12\x1b\n" +
-	"\tgroup_ids\x18\x01 \x03(\tR\bgroupIds\"2\n" +
+	"\tgroup_ids\x18\x01 \x03(\tR\bgroupIds\"Y\n" +
 	"\x15GetGroupStatusRequest\x12\x19\n" +
-	"\bgroup_id\x18\x01 \x01(\tR\agroupId\"\xbe\x01\n" +
+	"\bgroup_id\x18\x01 \x01(\tR\agroupId\x12%\n" +
+	"\x0eparticipant_id\x18\x02 \x01(\tR\rparticipantId\"\xbe\x01\n" +
 	"\x16GetGroupStatusResponse\x12B\n" +
 	"\x05group\x18\x01 \x01(\v2,.timeslice_orchestrator.v1alpha1.GroupStatusR\x05group\x12`\n" +
-	"\x10agent_job_states\x18\x02 \x03(\v26.timeslice_orchestrator.v1alpha1.SnapshotAgentJobStateR\x0eagentJobStates\"\xd2\x03\n" +
+	"\x10agent_job_states\x18\x02 \x03(\v26.timeslice_orchestrator.v1alpha1.SnapshotAgentJobStateR\x0eagentJobStates\"\xed\x04\n" +
 	"\vGroupStatus\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\tR\agroupId\x12S\n" +
 	"\vgroup_state\x18\x02 \x01(\x0e22.timeslice_orchestrator.v1alpha1.GroupStatus.StateR\n" +
@@ -788,7 +966,9 @@ const file_timeslice_orchestrator_proto_rawDesc = "" +
 	"active_job\x18\x05 \x01(\tR\tactiveJob\x12,\n" +
 	"\x12waiter_queue_depth\x18\x06 \x01(\x03R\x10waiterQueueDepth\x12\x1d\n" +
 	"\n" +
-	"loaded_job\x18\a \x01(\tR\tloadedJob\"\x80\x01\n" +
+	"loaded_job\x18\a \x01(\tR\tloadedJob\x12/\n" +
+	"\x13background_protocol\x18\b \x01(\x05R\x12backgroundProtocol\x12>\n" +
+	"\rvacate_within\x18\t \x01(\v2\x19.google.protobuf.DurationR\fvacateWithin\"\xaa\x01\n" +
 	"\x05State\x12\x15\n" +
 	"\x11STATE_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rSTATE_UNKNOWN\x10\x01\x12\x0e\n" +
@@ -796,11 +976,14 @@ const file_timeslice_orchestrator_proto_rawDesc = "" +
 	"STATE_IDLE\x10\x02\x12\x16\n" +
 	"\x12STATE_IDLE_YIELDED\x10\x03\x12\x10\n" +
 	"\fSTATE_LOCKED\x10\x04\x12\x13\n" +
-	"\x0fSTATE_SWITCHING\x10\x05\"\x9f\x02\n" +
+	"\x0fSTATE_SWITCHING\x10\x05\x12\x14\n" +
+	"\x10STATE_BACKGROUND\x10\x06\x12\x12\n" +
+	"\x0eSTATE_VACATING\x10\a\"\xf0\x02\n" +
 	"\x15SnapshotAgentJobState\x12\x14\n" +
 	"\x05agent\x18\x01 \x01(\tR\x05agent\x12Y\n" +
 	"\tjob_state\x18\x02 \x01(\x0e2<.timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.StateR\bjobState\x12\x15\n" +
-	"\x06job_id\x18\x03 \x01(\tR\x05jobId\"~\n" +
+	"\x06job_id\x18\x03 \x01(\tR\x05jobId\x129\n" +
+	"\x04role\x18\x04 \x01(\x0e2%.timeslice_orchestrator.v1alpha1.RoleR\x04role\"\x93\x01\n" +
 	"\x05State\x12\x15\n" +
 	"\x11STATE_UNSPECIFIED\x10\x00\x12\x0e\n" +
 	"\n" +
@@ -808,7 +991,12 @@ const file_timeslice_orchestrator_proto_rawDesc = "" +
 	"\rSTATE_RUNNING\x10\x02\x12\x17\n" +
 	"\x13STATE_TRANSITIONING\x10\x03\x12\x0f\n" +
 	"\vSTATE_SAVED\x10\x04\x12\x11\n" +
-	"\rSTATE_FAULTED\x10\x052\xef\x03\n" +
+	"\rSTATE_FAULTED\x10\x05\x12\x13\n" +
+	"\x0fSTATE_SUSPENDED\x10\x06*F\n" +
+	"\x04Role\x12\x14\n" +
+	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fROLE_FOREGROUND\x10\x01\x12\x13\n" +
+	"\x0fROLE_BACKGROUND\x10\x022\xef\x03\n" +
 	"\x1cTimeSliceOrchestratorService\x12l\n" +
 	"\aAcquire\x12/.timeslice_orchestrator.v1alpha1.AcquireRequest\x1a0.timeslice_orchestrator.v1alpha1.AcquireResponse\x12f\n" +
 	"\x05Yield\x12-.timeslice_orchestrator.v1alpha1.YieldRequest\x1a..timeslice_orchestrator.v1alpha1.YieldResponse\x12u\n" +
@@ -828,42 +1016,49 @@ func file_timeslice_orchestrator_proto_rawDescGZIP() []byte {
 	return file_timeslice_orchestrator_proto_rawDescData
 }
 
-var file_timeslice_orchestrator_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_timeslice_orchestrator_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_timeslice_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_timeslice_orchestrator_proto_goTypes = []any{
-	(GroupStatus_State)(0),           // 0: timeslice_orchestrator.v1alpha1.GroupStatus.State
-	(SnapshotAgentJobState_State)(0), // 1: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State
-	(*AcquireRequest)(nil),           // 2: timeslice_orchestrator.v1alpha1.AcquireRequest
-	(*AcquireResponse)(nil),          // 3: timeslice_orchestrator.v1alpha1.AcquireResponse
-	(*YieldRequest)(nil),             // 4: timeslice_orchestrator.v1alpha1.YieldRequest
-	(*YieldResponse)(nil),            // 5: timeslice_orchestrator.v1alpha1.YieldResponse
-	(*ListGroupsRequest)(nil),        // 6: timeslice_orchestrator.v1alpha1.ListGroupsRequest
-	(*ListGroupsResponse)(nil),       // 7: timeslice_orchestrator.v1alpha1.ListGroupsResponse
-	(*GetGroupStatusRequest)(nil),    // 8: timeslice_orchestrator.v1alpha1.GetGroupStatusRequest
-	(*GetGroupStatusResponse)(nil),   // 9: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse
-	(*GroupStatus)(nil),              // 10: timeslice_orchestrator.v1alpha1.GroupStatus
-	(*SnapshotAgentJobState)(nil),    // 11: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState
-	(*timestamppb.Timestamp)(nil),    // 12: google.protobuf.Timestamp
+	(Role)(0),                        // 0: timeslice_orchestrator.v1alpha1.Role
+	(GroupStatus_State)(0),           // 1: timeslice_orchestrator.v1alpha1.GroupStatus.State
+	(SnapshotAgentJobState_State)(0), // 2: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State
+	(*AcquireRequest)(nil),           // 3: timeslice_orchestrator.v1alpha1.AcquireRequest
+	(*AcquireResponse)(nil),          // 4: timeslice_orchestrator.v1alpha1.AcquireResponse
+	(*YieldRequest)(nil),             // 5: timeslice_orchestrator.v1alpha1.YieldRequest
+	(*YieldResponse)(nil),            // 6: timeslice_orchestrator.v1alpha1.YieldResponse
+	(*ListGroupsRequest)(nil),        // 7: timeslice_orchestrator.v1alpha1.ListGroupsRequest
+	(*ListGroupsResponse)(nil),       // 8: timeslice_orchestrator.v1alpha1.ListGroupsResponse
+	(*GetGroupStatusRequest)(nil),    // 9: timeslice_orchestrator.v1alpha1.GetGroupStatusRequest
+	(*GetGroupStatusResponse)(nil),   // 10: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse
+	(*GroupStatus)(nil),              // 11: timeslice_orchestrator.v1alpha1.GroupStatus
+	(*SnapshotAgentJobState)(nil),    // 12: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState
+	(*durationpb.Duration)(nil),      // 13: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),    // 14: google.protobuf.Timestamp
 }
 var file_timeslice_orchestrator_proto_depIdxs = []int32{
-	10, // 0: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse.group:type_name -> timeslice_orchestrator.v1alpha1.GroupStatus
-	11, // 1: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse.agent_job_states:type_name -> timeslice_orchestrator.v1alpha1.SnapshotAgentJobState
-	0,  // 2: timeslice_orchestrator.v1alpha1.GroupStatus.group_state:type_name -> timeslice_orchestrator.v1alpha1.GroupStatus.State
-	12, // 3: timeslice_orchestrator.v1alpha1.GroupStatus.state_timestamp:type_name -> google.protobuf.Timestamp
-	1,  // 4: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.job_state:type_name -> timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State
-	2,  // 5: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Acquire:input_type -> timeslice_orchestrator.v1alpha1.AcquireRequest
-	4,  // 6: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Yield:input_type -> timeslice_orchestrator.v1alpha1.YieldRequest
-	6,  // 7: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.ListGroups:input_type -> timeslice_orchestrator.v1alpha1.ListGroupsRequest
-	8,  // 8: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.GetGroupStatus:input_type -> timeslice_orchestrator.v1alpha1.GetGroupStatusRequest
-	3,  // 9: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Acquire:output_type -> timeslice_orchestrator.v1alpha1.AcquireResponse
-	5,  // 10: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Yield:output_type -> timeslice_orchestrator.v1alpha1.YieldResponse
-	7,  // 11: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.ListGroups:output_type -> timeslice_orchestrator.v1alpha1.ListGroupsResponse
-	9,  // 12: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.GetGroupStatus:output_type -> timeslice_orchestrator.v1alpha1.GetGroupStatusResponse
-	9,  // [9:13] is the sub-list for method output_type
-	5,  // [5:9] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	0,  // 0: timeslice_orchestrator.v1alpha1.AcquireRequest.role:type_name -> timeslice_orchestrator.v1alpha1.Role
+	0,  // 1: timeslice_orchestrator.v1alpha1.YieldRequest.role:type_name -> timeslice_orchestrator.v1alpha1.Role
+	13, // 2: timeslice_orchestrator.v1alpha1.YieldRequest.expected_idle:type_name -> google.protobuf.Duration
+	11, // 3: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse.group:type_name -> timeslice_orchestrator.v1alpha1.GroupStatus
+	12, // 4: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse.agent_job_states:type_name -> timeslice_orchestrator.v1alpha1.SnapshotAgentJobState
+	1,  // 5: timeslice_orchestrator.v1alpha1.GroupStatus.group_state:type_name -> timeslice_orchestrator.v1alpha1.GroupStatus.State
+	14, // 6: timeslice_orchestrator.v1alpha1.GroupStatus.state_timestamp:type_name -> google.protobuf.Timestamp
+	13, // 7: timeslice_orchestrator.v1alpha1.GroupStatus.vacate_within:type_name -> google.protobuf.Duration
+	2,  // 8: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.job_state:type_name -> timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State
+	0,  // 9: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.role:type_name -> timeslice_orchestrator.v1alpha1.Role
+	3,  // 10: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Acquire:input_type -> timeslice_orchestrator.v1alpha1.AcquireRequest
+	5,  // 11: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Yield:input_type -> timeslice_orchestrator.v1alpha1.YieldRequest
+	7,  // 12: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.ListGroups:input_type -> timeslice_orchestrator.v1alpha1.ListGroupsRequest
+	9,  // 13: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.GetGroupStatus:input_type -> timeslice_orchestrator.v1alpha1.GetGroupStatusRequest
+	4,  // 14: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Acquire:output_type -> timeslice_orchestrator.v1alpha1.AcquireResponse
+	6,  // 15: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Yield:output_type -> timeslice_orchestrator.v1alpha1.YieldResponse
+	8,  // 16: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.ListGroups:output_type -> timeslice_orchestrator.v1alpha1.ListGroupsResponse
+	10, // 17: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.GetGroupStatus:output_type -> timeslice_orchestrator.v1alpha1.GetGroupStatusResponse
+	14, // [14:18] is the sub-list for method output_type
+	10, // [10:14] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_timeslice_orchestrator_proto_init() }
@@ -876,7 +1071,7 @@ func file_timeslice_orchestrator_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_timeslice_orchestrator_proto_rawDesc), len(file_timeslice_orchestrator_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,

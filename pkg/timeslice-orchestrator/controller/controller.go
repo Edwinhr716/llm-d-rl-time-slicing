@@ -20,6 +20,32 @@ const (
 	operationPollInterval = 1 * time.Second
 )
 
+// ForegroundWaitBlocking is option A for how reconcile waits on a foreground
+// snapshot or restore: it blocks on the agent operation, bounded by
+// Controller.ForegroundOpTimeout. It is the only mode implemented.
+//
+// PENDING LEAD DECISION (foreground wait, A or B): option B, which starts the
+// operation and checks it on a later requeue, is not implemented, and
+// ValidateForegroundWait refuses it until the lead decides.
+const ForegroundWaitBlocking = "blocking"
+
+// ForegroundWaitAsync names option B. It is recognised only so that the
+// error can say why it is refused.
+const ForegroundWaitAsync = "async"
+
+// ValidateForegroundWait checks a --foreground-wait value.
+func ValidateForegroundWait(mode string) error {
+	switch mode {
+	case ForegroundWaitBlocking:
+		return nil
+	case ForegroundWaitAsync:
+		return fmt.Errorf("foreground wait %q (option B) is not implemented (PENDING LEAD DECISION); use %q",
+			mode, ForegroundWaitBlocking)
+	default:
+		return fmt.Errorf("unknown foreground wait %q: must be %q", mode, ForegroundWaitBlocking)
+	}
+}
+
 // handleCrash is a helper that recovers from panics, logs the panic and stack trace.
 // It is intended to be used in `defer` statements in goroutines.
 func handleCrash(ctx context.Context) {
@@ -101,6 +127,12 @@ type Controller struct {
 	// while the current active job's grant is unconsumed (granted but never
 	// observed RUNNING). See waitForGrantSettlement.
 	SettleTimeout time.Duration
+
+	// ForegroundOpTimeout bounds each blocking wait on a foreground snapshot
+	// or restore operation (foreground wait option A). When it expires the
+	// reconcile returns an error and is retried; the job then reports
+	// TRANSITIONING until the agent finishes. Zero means unbounded.
+	ForegroundOpTimeout time.Duration
 
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
@@ -668,6 +700,12 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
 	ctx = logging.WithOperationID(ctx, operationID)
+
+	if c.ForegroundOpTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.ForegroundOpTimeout)
+		defer cancel()
+	}
 
 	ticker := time.NewTicker(operationPollInterval)
 	defer ticker.Stop()
