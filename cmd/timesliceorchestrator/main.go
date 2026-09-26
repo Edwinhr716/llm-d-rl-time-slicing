@@ -42,7 +42,9 @@ func run() error {
 	port := flag.Int("port", 50051, "The server port")
 	metricsPort := flag.Int("metrics-port", 8080, "The metrics server port")
 	kubeconfig := flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	controllerWorkers := flag.Int("controller-workers", 1, "The number of workers for the controller")
+	controllerWorkers := flag.Int("controller-workers", controller.DefaultWorkers,
+		"The number of workers for the controller. More than one lets other groups and the resync proceed "+
+			"while one group waits on a slow agent.")
 	snapshotAgentPort := flag.Int("snapshot-agent-port", 9001, "The default port for snapshot agents")
 	resyncPeriod := flag.Duration("resync-period", 30*time.Second, "The period for periodic resync of agent states")
 	servingQuantum := flag.Duration("serving-quantum", envDuration("TIMESLICE_SERVING_QUANTUM", 0),
@@ -77,6 +79,23 @@ func run() error {
 			"timeslice_orchestrator_dispatch_budget_rising_edge_skipped_total to see the orchestrator "+
 			"declining to open it. Supersedes --dispatch-budget-open-delay. "+
 			"Overridable with the TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE environment variable.")
+	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
+	// are proposals awaiting the lead's sign-off.
+	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
+		"Bound on every call to a snapshot agent, including each status and operation poll. 0 disables it. "+
+			"PENDING LEAD DECISION.")
+	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
+		"Bound on waiting for one snapshot or restore operation to finish. 0 disables it.")
+	retryBaseDelay := flag.Duration("retry-base-delay", 1*time.Second,
+		"First retry delay after a failed reconcile of a group; it doubles on each further failure. "+
+			"PENDING LEAD DECISION.")
+	retryMaxDelay := flag.Duration("retry-max-delay", 30*time.Second,
+		"Cap on the retry delay after failed reconciles of a group. PENDING LEAD DECISION.")
+	holderWaitRequeue := flag.Duration("holder-wait-requeue", 1*time.Second,
+		"Re-reconcile a group this long after a pass that ends with the lock holder not yet loaded, so an "+
+			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
+	killPollInterval := flag.Duration("kill-poll-interval", controller.DefaultKillPollInterval,
+		"How often a kill operation is polled. PENDING LEAD DECISION.")
 	flag.Parse()
 
 	if *budgetRedisAddr != "" && *budgetJob == "" {
@@ -118,9 +137,9 @@ func run() error {
 	lockStore := store.NewConfigMapLockStore(clientset)
 	groupStore := store.NewGroupStore(lockStore)
 	jobStore := store.NewJobStore()
-	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, *snapshotAgentPort)
+	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, *snapshotAgentPort).WithRPCTimeout(*agentRPCTimeout)
 	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
-		workqueue.DefaultTypedControllerRateLimiter[string](),
+		controller.NewRateLimiter(*retryBaseDelay, *retryMaxDelay),
 		workqueue.TypedRateLimitingQueueConfig[string]{
 			Name: "groups",
 		},
@@ -145,6 +164,9 @@ func run() error {
 		snapshotAgentStore,
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
+	ctrl.HolderWaitRequeue = *holderWaitRequeue
+	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
+	ctrl.KillPollInterval = *killPollInterval
 
 	// Start informers
 	nodeInformerFactory.Start(ctx.Done())
@@ -170,6 +192,13 @@ func run() error {
 		"dispatchBudgetJob", *budgetJob,
 		"dispatchBudgetOpenDelay", *budgetOpenDelay,
 		"dispatchBudgetExternalRisingEdge", *budgetExternalRisingEdge,
+		"controllerWorkers", *controllerWorkers,
+		"agentRPCTimeout", *agentRPCTimeout,
+		"foregroundOpTimeout", *foregroundOpTimeout,
+		"retryBaseDelay", *retryBaseDelay,
+		"retryMaxDelay", *retryMaxDelay,
+		"holderWaitRequeue", *holderWaitRequeue,
+		"killPollInterval", *killPollInterval,
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
 }

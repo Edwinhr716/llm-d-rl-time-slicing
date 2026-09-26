@@ -64,6 +64,25 @@ func (q *WaitingJobQueue) Dequeue() (string, bool) {
 	return job.JobID, true
 }
 
+// Remove deletes the job from the queue wherever it is, keeping the order of the
+// others. It returns false if the job was not queued.
+//
+// A waiter whose Acquire has failed, been cancelled or been refused must leave
+// the queue: left behind, it is promoted on the next Yield and the controller
+// evicts the running job for a caller that is no longer waiting.
+func (q *WaitingJobQueue) Remove(jobID string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	elem, ok := q.exist[jobID]
+	if !ok {
+		return false
+	}
+	_ = q.jobs.Remove(elem)
+	delete(q.exist, jobID)
+	return true
+}
+
 // Peek returns the next job from the front of the queue without removing it.
 // Returns the jobID and true if successful, or empty string and false if the queue is empty.
 func (q *WaitingJobQueue) Peek() (string, bool) {
