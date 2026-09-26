@@ -1,0 +1,102 @@
+# One-shot node preflight for the snapshot agent (see check.sh for the checks).
+#
+# Container "privileged" runs the way the snapshot agent runs (privileged,
+# host /sys/fs/cgroup read-write, host GPU driver and /dev), starts a small
+# CUDA process and asks cuda-checkpoint for its state. Container
+# "unprivileged" reports what an ordinary pod sees. The pod requests no GPU:
+# like the agent, it reaches the device through /dev, so pick an idle node.
+#
+# Placeholders: ${NAMESPACE}, ${NODE}. Usage:
+#   kubectl create namespace "$NAMESPACE"
+#   kubectl -n "$NAMESPACE" create configmap node-preflight --from-file=check.sh
+#   sed -e "s|\${NAMESPACE}|$NAMESPACE|g" -e "s|\${NODE}|$NODE|g" pod.yaml | kubectl apply -f -
+#   kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Succeeded pod/node-preflight --timeout=10m
+#   kubectl -n "$NAMESPACE" logs node-preflight -c privileged
+#   kubectl -n "$NAMESPACE" logs node-preflight -c unprivileged
+#   kubectl delete namespace "$NAMESPACE"
+#
+# The host paths are the GKE Container-Optimized OS defaults also used by
+# deploy/snapshot-agent/values.yaml; change them for other node images.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node-preflight
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: snapshot-agent-node-preflight
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: ${NODE}
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  automountServiceAccountToken: false
+  containers:
+    - name: privileged
+      image: python:3.12-slim
+      command: ["bash", "/preflight/check.sh", "privileged"]
+      securityContext:
+        privileged: true
+      env:
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NVIDIA_DIR
+          value: /usr/local/nvidia
+        - name: HOST_CGROUP_MOUNT
+          value: /host/sys/fs/cgroup
+      volumeMounts:
+        - name: preflight
+          mountPath: /preflight
+        - name: host-cgroup
+          mountPath: /host/sys/fs/cgroup
+        - name: nvidia-driver
+          mountPath: /usr/local/nvidia
+          readOnly: true
+        - name: nvidia-devices
+          mountPath: /dev
+        - name: os-release
+          mountPath: /host/etc/os-release
+          readOnly: true
+    - name: unprivileged
+      image: python:3.12-slim
+      command: ["bash", "/preflight/check.sh", "unprivileged"]
+      env:
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      volumeMounts:
+        - name: preflight
+          mountPath: /preflight
+  volumes:
+    - name: preflight
+      configMap:
+        name: node-preflight
+    - name: host-cgroup
+      hostPath:
+        path: /sys/fs/cgroup
+        type: Directory
+    - name: nvidia-driver
+      hostPath:
+        path: /home/kubernetes/bin/nvidia
+        type: Directory
+    - name: nvidia-devices
+      hostPath:
+        path: /dev
+        type: Directory
+    - name: os-release
+      hostPath:
+        path: /etc/os-release
+        type: File
