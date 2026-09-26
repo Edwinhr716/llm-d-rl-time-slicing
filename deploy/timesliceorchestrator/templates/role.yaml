@@ -3,7 +3,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "timesliceorchestrator.fullname" . }}-configmap
-  namespace: timeslice-system
+  namespace: {{ include "timesliceorchestrator.lockNamespace" . }}
   labels:
     {{- include "timesliceorchestrator.labels" . | nindent 4 }}
 rules:
