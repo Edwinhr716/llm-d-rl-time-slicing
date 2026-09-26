@@ -12,5 +12,5 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ include "timesliceorchestrator.serviceAccountName" . }}
-    namespace: timeslice-system
+    namespace: {{ include "timesliceorchestrator.namespace" . }}
 {{- end }}

@@ -2,11 +2,15 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "timesliceorchestrator.fullname" . }}
-  namespace: timeslice-system
+  namespace: {{ include "timesliceorchestrator.namespace" . }}
   labels:
     {{- include "timesliceorchestrator.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "timesliceorchestrator.selectorLabels" . | nindent 6 }}
@@ -28,6 +32,19 @@ spec:
             - "--dispatch-budget-job={{ .Values.dispatchBudget.job }}"
             - "--dispatch-budget-open-delay={{ .Values.dispatchBudget.openDelay | default "0s" }}"
             - "--dispatch-budget-external-rising-edge={{ .Values.dispatchBudget.externalRisingEdge | default false }}"
+            {{- $lockNamespace := include "timesliceorchestrator.lockNamespace" . }}
+            {{- if ne $lockNamespace "timeslice-system" }}
+            - "--lock-namespace={{ $lockNamespace }}"
+            {{- end }}
+            {{- with .Values.lock.configMap }}
+            - "--lock-configmap={{ . }}"
+            {{- end }}
+            {{- with .Values.scope.watchNamespaces }}
+            - "--watch-namespaces={{ join "," . }}"
+            {{- end }}
+            {{- with .Values.scope.nodeSelector }}
+            - "--node-selector={{ . }}"
+            {{- end }}
           ports:
             - name: grpc
               containerPort: 50051
@@ -37,3 +54,15 @@ spec:
               protocol: TCP
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -47,14 +47,40 @@ type PodInfo struct {
 // KubernetesOrchestrator implements controller.InfrastructureOrchestrator for Kubernetes.
 type KubernetesOrchestrator struct {
 	nodeInformer       corev1informers.NodeInformer
-	podInformer        corev1informers.PodInformer
+	podInformers       []corev1informers.PodInformer
 	nodeLister         corev1listers.NodeLister
-	podLister          corev1listers.PodLister
+	podListers         []corev1listers.PodLister
 	nodeSynced         cache.InformerSynced
-	podSynced          cache.InformerSynced
+	podSynced          []cache.InformerSynced
+	nodeScopedPods     bool
 	groupStore         *store.GroupStore
 	jobStore           *store.JobStore
 	snapshotAgentStore store.SnapshotAgentStore
+}
+
+// Option configures a KubernetesOrchestrator.
+type Option func(*KubernetesOrchestrator)
+
+// WithPodInformers adds pod informers next to the one passed to
+// NewKubernetesOrchestrator. Use it to watch several namespaces, one
+// namespace-scoped informer each (see Scope.NewInformerFactories). Pods from
+// all informers are treated as one set.
+func WithPodInformers(podInformers ...corev1informers.PodInformer) Option {
+	return func(k *KubernetesOrchestrator) {
+		for _, pi := range podInformers {
+			k.addPodInformer(pi)
+		}
+	}
+}
+
+// WithNodeScopedPods ignores pods bound to a node that the node informer does
+// not see. Set it when the node informer is limited by --node-selector, so a
+// pod on a node outside the selector joins no group. Pods not yet bound to a
+// node are kept.
+func WithNodeScopedPods() Option {
+	return func(k *KubernetesOrchestrator) {
+		k.nodeScopedPods = true
+	}
 }
 
 // NewKubernetesOrchestrator creates a new KubernetesOrchestrator.
@@ -64,23 +90,44 @@ func NewKubernetesOrchestrator(
 	groupStore *store.GroupStore,
 	jobStore *store.JobStore,
 	snapshotAgentStore store.SnapshotAgentStore,
+	opts ...Option,
 ) *KubernetesOrchestrator {
-	return &KubernetesOrchestrator{
+	k := &KubernetesOrchestrator{
 		nodeInformer:       nodeInformer,
-		podInformer:        podInformer,
 		nodeLister:         nodeInformer.Lister(),
-		podLister:          podInformer.Lister(),
 		nodeSynced:         nodeInformer.Informer().HasSynced,
-		podSynced:          podInformer.Informer().HasSynced,
 		groupStore:         groupStore,
 		jobStore:           jobStore,
 		snapshotAgentStore: snapshotAgentStore,
 	}
+	k.addPodInformer(podInformer)
+	for _, opt := range opts {
+		opt(k)
+	}
+	return k
+}
+
+func (k *KubernetesOrchestrator) addPodInformer(pi corev1informers.PodInformer) {
+	k.podInformers = append(k.podInformers, pi)
+	k.podListers = append(k.podListers, pi.Lister())
+	k.podSynced = append(k.podSynced, pi.Informer().HasSynced)
+}
+
+// podOnWatchedNode reports whether the pod may join a group: always, unless
+// WithNodeScopedPods is set and the pod is bound to a node outside the node
+// informer's scope.
+func (k *KubernetesOrchestrator) podOnWatchedNode(pod *corev1.Pod) bool {
+	if !k.nodeScopedPods || pod.Spec.NodeName == "" {
+		return true
+	}
+	_, err := k.nodeLister.Get(pod.Spec.NodeName)
+	return err == nil
 }
 
 // Init initializes the KubernetesOrchestrator by waiting for informer caches to sync.
 func (k *KubernetesOrchestrator) Init(ctx context.Context) error {
-	if !cache.WaitForCacheSync(ctx.Done(), k.nodeSynced, k.podSynced) {
+	synced := append([]cache.InformerSynced{k.nodeSynced}, k.podSynced...)
+	if !cache.WaitForCacheSync(ctx.Done(), synced...) {
 		return fmt.Errorf("failed to wait for informer caches to sync")
 	}
 	return nil
@@ -103,14 +150,18 @@ func (k *KubernetesOrchestrator) getNodesForGroup(groupID string) ([]string, err
 // getPodsForGroup returns the pods that are tied to the given group.
 func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, error) {
 	selector := labels.SelectorFromSet(labels.Set{PodLabelKey: groupID})
-	pods, err := k.podLister.List(selector)
-	if err != nil {
-		return nil, err
+	pods := make([]*corev1.Pod, 0)
+	for _, lister := range k.podListers {
+		listed, err := lister.List(selector)
+		if err != nil {
+			return nil, err
+		}
+		pods = append(pods, listed...)
 	}
 	var podInfos []PodInfo
 	for _, pod := range pods {
 		jobID := pod.Labels[JobLabelKey]
-		if jobID == "" {
+		if jobID == "" || !k.podOnWatchedNode(pod) {
 			continue
 		}
 		podInfos = append(podInfos, PodInfo{
@@ -310,19 +361,24 @@ func (k *KubernetesOrchestrator) getGroupsFromNode(node *corev1.Node) []string {
 }
 
 func (k *KubernetesOrchestrator) setupPodInformer(ctx context.Context, queue controller.WorkQueue) error {
-	_, err := k.podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			k.enqueuePod(ctx, obj, queue)
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			k.enqueuePod(ctx, newObj, queue)
-			k.enqueuePod(ctx, oldObj, queue)
-		},
-		DeleteFunc: func(obj interface{}) {
-			k.enqueuePod(ctx, obj, queue)
-		},
-	})
-	return err
+	for _, pi := range k.podInformers {
+		_, err := pi.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				k.enqueuePod(ctx, obj, queue)
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				k.enqueuePod(ctx, newObj, queue)
+				k.enqueuePod(ctx, oldObj, queue)
+			},
+			DeleteFunc: func(obj interface{}) {
+				k.enqueuePod(ctx, obj, queue)
+			},
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (k *KubernetesOrchestrator) enqueuePod(ctx context.Context, obj interface{}, queue controller.WorkQueue) {
@@ -339,6 +395,14 @@ func (k *KubernetesOrchestrator) enqueuePod(ctx context.Context, obj interface{}
 			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
 			return
 		}
+	}
+
+	// Before the node cache has synced every node looks unknown; the node's
+	// own Add event enqueues its groups once it arrives.
+	if k.nodeSynced() && !k.podOnWatchedNode(pod) {
+		slog.InfoContext(ctx, "Ignoring pod bound to a node outside --node-selector",
+			"pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), "node", pod.Spec.NodeName)
+		return
 	}
 
 	slog.InfoContext(ctx, "Enqueue Pod", "pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))

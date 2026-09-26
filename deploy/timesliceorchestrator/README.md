@@ -13,7 +13,11 @@ Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*
 ## Deployment with Helm
 
 > [!IMPORTANT]
-> The TimeSlice Orchestrator is hardcoded to manage its locks (stored as a ConfigMap) in the `timeslice-system` namespace. Consequently, the Helm chart creates namespace-scoped RBAC resources (`Role` and `RoleBinding`) specifically in the `timeslice-system` namespace.
+> By default the orchestrator keeps its locks (a ConfigMap named
+> `timeslice-orchestrator-locks`) in the `timeslice-system` namespace, and the
+> Helm chart creates the namespace-scoped RBAC resources (`Role` and
+> `RoleBinding`) there. See
+> [Scoping and second installs](#scoping-and-second-installs) to change this.
 >
 > It is highly recommended to deploy the orchestrator itself into the `timeslice-system` namespace.
 
@@ -94,3 +98,46 @@ helm upgrade --install timesliceorchestrator ./timesliceorchestrator \
   --namespace timeslice-system \
   --create-namespace
 ```
+
+## Scoping and second installs
+
+By default the orchestrator watches pods in every namespace and every node,
+and keeps its locks in `timeslice-system/timeslice-orchestrator-locks`. These
+chart values (and the flags they set) narrow that down:
+
+* `namespace` (default `timeslice-system`): namespace for the Deployment,
+  Service, ServiceAccount and bindings.
+* `lock.namespace`, flag `--lock-namespace` (default `""`, the chart
+  namespace): namespace of the lock ConfigMap. The chart's `Role` is created
+  there.
+* `lock.configMap`, flag `--lock-configmap` (default `""`, which means
+  `timeslice-orchestrator-locks`): name of the lock ConfigMap.
+* `scope.watchNamespaces`, flag `--watch-namespaces` (default `[]`, all
+  namespaces): pods are watched only in these namespaces, one informer each.
+  Pods elsewhere join no group.
+* `scope.nodeSelector`, flag `--node-selector` (default `""`, all nodes):
+  label selector limiting the nodes the orchestrator sees. Nodes outside it
+  contribute to no group, and pods bound to them are ignored. Group
+  membership still comes from the `group.timeslice.io/<group>` node label.
+* `strategy` (default `type: Recreate`): the old pod stops before the new one
+  starts, so two replicas never act on the lock ConfigMap at once.
+
+Flags are only passed when they differ from the defaults, so an image without
+them keeps working with the default values.
+
+Two orchestrators in one cluster must use different lock ConfigMaps and
+should watch disjoint namespaces and nodes. For example, a second install
+that manages only the `rl-demo` namespace and the nodes labelled
+`timeslice.io/pool=demo`:
+
+```bash
+helm upgrade --install demo-orchestrator ./timesliceorchestrator \
+  --namespace rl-demo-system --create-namespace \
+  --set namespace=rl-demo-system \
+  --set lock.configMap=demo-orchestrator-locks \
+  --set 'scope.watchNamespaces={rl-demo}' \
+  --set scope.nodeSelector=timeslice.io/pool=demo
+```
+
+The chart still grants read access to pods and nodes cluster-wide through a
+`ClusterRole`.
