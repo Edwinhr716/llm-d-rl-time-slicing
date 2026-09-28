@@ -57,6 +57,9 @@ type options struct {
 	leaderElect        bool
 	leaseNamespace     string
 	podName            string
+
+	// Pending lead decision D-NS-2: false = keep (today), true = ns-label.
+	guestNodeLabel bool
 }
 
 func main() {
@@ -89,6 +92,8 @@ func main() {
 	flag.BoolVar(&o.leaderElect, "leader-elect", false, "run several replicas; only the Lease holder acts as the kubelet")
 	flag.StringVar(&o.leaseNamespace, "leader-elect-namespace", os.Getenv("POD_NAMESPACE"), "namespace of the leader-election Lease (env POD_NAMESPACE)")
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
+	flag.BoolVar(&o.guestNodeLabel, "guest-node-label", false,
+		"also label the virtual Node timeslice.io/guest=true, for guests with a preferred node affinity (virtual-node=true stays)")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -177,7 +182,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	}
 	cfg := provider.NodeConfig{
 		Name: o.nodeName, InternalIP: o.hostIP, KubeletPort: int32(o.kubeletPort),
-		KubeletVersion: o.kubeletVersion, GPUs: o.gpus,
+		KubeletVersion: o.kubeletVersion, GPUs: o.gpus, GuestNodeLabel: o.guestNodeLabel,
 	}
 	if o.providerIDFromHost {
 		cfg.ProviderID = host.Spec.ProviderID
@@ -251,6 +256,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		if err := n.WaitReady(ctx, 0); err == nil {
 			log.G(ctx).WithField("node", o.nodeName).WithField("host", o.hostNode).
 				WithField("providerID", cfg.ProviderID).Info("node registered and controllers running")
+			log.G(ctx).WithField("node", o.nodeName).WithField("labels", nodeSpec.Labels).Info("virtual node labels")
 		}
 	}()
 	return n.Run(ctx) // blocks until ctx is cancelled or a controller fails

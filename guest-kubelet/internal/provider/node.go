@@ -13,6 +13,10 @@ const (
 	GuestTaintKey = "timeslice.io/guest"
 	// VirtualNodeLabel marks the Node as virtual, for selectors and for humans.
 	VirtualNodeLabel = "timeslice.io/virtual-node"
+	// GuestNodeLabel is set to "true" on the Node only with --guest-node-label (pending lead
+	// decision D-NS-2, option ns-label). A guest's preferred node affinity selects it, so the
+	// guest falls back to real capacity when no virtual Node can take it. Same key as the taint.
+	GuestNodeLabel = GuestTaintKey
 	// GPUResource is advertised as plain capacity so the default scheduler can fit guests.
 	GPUResource corev1.ResourceName = "nvidia.com/gpu"
 )
@@ -33,6 +37,8 @@ type NodeConfig struct {
 	// GKE denies it: the validate-node-providerid admission policy requires the providerID to
 	// end in "/<node name>". Empty on GKE.
 	ProviderID string
+	// GuestNodeLabel adds the label GuestNodeLabel=true next to VirtualNodeLabel (D-NS-2).
+	GuestNodeLabel bool
 }
 
 // NewNodeSpec builds the Node object that the library registers once at startup.
@@ -62,14 +68,7 @@ func NewNodeSpec(cfg NodeConfig) corev1.Node {
 			// No kubernetes.io/os label either: every GKE system DaemonSet that landed on the
 			// M0 node (collector, fluentbit-gke, gcsfusecsi-node, gke-metrics-agent, pdcsi-node)
 			// requires kubernetes.io/os=linux, so without it none of them is scheduled here.
-			Labels: map[string]string{
-				"type":                   "virtual-kubelet",
-				VirtualNodeLabel:         "true",
-				"kubernetes.io/role":     "agent",
-				"kubernetes.io/hostname": cfg.Name,
-				"kubernetes.io/arch":     "amd64",
-				"node.kubernetes.io/exclude-from-external-load-balancers": "true",
-			},
+			Labels: nodeLabels(cfg.Name, cfg.GuestNodeLabel),
 		},
 		Spec: corev1.NodeSpec{
 			ProviderID: cfg.ProviderID,
@@ -101,6 +100,21 @@ func NewNodeSpec(cfg NodeConfig) corev1.Node {
 			},
 		},
 	}
+}
+
+func nodeLabels(name string, guestNodeLabel bool) map[string]string {
+	labels := map[string]string{
+		"type":                   "virtual-kubelet",
+		VirtualNodeLabel:         "true",
+		"kubernetes.io/role":     "agent",
+		"kubernetes.io/hostname": name,
+		"kubernetes.io/arch":     "amd64",
+		"node.kubernetes.io/exclude-from-external-load-balancers": "true",
+	}
+	if guestNodeLabel {
+		labels[GuestNodeLabel] = "true"
+	}
+	return labels
 }
 
 // NodeProvider is the node half of the provider. The library calls Ping every 10s and
