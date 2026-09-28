@@ -32,6 +32,18 @@ type Options struct {
 	OrphanGrace time.Duration
 	// Resync is the mirror informer's resync period.
 	Resync time.Duration
+	// Prober runs the guests' readinessProbes and supplies the ready flags (M2). Nil keeps the
+	// M1 behaviour: the mirror's ready flags, which mean only "running", are copied.
+	Prober Prober
+}
+
+// Prober is the readiness prober the backend drives (internal/probe implements it).
+type Prober interface {
+	Readiness
+	// Sync starts or stops the guest's probe workers for the mirror's current state.
+	Sync(guest, mirror *corev1.Pod)
+	// Forget drops everything held for a guest whose mirror is gone.
+	Forget(uid types.UID, namespace, name string)
 }
 
 // Backend creates, watches and deletes mirror pods. It keeps no state of its own that matters
@@ -117,8 +129,33 @@ func (b *Backend) mirrorChanged(obj any) {
 	if !ok {
 		return
 	}
-	if g := b.guestFor(m); g != nil {
-		b.emit(TranslateStatus(g, m))
+	g := b.guestFor(m)
+	if g == nil {
+		return
+	}
+	if b.opts.Prober != nil {
+		b.opts.Prober.Sync(g, m)
+	}
+	b.emit(b.translate(g, m))
+}
+
+// translate is TranslateStatusWith the configured prober, if any.
+func (b *Backend) translate(guest, m *corev1.Pod) *corev1.Pod {
+	if b.opts.Prober == nil {
+		return TranslateStatus(guest, m)
+	}
+	return TranslateStatusWith(guest, m, b.opts.Prober)
+}
+
+// Refresh re-translates a guest's status and hands it to the pod controller. The prober calls
+// it when a readiness verdict changes, which no mirror event would report.
+func (b *Backend) Refresh(namespace, name string) {
+	g, err := b.guests.Pods(namespace).Get(name)
+	if err != nil {
+		return
+	}
+	if m, ok := b.mirrorOf(g); ok {
+		b.emit(b.translate(g, m))
 	}
 }
 
@@ -133,6 +170,7 @@ func (b *Backend) mirrorDeleted(obj any) {
 			return
 		}
 	}
+	b.forgetProbes(m)
 	g := b.guestFor(m)
 	if g == nil {
 		return
@@ -143,6 +181,15 @@ func (b *Backend) mirrorDeleted(obj any) {
 	}
 	b.emit(TerminalStatus(g, m, ReasonGuestDeleted))
 	go b.finishGuestDeletion(context.Background(), g)
+}
+
+// forgetProbes drops the prober's state for the guest of a deleted mirror, found from the mirror
+// alone: the guest may be gone too.
+func (b *Backend) forgetProbes(mirrorPod *corev1.Pod) {
+	if b.opts.Prober != nil {
+		uid := types.UID(mirrorPod.Labels[LabelMirrorOf])
+		b.opts.Prober.Forget(uid, mirrorPod.Namespace, mirrorPod.Annotations[AnnotationGuestName])
+	}
 }
 
 // finishGuestDeletion removes a guest whose containers have stopped, as the real kubelet's
@@ -195,7 +242,7 @@ func (b *Backend) Get(namespace, name string) (*corev1.Pod, error) {
 	if !ok {
 		return nil, errdefs.NotFoundf("no mirror for guest %s/%s", namespace, name)
 	}
-	return TranslateStatus(g, m), nil
+	return b.translate(g, m), nil
 }
 
 // List returns every guest that has a mirror. At startup the library deletes any of these
@@ -208,7 +255,7 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 	var out []*corev1.Pod
 	for _, m := range ms {
 		if g := b.guestFor(m); g != nil {
-			out = append(out, TranslateStatus(g, m))
+			out = append(out, b.translate(g, m))
 		}
 	}
 	return out, nil
@@ -240,7 +287,7 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 			return err
 		}
 	}
-	b.emit(TranslateStatus(guest, m))
+	b.emit(b.translate(guest, m))
 	return nil
 }
 
