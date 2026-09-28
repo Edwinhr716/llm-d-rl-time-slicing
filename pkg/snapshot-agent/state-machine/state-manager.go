@@ -116,6 +116,10 @@ type StateManager struct {
 	// reportResumed selects the outcome of a successful Resume:
 	// OUTCOME_RESUMED when true, OUTCOME_UNSPECIFIED when false.
 	reportResumed bool
+	// unknownJobSuspend is the unknown-job Suspend policy
+	// (UnknownJobSuspendReleased or UnknownJobSuspendPrecondition); see
+	// WithUnknownJobSuspend.
+	unknownJobSuspend string
 }
 
 // Option configures a StateManager.
@@ -135,10 +139,11 @@ func WithReportResumedOutcome(report bool) Option {
 // NewStateManager creates a new StateManager instance.
 func NewStateManager(opts ...Option) *StateManager {
 	sm := &StateManager{
-		jobs:          make(map[string]*Job),
-		operations:    make(map[string]*Operation),
-		now:           time.Now,
-		reportResumed: true,
+		jobs:              make(map[string]*Job),
+		operations:        make(map[string]*Operation),
+		now:               time.Now,
+		reportResumed:     true,
+		unknownJobSuspend: UnknownJobSuspendReleased,
 	}
 	for _, opt := range opts {
 		opt(sm)

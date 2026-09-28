@@ -111,7 +111,9 @@ func ErrorReasonOf(err error) pb.ErrorReason {
 //   - Suspend runs the worker from RUNNING, SAVED, SUSPENDED and IDLE (the
 //     worker reports RELEASED when no process is left). It completes at
 //     once with RELEASED for an unknown job or an IDLE job whose last
-//     outcome is KILLED.
+//     outcome is KILLED. With WithUnknownJobSuspend(
+//     UnknownJobSuspendPrecondition) a Suspend of an unknown job is refused
+//     with FAILED_PRECONDITION instead.
 //   - Resume runs the worker from SAVED and SUSPENDED and completes at once
 //     from RUNNING.
 //   - Anything else is refused with FAILED_PRECONDITION, and a running
@@ -141,9 +143,10 @@ func (sm *StateManager) StartGuestOp(
 			return "", refuse(codes.FailedPrecondition, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
 				"cannot resume job %s: the job is unknown to this agent", jobID)
 		}
-		op := sm.newCompletedOpLocked(jobID, intent, pb.Outcome_OUTCOME_RELEASED)
-		op.Epoch = epoch
-		return op.ID, nil
+		if sm.unknownJobSuspend == UnknownJobSuspendPrecondition {
+			return "", refuseUnknownSuspend(jobID)
+		}
+		return sm.releaseUnknownLocked(jobID, epoch), nil
 	}
 
 	job.mu.Lock()
