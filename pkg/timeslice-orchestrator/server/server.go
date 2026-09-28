@@ -54,6 +54,13 @@ type Server struct {
 	minBubble      time.Duration
 	noticeWindow   time.Duration
 	killBudget     time.Duration
+
+	// hostAcks makes the foreground wait for every host's vacate ack (D-NS-4
+	// hybrid). See WithHostAcks.
+	hostAcks bool
+	// immediateStop makes StartServer stop without waiting for RPCs in
+	// flight. See WithImmediateStop.
+	immediateStop bool
 }
 
 // BackgroundProtocolVersion is the value of GroupStatus.background_protocol
@@ -140,6 +147,26 @@ func WithNoticeTiming(noticeWindow, killBudget time.Duration) Option {
 		if killBudget > 0 {
 			s.killBudget = killBudget
 		}
+	}
+}
+
+// WithHostAcks makes a foreground Acquire wait, beyond the background grants
+// and claims, until every host of the running notice has acked its vacate
+// command (PENDING LEAD DECISION D-NS-4, option hybrid). Off (the default)
+// keeps the pull protocol's rule.
+func WithHostAcks(enabled bool) Option {
+	return func(s *Server) {
+		s.hostAcks = enabled
+	}
+}
+
+// WithImmediateStop makes StartServer stop the gRPC server without waiting
+// for RPCs in flight, as a crashed process would. The evaluation wiring uses
+// it to restart the orchestrator while Acquire calls block; the binary never
+// sets it.
+func WithImmediateStop(enabled bool) Option {
+	return func(s *Server) {
+		s.immediateStop = enabled
 	}
 }
 
@@ -250,6 +277,8 @@ func (s *Server) defaultCheckAcquire(
 		// The accelerator is back with the foreground: any notice is over.
 		group.Spec().ClearNotice()
 		slog.InfoContext(ctx, "Acquire succeeded, job loaded and lock held")
+		slog.InfoContext(ctx, "Foreground granted",
+			"group", groupID, "job", jobID, "waited_ms", time.Since(startTime).Milliseconds())
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
 			Success:         true,
@@ -624,8 +653,13 @@ func StartServer(
 			return err
 		}
 	case <-ctx.Done():
-		slog.InfoContext(ctx, "Context canceled, shutting down servers gracefully")
-		s.GracefulStop()
+		if orchServer.immediateStop {
+			slog.InfoContext(ctx, "Context canceled, stopping servers immediately")
+			s.Stop()
+		} else {
+			slog.InfoContext(ctx, "Context canceled, shutting down servers gracefully")
+			s.GracefulStop()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			slog.ErrorContext(ctx, "HTTP metrics server shutdown error", "error", err)

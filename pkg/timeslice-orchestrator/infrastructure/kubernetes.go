@@ -86,6 +86,22 @@ func (k *KubernetesOrchestrator) Init(ctx context.Context) error {
 	return nil
 }
 
+// NodeAddress returns the InternalIP of the named node, or the name itself
+// when the node is unknown or has no InternalIP. The host command client dials
+// it (D-NS-4 hybrid).
+func (k *KubernetesOrchestrator) NodeAddress(name string) string {
+	node, err := k.nodeLister.Get(name)
+	if err != nil {
+		return name
+	}
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+			return addr.Address
+		}
+	}
+	return name
+}
+
 // getNodesForGroup returns the names of the nodes that belong to the given group.
 func (k *KubernetesOrchestrator) getNodesForGroup(groupID string) ([]string, error) {
 	selector := labels.SelectorFromSet(labels.Set{NodeLabelPrefix + groupID: "true"})

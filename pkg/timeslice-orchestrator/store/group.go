@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -47,6 +48,23 @@ type GroupSpec struct {
 	// noticeAt is when the current notice to the background started. Zero
 	// when no notice runs.
 	noticeAt time.Time
+
+	// The fields below are the host command barrier (D-NS-4 hybrid). They
+	// are used only when the orchestrator pushes vacate commands to the
+	// hosts; without host commands they are recorded but never read.
+	//
+	// noticeEpoch is the epoch of the current notice's vacate command, taken
+	// from the notice start time. Zero when no notice runs.
+	noticeEpoch int64
+	// noticeHosts are the nodes that held a grant or a claim when the notice
+	// started. Each must ack the notice's vacate before the foreground is
+	// granted, even if it yields in the meantime.
+	noticeHosts map[string]bool
+	// acked records, per node, the notice epoch the node last acked vacated.
+	acked map[string]int64
+	// seen records the nodes whose participant this process has heard from
+	// (an Acquire or a status poll).
+	seen map[string]bool
 }
 
 // participant is the in-memory record of a node's background participant.
@@ -411,6 +429,10 @@ func (s *GroupSpec) Lend() bool {
 func (s *GroupSpec) RegisterParticipant(node, id string, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.registerLocked(node, id, now)
+}
+
+func (s *GroupSpec) registerLocked(node, id string, now time.Time) {
 	p, ok := s.participants[node]
 	if !ok {
 		p = &participant{}
@@ -419,6 +441,34 @@ func (s *GroupSpec) RegisterParticipant(node, id string, now time.Time) {
 	p.id = id
 	p.lastSeen = now
 	p.blocked = true
+	s.markSeenLocked(node)
+}
+
+// RegisterParticipantFirstClaim is RegisterParticipant for the host command
+// barrier (D-NS-4 hybrid). If this process has never heard from node's
+// participant, the participant may still hold a grant from an earlier
+// process (for example after an orchestrator restart), so it is registered
+// with a claim, as a first status poll would be (fail closed). The claim ends
+// with the host's vacate ack, a background Yield or a lend. It reports
+// whether a claim was registered.
+func (s *GroupSpec) RegisterParticipantFirstClaim(node, id string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, known := s.participants[node]
+	if known || s.seen[node] {
+		s.registerLocked(node, id, now)
+		return false
+	}
+	s.participants[node] = &participant{id: id, lastSeen: now, blocked: true, claimed: true}
+	s.markSeenLocked(node)
+	return true
+}
+
+func (s *GroupSpec) markSeenLocked(node string) {
+	if s.seen == nil {
+		s.seen = make(map[string]bool)
+	}
+	s.seen[node] = true
 }
 
 // UnregisterParticipant records that node's participant stopped waiting in
@@ -445,9 +495,16 @@ func (s *GroupSpec) UnregisterParticipant(node string) {
 func (s *GroupSpec) Touch(node, id string, now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.markSeenLocked(node)
 	if p, ok := s.participants[node]; ok {
 		p.id = id
 		p.lastSeen = now
+		return false
+	}
+	if !s.noticeAt.IsZero() && s.noticeEpoch != 0 && s.acked[node] == s.noticeEpoch {
+		// The node acked this notice's vacate, and nothing is lent while a
+		// notice runs, so it cannot hold a grant: no claim.
+		s.participants[node] = &participant{id: id, lastSeen: now}
 		return false
 	}
 	s.participants[node] = &participant{id: id, lastSeen: now, claimed: true}
@@ -520,6 +577,13 @@ func (s *GroupSpec) EnsureNotice(now time.Time) time.Time {
 	defer s.mu.Unlock()
 	if s.noticeAt.IsZero() {
 		s.noticeAt = now
+		s.noticeEpoch = now.UnixNano()
+		s.noticeHosts = make(map[string]bool)
+		for node, p := range s.participants {
+			if p.holds() {
+				s.noticeHosts[node] = true
+			}
+		}
 	}
 	return s.noticeAt
 }
@@ -529,6 +593,83 @@ func (s *GroupSpec) ClearNotice() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.noticeAt = time.Time{}
+	s.noticeEpoch = 0
+	s.noticeHosts = nil
+	s.acked = nil
+}
+
+// NoticeEpoch returns the epoch of the current notice's vacate command, or
+// zero when no notice runs.
+func (s *GroupSpec) NoticeEpoch() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.noticeEpoch
+}
+
+// PendingAcks returns, sorted, the nodes that must still ack the current
+// notice's vacate: those that held a grant or a claim when the notice started
+// and those that hold one now, minus those that acked this notice. It is
+// empty when no notice runs.
+func (s *GroupSpec) PendingAcks() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.noticeAt.IsZero() {
+		return nil
+	}
+	need := make(map[string]bool, len(s.noticeHosts))
+	for node := range s.noticeHosts {
+		need[node] = true
+	}
+	for node, p := range s.participants {
+		if p.holds() {
+			need[node] = true
+		}
+	}
+	var pending []string
+	for node := range need {
+		if s.acked[node] != s.noticeEpoch {
+			pending = append(pending, node)
+		}
+	}
+	sort.Strings(pending)
+	return pending
+}
+
+// AckVacate records that node acked the vacate of the notice with the given
+// epoch: its guests are suspended, so its grant or claim ends. The
+// participant record is kept, so its next status poll is not a claim. It
+// reports false, and changes nothing, when no notice runs or epoch is not the
+// current notice's (a late ack from an earlier cycle).
+func (s *GroupSpec) AckVacate(node string, epoch int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.noticeAt.IsZero() || epoch == 0 || epoch != s.noticeEpoch {
+		return false
+	}
+	if s.acked == nil {
+		s.acked = make(map[string]int64)
+	}
+	s.acked[node] = epoch
+	if p, ok := s.participants[node]; ok {
+		p.granted = false
+		p.claimed = false
+	}
+	return true
+}
+
+// LendableParticipants returns, sorted, the nodes whose participant waits in
+// Acquire(ROLE_BACKGROUND) or holds a claim, and is not yet granted.
+func (s *GroupSpec) LendableParticipants() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var nodes []string
+	for node, p := range s.participants {
+		if !p.granted && (p.blocked || p.claimed) {
+			nodes = append(nodes, node)
+		}
+	}
+	sort.Strings(nodes)
+	return nodes
 }
 
 // NoticeAt returns when the current notice started, or zero.

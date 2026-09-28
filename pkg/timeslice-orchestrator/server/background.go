@@ -81,7 +81,13 @@ func (s *Server) acquireBackground(
 	}
 
 	spec := group.Spec()
-	spec.RegisterParticipant(node, jobID, time.Now())
+	if !s.hostAcks {
+		spec.RegisterParticipant(node, jobID, time.Now())
+	} else if spec.RegisterParticipantFirstClaim(node, jobID, time.Now()) {
+		// D-NS-4 hybrid: a host this process never heard from may hold a
+		// grant from an earlier process, whichever RPC it sends first.
+		slog.InfoContext(ctx, "Unknown background participant registered with a claim", "node", node)
+	}
 	if s.ctrl != nil {
 		s.ctrl.EnqueueWork(group.ID())
 	}
@@ -167,10 +173,14 @@ func (s *Server) touchParticipant(ctx context.Context, group *store.Group, parti
 // startNoticeIfBackgroundHeld starts a notice when a background participant
 // holds a grant or a claim, and reports whether one does. A notice already
 // running keeps its start time.
+//
+// With host acks (D-NS-4 hybrid) it also reports true while a host has not
+// acked the running notice's vacate, even if that host already yielded: the
+// foreground is granted only after every ack.
 func (s *Server) startNoticeIfBackgroundHeld(ctx context.Context, group *store.Group) bool {
 	spec := group.Spec()
 	if !spec.BackgroundHeld() {
-		return false
+		return s.hostAcks && len(spec.PendingAcks()) > 0
 	}
 	now := time.Now()
 	if noticeAt := spec.EnsureNotice(now); noticeAt.Equal(now) {

@@ -136,6 +136,9 @@ type Controller struct {
 
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
+
+	// hostPush is the host command push (D-NS-4 hybrid). Nil when disabled.
+	hostPush *hostPush
 }
 
 // settleEntry remembers when a group's active job was first seen holding an
@@ -285,8 +288,30 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		return err
 	}
 
+	if c.hostPush != nil && c.reconcileHostCommands(ctx, group) {
+		// Fail closed: background guests may be on the accelerator, or a host
+		// has not acked the notice. Promote nothing and restore nothing; a
+		// host ack requeues the group. A lend may still offload, since that
+		// only takes context off the accelerator.
+		if c.lendPending(group) {
+			group.Spec().SetActiveJob("")
+			for _, node := range group.Status().Nodes() {
+				if err := c.reconcileNode(ctx, group.ID(), node, ""); err != nil {
+					return fmt.Errorf("failed to offload node %s for a lend: %w", node, err)
+				}
+			}
+		}
+		c.reconcileLend(ctx, group)
+		return c.updateGroupStatus(ctx, group)
+	}
+
 	if _, err := group.Spec().TryPromote(ctx); err != nil {
 		return fmt.Errorf("failed to promote next job: %w", err)
+	}
+
+	if c.hostPush != nil && c.lendPending(group) {
+		// Lending: offload every job's context before any host is granted.
+		group.Spec().SetActiveJob("")
 	}
 
 	activeJob := group.Spec().ActiveJob()
@@ -297,6 +322,10 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		if err := c.reconcileNode(ctx, group.ID(), node, activeJob); err != nil {
 			return fmt.Errorf("failed to reconcile node %s: %w", node, err)
 		}
+	}
+
+	if c.hostPush != nil {
+		c.reconcileLend(ctx, group)
 	}
 
 	// 4. Update Status
