@@ -7,9 +7,9 @@ CONTEXT ?= YOUR_KUBE_CONTEXT
 KUBECTL := kubectl --context $(CONTEXT)
 HOST    ?= YOUR_GPU_NODE
 VNODE   ?= vk-$(lastword $(subst -, ,$(HOST)))
-SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|'
+SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|' -e 's|__VK_NODE__|$(VNODE)|g'
 
-.PHONY: build deploy test-guest gpu-guest status undeploy
+.PHONY: build deploy node-guard test-guest gpu-guest status undeploy
 
 build: ## vet, test, build and push the image remotely
 	gcloud builds submit --project=$(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
@@ -17,6 +17,9 @@ build: ## vet, test, build and push the image remotely
 deploy: ## namespace, RBAC, Deployment (image tag = TAG)
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
 	$(SUBST) deploy/deployment.yaml | $(KUBECTL) apply -f -
+
+node-guard: ## D-VK-2 option d: delete policy for the virtual Node plus the donor-controller stand-in
+	for f in deploy/opt-d/*.yaml; do $(SUBST) $$f | $(KUBECTL) apply -f - || exit 1; done
 
 test-guest: ## step one: CPU-only guest and a Service selecting it
 	$(SUBST) deploy/test-guest.yaml | $(KUBECTL) apply -f -
@@ -32,6 +35,7 @@ status:
 
 undeploy: ## namespace first (guests, then mirrors via ownerRef), then cluster-scoped objects
 	-$(KUBECTL) delete ns guest-kubelet-proto --wait=true
+	-for f in deploy/opt-d/*.yaml; do $(SUBST) $$f | $(KUBECTL) delete --ignore-not-found -f -; done
 	-$(KUBECTL) delete node $(VNODE)
 	-$(KUBECTL) -n kube-node-lease delete lease $(VNODE)
 	-$(KUBECTL) delete clusterrole,clusterrolebinding guest-kubelet-proto
