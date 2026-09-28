@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
@@ -107,6 +108,13 @@ func TestNewNodeSpec(t *testing.T) {
 	})
 	if n.Labels[VirtualNodeLabel] != "true" || n.Labels["type"] != "virtual-kubelet" {
 		t.Errorf("labels: %v", n.Labels)
+	}
+	// The group labels belong to the real node only; an orchestrator must never see the
+	// virtual Node as a member of a group.
+	for l := range n.Labels {
+		if strings.HasPrefix(l, "group.timeslice.io/") || l == "timeslice.io/group" || l == "timeslice.io/donor" {
+			t.Errorf("the virtual node must not have group label %s", l)
+		}
 	}
 	for _, l := range []string{"cloud.google.com/gke-nodepool", "kubernetes.io/os"} {
 		if _, ok := n.Labels[l]; ok {

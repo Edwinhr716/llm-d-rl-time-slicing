@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
 
@@ -216,6 +217,25 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	defer eb.Shutdown()
 	recorder := provider.GuestOnlyRecorder{
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
+	}
+
+	// The host node's labels name the group. Resolved at start and on every label
+	// change; while there is none, no mirror is created and the VK Node gets GroupUnresolved.
+	vkNodeRef := &corev1.ObjectReference{Kind: "Node", Name: o.nodeName, UID: types.UID(o.nodeName)}
+	resolver := group.NewResolver(o.hostNode, os.Stderr)
+	resolver.OnChange = func(res group.Result) {
+		if _, ok := res.Group(); !ok {
+			recorder.Eventf(vkNodeRef, corev1.EventTypeWarning, group.EventGroupUnresolved,
+				"host node %s resolves to no group (%s); no mirror will be created", o.hostNode, res.Reason)
+		}
+	}
+	if err := resolver.Start(ctx, client); err != nil {
+		return err
+	}
+	mopts.Group = resolver.Current
+	mopts.OnUnresolved = func(guest *corev1.Pod, reason string) {
+		recorder.Eventf(vkNodeRef, corev1.EventTypeWarning, group.EventGroupUnresolved,
+			"no mirror for guest %s/%s: host node %s resolves to no group (%s)", guest.Namespace, guest.Name, o.hostNode, reason)
 	}
 
 	var backend *mirror.Backend

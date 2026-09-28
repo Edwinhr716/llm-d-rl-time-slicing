@@ -1,0 +1,15 @@
+# The two labels a donor controller writes on a node when a donor pod lands there. Until that
+# controller exists they are applied by hand, as a merge patch:
+#
+#   sed -e "s|__HOST__|<node>|" -e "s|__GROUP__|<namespace>.<job-id>.<worker group>|" \
+#     deploy/host-labels.yaml | kubectl patch node <node> --type=merge --patch-file=/dev/stdin
+#
+# __GROUP__ is the donor pods' timeslice.io/group value, verbatim (at most 63 characters).
+# A node that still carries group.timeslice.io/<group>=true keeps working as long as both forms
+# name the same group; if they differ, the node is in no group.
+# Remove with: kubectl label node <node> timeslice.io/donor- timeslice.io/group-
+metadata:
+  name: __HOST__
+  labels:
+    timeslice.io/donor: "true"
+    timeslice.io/group: "__GROUP__"

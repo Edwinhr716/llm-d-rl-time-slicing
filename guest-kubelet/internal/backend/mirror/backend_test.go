@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,8 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
 type harness struct {
@@ -262,5 +265,81 @@ func TestGuestRemovedWhenMirrorStops(t *testing.T) {
 	h.b.finishGuestDeletion(context.Background(), g)
 	if _, err := h.client.CoreV1().Pods("ns").Get(context.Background(), "vllm", metav1.GetOptions{}); err == nil {
 		t.Error("guest should be deleted once its mirror is gone")
+	}
+}
+
+// The mirror carries the host node's group and is refused while there is none.
+
+func TestBuildSetsGroupLabel(t *testing.T) {
+	cfg := testConfig()
+	cfg.Group = "team-a.rc-1.trainers"
+	m, err := Build(testGuest(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Labels[LabelGroup] != "team-a.rc-1.trainers" || m.Labels[LabelMirrorOf] != "guest-uid" {
+		t.Errorf("labels: %v", m.Labels)
+	}
+	cfg.Group = ""
+	m, err = Build(testGuest(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Labels[LabelGroup]; ok {
+		t.Errorf("no group: want no %s label, got %v", LabelGroup, m.Labels)
+	}
+}
+
+func TestCreateRefusedWhileGroupUnresolved(t *testing.T) {
+	res := group.Result{Reason: group.ReasonGroupWithoutDonor}
+	var refused []string
+	opts := testOptions()
+	opts.Group = func() group.Result { return res }
+	opts.OnUnresolved = func(g *corev1.Pod, reason string) { refused = append(refused, g.Name+":"+reason) }
+	h := newHarness(t, opts)
+	g := cpuGuest("g1")
+	h.addGuest(g)
+
+	err := h.b.Create(context.Background(), g)
+	if !errors.Is(err, ErrGroupUnresolved) {
+		t.Fatalf("want ErrGroupUnresolved, got %v", err)
+	}
+	if h.mirror("vllm-m") != nil {
+		t.Fatal("no mirror may exist while the group is unresolved")
+	}
+	if len(refused) != 1 || refused[0] != "vllm:"+group.ReasonGroupWithoutDonor {
+		t.Errorf("OnUnresolved calls: %v", refused)
+	}
+
+	// The donor controller finishes writing the pair; the library's retry now succeeds.
+	res = group.Result{Groups: []string{"team-a.rc-1.trainers"}, Reason: group.ReasonOK}
+	if err := h.b.Create(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mirror("vllm-m"); m == nil || m.Labels[LabelGroup] != "team-a.rc-1.trainers" {
+		t.Fatalf("mirror with group label expected, got %v", m)
+	}
+}
+
+func TestReadoptionRefreshesGroupLabel(t *testing.T) {
+	cfg := testOptions().Config
+	cfg.Group = "old.rc-0.trainers"
+	orphan, err := Build(cpuGuest("old-uid"), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan.UID = "mirror-uid"
+	orphan.Status.Phase = corev1.PodRunning
+	opts := testOptions()
+	newGroup := group.Result{Groups: []string{"new.rc-1.trainers"}, Reason: group.ReasonOK}
+	opts.Group = func() group.Result { return newGroup }
+	h := newHarness(t, opts, orphan)
+	g := cpuGuest("new-uid")
+	h.addGuest(g)
+	if err := h.b.Create(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mirror("vllm-m"); m.UID != "mirror-uid" || m.Labels[LabelGroup] != "new.rc-1.trainers" {
+		t.Errorf("adopted mirror: uid=%s group=%s", m.UID, m.Labels[LabelGroup])
 	}
 }

@@ -13,6 +13,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
 const (
@@ -21,6 +23,8 @@ const (
 	// LabelMirrorNode holds the virtual node's name. The backend's informer selects on it,
 	// so two guest kubelets never adopt each other's mirrors.
 	LabelMirrorNode = "timeslice.io/mirror-node"
+	// LabelGroup holds the group the real node yields to, as read from the node's labels.
+	LabelGroup = group.LabelGroup
 	// AnnotationGuestName is the guest pod's name (labels cannot hold every pod name).
 	AnnotationGuestName = "timeslice.io/guest-name"
 	// AnnotationGuestSpecHash is a hash of the guest's containers. A guest re-created with the
@@ -58,6 +62,9 @@ type Config struct {
 	// mirror. With false, the mirror outlives a guest that is force-deleted (for example after
 	// the virtual Node is deleted) and a guest re-created with the same name re-adopts it.
 	OwnerRef bool
+	// Group is the group the real node yields to (internal/group). When set, the mirror
+	// carries it as LabelGroup. The backend sets it per create from the host node's labels.
+	Group string
 }
 
 // Name returns the mirror's name for a guest.
@@ -165,7 +172,15 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 	if cfg.OwnerRef {
 		m.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
 	}
-	return m, nil
+	return withGroup(m, cfg.Group), nil
+}
+
+// withGroup labels the mirror with the real node's group, if there is one.
+func withGroup(mirror *corev1.Pod, grp string) *corev1.Pod {
+	if grp != "" {
+		mirror.Labels[LabelGroup] = grp
+	}
+	return mirror
 }
 
 // OwnerRef is the reference from a mirror to its guest. blockOwnerDeletion is left unset: it
