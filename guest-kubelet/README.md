@@ -26,6 +26,12 @@ kubelet for the guest pods scheduled onto it.
 - `--mirror-owner-ref=false` lets mirrors outlive guests that were force-deleted after a Node
   deletion. A guest re-created with the same name and the same containers re-adopts the mirror
   (same UID and IP). Orphans are deleted after `--orphan-grace`.
+- Every mirror carries `timeslice.io/job-id=<guest UID>-<attempt>`.
+  `--mirror-identity` (pending decision) picks what a restarted guest kubelet
+  does with the mirrors it finds: `readopt` (default) keeps them and their job
+  id; `incarnation` marks the guest NotReady, deletes each mirror with normal
+  grace and, once it is gone, creates a new one with the next attempt. With
+  `incarnation`, orphans are never re-adopted.
 - Not yet: probes (a guest is Ready when its container starts), logs/exec (use `kubectl logs
   <guest>-m`), stats.
 

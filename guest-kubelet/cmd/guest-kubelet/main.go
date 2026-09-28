@@ -51,6 +51,7 @@ type options struct {
 	reserveClaim             bool
 	mirrorOwnerRef           bool
 	orphanGrace              time.Duration
+	mirrorIdentity           string
 
 	// M1: surviving an outage
 	providerIDFromHost bool
@@ -81,6 +82,10 @@ func main() {
 	flag.BoolVar(&o.reserveClaim, "reserve-claim", false, "add GPU mirrors to the claim's status.reservedFor (kube-controller-manager also does it)")
 	flag.BoolVar(&o.mirrorOwnerRef, "mirror-owner-ref", true, "make the guest the mirror's owner (false: mirrors survive guest force-deletion and can be re-adopted)")
 	flag.DurationVar(&o.orphanGrace, "orphan-grace", 10*time.Minute, "how long a mirror without a guest is kept for re-adoption")
+	// PENDING LEAD DECISION D-VK-6. readopt is today's behaviour.
+	flag.StringVar(&o.mirrorIdentity, "mirror-identity", string(mirror.IdentityReadopt),
+		"after a restart: readopt (keep the mirrors found and their job id) or incarnation "+
+			"(delete them with normal grace, then create new ones with the next job-id attempt)")
 
 	// Off by default: GKE's ValidatingAdmissionPolicy validate-node-providerid denies a Node
 	// whose providerID does not end in "/<node name>", so on GKE this flag makes the Node
@@ -196,6 +201,9 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey, OwnerRef: o.mirrorOwnerRef,
 		},
 		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
+	}
+	if mopts.Identity, err = mirror.ParseIdentity(o.mirrorIdentity); err != nil {
+		return err
 	}
 	if mopts.CPUHeadroom, err = resource.ParseQuantity(o.cpuHeadroom); err != nil {
 		return fmt.Errorf("--mirror-cpu-headroom: %w", err)

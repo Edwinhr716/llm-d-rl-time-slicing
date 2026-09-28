@@ -37,6 +37,14 @@ func (h *harness) emittedPods() []*corev1.Pod {
 
 func newHarness(t *testing.T, opts Options, objs ...runtime.Object) *harness {
 	t.Helper()
+	h := buildHarness(t, &opts, objs...)
+	h.start()
+	return h
+}
+
+// buildHarness is newHarness without Start, so a test can put guests in the lister first.
+func buildHarness(t *testing.T, opts *Options, objs ...runtime.Object) *harness {
+	t.Helper()
 	client := fake.NewClientset(objs...)
 	// The API server sets UIDs; the fake does not.
 	client.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
@@ -48,18 +56,22 @@ func newHarness(t *testing.T, opts Options, objs ...runtime.Object) *harness {
 	})
 	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	h := &harness{t: t, client: client, guests: idx}
-	h.b = New(client, corev1listers.NewPodLister(idx), opts)
+	h.b = New(client, corev1listers.NewPodLister(idx), *opts)
 	h.b.SetStatusCallback(func(p *corev1.Pod) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		h.emitted = append(h.emitted, p)
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	if err := h.b.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
 	return h
+}
+
+func (h *harness) start() {
+	h.t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	h.t.Cleanup(cancel)
+	if err := h.b.Start(ctx); err != nil {
+		h.t.Fatal(err)
+	}
 }
 
 func testOptions() Options {
