@@ -116,6 +116,10 @@ type StateManager struct {
 	// reportResumed selects the outcome of a successful Resume:
 	// OUTCOME_RESUMED when true, OUTCOME_UNSPECIFIED when false.
 	reportResumed bool
+	// epochOnRefusal selects whether a guest call refused after fencing
+	// still raises the job's last epoch: EpochOnRefusalRaise or
+	// EpochOnRefusalAcceptedOnly.
+	epochOnRefusal string
 }
 
 // Option configures a StateManager.
@@ -132,13 +136,53 @@ func WithReportResumedOutcome(report bool) Option {
 	}
 }
 
+// Values of WithEpochOnRefusal and the --epoch-on-refusal flag.
+const (
+	// EpochOnRefusalRaise raises the job's last epoch for every call that
+	// passes fencing, even when the call is then refused (the default).
+	EpochOnRefusalRaise = "raise"
+	// EpochOnRefusalAcceptedOnly raises it only for a call that returns an
+	// operation ID.
+	EpochOnRefusalAcceptedOnly = "accepted-only"
+)
+
+// ValidEpochOnRefusal reports whether mode is a value WithEpochOnRefusal
+// accepts.
+func ValidEpochOnRefusal(mode string) bool {
+	return mode == EpochOnRefusalRaise || mode == EpochOnRefusalAcceptedOnly
+}
+
+// WithEpochOnRefusal selects whether a Suspend or Resume that passes epoch
+// fencing but is then refused (FAILED_PRECONDITION for the job state,
+// DEADLINE_INFEASIBLE, or Aborted because a Kill, Snapshot or Restore runs)
+// still raises the job's last epoch:
+//   - EpochOnRefusalRaise (default): it does;
+//   - EpochOnRefusalAcceptedOnly: only a call that returns an operation ID
+//     (a started worker or an immediate answer) raises it.
+//
+// A STALE_EPOCH refusal never moves the epoch, and SeedEpoch raises it in
+// both modes. Any other value behaves as EpochOnRefusalRaise; callers
+// validate the value with ValidEpochOnRefusal first.
+//
+// PENDING LEAD DECISION (D-AGENT-6): the default raises the epoch.
+func WithEpochOnRefusal(mode string) Option {
+	return func(sm *StateManager) {
+		if ValidEpochOnRefusal(mode) {
+			sm.epochOnRefusal = mode
+		} else {
+			sm.epochOnRefusal = EpochOnRefusalRaise
+		}
+	}
+}
+
 // NewStateManager creates a new StateManager instance.
 func NewStateManager(opts ...Option) *StateManager {
 	sm := &StateManager{
-		jobs:          make(map[string]*Job),
-		operations:    make(map[string]*Operation),
-		now:           time.Now,
-		reportResumed: true,
+		jobs:           make(map[string]*Job),
+		operations:     make(map[string]*Operation),
+		now:            time.Now,
+		reportResumed:  true,
+		epochOnRefusal: EpochOnRefusalRaise,
 	}
 	for _, opt := range opts {
 		opt(sm)

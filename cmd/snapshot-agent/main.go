@@ -49,7 +49,18 @@ func main() {
 	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
 	reportResumed := flag.Bool("report-resumed-outcome", true,
 		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
+	// PENDING LEAD DECISION (D-AGENT-6): the default raises the stored epoch
+	// for a call refused after fencing; "accepted-only" raises it only for
+	// an accepted call.
+	epochOnRefusal := flag.String("epoch-on-refusal", statemachine.EpochOnRefusalRaise,
+		"Whether a Suspend or Resume refused after epoch fencing raises the stored epoch: "+
+			"'raise' or 'accepted-only' (pending decision)")
 	flag.Parse()
+
+	if !statemachine.ValidEpochOnRefusal(*epochOnRefusal) {
+		slog.Error("Invalid --epoch-on-refusal, must be 'raise' or 'accepted-only'", "value", *epochOnRefusal)
+		os.Exit(1)
+	}
 
 	depMode := *deploymentMode
 	if envDepMode := os.Getenv("DEPLOYMENT_MODE"); envDepMode != "" {
@@ -162,10 +173,12 @@ func main() {
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed)
+		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed,
+		"epochOnRefusal", *epochOnRefusal)
 	err = server.StartServer(
 		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
-		statemachine.WithReportResumedOutcome(*reportResumed))
+		statemachine.WithReportResumedOutcome(*reportResumed),
+		statemachine.WithEpochOnRefusal(*epochOnRefusal))
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)

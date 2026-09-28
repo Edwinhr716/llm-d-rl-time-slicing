@@ -160,15 +160,42 @@ func (sm *StateManager) StartGuestOp(
 		return "", refuse(codes.FailedPrecondition, pb.ErrorReason_STALE_EPOCH,
 			"%s of job %s: epoch %d was already used for %s", intent, jobID, epoch, rec.Type)
 	}
-	// The epoch is used from here on even if the call is refused below: the
-	// caller wrote it on the mirror before calling, and any lower call is
-	// late.
-	job.LastEpoch = epoch
 
+	var (
+		opID string
+		err  error
+	)
 	if job.current != nil {
-		return sm.preemptLocked(job, intent, epoch, deadline, worker)
+		opID, err = sm.preemptLocked(job, intent, epoch, deadline, worker)
+	} else {
+		opID, err = sm.answerByStateLocked(job, intent, epoch, deadline, worker)
 	}
-	return sm.answerByStateLocked(job, intent, epoch, deadline, worker)
+	sm.recordEpochLocked(job, intent, epoch, err)
+	return opID, err
+}
+
+// recordEpochLocked stores the epoch of a call that passed fencing, per
+// WithEpochOnRefusal. err is the call's refusal, nil when it was accepted.
+//   - EpochOnRefusalRaise: the epoch is stored even if the call was
+//     refused. The caller wrote it on the mirror before calling, and any
+//     lower call is late.
+//   - EpochOnRefusalAcceptedOnly: only an accepted call stores it.
+//
+// Nothing between fencing and this call reads LastEpoch, so storing it here
+// is the same as storing it right after fencing.
+//
+// PENDING LEAD DECISION (D-AGENT-6): the collapse keeps one branch.
+func (sm *StateManager) recordEpochLocked(job *Job, intent OpType, epoch int64, err error) {
+	raised := err == nil || sm.epochOnRefusal != EpochOnRefusalAcceptedOnly
+	if raised {
+		job.LastEpoch = epoch
+	}
+	if err != nil {
+		slog.Warn("Guest operation refused after epoch fencing",
+			"jobID", job.ID, "intent", intent, "state", job.State, "reason", ErrorReasonOf(err),
+			"code", status.Code(err), "epoch", epoch, "lastEpoch", job.LastEpoch, "epochRaised", raised,
+			"epochOnRefusal", sm.epochOnRefusal, "error", err)
+	}
 }
 
 // preemptLocked answers a guest call that passed fencing while the job has
