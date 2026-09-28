@@ -49,7 +49,16 @@ func main() {
 	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
 	reportResumed := flag.Bool("report-resumed-outcome", true,
 		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
+	// PENDING LEAD DECISION (D-AGENT-5): the default accepts epoch 0;
+	// "require" refuses a Suspend or Resume with epoch 0 with InvalidArgument.
+	epochZero := flag.String("epoch-zero", statemachine.EpochZeroAccept,
+		"Suspend or Resume with epoch 0: 'accept' fences it like any epoch, 'require' refuses it (pending decision)")
 	flag.Parse()
+
+	if !statemachine.ValidEpochZero(*epochZero) {
+		slog.Error("Invalid --epoch-zero, must be 'accept' or 'require'", "value", *epochZero)
+		os.Exit(1)
+	}
 
 	depMode := *deploymentMode
 	if envDepMode := os.Getenv("DEPLOYMENT_MODE"); envDepMode != "" {
@@ -162,10 +171,11 @@ func main() {
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed)
+		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed, "epochZero", *epochZero)
 	err = server.StartServer(
 		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
-		statemachine.WithReportResumedOutcome(*reportResumed))
+		statemachine.WithReportResumedOutcome(*reportResumed),
+		statemachine.WithEpochZero(*epochZero))
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)

@@ -116,6 +116,9 @@ type StateManager struct {
 	// reportResumed selects the outcome of a successful Resume:
 	// OUTCOME_RESUMED when true, OUTCOME_UNSPECIFIED when false.
 	reportResumed bool
+	// epochZero selects how a Suspend or Resume with epoch 0 is answered:
+	// EpochZeroAccept or EpochZeroRequire.
+	epochZero string
 }
 
 // Option configures a StateManager.
@@ -132,6 +135,41 @@ func WithReportResumedOutcome(report bool) Option {
 	}
 }
 
+// Values of WithEpochZero and the --epoch-zero flag.
+const (
+	// EpochZeroAccept fences epoch 0 like any other epoch (the default).
+	EpochZeroAccept = "accept"
+	// EpochZeroRequire refuses a Suspend or Resume with epoch 0 with
+	// InvalidArgument, before the job lookup and epoch fencing.
+	EpochZeroRequire = "require"
+)
+
+// ValidEpochZero reports whether mode is a value WithEpochZero accepts.
+func ValidEpochZero(mode string) bool {
+	return mode == EpochZeroAccept || mode == EpochZeroRequire
+}
+
+// WithEpochZero selects how a Suspend or Resume with epoch 0 (the proto
+// default when a caller never sets the field) is answered:
+//   - EpochZeroAccept (default): 0 is fenced like any other epoch;
+//   - EpochZeroRequire: the call is refused with InvalidArgument before
+//     the job lookup and fencing; it creates no operation and does not
+//     change the job's last epoch. Kill has no epoch and is unaffected.
+//
+// Any other value behaves as EpochZeroAccept; callers validate the value
+// with ValidEpochZero first.
+//
+// PENDING LEAD DECISION (D-AGENT-5): the default accepts epoch 0.
+func WithEpochZero(mode string) Option {
+	return func(sm *StateManager) {
+		if ValidEpochZero(mode) {
+			sm.epochZero = mode
+		} else {
+			sm.epochZero = EpochZeroAccept
+		}
+	}
+}
+
 // NewStateManager creates a new StateManager instance.
 func NewStateManager(opts ...Option) *StateManager {
 	sm := &StateManager{
@@ -139,6 +177,7 @@ func NewStateManager(opts ...Option) *StateManager {
 		operations:    make(map[string]*Operation),
 		now:           time.Now,
 		reportResumed: true,
+		epochZero:     EpochZeroAccept,
 	}
 	for _, opt := range opts {
 		opt(sm)

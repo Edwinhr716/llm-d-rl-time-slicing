@@ -130,6 +130,9 @@ func (sm *StateManager) StartGuestOp(
 		return "", refuse(codes.InvalidArgument, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
 			"%s of job %s: a deadline is required", intent, jobID)
 	}
+	if err := sm.checkEpochZero(jobID, intent, epoch); err != nil {
+		return "", err
+	}
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -169,6 +172,22 @@ func (sm *StateManager) StartGuestOp(
 		return sm.preemptLocked(job, intent, epoch, deadline, worker)
 	}
 	return sm.answerByStateLocked(job, intent, epoch, deadline, worker)
+}
+
+// checkEpochZero applies WithEpochZero. Under EpochZeroRequire a call with
+// epoch 0 is refused with InvalidArgument before the job lookup, so it
+// creates no operation (no RELEASED for an unknown job) and leaves the
+// job's last epoch unchanged. EpochZeroAccept lets it through to fencing.
+//
+// PENDING LEAD DECISION (D-AGENT-5): the collapse keeps one branch.
+func (sm *StateManager) checkEpochZero(jobID string, intent OpType, epoch int64) error {
+	if epoch != 0 || sm.epochZero != EpochZeroRequire {
+		return nil
+	}
+	slog.Warn("Refusing guest operation with epoch 0", "jobID", jobID, "intent", intent,
+		"epochZero", sm.epochZero)
+	return refuse(codes.InvalidArgument, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
+		"%s of job %s: epoch must be at least 1", intent, jobID)
 }
 
 // preemptLocked answers a guest call that passed fencing while the job has
