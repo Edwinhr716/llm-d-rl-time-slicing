@@ -29,6 +29,10 @@ const (
 	// operation. PENDING LEAD DECISION (Q13).
 	DefaultKillPollInterval = 100 * time.Millisecond
 
+	// DefaultBackgroundLiveness is L, how long a background participant that
+	// holds a grant or a claim may go without a status poll.
+	DefaultBackgroundLiveness = 3 * time.Second
+
 	// rateLimiterQPS and rateLimiterBurst are the overall bucket that
 	// client-go's default controller rate limiter also applies.
 	rateLimiterQPS   = 10
@@ -171,8 +175,25 @@ type Controller struct {
 	// KillPollInterval is how often WaitForKillOperation polls.
 	KillPollInterval time.Duration
 
+	// NoticeWindow (N) and KillBudget (K) set the vacate deadline of a
+	// notice to the background, T = start + N - K. They must match the
+	// server's --notice-window and --kill-budget.
+	NoticeWindow time.Duration
+	KillBudget   time.Duration
+
+	// BackgroundLiveness (L): a participant that holds a grant or a claim and
+	// has not been seen for this long loses the grant and its guests are
+	// killed.
+	BackgroundLiveness time.Duration
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
+
+	noticeMu sync.Mutex
+	notices  map[string]*noticeTrack
+
+	killMu sync.Mutex
+	kills  map[string]*killRecord
 }
 
 // settleEntry remembers when a group's active job was first seen holding an
@@ -191,15 +212,20 @@ func NewController(
 	agentStore store.SnapshotAgentStore,
 ) *Controller {
 	return &Controller{
-		queue:             queue,
-		groupStore:        groupStore,
-		jobStore:          jobStore,
-		infraOrchestrator: infraOrchestrator,
-		agentStore:        agentStore,
-		ResyncPeriod:      30 * time.Second,
-		SettleTimeout:     30 * time.Second,
-		KillPollInterval:  DefaultKillPollInterval,
-		settleSince:       make(map[string]settleEntry),
+		queue:              queue,
+		groupStore:         groupStore,
+		jobStore:           jobStore,
+		infraOrchestrator:  infraOrchestrator,
+		agentStore:         agentStore,
+		ResyncPeriod:       30 * time.Second,
+		SettleTimeout:      30 * time.Second,
+		KillPollInterval:   DefaultKillPollInterval,
+		NoticeWindow:       defaultNoticeWindow,
+		KillBudget:         defaultKillBudget,
+		BackgroundLiveness: DefaultBackgroundLiveness,
+		kills:              make(map[string]*killRecord),
+		settleSince:        make(map[string]settleEntry),
+		notices:            make(map[string]*noticeTrack),
 	}
 }
 
@@ -328,14 +354,41 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		return fmt.Errorf("failed to promote next job: %w", err)
 	}
 
+	// Background participant protocol: lend when the foreground left a
+	// bubble, and run the notice when the foreground wants the accelerator
+	// back while a node is busy. Kills (at T, on a FAULTED guest, and when a
+	// holding participant is unseen for L) run before the notice bookkeeping.
+	defer c.requeueDuringNotice(group)
+	lending := c.prepareLend(ctx, group)
+	if err := c.reconcileKills(ctx, group); err != nil {
+		return err
+	}
+	live, err := c.liveGuests(ctx, group.ID())
+	if err != nil {
+		return err
+	}
+	c.reconcileNotice(ctx, group, live)
+
 	activeJob := group.Spec().ActiveJob()
 
 	// 3. Act
 	// TODO: add optional fan out parallelism for node reconciliation
+	allGranted := true
 	for _, node := range group.Status().Nodes() {
 		if err := c.reconcileNode(ctx, group.ID(), node, activeJob); err != nil {
 			return fmt.Errorf("failed to reconcile node %s: %w", node, err)
 		}
+		if !lending {
+			continue
+		}
+		granted, err := c.grantIfVacant(ctx, group, node)
+		if err != nil {
+			return err
+		}
+		allGranted = allGranted && granted
+	}
+	if lending && allGranted {
+		group.Spec().SetLend(false)
 	}
 
 	// 4. Update Status
@@ -366,7 +419,7 @@ func (c *Controller) requeueWhileHolderWaits(ctx context.Context, groupID string
 	if holder == "" || group.Status().LoadedJob() == holder {
 		return
 	}
-	slog.DebugContext(ctx, "Lock holder is not loaded yet, requeueing", "holder", holder, "after", c.HolderWaitRequeue)
+	slog.DebugContext(ctx, "Lock holder is not loaded yet, requeuing", "holder", holder, "after", c.HolderWaitRequeue)
 	c.queue.AddAfter(groupID, c.HolderWaitRequeue)
 }
 
@@ -378,8 +431,13 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 		return fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
 	}
 
+	// Background guests are never snapshotted or restored by the controller:
+	// the node's background participant suspends and resumes them.
 	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
 	for _, job := range jobs {
+		if job.Background() {
+			continue
+		}
 		state, ok := job.ContextState()[nodeName]
 		if !ok {
 			state = pb.SnapshotAgentJobState_STATE_UNSPECIFIED
@@ -448,6 +506,18 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 	// 4. Ensure active job is loaded where there is available context
 	state, ok := agentJobStates[activeJobID]
 	if !ok || state != pb.SnapshotAgentJobState_STATE_SAVED {
+		return nil
+	}
+
+	// Guard (fail closed): never restore the foreground onto a node whose
+	// background participant holds a grant or a claim, or where a guest is
+	// still live.
+	busy, err := c.nodeBusy(ctx, groupID, nodeName)
+	if err != nil {
+		return err
+	}
+	if busy {
+		slog.InfoContext(ctx, "Restore held: the node is busy with the background", "jobID", activeJobID)
 		return nil
 	}
 
@@ -553,6 +623,9 @@ func (c *Controller) tryDeduceActiveJob(ctx context.Context, group *store.Group)
 
 	var loadedJob string
 	for _, job := range jobs {
+		if job.Background() {
+			continue
+		}
 		loaded, err := c.isJobLoaded(ctx, group, job.JobID())
 		if err != nil {
 			return fmt.Errorf("failed to check if job %s is loaded: %w", job.JobID(), err)
@@ -597,10 +670,26 @@ func (c *Controller) isJobLoaded(ctx context.Context, group *store.Group, jobID 
 		return false, nil
 	}
 
+	// Fail closed: nothing foreground is loaded while a node is busy with the
+	// background, or while a notice host has not been seen clear.
+	busy, err := c.anyNodeBusy(ctx, group)
+	if err != nil {
+		return false, err
+	}
+	if busy || c.noticeHostsPending(group) {
+		return false, nil
+	}
+
 	// Map of node -> jobID of the job running on it.
 	// If multiple jobs are running on the same node, we error out.
 	nodeRunningJob := make(map[string]string)
 	for _, job := range jobs {
+		if job.Background() {
+			if job.JobID() == jobID {
+				return false, nil
+			}
+			continue
+		}
 		for node, state := range job.ContextState() {
 			if state == pb.SnapshotAgentJobState_STATE_RUNNING {
 				if current, ok := nodeRunningJob[node]; ok && current != job.JobID() {
@@ -724,7 +813,7 @@ func (c *Controller) observeNodeJobContext(ctx context.Context, groupID, nodeNam
 
 	for _, js := range resp.JobStatuses {
 		// Only update if the job is known in this group
-		_, err := c.jobStore.Get(ctx, groupID, js.JobId)
+		job, err := c.jobStore.Get(ctx, groupID, js.JobId)
 		if errors.Is(err, store.ErrNotFound) {
 			continue
 		} else if err != nil {
@@ -734,6 +823,11 @@ func (c *Controller) observeNodeJobContext(ctx context.Context, groupID, nodeNam
 		state := translateJobState(js.State)
 		if err := c.jobStore.UpdateContextState(ctx, groupID, js.JobId, nodeName, state); err != nil {
 			return fmt.Errorf("failed to update job context state for job %s on node %s: %w", js.JobId, nodeName, err)
+		}
+		// A KILLED guest that still shows device memory is not vacated; the
+		// kill path treats it as an unconfirmed kill (unconfirmed_kill.go).
+		if job.Background() && js.GetLastOutcome() == agentpb.Outcome_OUTCOME_KILLED && js.GetDeviceBytes() == 0 {
+			job.SetKilled(nodeName, true)
 		}
 		slog.DebugContext(ctx, "Updated job context state", "job", js.JobId, "node", nodeName, "state", state)
 	}
@@ -752,6 +846,8 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 		return pb.SnapshotAgentJobState_STATE_SAVED
 	case agentpb.JobState_JOB_STATE_FAULTED:
 		return pb.SnapshotAgentJobState_STATE_FAULTED
+	case agentpb.JobState_JOB_STATE_SUSPENDED:
+		return pb.SnapshotAgentJobState_STATE_SUSPENDED
 	default:
 		return pb.SnapshotAgentJobState_STATE_UNSPECIFIED
 	}

@@ -97,6 +97,9 @@ func run() error {
 	killBudget := flag.Duration("kill-budget", server.DefaultKillBudget,
 		"Kill budget K reserved at the end of the notice window; guests must vacate by T = notice + N - K. "+
 			"PENDING LEAD DECISION.")
+	backgroundLiveness := flag.Duration("background-liveness", controller.DefaultBackgroundLiveness,
+		"Background liveness L: a background participant that holds a grant or a claim and has not polled "+
+			"GetGroupStatus for this long loses the grant and its guests are killed.")
 	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
 	// are proposals awaiting the lead's sign-off.
 	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
@@ -134,6 +137,9 @@ func run() error {
 	}
 	if *minBubble < 0 {
 		return fmt.Errorf("--min-bubble must not be negative, got %v", *minBubble)
+	}
+	if *backgroundLiveness <= 0 {
+		return fmt.Errorf("--background-liveness must be positive, got %v", *backgroundLiveness)
 	}
 	if *noticeWindow <= 0 || *killBudget <= 0 || *killBudget >= *noticeWindow {
 		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
@@ -217,6 +223,9 @@ func run() error {
 	ctrl.HolderWaitRequeue = *holderWaitRequeue
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 	ctrl.KillPollInterval = *killPollInterval
+	ctrl.NoticeWindow = *noticeWindow
+	ctrl.KillBudget = *killBudget
+	ctrl.BackgroundLiveness = *backgroundLiveness
 
 	// Start informers
 	informerFactories.Nodes.Start(ctx.Done())
@@ -255,6 +264,7 @@ func run() error {
 		"minBubble", *minBubble,
 		"noticeWindow", *noticeWindow,
 		"killBudget", *killBudget,
+		"backgroundLiveness", *backgroundLiveness,
 		"controllerWorkers", *controllerWorkers,
 		"agentRPCTimeout", *agentRPCTimeout,
 		"retryBaseDelay", *retryBaseDelay,

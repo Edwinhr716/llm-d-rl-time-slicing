@@ -107,6 +107,8 @@ func (q *recordingQueue) Add(g string) {
 }
 func (q *recordingQueue) AddRateLimited(g string) { q.Add(g) }
 
+func (q *recordingQueue) AddAfter(g string, _ time.Duration) { q.Add(g) }
+
 func (q *recordingQueue) Forget(string) {}
 
 func (q *recordingQueue) Done(string) {}

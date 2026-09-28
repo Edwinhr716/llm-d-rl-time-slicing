@@ -66,6 +66,12 @@ func (f *fakeSnapshotAgentStore) Restore(
 	return &agentpb.RestoreResponse{}, nil
 }
 
+func (f *fakeSnapshotAgentStore) Kill(
+	context.Context, string, string, string, time.Time,
+) (*agentpb.KillResponse, error) {
+	return &agentpb.KillResponse{}, nil
+}
+
 func TestObserveGroupState_Cleanup(t *testing.T) {
 	clientset := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(clientset, 0)

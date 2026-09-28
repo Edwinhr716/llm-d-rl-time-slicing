@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
@@ -47,9 +48,12 @@ const (
 
 // PodInfo contains simplified information about a pod.
 type PodInfo struct {
-	UID        string
-	JobID      string
+	UID   string
+	JobID string
+	// Background is true for a mirror pod (label timeslice.io/role=background).
 	Background bool
+	// NodeName is the node the pod is bound to, if any.
+	NodeName string
 }
 
 // KubernetesOrchestrator implements controller.InfrastructureOrchestrator for Kubernetes.
@@ -172,10 +176,17 @@ func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, err
 		if jobID == "" || !k.podOnWatchedNode(pod) {
 			continue
 		}
+		background := pod.Labels[RoleLabelKey] == RoleBackground
+		// A mirror pod in a terminal phase counts as gone: its guest holds
+		// nothing. A pod that is only being deleted still counts as live.
+		if background && (pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed) {
+			continue
+		}
 		podInfos = append(podInfos, PodInfo{
 			UID:        string(pod.UID),
 			JobID:      jobID,
-			Background: pod.Labels[RoleLabelKey] == RoleBackground,
+			Background: background,
+			NodeName:   pod.Spec.NodeName,
 		})
 	}
 	return podInfos, nil
@@ -244,10 +255,15 @@ func (k *KubernetesOrchestrator) updateJobsAndPods(ctx context.Context, groupID 
 	// job mistaken for a guest would have its faults ignored, so any doubt
 	// resolves to foreground.
 	jobBackground := make(map[string]bool)
+	// jobNodes holds the nodes of each job's non-terminal mirror pods.
+	jobNodes := make(map[string][]string)
 	for _, pod := range pods {
 		jobPods[pod.JobID] = append(jobPods[pod.JobID], pod.UID)
 		background, seen := jobBackground[pod.JobID]
 		jobBackground[pod.JobID] = pod.Background && (background || !seen)
+		if pod.Background && pod.NodeName != "" && !slices.Contains(jobNodes[pod.JobID], pod.NodeName) {
+			jobNodes[pod.JobID] = append(jobNodes[pod.JobID], pod.NodeName)
+		}
 	}
 
 	// Update or create jobs
@@ -266,6 +282,7 @@ func (k *KubernetesOrchestrator) updateJobsAndPods(ctx context.Context, groupID 
 			role = store.RoleBackground
 		}
 		job.SetRole(role)
+		job.SetPodNodes(jobNodes[jobID])
 		if err := k.jobStore.Put(ctx, job); err != nil {
 			return err
 		}

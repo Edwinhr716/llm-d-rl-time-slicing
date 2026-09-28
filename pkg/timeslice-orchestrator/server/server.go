@@ -278,12 +278,16 @@ func (s *Server) defaultCheckAcquire(
 	if group.Spec().LockingJob() == jobID && group.Status().LoadedJob() == jobID {
 		// The accelerator is back with the foreground: any notice is over.
 		group.Spec().ClearNotice()
+		vramUnconfirmed := group.Spec().TakeVramUnconfirmed()
 		slog.InfoContext(ctx, "Acquire succeeded, job loaded and lock held")
+		slog.InfoContext(ctx, "Foreground granted", "group", groupID, "job", jobID,
+			"waited_ms", time.Since(startTime).Milliseconds(), "vramUnconfirmed", vramUnconfirmed)
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
 			Success:         true,
 			ContextRestored: true, // Default to true, as we don't have enough info to determine if it was zero-overhead
 			WaitedMs:        time.Since(startTime).Milliseconds(),
+			VramUnconfirmed: vramUnconfirmed,
 		}, nil, true
 	}
 
@@ -311,12 +315,15 @@ func (s *Server) groupFaults(ctx context.Context, groupID, callerID string) (gro
 		return faults, err
 	}
 	for _, job := range jobs {
-		if !jobFaulted(job) {
-			continue
-		}
 		if job.Role() == store.RoleBackground {
+			if !guestFaultedLive(job) {
+				continue
+			}
 			faults.guest = job.JobID()
 			faults.caller = faults.caller || job.JobID() == callerID
+			continue
+		}
+		if !jobFaulted(job) {
 			continue
 		}
 		faults.foreground = true
@@ -683,7 +690,7 @@ func StartServer(
 		}
 	case <-ctx.Done():
 		slog.InfoContext(ctx, "Context canceled, shutting down servers gracefully")
-		s.GracefulStop()
+		stopGRPC(ctx, s)
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			slog.ErrorContext(ctx, "HTTP metrics server shutdown error", "error", err)
@@ -694,4 +701,37 @@ func StartServer(
 	}
 
 	return nil
+}
+
+// grpcStopGrace bounds GracefulStop: a blocked Acquire (foreground, or a
+// background participant waiting for the lend) never ends on its own, so a
+// graceful stop could otherwise wait forever.
+const grpcStopGrace = 5 * time.Second
+
+// stopGRPC stops the server gracefully, and forcibly after grpcStopGrace.
+func stopGRPC(ctx context.Context, s *grpc.Server) {
+	done := make(chan struct{})
+	go func() {
+		s.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(grpcStopGrace):
+		slog.WarnContext(ctx, "Graceful gRPC stop timed out, stopping", "grace", grpcStopGrace)
+		s.Stop()
+		<-done
+	}
+}
+
+// guestFaultedLive reports whether a background job is FAULTED on a node
+// where it has not been cleared: not killed (agent report or a confirmed
+// Kill) and not handed back after an unconfirmed Kill.
+func guestFaultedLive(job *store.Job) bool {
+	for node, state := range job.ContextState() {
+		if state == pb.SnapshotAgentJobState_STATE_FAULTED && !job.Killed(node) && !job.UnconfirmedKill(node) {
+			return true
+		}
+	}
+	return false
 }
