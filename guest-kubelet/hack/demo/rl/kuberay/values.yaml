@@ -1,0 +1,11 @@
+# Values for the kuberay-operator Helm chart. Chart and image version are
+# pinned in install.sh (KUBERAY_VERSION); keep image.tag equal to it.
+image:
+  repository: quay.io/kuberay/operator
+  tag: v1.5.1
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 512Mi

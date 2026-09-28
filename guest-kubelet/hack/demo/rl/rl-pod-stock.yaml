@@ -1,0 +1,172 @@
+# yamllint disable rule:indentation
+# Stock reference for rl-pod.yaml (hook K2): the same two Pods as a verl user
+# would write them without time-slicing. No timeslice labels, no TIMESLICE_*
+# env, no shared claim (ordinary nvidia.com/gpu), no group-host placement.
+# The Ray resource pins and the timeslice command settings of the Pod form
+# live inside the image scripts (run_head.sh, run_rollout.sh), so they are
+# the same in both files and do not show in the manifest diff.
+# Placeholders: __NS__ __REGISTRY__. Used only as the baseline of the diff.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rl-head
+  namespace: __NS__
+  labels:
+    app: rl-head
+spec:
+  restartPolicy: Never
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  containers:
+  - name: head
+    image: __REGISTRY__/rl-trainer:v0.1.6
+    env:
+    - name: VLLM_USE_V1
+      value: "1"
+    - name: STALENESS_THRESHOLD
+      value: "8"
+    - name: RUN_SECONDS
+      value: "10800"
+    - name: MODEL_ID
+      value: "Qwen/Qwen2.5-0.5B-Instruct"
+    - name: MAX_RESPONSE_LEN
+      value: "6144"
+    - name: ROLLOUT_N
+      value: "4"
+    - name: PPO_MINI_BATCH
+      value: "4"
+    - name: GEN_BATCH_SIZE
+      value: "1"
+    - name: ROLLOUT_MAX_LEN
+      value: "8192"
+    - name: PPO_MAX_TOKEN_LEN
+      value: "8192"
+    - name: PARAM_OFFLOAD
+      value: "True"
+    - name: PYTORCH_CUDA_ALLOC_CONF
+      value: "expandable_segments:True"
+    - name: HF_HOME
+      value: "/workspace/hf"
+    - name: NCCL_CUMEM_ENABLE
+      value: "0"
+    - name: NCCL_NVLS_ENABLE
+      value: "0"
+    - name: ACTOR_LR
+      value: "1e-6"
+    - name: EXP_NAME
+      value: "rl-batch-code-l4"
+    - name: OPTIMIZER_OFFLOAD
+      value: "True"
+    - name: ROLLOUT_GPU_FRAC
+      value: "0.55"
+    - name: VERL_REPO
+      value: "https://github.com/aishukamal/verl.git"
+    - name: VERL_REF
+      value: "feat/fully-async-lifecycle-hooks"
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      set -euo pipefail
+      echo "=== current-integration demo: RL trainer — HEAD (shared L4 node) ==="
+      echo "Node: $(hostname)"; echo "Date: $(date)"
+      mkdir -p /workspace/results
+      bash /opt/timeslice-demo/run_head.sh 2>&1 | tee /workspace/results/experiment.log
+    ports:
+    - containerPort: 6379
+    - containerPort: 8265
+    resources:
+      requests:
+        cpu: "8"
+        memory: "40Gi"
+      limits:
+        memory: "64Gi"
+        nvidia.com/gpu: "1"
+    volumeMounts:
+    - name: results
+      mountPath: /workspace/results
+    - name: dshm
+      mountPath: /dev/shm
+  volumes:
+  - name: results
+    emptyDir: {}
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 8Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rl-rollout
+  namespace: __NS__
+  labels:
+    app: rl-rollout
+spec:
+  restartPolicy: Never
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  containers:
+  - name: rollout
+    image: __REGISTRY__/rl-trainer:v0.1.6
+    env:
+    - name: VLLM_USE_V1
+      value: "1"
+    - name: MODEL_ID
+      value: "Qwen/Qwen2.5-0.5B-Instruct"
+    - name: HF_HOME
+      value: "/workspace/hf"
+    - name: NCCL_CUMEM_ENABLE
+      value: "0"
+    - name: NCCL_NVLS_ENABLE
+      value: "0"
+    - name: VERL_REPO
+      value: "https://github.com/aishukamal/verl.git"
+    - name: VERL_REF
+      value: "feat/fully-async-lifecycle-hooks"
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      set -euo pipefail
+      echo "=== current-integration demo: RL trainer — ROLLOUT (dedicated L4 node) ==="
+      echo "Node: $(hostname)"; echo "Date: $(date)"
+      mkdir -p /workspace/results
+      bash /opt/timeslice-demo/run_rollout.sh 2>&1 | tee /workspace/results/experiment.log
+    resources:
+      requests:
+        cpu: "12"
+        memory: "60Gi"
+      limits:
+        nvidia.com/gpu: "1"
+    volumeMounts:
+    - name: results
+      mountPath: /workspace/results
+    - name: dshm
+      mountPath: /dev/shm
+  volumes:
+  - name: results
+    emptyDir: {}
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-head
+  namespace: __NS__
+spec:
+  clusterIP: None
+  selector:
+    app: rl-head
+  ports:
+  - name: ray-gcs
+    port: 6379
+    targetPort: 6379
+  - name: ray-dashboard
+    port: 8265
+    targetPort: 8265
