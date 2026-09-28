@@ -1,0 +1,462 @@
+# M2 router: llm-d-router EPP plus a standalone Envoy in front of InferencePool q5-pool, whose
+# only member is the guest q5-sim. The stock llm-d-async e2e recipe (EPP, EPP config without
+# flow control, Envoy), with a q5- prefix, this namespace and the pool selector app=q5-sim.
+# The InferencePool CRDs must already be installed.
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: q5-pool
+  namespace: guest-kubelet-proto
+spec:
+  targetPorts:
+    - number: 8000
+  selector:
+    matchLabels:
+      app: q5-sim
+  endpointPickerRef:
+    name: q5-epp
+    kind: Service
+    port:
+      number: 9002
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: q5-epp
+  namespace: guest-kubelet-proto
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: q5-epp-pod-read
+  namespace: guest-kubelet-proto
+rules:
+  - apiGroups: ["inference.networking.x-k8s.io"]
+    resources: ["inferenceobjectives", "inferencemodelrewrites"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["inference.networking.k8s.io"]
+    resources: ["inferencepools"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "watch", "list"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: q5-epp-pod-read-binding
+  namespace: guest-kubelet-proto
+subjects:
+  - kind: ServiceAccount
+    name: q5-epp
+    namespace: guest-kubelet-proto
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: q5-epp-pod-read
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: q5-epp-auth-reviewer
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: q5-epp-auth-reviewer-binding
+subjects:
+  - kind: ServiceAccount
+    name: q5-epp
+    namespace: guest-kubelet-proto
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: q5-epp-auth-reviewer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: q5-epp
+  namespace: guest-kubelet-proto
+  labels:
+    app: q5-epp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: q5-epp
+  template:
+    metadata:
+      labels:
+        app: q5-epp
+    spec:
+      serviceAccountName: q5-epp
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: q5-epp
+          image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --pool-name
+            - "q5-pool"
+            - --pool-namespace
+            - "guest-kubelet-proto"
+            - --v
+            - "4"
+            - --zap-encoder
+            - "json"
+            - --grpc-port
+            - "9002"
+            - --grpc-health-port
+            - "9003"
+            - --config-file
+            - /config/default-plugins.yaml
+            - --metrics-endpoint-auth=false
+          ports:
+            - containerPort: 9002
+            - containerPort: 9003
+            - name: metrics
+              containerPort: 9090
+          livenessProbe:
+            grpc:
+              port: 9003
+              service: inference-extension
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            grpc:
+              port: 9003
+              service: inference-extension
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: plugins-config-volume
+              mountPath: "/config"
+      volumes:
+        - name: plugins-config-volume
+          configMap:
+            name: q5-epp-plugins-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: q5-epp
+  namespace: guest-kubelet-proto
+spec:
+  selector:
+    app: q5-epp
+  ports:
+    - name: grpc
+      protocol: TCP
+      port: 9002
+      targetPort: 9002
+      appProtocol: http2
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+---
+# EPP plugins config without flow control.
+# The budget gate's CascadeMetricSource will fall back to vLLM metrics.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: q5-epp-plugins-config
+  namespace: guest-kubelet-proto
+data:
+  default-plugins.yaml: |
+    apiVersion: inference.networking.x-k8s.io/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+    - type: queue-scorer
+    - type: kv-cache-utilization-scorer
+    schedulingProfiles:
+    - name: default
+      plugins:
+      - pluginRef: queue-scorer
+      - pluginRef: kv-cache-utilization-scorer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: q5-router
+  namespace: guest-kubelet-proto
+  labels:
+    app: q5-router
+data:
+  envoy.yaml: |
+    layered_runtime:
+      layers:
+        - name: static
+          static_layer:
+            fault.http.abort.abort_percent: 0
+            fault.http.delay.fixed_delay_percent: 0
+        - name: admin
+          admin_layer: {}
+    admin:
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 19000
+      access_log:
+        - name: q5-router.access_loggers.file
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+            path: /dev/null
+    static_resources:
+      listeners:
+        - name: q5-router-proxy-ready-0.0.0.0-19001
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: 19001
+          filter_chains:
+            - filters:
+                - name: q5-router.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: envoy-ready-http
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                        - name: prometheus_stats
+                          domains: ["*"]
+                          routes:
+                            - match:
+                                prefix: "/stats/prometheus"
+                              route:
+                                cluster: "prometheus_stats"
+                    http_filters:
+                      - name: q5-router.filters.http.health_check
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+                          pass_through_mode: false
+                          headers:
+                            - name: ":path"
+                              string_match:
+                                exact: "/ready"
+                      - name: q5-router.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+        - name: vllm
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: 8081
+          per_connection_buffer_limit_bytes: 32768
+          filter_chains:
+            - name: vllm
+              filters:
+                - name: q5-router.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: http-8081
+                    route_config:
+                      name: vllm
+                      virtual_hosts:
+                        - name: vllm-default
+                          domains: ["*"]
+                          routes:
+                            - match:
+                                prefix: "/"
+                              route:
+                                cluster: original_destination_cluster
+                                timeout: 86400s
+                                idle_timeout: 86400s
+                                upgrade_configs:
+                                  - upgrade_type: websocket
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_proc:
+                                  "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
+                                  config: {}
+                    http_filters:
+                      - name: q5-router.filters.http.ext_proc
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                          grpc_service:
+                            envoy_grpc:
+                              cluster_name: ext_proc
+                              authority: q5-epp:9002
+                            timeout: 10s
+                          processing_mode:
+                            request_header_mode: SEND
+                            response_header_mode: SEND
+                            request_body_mode: FULL_DUPLEX_STREAMED
+                            response_body_mode: FULL_DUPLEX_STREAMED
+                            request_trailer_mode: SEND
+                            response_trailer_mode: SEND
+                          message_timeout: 1000s
+                      - name: q5-router.filters.http.fault
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+                          delay:
+                            percentage:
+                              numerator: 0
+                              denominator: HUNDRED
+                            fixed_delay: 60s
+                          abort:
+                            percentage:
+                              numerator: 0
+                              denominator: HUNDRED
+                            http_status: 503
+                      - name: q5-router.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                          suppress_envoy_headers: true
+                    http2_protocol_options:
+                      max_concurrent_streams: 100
+                      initial_stream_window_size: 65536
+                      initial_connection_window_size: 1048576
+                    use_remote_address: true
+                    normalize_path: true
+                    merge_slashes: true
+                    server_header_transformation: PASS_THROUGH
+                    common_http_protocol_options:
+                      headers_with_underscores_action: REJECT_REQUEST
+                    path_with_escaped_slashes_action: UNESCAPE_AND_REDIRECT
+                    access_log:
+                      - name: q5-router.access_loggers.file
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                          path: /dev/stdout
+      clusters:
+        - name: prometheus_stats
+          type: STATIC
+          connect_timeout: 0.250s
+          load_assignment:
+            cluster_name: prometheus_stats
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: 19000
+        - name: original_destination_cluster
+          type: ORIGINAL_DST
+          connect_timeout: 1000s
+          lb_policy: CLUSTER_PROVIDED
+          circuit_breakers:
+            thresholds:
+              - max_connections: 40000
+                max_pending_requests: 40000
+                max_requests: 40000
+          original_dst_lb_config:
+            use_http_header: true
+            http_header_name: x-gateway-destination-endpoint
+        - name: ext_proc
+          type: STRICT_DNS
+          connect_timeout: 86400s
+          lb_policy: LEAST_REQUEST
+          circuit_breakers:
+            thresholds:
+              - max_connections: 40000
+                max_pending_requests: 40000
+                max_requests: 40000
+                max_retries: 1024
+          health_checks:
+            - timeout: 2s
+              interval: 10s
+              unhealthy_threshold: 3
+              healthy_threshold: 2
+              reuse_connection: true
+              grpc_health_check:
+                service_name: "envoy.service.ext_proc.v3.ExternalProcessor"
+              tls_options:
+                alpn_protocols: ["h2"]
+          transport_socket:
+            name: "envoy.transport_sockets.tls"
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              common_tls_context:
+                validation_context:
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options:
+                  initial_stream_window_size: 65536
+                  initial_connection_window_size: 1048576
+          load_assignment:
+            cluster_name: ext_proc
+            endpoints:
+              - locality:
+                  region: ext_proc/e2e/0
+                lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: q5-epp
+                          port_value: 9002
+                    load_balancing_weight: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: q5-router
+  namespace: guest-kubelet-proto
+  labels: {app: q5-router}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: q5-router}
+  template:
+    metadata:
+      labels: {app: q5-router}
+    spec:
+      containers:
+        - name: q5-router
+          image: docker.io/envoyproxy/envoy:distroless-v1.33.2
+          command: ["envoy"]
+          args:
+            - --service-cluster
+            - q5/inference-gateway
+            - --service-node
+            - $(ENVOY_POD_NAME)
+            - --log-level
+            - info
+            - --cpuset-threads
+            - --drain-strategy
+            - immediate
+            - --drain-time-s
+            - "60"
+            - -c
+            - /etc/envoy/envoy.yaml
+          env:
+            - name: ENVOY_POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          ports:
+            - {name: http-8081, containerPort: 8081}
+            - {name: admin, containerPort: 19000}
+            - {name: metrics, containerPort: 19001}
+          readinessProbe:
+            httpGet: {path: /ready, port: 19001}
+            periodSeconds: 5
+            failureThreshold: 1
+          resources:
+            requests: {cpu: 100m, memory: 512Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/envoy, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: q5-router
+            items: [{key: envoy.yaml, path: envoy.yaml}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: q5-router
+  namespace: guest-kubelet-proto
+  labels: {app: q5-router}
+spec:
+  selector: {app: q5-router}
+  ports: [{name: http-8081, port: 8081, targetPort: 8081}]

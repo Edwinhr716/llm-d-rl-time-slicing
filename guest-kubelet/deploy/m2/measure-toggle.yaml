@@ -1,0 +1,41 @@
+# Toggle mode: switches q5-toggle's probe endpoint 25 times each way, so the guest kubelet's
+# own readinessProbe sees the change; times trigger -> notify, e1, e2 and e3.
+# It runs on the guest kubelet's host with host networking: same clock as the guest kubelet,
+# and the loopback-only debug endpoint is reachable. Results go to the pod log.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: q5-measure-toggle
+  namespace: guest-kubelet-proto
+  labels: {app: q5-measure}
+spec:
+  serviceAccountName: q5-measure
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    kubernetes.io/hostname: __HOST__
+  tolerations:
+    - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+    - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: measure
+      image: __IMAGE__
+      command: ["/q5-measure"]
+      args:
+        - --mode=toggle
+        - --guest=q5-toggle
+        - --service=q5-toggle
+        - --service-port=8080
+        - --edges=25
+      resources:
+        requests: {cpu: 100m, memory: 64Mi}
+        limits: {cpu: 500m, memory: 128Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: ["ALL"]}

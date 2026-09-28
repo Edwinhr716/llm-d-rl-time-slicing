@@ -31,6 +31,7 @@ type Backend interface {
 // Provider implements nodeutil.Provider and node.PodNotifier on top of a Backend.
 type Provider struct {
 	backend   Backend
+	hook      func(*corev1.Pod)
 	admission *Admission
 
 	mu     sync.Mutex
@@ -73,6 +74,11 @@ func IsGuest(pod *corev1.Pod) bool {
 
 func key(p *corev1.Pod) string { return p.Namespace + "/" + p.Name }
 
+// SetNotifyHook installs a function called with each guest status just before it is handed to
+// the pod controller. M2 uses it to time-stamp Ready edges (the start of Q5 span e1). Call it
+// before NotifyPods.
+func (p *Provider) SetNotifyHook(hook func(*corev1.Pod)) { p.hook = hook }
+
 // NotifyPods is called once by the pod controller at startup. From then on, every mirror change
 // the backend sees is translated and written to the guest through cb.
 func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
@@ -81,6 +87,9 @@ func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
 	p.mu.Unlock()
 	p.backend.SetStatusCallback(func(pod *corev1.Pod) {
 		if IsGuest(pod) {
+			if p.hook != nil {
+				p.hook(pod)
+			}
 			cb(pod)
 		}
 	})
