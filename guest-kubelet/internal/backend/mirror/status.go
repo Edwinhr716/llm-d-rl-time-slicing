@@ -1,6 +1,9 @@
 package mirror
 
 import (
+	"fmt"
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -11,6 +14,14 @@ const (
 	ReasonGuestDeleted  = "GuestKubeletPodDeleted"
 )
 
+// Readiness is the guest kubelet's own readiness verdict per guest container (M2). The mirror
+// carries no probes, so its ready flags say only "running"; a Readiness replaces them.
+type Readiness interface {
+	// ContainerReady returns the verdict for one container and whether there is one. With none,
+	// the mirror's flag stands (ready once running, as for a container without a probe).
+	ContainerReady(guest *corev1.Pod, container string) (bool, bool)
+}
+
 // TranslateStatus is the guest's status given its mirror's status: the real kubelet's view of
 // the process, copied upward. It returns a new guest object; neither input is modified.
 //
@@ -19,6 +30,14 @@ const (
 // Kept from the guest: qosClass (immutable once set, and the mirror's differs when its
 // requests were capped), and any readiness-gate conditions the mirror cannot have.
 func TranslateStatus(guest, m *corev1.Pod) *corev1.Pod {
+	return TranslateStatusWith(guest, m, nil)
+}
+
+// TranslateStatusWith is TranslateStatus with the guest kubelet's readiness verdicts applied:
+// each container's ready flag comes from rd (and is false unless the container runs), and the
+// ContainersReady and Ready conditions are recomputed from those flags. A nil rd is M1: the
+// mirror's flags and conditions are copied as they are.
+func TranslateStatusWith(guest, m *corev1.Pod, rd Readiness) *corev1.Pod {
 	out := guest.DeepCopy()
 	ms := m.Status.DeepCopy()
 	st := corev1.PodStatus{
@@ -38,18 +57,21 @@ func TranslateStatus(guest, m *corev1.Pod) *corev1.Pod {
 	if st.Phase == "" {
 		st.Phase = corev1.PodPending
 	}
+	if rd != nil {
+		applyReadiness(&st, guest, rd)
+	}
 	// The mirror has no readiness gates, so its Ready ignores the guest's gates. Keep the
 	// guest's gate conditions, and hold Ready false until every gate is true, which is what the
 	// real kubelet does.
 	for _, g := range guest.Spec.ReadinessGates {
 		c := findCondition(guest.Status.Conditions, g.ConditionType)
 		if c == nil {
-			setReadyFalse(&st, "ReadinessGatesNotReady")
+			setReadyFalse(&st, guest, "ReadinessGatesNotReady")
 			continue
 		}
 		st.Conditions = append(st.Conditions, *c)
 		if c.Status != corev1.ConditionTrue {
-			setReadyFalse(&st, "ReadinessGatesNotReady")
+			setReadyFalse(&st, guest, "ReadinessGatesNotReady")
 		}
 	}
 	out.Status = st
@@ -115,8 +137,71 @@ func findCondition(conds []corev1.PodCondition, t corev1.PodConditionType) *core
 	return nil
 }
 
-func setReadyFalse(st *corev1.PodStatus, reason string) {
-	if c := findCondition(st.Conditions, corev1.PodReady); c != nil && c.Status == corev1.ConditionTrue {
-		c.Status, c.Reason = corev1.ConditionFalse, reason
+// setReadyFalse holds Ready false. The transition time is the guest's own if it was already
+// false there, so a re-translation does not change the status.
+func setReadyFalse(st *corev1.PodStatus, guest *corev1.Pod, reason string) {
+	c := findCondition(st.Conditions, corev1.PodReady)
+	if c == nil || c.Status != corev1.ConditionTrue {
+		return
 	}
+	c.Status, c.Reason = corev1.ConditionFalse, reason
+	if prev := findCondition(guest.Status.Conditions, corev1.PodReady); prev != nil && prev.Status == corev1.ConditionFalse {
+		c.LastTransitionTime = prev.LastTransitionTime
+	}
+}
+
+// applyReadiness sets each container's ready flag from rd and recomputes ContainersReady and
+// Ready, as the kubelet's status manager does. A condition keeps its previous transition time on
+// the guest while its status does not change.
+func applyReadiness(st *corev1.PodStatus, guest *corev1.Pod, rd Readiness) {
+	var unready []string
+	for i := range st.ContainerStatuses {
+		cs := &st.ContainerStatuses[i]
+		if verdict, has := rd.ContainerReady(guest, cs.Name); has {
+			cs.Ready = verdict && cs.State.Running != nil
+		}
+		if !cs.Ready {
+			unready = append(unready, cs.Name)
+		}
+	}
+	for i := range guest.Spec.Containers {
+		if name := guest.Spec.Containers[i].Name; findContainerStatus(st.ContainerStatuses, name) == nil {
+			unready = append(unready, name)
+		}
+	}
+	allReady := len(unready) == 0
+	msg := ""
+	if !allReady {
+		msg = fmt.Sprintf("containers with unready status: [%s]", strings.Join(unready, " "))
+	}
+	setCondition(st, guest, corev1.ContainersReady, allReady, msg)
+	setCondition(st, guest, corev1.PodReady, allReady && st.Phase == corev1.PodRunning, msg)
+}
+
+func setCondition(st *corev1.PodStatus, guest *corev1.Pod, ct corev1.PodConditionType, isTrue bool, msg string) {
+	want := corev1.PodCondition{Type: ct, Status: corev1.ConditionFalse}
+	if isTrue {
+		want.Status = corev1.ConditionTrue
+	} else {
+		want.Reason, want.Message = "ContainersNotReady", msg
+	}
+	want.LastTransitionTime = metav1.Now()
+	if prev := findCondition(guest.Status.Conditions, ct); prev != nil && prev.Status == want.Status {
+		want.LastTransitionTime = prev.LastTransitionTime
+	}
+	if cur := findCondition(st.Conditions, ct); cur != nil {
+		want.LastProbeTime = cur.LastProbeTime
+		*cur = want
+		return
+	}
+	st.Conditions = append(st.Conditions, want)
+}
+
+func findContainerStatus(statuses []corev1.ContainerStatus, name string) *corev1.ContainerStatus {
+	for i := range statuses {
+		if statuses[i].Name == name {
+			return &statuses[i]
+		}
+	}
+	return nil
 }

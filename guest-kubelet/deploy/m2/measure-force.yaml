@@ -1,0 +1,42 @@
+# Force mode: flips q5-sim's readiness 25 times each way through the guest kubelet's debug
+# endpoint and times notify, e1, e2, e3 and Ready -> InferencePool.
+# It runs on the guest kubelet's host with host networking: same clock as the guest kubelet,
+# and the loopback-only debug endpoint is reachable. Results go to the pod log.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: q5-measure-force
+  namespace: guest-kubelet-proto
+  labels: {app: q5-measure}
+spec:
+  serviceAccountName: q5-measure
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    kubernetes.io/hostname: __HOST__
+  tolerations:
+    - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+    - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: measure
+      image: __IMAGE__
+      command: ["/q5-measure"]
+      args:
+        - --mode=force
+        - --guest=q5-sim
+        - --service=q5-sim
+        - --service-port=8000
+        - --router-url=http://q5-router.guest-kubelet-proto.svc.cluster.local:8081/v1/completions
+        - --edges=25
+      resources:
+        requests: {cpu: 100m, memory: 64Mi}
+        limits: {cpu: 500m, memory: 128Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: ["ALL"]}

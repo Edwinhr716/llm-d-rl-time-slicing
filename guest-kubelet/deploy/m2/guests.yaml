@@ -1,0 +1,92 @@
+# M2 guests on the virtual node. The guest kubelet strips probes from the mirrors and runs
+# each guest's readinessProbe itself, against the mirror's pod IP.
+#
+# q5-sim: an llm-d-inference-sim model server, the only member of InferencePool q5-pool
+# (router.yaml). Force-mode runs flip its readiness through the guest kubelet's debug endpoint.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: q5-sim
+  namespace: guest-kubelet-proto
+  labels:
+    app: q5-sim
+    inference.networking.k8s.io/engine-type: vllm
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: __VNODE__
+  tolerations:
+    - {key: timeslice.io/guest, operator: Exists, effect: NoSchedule}
+  containers:
+    - name: sim
+      image: ghcr.io/llm-d/llm-d-inference-sim:v0.10.0
+      args:
+        - --model=test-model
+        - --port=8000
+        - '--fake-metrics={"kv-cache-usage": 0, "waiting-requests": 0, "running-requests": 0}'
+      ports: [{name: http, containerPort: 8000}]
+      readinessProbe:
+        httpGet: {path: /metrics, port: http}
+        periodSeconds: 1
+        failureThreshold: 3
+      resources:
+        requests: {cpu: 200m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: q5-sim
+  namespace: guest-kubelet-proto
+spec:
+  selector: {app: q5-sim}
+  ports: [{port: 8000, targetPort: 8000}]
+---
+# q5-toggle: its readinessProbe passes while /www/ready exists. GET /cgi-bin/down removes the
+# file and /cgi-bin/up creates it, so toggle-mode runs exercise the real probe path.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: q5-toggle
+  namespace: guest-kubelet-proto
+  labels: {app: q5-toggle}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: __VNODE__
+  tolerations:
+    - {key: timeslice.io/guest, operator: Exists, effect: NoSchedule}
+  containers:
+    - name: httpd
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          mkdir -p /www/cgi-bin
+          cat > /www/cgi-bin/up <<'X'
+          #!/bin/sh
+          touch /www/ready
+          printf 'Content-Type: text/plain\r\n\r\nup\n'
+          X
+          cat > /www/cgi-bin/down <<'X'
+          #!/bin/sh
+          rm -f /www/ready
+          printf 'Content-Type: text/plain\r\n\r\ndown\n'
+          X
+          chmod +x /www/cgi-bin/up /www/cgi-bin/down
+          touch /www/ready
+          exec httpd -f -p 8080 -h /www
+      ports: [{name: http, containerPort: 8080}]
+      readinessProbe:
+        httpGet: {path: /ready, port: http}
+        periodSeconds: 1
+        successThreshold: 1
+        failureThreshold: 1
+      resources:
+        requests: {cpu: 50m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: q5-toggle
+  namespace: guest-kubelet-proto
+spec:
+  selector: {app: q5-toggle}
+  ports: [{port: 8080, targetPort: 8080}]
