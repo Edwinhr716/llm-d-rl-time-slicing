@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
@@ -65,9 +66,15 @@ type KubernetesOrchestrator struct {
 	nodeSynced         cache.InformerSynced
 	podSynced          []cache.InformerSynced
 	nodeScopedPods     bool
+	exemptBackground   bool
 	groupStore         *store.GroupStore
 	jobStore           *store.JobStore
 	snapshotAgentStore store.SnapshotAgentStore
+
+	// observedJobsMu guards observedJobs, the last job-ID set logged per
+	// group by logGroupJobs.
+	observedJobsMu sync.Mutex
+	observedJobs   map[string][]string
 }
 
 // Option configures a KubernetesOrchestrator.
@@ -127,13 +134,16 @@ func (k *KubernetesOrchestrator) addPodInformer(pi corev1informers.PodInformer) 
 
 // podOnWatchedNode reports whether the pod may join a group: always, unless
 // WithNodeScopedPods is set and the pod is bound to a node outside the node
-// informer's scope.
-func (k *KubernetesOrchestrator) podOnWatchedNode(pod *corev1.Pod) bool {
+// informer's scope. With WithNodeSelectorExemptBackground, a background pod
+// bound to such a node is kept too (see keepExemptBackgroundPod).
+func (k *KubernetesOrchestrator) podOnWatchedNode(ctx context.Context, pod *corev1.Pod) bool {
 	if !k.nodeScopedPods || pod.Spec.NodeName == "" {
 		return true
 	}
-	_, err := k.nodeLister.Get(pod.Spec.NodeName)
-	return err == nil
+	if _, err := k.nodeLister.Get(pod.Spec.NodeName); err == nil {
+		return true
+	}
+	return k.keepExemptBackgroundPod(ctx, pod)
 }
 
 // Init initializes the KubernetesOrchestrator by waiting for informer caches to sync.
@@ -160,7 +170,7 @@ func (k *KubernetesOrchestrator) getNodesForGroup(groupID string) ([]string, err
 }
 
 // getPodsForGroup returns the pods that are tied to the given group.
-func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, error) {
+func (k *KubernetesOrchestrator) getPodsForGroup(ctx context.Context, groupID string) ([]PodInfo, error) {
 	selector := labels.SelectorFromSet(labels.Set{PodLabelKey: groupID})
 	pods := make([]*corev1.Pod, 0)
 	for _, lister := range k.podListers {
@@ -173,7 +183,7 @@ func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, err
 	var podInfos []PodInfo
 	for _, pod := range pods {
 		jobID := pod.Labels[JobLabelKey]
-		if jobID == "" || !k.podOnWatchedNode(pod) {
+		if jobID == "" || !k.podOnWatchedNode(ctx, pod) {
 			continue
 		}
 		background := pod.Labels[RoleLabelKey] == RoleBackground
@@ -203,7 +213,7 @@ func (k *KubernetesOrchestrator) ObserveGroupState(ctx context.Context, groupID 
 	}
 
 	// 2. Find pods tied to the group
-	pods, err := k.getPodsForGroup(groupID)
+	pods, err := k.getPodsForGroup(ctx, groupID)
 	if err != nil {
 		return fmt.Errorf("failed to get pods for group %s: %w", groupID, err)
 	}
@@ -213,6 +223,7 @@ func (k *KubernetesOrchestrator) ObserveGroupState(ctx context.Context, groupID 
 		if err := k.cleanupGroup(ctx, groupID); err != nil {
 			return fmt.Errorf("failed to cleanup group %s: %w", groupID, err)
 		}
+		k.logGroupJobs(ctx, groupID, nil)
 		return nil
 	}
 
@@ -225,8 +236,31 @@ func (k *KubernetesOrchestrator) ObserveGroupState(ctx context.Context, groupID 
 	if err := k.updateJobsAndPods(ctx, groupID, pods); err != nil {
 		return err
 	}
+	k.logGroupJobs(ctx, groupID, pods)
 
 	return nil
+}
+
+// logGroupJobs logs "Group jobs observed" with the sorted job IDs of the group
+// whenever that set differs from the one logged last for the group.
+func (k *KubernetesOrchestrator) logGroupJobs(ctx context.Context, groupID string, pods []PodInfo) {
+	jobs := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		jobs = append(jobs, pod.JobID)
+	}
+	slices.Sort(jobs)
+	jobs = slices.Compact(jobs)
+
+	k.observedJobsMu.Lock()
+	defer k.observedJobsMu.Unlock()
+	if last, seen := k.observedJobs[groupID]; seen && slices.Equal(last, jobs) {
+		return
+	}
+	if k.observedJobs == nil {
+		k.observedJobs = map[string][]string{}
+	}
+	k.observedJobs[groupID] = jobs
+	slog.InfoContext(ctx, "Group jobs observed", "group", groupID, "jobs", jobs)
 }
 
 func (k *KubernetesOrchestrator) updateGroupNodes(ctx context.Context, groupID string, groupNodes []string) error {
@@ -436,7 +470,7 @@ func (k *KubernetesOrchestrator) enqueuePod(ctx context.Context, obj interface{}
 
 	// Before the node cache has synced every node looks unknown; the node's
 	// own Add event enqueues its groups once it arrives.
-	if k.nodeSynced() && !k.podOnWatchedNode(pod) {
+	if k.nodeSynced() && !k.podOnWatchedNode(ctx, pod) {
 		slog.InfoContext(ctx, "Ignoring pod bound to a node outside --node-selector",
 			"pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), "node", pod.Spec.NodeName)
 		return

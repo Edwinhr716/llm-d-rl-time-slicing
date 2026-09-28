@@ -3,14 +3,18 @@
 package evalwire
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +27,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -81,6 +86,9 @@ func TestEvalwire_FlagsMatchMain(t *testing.T) {
 	if fv.foregroundWait != controller.ForegroundWaitBlocking {
 		t.Errorf("--foreground-wait default = %q, want %q", fv.foregroundWait, controller.ForegroundWaitBlocking)
 	}
+	if fv.nodeSelectorExemptBackground {
+		t.Error("--node-selector-exempt-background default = true, want false")
+	}
 }
 
 func TestEvalwire_RejectsBadArgs(t *testing.T) {
@@ -92,6 +100,10 @@ func TestEvalwire_RejectsBadArgs(t *testing.T) {
 		{"--kill-budget=40s", "--notice-window=30s"},
 		{"stray"},
 		{"--host-command-port=-1"},
+		{"--node-selector=pool==("},
+		{"--watch-namespaces=Bad_NS"},
+		{"--node-selector-exempt-background=maybe"},
+		{"--dispatch-budget-redis-addr=127.0.0.1:1"},
 	} {
 		if orch, err := Start(context.Background(), Config{Clientset: cs, Args: args}); err == nil {
 			orch.Stop()
@@ -163,13 +175,18 @@ func TestEvalwire_StartStopRestart(t *testing.T) {
 	const groupID = "g-eval"
 	cs := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name:   "127.0.0.1",
-		Labels: map[string]string{infrastructure.NodeLabelPrefix + groupID: "true"},
+		Labels: map[string]string{infrastructure.NodeLabelPrefix + groupID: "true", "pool": "demo"},
 	}})
 	args := []string{
 		"--foreground-wait=blocking",
 		"--controller-workers=4",
 		"--foreground-op-timeout=60s",
 		"--resync-period=30s",
+		"--lock-namespace=eval",
+		"--lock-configmap=eval-locks",
+		"--watch-namespaces=demo",
+		"--node-selector=pool=demo",
+		"--node-selector-exempt-background=true",
 	}
 
 	// The second Start on the same clientset models an orchestrator restart.
@@ -182,5 +199,107 @@ func TestEvalwire_StartStopRestart(t *testing.T) {
 		checkMetrics(t, orch.MetricsAddr)
 		orch.Stop()
 		orch.Stop() // idempotent
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent writers.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func evalPod(name, job, node, role string) *corev1.Pod {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "demo",
+			Name:      name,
+			UID:       types.UID("uid-" + name),
+			Labels:    map[string]string{infrastructure.PodLabelKey: "g1", infrastructure.JobLabelKey: job},
+		},
+		Spec: corev1.PodSpec{NodeName: node},
+	}
+	if role != "" {
+		pod.Labels["timeslice.io/role"] = role
+	}
+	return pod
+}
+
+// TestEvalwire_GroupJobs checks GroupJobs for both values of
+// --node-selector-exempt-background, on the D-ORCH-4 C4 shape: the trainer's
+// host is selected, the host of a background pod is not.
+func TestEvalwire_GroupJobs(t *testing.T) {
+	trainer := JobInfo{JobID: "job-trainer", Role: "foreground"}
+	mirror := JobInfo{JobID: "vk/node-other", Role: "background"}
+	for _, tc := range []struct {
+		exempt string
+		want   []JobInfo
+	}{
+		{exempt: "false", want: []JobInfo{trainer}},
+		{exempt: "true", want: []JobInfo{trainer, mirror}},
+	} {
+		t.Run("exempt="+tc.exempt, func(t *testing.T) {
+			cs := fake.NewClientset(
+				&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+					Name:   "node-demo",
+					Labels: map[string]string{infrastructure.NodeLabelPrefix + "g1": "true", "pool": "demo"},
+				}},
+				&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+					Name:   "node-other",
+					Labels: map[string]string{infrastructure.NodeLabelPrefix + "g1": "true", "pool": "other"},
+				}},
+				evalPod("trainer", "job-trainer", "node-demo", ""),
+				evalPod("mirror", "vk/node-other", "node-other", "background"),
+			)
+			logs := &syncBuffer{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+			defer slog.SetDefault(prev)
+
+			orch, err := Start(context.Background(), Config{Clientset: cs, AgentPort: 1, Args: []string{
+				"--controller-workers=4",
+				"--node-selector=pool=demo",
+				"--node-selector-exempt-background=" + tc.exempt,
+			}})
+			if err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer orch.Stop()
+			if want := "nodeSelectorExemptBackground=" + tc.exempt; !strings.Contains(logs.String(), want) {
+				t.Errorf("startup log lacks %q", want)
+			}
+
+			deadline := time.Now().Add(10 * time.Second)
+			var got []JobInfo
+			for {
+				got = orch.GroupJobs("g1")
+				if slices.Equal(got, tc.want) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("GroupJobs(g1) = %v, want %v", got, tc.want)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			// Steady state: the set does not change on later reconciles.
+			time.Sleep(500 * time.Millisecond)
+			if got = orch.GroupJobs("g1"); !slices.Equal(got, tc.want) {
+				t.Errorf("GroupJobs(g1) later = %v, want %v", got, tc.want)
+			}
+			if got := orch.GroupJobs("no-such-group"); len(got) != 0 {
+				t.Errorf("GroupJobs(no-such-group) = %v, want none", got)
+			}
+		})
 	}
 }

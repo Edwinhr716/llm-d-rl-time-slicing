@@ -30,7 +30,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,7 +43,9 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -61,6 +65,15 @@ type Config struct {
 	Args []string
 }
 
+// JobInfo is one job in a group's job store.
+type JobInfo struct {
+	// JobID is the timeslice.io/job-id of the job's pods.
+	JobID string
+	// Role is "background" when a pod of the job carries
+	// timeslice.io/role=background, and "foreground" otherwise.
+	Role string
+}
+
 // Orch is a running in-process orchestrator.
 type Orch struct {
 	// Addr is the gRPC address (host:port) of the orchestrator service.
@@ -72,6 +85,9 @@ type Orch struct {
 	// Acquire, for example) are cut after the server stop grace (5 s). After
 	// Stop, Start may run again on the same clientset.
 	Stop func()
+	// GroupJobs returns the jobs the orchestrator's job store holds for the
+	// group right now, sorted by job ID.
+	GroupJobs func(group string) []JobInfo
 }
 
 // flagValues holds the parsed flags, one field per flag in main.go.
@@ -105,6 +121,8 @@ type flagValues struct {
 	lockConfigMap            string
 	watchNamespaces          string
 	nodeSelector             string
+	// nodeSelectorExemptBackground is D-ORCH-4 (false = match, true = exempt).
+	nodeSelectorExemptBackground bool
 }
 
 // newFlagSet declares the flags of cmd/timesliceorchestrator/main.go with the
@@ -150,6 +168,8 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.StringVar(&fv.lockConfigMap, "lock-configmap", store.ConfigMapName, "Name of the lock ConfigMap")
 	fs.StringVar(&fv.watchNamespaces, "watch-namespaces", "", "Comma-separated namespaces whose pods are watched; empty watches all")
 	fs.StringVar(&fv.nodeSelector, "node-selector", "", "Label selector limiting the nodes this orchestrator sees; empty watches all")
+	fs.BoolVar(&fv.nodeSelectorExemptBackground, "node-selector-exempt-background", false,
+		"Keep role=background pods bound to a node outside --node-selector")
 	return fs, fv
 }
 
@@ -243,6 +263,11 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	}
 	if !scope.AllNodes() {
 		infraOpts = append(infraOpts, infrastructure.WithNodeScopedPods())
+		if fv.nodeSelectorExemptBackground {
+			infraOpts = append(infraOpts, infrastructure.WithNodeSelectorExemptBackground())
+		}
+	} else if fv.nodeSelectorExemptBackground {
+		slog.Warn("--node-selector-exempt-background has no effect without --node-selector")
 	}
 	infraOrch := infrastructure.NewKubernetesOrchestrator(
 		informerFactories.Nodes.Core().V1().Nodes(),
@@ -269,6 +294,13 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
 	ctrl.KillPollInterval = fv.killPollInterval
 	ctrl.BackgroundLiveness = fv.backgroundLiveness
+
+	// Listers for GroupJobs, created before the factories start so their
+	// informers are the ones the orchestrator already uses.
+	podListers := make([]corev1listers.PodLister, 0, len(informerFactories.Pods))
+	for _, f := range informerFactories.Pods {
+		podListers = append(podListers, f.Core().V1().Pods().Lister())
+	}
 
 	informerFactories.Nodes.Start(ctx.Done())
 	for _, f := range informerFactories.Pods {
@@ -320,6 +352,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,
+		"nodeSelectorExemptBackground", fv.nodeSelectorExemptBackground,
 	)
 
 	// serveErr is written before exited is closed and read only after.
@@ -333,6 +366,9 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	orch := &Orch{
 		Addr:        net.JoinHostPort("127.0.0.1", strconv.Itoa(grpcPort)),
 		MetricsAddr: net.JoinHostPort("127.0.0.1", strconv.Itoa(metricsPort)),
+	}
+	orch.GroupJobs = func(group string) []JobInfo {
+		return groupJobs(ctx, jobStore, podListers, group)
 	}
 	var stopOnce sync.Once
 	orch.Stop = func() {
@@ -360,6 +396,38 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		}
 	}
 	return orch, nil
+}
+
+// groupJobs lists the job store's jobs for group, with each job's role read
+// from the timeslice.io/role label of its pods.
+func groupJobs(ctx context.Context, jobStore *store.JobStore, podListers []corev1listers.PodLister, group string) []JobInfo {
+	jobs, err := jobStore.ListByGroup(ctx, group)
+	if err != nil {
+		return nil
+	}
+	background := map[string]bool{}
+	selector := labels.SelectorFromSet(labels.Set{infrastructure.PodLabelKey: group})
+	for _, lister := range podListers {
+		pods, err := lister.List(selector)
+		if err != nil {
+			continue
+		}
+		for _, pod := range pods {
+			if pod.Labels[infrastructure.RoleLabelKey] == infrastructure.RoleBackground {
+				background[pod.Labels[infrastructure.JobLabelKey]] = true
+			}
+		}
+	}
+	out := make([]JobInfo, 0, len(jobs))
+	for _, job := range jobs {
+		role := "foreground"
+		if background[job.JobID()] {
+			role = infrastructure.RoleBackground
+		}
+		out = append(out, JobInfo{JobID: job.JobID(), Role: role})
+	}
+	slices.SortFunc(out, func(a, b JobInfo) int { return strings.Compare(a.JobID, b.JobID) })
+	return out
 }
 
 // hostResolver matches the one in main.go.

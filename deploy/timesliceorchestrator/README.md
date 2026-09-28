@@ -119,6 +119,13 @@ chart values (and the flags they set) narrow that down:
   label selector limiting the nodes the orchestrator sees. Nodes outside it
   contribute to no group, and pods bound to them are ignored. Group
   membership still comes from the `group.timeslice.io/<group>` node label.
+  See [Choosing a node selector](#choosing-a-node-selector).
+* `scope.nodeSelectorExemptBackground`, flag
+  `--node-selector-exempt-background` (default `false`): keep pods labelled
+  `timeslice.io/role=background` in their group even when they are bound to a
+  node outside the node selector. Only pods are exempt: such a node still
+  contributes to no group, so the orchestrator never commands it. No effect
+  without a node selector.
 * `strategy` (default `type: Recreate`): the old pod stops before the new one
   starts, so two replicas never act on the lock ConfigMap at once.
 
@@ -141,3 +148,29 @@ helm upgrade --install demo-orchestrator ./timesliceorchestrator \
 
 The chart still grants read access to pods and nodes cluster-wide through a
 `ClusterRole`.
+
+### Choosing a node selector
+
+The selector must select every real host that carries the group label;
+mirrors are bound there. The virtual kubelet runs each guest as a mirror pod
+on the real host, and the mirror pod is how the orchestrator counts the guest,
+so a host outside the selector hides its guests and never joins the group.
+The virtual node itself carries no group label and need not be selected.
+
+A label selector cannot match a key prefix, so pick one of the layouts in
+[`examples/`](examples/):
+
+* [`node-selector-prefix.yaml`](examples/node-selector-prefix.yaml): hosts
+  carry `group.timeslice.io/<group>=true`. The selector names one group, so
+  use one orchestrator install per group.
+* [`node-selector-ns.yaml`](examples/node-selector-ns.yaml): every donor host
+  carries `timeslice.io/donor=true`, so one selector covers every group.
+
+For example, for group `my-group` with the first layout:
+
+```bash
+helm upgrade --install my-group-orchestrator ./timesliceorchestrator \
+  -f ./timesliceorchestrator/examples/node-selector-prefix.yaml \
+  --set lock.configMap=my-group-orchestrator-locks \
+  --set 'scope.nodeSelector=group.timeslice.io/my-group=true'
+```

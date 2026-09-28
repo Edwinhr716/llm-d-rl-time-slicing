@@ -134,6 +134,10 @@ func run() error {
 		"Label selector (kubectl syntax, e.g. pool=demo) limiting the nodes this orchestrator sees. "+
 			"Nodes outside it contribute to no group, and pods bound to them are ignored. Group membership "+
 			"still comes from the group.timeslice.io/<group> node label. Empty (the default) watches all nodes.")
+	nodeSelectorExemptBackground := flag.Bool("node-selector-exempt-background", false,
+		"Keep pods labelled timeslice.io/role=background in their group even when they are bound to a node "+
+			"outside --node-selector. Only pods are exempt: such a node still contributes to no group. "+
+			"False (the default) drops them like any other pod. No effect without --node-selector.")
 	flag.Parse()
 
 	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {
@@ -210,6 +214,11 @@ func run() error {
 	}
 	if !scope.AllNodes() {
 		infraOpts = append(infraOpts, infrastructure.WithNodeScopedPods())
+		if *nodeSelectorExemptBackground {
+			infraOpts = append(infraOpts, infrastructure.WithNodeSelectorExemptBackground())
+		}
+	} else if *nodeSelectorExemptBackground {
+		slog.Warn("--node-selector-exempt-background has no effect without --node-selector")
 	}
 	infraOrch := infrastructure.NewKubernetesOrchestrator(
 		informerFactories.Nodes.Core().V1().Nodes(),
@@ -298,6 +307,7 @@ func run() error {
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,
+		"nodeSelectorExemptBackground", *nodeSelectorExemptBackground,
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
 }
