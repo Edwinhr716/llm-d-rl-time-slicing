@@ -696,11 +696,45 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 	}
 }
 
-// waitForOperation blocks until the given operation on the node completes or fails.
+// Outcomes logged on "Foreground operation finished".
+const (
+	foregroundOutcomeComplete  = "complete"
+	foregroundOutcomeFailed    = "failed"
+	foregroundOutcomeTimeout   = "timeout"
+	foregroundOutcomeCancelled = "cancelled"
+)
+
+// waitForOperation blocks until the given operation on the node completes or
+// fails, bounded by ForegroundOpTimeout (--foreground-wait=blocking). It logs
+// "Foreground operation started" and "Foreground operation finished" around
+// the wait.
 func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
 	ctx = logging.WithOperationID(ctx, operationID)
 
+	slog.InfoContext(ctx, "Foreground operation started",
+		"group", groupID, "job", jobID, "operation_id", operationID, "type", operationType)
+
+	err := c.pollOperation(ctx, groupID, jobID, nodeName, operationID, operationType)
+
+	outcome := foregroundOutcomeComplete
+	switch {
+	case err == nil:
+	case errors.Is(err, context.DeadlineExceeded):
+		outcome = foregroundOutcomeTimeout
+	case errors.Is(err, context.Canceled):
+		outcome = foregroundOutcomeCancelled
+	default:
+		outcome = foregroundOutcomeFailed
+	}
+	slog.InfoContext(ctx, "Foreground operation finished",
+		"group", groupID, "job", jobID, "operation_id", operationID, "type", operationType, "outcome", outcome)
+	return err
+}
+
+// pollOperation polls the agent until the operation completes or fails, or
+// until ForegroundOpTimeout or ctx ends.
+func (c *Controller) pollOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
 	if c.ForegroundOpTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.ForegroundOpTimeout)
