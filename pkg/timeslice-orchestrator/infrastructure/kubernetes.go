@@ -369,3 +369,18 @@ func findRemovedNodes(oldNodes, newNodes []string) []string {
 	}
 	return removed
 }
+
+// NodeAddress returns the InternalIP of a node from the node cache, or the
+// node name when the node has none (the name is then resolved by DNS).
+func (k *KubernetesOrchestrator) NodeAddress(nodeName string) (string, error) {
+	node, err := k.nodeLister.Get(nodeName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get node %s: %w", nodeName, err)
+	}
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+			return addr.Address, nil
+		}
+	}
+	return nodeName, nil
+}

@@ -54,6 +54,9 @@ type Server struct {
 	minBubble      time.Duration
 	noticeWindow   time.Duration
 	killBudget     time.Duration
+
+	// Host commands (D-NS-4 ns-push-vk). See WithHostCommander.
+	hosts HostCommander
 }
 
 // BackgroundProtocolVersion is the value of GroupStatus.background_protocol
@@ -195,6 +198,7 @@ func (s *Server) Acquire(ctx context.Context, req *pb.AcquireRequest) (*pb.Acqui
 	// hold the accelerator starts the notice and keeps blocking below until
 	// they are gone (see defaultCheckAcquire).
 	s.startNoticeIfBackgroundHeld(ctx, group)
+	s.startNoticeIfHostsNotClear(ctx, group)
 	if s.ctrl != nil {
 		s.ctrl.EnqueueWork(groupID)
 	}
@@ -243,6 +247,11 @@ func (s *Server) defaultCheckAcquire(
 	if s.startNoticeIfBackgroundHeld(ctx, group) {
 		return nil, nil, false //nolint:nilnil // returning nil, nil is intended when done is false
 	}
+	// Fail closed: never grant while some host of the group has not acked
+	// a vacate (D-NS-4 ns-push-vk).
+	if s.startNoticeIfHostsNotClear(ctx, group) {
+		return nil, nil, false //nolint:nilnil // returning nil, nil is intended when done is false
+	}
 
 	// Check if we are the lock holder AND the context is loaded
 	// (fixes premature success bug)
@@ -250,6 +259,10 @@ func (s *Server) defaultCheckAcquire(
 		// The accelerator is back with the foreground: any notice is over.
 		group.Spec().ClearNotice()
 		slog.InfoContext(ctx, "Acquire succeeded, job loaded and lock held")
+		if s.hosts != nil {
+			slog.InfoContext(ctx, "Foreground granted",
+				"group", groupID, "job", jobID, "waited_ms", time.Since(startTime).Milliseconds())
+		}
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
 			Success:         true,
@@ -393,7 +406,7 @@ func (s *Server) GetGroupStatus(ctx context.Context, req *pb.GetGroupStatusReque
 
 	groupStatus := &pb.GroupStatus{
 		GroupId:          snap.ID,
-		GroupState:       snap.EffectiveState(),
+		GroupState:       s.hostsEffectiveState(snap.ID, snap.EffectiveState()),
 		StateTimestamp:   timestamppb.New(snap.StateTimestamp),
 		LockingJob:       snap.LockingJob,
 		ActiveJob:        snap.ActiveJob,
@@ -625,7 +638,7 @@ func StartServer(
 		}
 	case <-ctx.Done():
 		slog.InfoContext(ctx, "Context canceled, shutting down servers gracefully")
-		s.GracefulStop()
+		stopGRPC(ctx, s)
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			slog.ErrorContext(ctx, "HTTP metrics server shutdown error", "error", err)
@@ -636,4 +649,24 @@ func StartServer(
 	}
 
 	return nil
+}
+
+// grpcStopGrace bounds GracefulStop: a foreground Acquire blocks until it is
+// granted, so a graceful stop could otherwise wait forever.
+const grpcStopGrace = 5 * time.Second
+
+// stopGRPC stops the server gracefully, and forcibly after grpcStopGrace.
+func stopGRPC(ctx context.Context, s *grpc.Server) {
+	done := make(chan struct{})
+	go func() {
+		s.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(grpcStopGrace):
+		slog.WarnContext(ctx, "Graceful gRPC stop timed out, stopping", "grace", grpcStopGrace)
+		s.Stop()
+		<-done
+	}
 }

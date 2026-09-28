@@ -134,6 +134,10 @@ type Controller struct {
 	// TRANSITIONING until the agent finishes. Zero means unbounded.
 	ForegroundOpTimeout time.Duration
 
+	// Hosts commands the hosts of each group to vacate and resume (D-NS-4
+	// ns-push-vk). Nil (the default) disables host commands.
+	Hosts HostCommander
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
 }
@@ -285,8 +289,19 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		return err
 	}
 
+	if c.Hosts != nil && c.holdForHosts(ctx, group) {
+		if err := c.updateGroupStatus(ctx, group); err != nil {
+			return fmt.Errorf("failed to update group status: %w", err)
+		}
+		return nil
+	}
+
 	if _, err := group.Spec().TryPromote(ctx); err != nil {
 		return fmt.Errorf("failed to promote next job: %w", err)
+	}
+
+	if c.Hosts != nil {
+		c.prepareLend(ctx, group)
 	}
 
 	activeJob := group.Spec().ActiveJob()
@@ -296,6 +311,12 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 	for _, node := range group.Status().Nodes() {
 		if err := c.reconcileNode(ctx, group.ID(), node, activeJob); err != nil {
 			return fmt.Errorf("failed to reconcile node %s: %w", node, err)
+		}
+	}
+
+	if c.Hosts != nil {
+		if err := c.resumeIfLent(ctx, group); err != nil {
+			return err
 		}
 	}
 
