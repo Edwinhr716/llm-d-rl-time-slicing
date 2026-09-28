@@ -175,8 +175,19 @@ type Controller struct {
 	// KillPollInterval is how often WaitForKillOperation polls.
 	KillPollInterval time.Duration
 
+	// BackgroundLiveness is L: a host whose commands have failed for this long
+	// during a vacate barrier counts as unseen, and its guests are killed.
+	// Zero means DefaultBackgroundLiveness.
+	BackgroundLiveness time.Duration
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
+
+	// killMu guards kills, agentSeen and holdLogged (kill path, kill.go).
+	killMu     sync.Mutex
+	kills      map[string]*killRecord
+	agentSeen  map[string]time.Time
+	holdLogged map[string]time.Time
 }
 
 // settleEntry remembers when a group's active job was first seen holding an
@@ -324,6 +335,15 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		return fmt.Errorf("failed to try deducing active job: %w", err)
 	}
 
+	if c.Hosts != nil {
+		// Kill path (ORCH-A4), ahead of every hold so a kill due at T is
+		// never delayed: a guest the agent reports FAULTED is killed at any
+		// time, and a host not clear at T or unseen for L has its guests
+		// killed.
+		c.killFaultedGuests(ctx, group)
+		c.killOverdueHosts(ctx, group)
+	}
+
 	if err := c.waitForGrantSettlement(ctx, group); err != nil {
 		return err
 	}
@@ -387,7 +407,7 @@ func (c *Controller) requeueWhileHolderWaits(ctx context.Context, groupID string
 	if holder == "" || group.Status().LoadedJob() == holder {
 		return
 	}
-	slog.DebugContext(ctx, "Lock holder is not loaded yet, requeueing", "holder", holder, "after", c.HolderWaitRequeue)
+	slog.DebugContext(ctx, "Lock holder is not loaded yet, requeuing", "holder", holder, "after", c.HolderWaitRequeue)
 	c.queue.AddAfter(groupID, c.HolderWaitRequeue)
 }
 
@@ -401,6 +421,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 
 	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
 	for _, job := range jobs {
+		if c.hostsGuardGuests(job) {
+			continue
+		}
 		state, ok := job.ContextState()[nodeName]
 		if !ok {
 			state = pb.SnapshotAgentJobState_STATE_UNSPECIFIED
@@ -574,6 +597,9 @@ func (c *Controller) tryDeduceActiveJob(ctx context.Context, group *store.Group)
 
 	var loadedJob string
 	for _, job := range jobs {
+		if c.hostsGuardGuests(job) {
+			continue
+		}
 		loaded, err := c.isJobLoaded(ctx, group, job.JobID())
 		if err != nil {
 			return fmt.Errorf("failed to check if job %s is loaded: %w", job.JobID(), err)
@@ -622,6 +648,9 @@ func (c *Controller) isJobLoaded(ctx context.Context, group *store.Group, jobID 
 	// If multiple jobs are running on the same node, we error out.
 	nodeRunningJob := make(map[string]string)
 	for _, job := range jobs {
+		if c.hostsGuardGuests(job) {
+			continue
+		}
 		for node, state := range job.ContextState() {
 			if state == pb.SnapshotAgentJobState_STATE_RUNNING {
 				if current, ok := nodeRunningJob[node]; ok && current != job.JobID() {
@@ -742,16 +771,26 @@ func (c *Controller) observeNodeJobContext(ctx context.Context, groupID, nodeNam
 		slog.ErrorContext(ctx, "Failed to get status from snapshot agent", "error", err, "node", nodeName)
 		return nil
 	}
+	c.markAgentSeen(nodeName)
 
 	for _, js := range resp.JobStatuses {
 		// Only update if the job is known in this group
-		_, err := c.jobStore.Get(ctx, groupID, js.JobId)
+		job, err := c.jobStore.Get(ctx, groupID, js.JobId)
 		if errors.Is(err, store.ErrNotFound) {
 			continue
 		} else if err != nil {
 			return fmt.Errorf("failed to get job %s from store: %w", js.JobId, err)
 		}
 
+		// A guest the agent reports killed is vacated (contract), whatever
+		// its state. One seen RUNNING again since is live.
+		switch {
+		case js.GetLastOutcome() == agentpb.Outcome_OUTCOME_KILLED:
+			job.SetKilled(nodeName, true)
+		case js.GetState() == agentpb.JobState_JOB_STATE_RUNNING && job.Killed(nodeName):
+			job.SetKilled(nodeName, false)
+		default:
+		}
 		state := translateJobState(js.State)
 		if err := c.jobStore.UpdateContextState(ctx, groupID, js.JobId, nodeName, state); err != nil {
 			return fmt.Errorf("failed to update job context state for job %s on node %s: %w", js.JobId, nodeName, err)
@@ -773,6 +812,8 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 		return pb.SnapshotAgentJobState_STATE_SAVED
 	case agentpb.JobState_JOB_STATE_FAULTED:
 		return pb.SnapshotAgentJobState_STATE_FAULTED
+	case agentpb.JobState_JOB_STATE_SUSPENDED:
+		return pb.SnapshotAgentJobState_STATE_SUSPENDED
 	default:
 		return pb.SnapshotAgentJobState_STATE_UNSPECIFIED
 	}

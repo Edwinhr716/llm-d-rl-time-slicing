@@ -287,16 +287,21 @@ func (s *Server) defaultCheckAcquire(
 	if group.Spec().LockingJob() == jobID && group.Status().LoadedJob() == jobID {
 		// The accelerator is back with the foreground: any notice is over.
 		group.Spec().ClearNotice()
+		// A node handed back after an unconfirmed guest Kill (D-NS-6) is
+		// reported once, on this grant.
+		vramUnconfirmed := group.Spec().TakeVramUnconfirmed()
 		slog.InfoContext(ctx, "Acquire succeeded, job loaded and lock held")
 		if s.hosts != nil {
 			slog.InfoContext(ctx, "Foreground granted",
-				"group", groupID, "job", jobID, "waited_ms", time.Since(startTime).Milliseconds())
+				"group", groupID, "job", jobID, "waited_ms", time.Since(startTime).Milliseconds(),
+				"vram_unconfirmed", vramUnconfirmed)
 		}
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
 			Success:         true,
 			ContextRestored: true, // Default to true, as we don't have enough info to determine if it was zero-overhead
 			WaitedMs:        time.Since(startTime).Milliseconds(),
+			VramUnconfirmed: vramUnconfirmed,
 		}, nil, true
 	}
 

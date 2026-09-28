@@ -9,6 +9,7 @@ import (
 	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/hostcmd"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -60,6 +61,12 @@ func (f *fakeHostCommander) Resume(string) {
 	f.allClear = false
 	f.events.add("resume")
 }
+
+func (f *fakeHostCommander) Barrier(string) (hostcmd.Barrier, bool) {
+	return hostcmd.Barrier{}, false
+}
+
+func (f *fakeHostCommander) ClearByOrchestrator(_, _, _ string) {}
 
 func (f *fakeHostCommander) setClear(allClear bool) {
 	f.mu.Lock()

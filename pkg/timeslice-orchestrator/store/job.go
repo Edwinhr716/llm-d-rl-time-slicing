@@ -35,6 +35,16 @@ type Job struct {
 	role         Role
 	pods         []string // pod UUIDs
 	contextState map[string]pb.SnapshotAgentJobState_State
+	// podNodes holds the nodes on which the job has a mirror pod that is not
+	// in a terminal phase. Only tracked for background jobs.
+	podNodes []string
+	// killed holds the nodes on which the agent reports the job killed
+	// (last_outcome OUTCOME_KILLED) or on which the orchestrator saw its own
+	// Kill of the job confirmed.
+	killed map[string]bool
+	// unconfirmedKill holds the nodes on which a Kill of the job was not
+	// confirmed and the node was handed back anyway (D-NS-6).
+	unconfirmedKill map[string]bool
 }
 
 // NewJob creates a new Job with default values.
@@ -101,4 +111,59 @@ func (j *Job) UpdateContextState(nodeName string, state pb.SnapshotAgentJobState
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.contextState[nodeName] = state
+}
+
+// Background reports whether the job is a background guest.
+func (j *Job) Background() bool {
+	return j.Role() == RoleBackground
+}
+
+// PodNodes returns the nodes on which the job has a non-terminal mirror pod.
+func (j *Job) PodNodes() []string {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return append([]string(nil), j.podNodes...)
+}
+
+// SetPodNodes records the nodes on which the job has a non-terminal mirror pod.
+func (j *Job) SetPodNodes(nodes []string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.podNodes = append([]string(nil), nodes...)
+}
+
+// Killed reports whether the job is known killed on nodeName.
+func (j *Job) Killed(nodeName string) bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.killed[nodeName]
+}
+
+// SetKilled records whether the job is killed on nodeName.
+func (j *Job) SetKilled(nodeName string, killed bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.killed == nil {
+		j.killed = make(map[string]bool)
+	}
+	j.killed[nodeName] = killed
+}
+
+// UnconfirmedKill reports whether nodeName was handed back after a Kill of the
+// job that was never confirmed.
+func (j *Job) UnconfirmedKill(nodeName string) bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.unconfirmedKill[nodeName]
+}
+
+// SetUnconfirmedKill records that nodeName was handed back after a Kill of the
+// job that was never confirmed.
+func (j *Job) SetUnconfirmedKill(nodeName string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.unconfirmedKill == nil {
+		j.unconfirmedKill = make(map[string]bool)
+	}
+	j.unconfirmedKill[nodeName] = true
 }

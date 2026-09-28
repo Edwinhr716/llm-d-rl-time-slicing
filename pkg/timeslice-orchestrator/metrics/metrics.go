@@ -101,6 +101,17 @@ var (
 			Help: "Number of dispatch budget evaluations that computed 1 but were not written, because the rising edge is published externally.",
 		},
 	)
+
+	// KillUnconfirmedTotal counts hosts handed back to the foreground at the end
+	// of the notice window after a guest Kill that was never confirmed
+	// (decision D-NS-6, today's behaviour). Each one makes the next foreground
+	// grant carry AcquireResponse.vram_unconfirmed = true.
+	KillUnconfirmedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "timeslice_kill_unconfirmed_total",
+			Help: "Number of hosts handed back to the foreground after a guest kill that was not confirmed.",
+		},
+	)
 )
 
 // CleanupGroup removes gauge series labeled with the given group so stale
@@ -123,5 +134,6 @@ func Register() {
 		DispatchBudgetWritesTotal,
 		DispatchBudgetHeldTotal,
 		DispatchBudgetRisingEdgeSkippedTotal,
+		KillUnconfirmedTotal,
 	)
 }

@@ -104,6 +104,9 @@ func run() error {
 			"every host of the group at <node InternalIP>:<port> to vacate by T = notice + N - K and is granted only "+
 			"after every host acked; a lend (Yield with --min-bubble) commands the hosts to resume. 0 (the default) "+
 			"disables host commands.")
+	backgroundLiveness := flag.Duration("background-liveness", controller.DefaultBackgroundLiveness,
+		"Background liveness L: with host commands on, a host whose commands have failed this long during a "+
+			"vacate counts as unseen and its guests are killed through their snapshot agent.")
 	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
 	// are proposals awaiting the lead's sign-off.
 	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
@@ -149,6 +152,9 @@ func run() error {
 
 	if *hostCommandPort < 0 || *hostCommandPort > 65535 {
 		return fmt.Errorf("--host-command-port must be 0 or a port number, got %d", *hostCommandPort)
+	}
+	if *backgroundLiveness <= 0 {
+		return fmt.Errorf("--background-liveness must be positive, got %v", *backgroundLiveness)
 	}
 
 	scope, err := infrastructure.ParseScope(*watchNamespaces, *nodeSelector)
@@ -228,6 +234,7 @@ func run() error {
 	ctrl.HolderWaitRequeue = *holderWaitRequeue
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 	ctrl.KillPollInterval = *killPollInterval
+	ctrl.BackgroundLiveness = *backgroundLiveness
 
 	// Start informers
 	informerFactories.Nodes.Start(ctx.Done())
@@ -281,6 +288,7 @@ func run() error {
 		"noticeWindow", *noticeWindow,
 		"killBudget", *killBudget,
 		"hostCommandPort", *hostCommandPort,
+		"backgroundLiveness", *backgroundLiveness,
 		"controllerWorkers", *controllerWorkers,
 		"agentRPCTimeout", *agentRPCTimeout,
 		"retryBaseDelay", *retryBaseDelay,

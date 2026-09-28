@@ -95,6 +95,7 @@ type flagValues struct {
 	noticeWindow             time.Duration
 	killBudget               time.Duration
 	hostCommandPort          int
+	backgroundLiveness       time.Duration
 	agentRPCTimeout          time.Duration
 	retryBaseDelay           time.Duration
 	retryMaxDelay            time.Duration
@@ -138,6 +139,8 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.DurationVar(&fv.noticeWindow, "notice-window", server.DefaultNoticeWindow, "Notice window N")
 	fs.DurationVar(&fv.killBudget, "kill-budget", server.DefaultKillBudget, "Kill budget K")
 	fs.IntVar(&fv.hostCommandPort, "host-command-port", 0, "Port of the per-host command endpoint; 0 disables host commands")
+	fs.DurationVar(&fv.backgroundLiveness, "background-liveness", controller.DefaultBackgroundLiveness,
+		"Background liveness L: a host whose commands have failed this long during a vacate counts as unseen")
 	fs.DurationVar(&fv.agentRPCTimeout, "agent-rpc-timeout", 5*time.Second, "Bound on every call to a snapshot agent")
 	fs.DurationVar(&fv.retryBaseDelay, "retry-base-delay", 1*time.Second, "First retry delay after a failed reconcile")
 	fs.DurationVar(&fv.retryMaxDelay, "retry-max-delay", 30*time.Second, "Cap on the retry delay")
@@ -167,6 +170,9 @@ func (fv *flagValues) validate() error {
 	}
 	if fv.hostCommandPort < 0 || fv.hostCommandPort > 65535 {
 		return fmt.Errorf("--host-command-port must be 0 or a port number, got %d", fv.hostCommandPort)
+	}
+	if fv.backgroundLiveness <= 0 {
+		return fmt.Errorf("--background-liveness must be positive, got %v", fv.backgroundLiveness)
 	}
 	if fv.budgetRedisAddr != "" && fv.budgetJob == "" {
 		return errors.New("--dispatch-budget-job is required when --dispatch-budget-redis-addr is set")
@@ -262,6 +268,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.HolderWaitRequeue = fv.holderWaitRequeue
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
 	ctrl.KillPollInterval = fv.killPollInterval
+	ctrl.BackgroundLiveness = fv.backgroundLiveness
 
 	informerFactories.Nodes.Start(ctx.Done())
 	for _, f := range informerFactories.Pods {
@@ -304,6 +311,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"noticeWindow", fv.noticeWindow,
 		"killBudget", fv.killBudget,
 		"hostCommandPort", fv.hostCommandPort,
+		"backgroundLiveness", fv.backgroundLiveness,
 		"agentRPCTimeout", fv.agentRPCTimeout,
 		"retryBaseDelay", fv.retryBaseDelay,
 		"retryMaxDelay", fv.retryMaxDelay,

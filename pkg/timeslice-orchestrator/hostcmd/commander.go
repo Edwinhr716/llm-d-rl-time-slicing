@@ -98,6 +98,9 @@ type host struct {
 	epoch int64
 	// failures counts consecutive failed commands. Zero means reachable.
 	failures int
+	// failingSince is when the current run of failed commands started. Zero
+	// while the host is reachable.
+	failingSince time.Time
 	// notClearLogged is set once the host was logged as not clear at the
 	// current barrier's deadline.
 	notClearLogged bool
@@ -185,10 +188,12 @@ func (c *Commander) SyncHosts(group string, nodes []string) {
 	defer c.mu.Unlock()
 	gh := c.groupLocked(group)
 	want := make(map[string]bool, len(nodes))
+	changed := false
 	for _, node := range nodes {
 		want[node] = true
 		if _, ok := gh.hosts[node]; !ok {
 			gh.hosts[node] = &host{node: node, state: StateUnknown}
+			changed = true
 		}
 	}
 	for node, hst := range gh.hosts {
@@ -197,7 +202,16 @@ func (c *Commander) SyncHosts(group string, nodes []string) {
 				hst.cancel()
 			}
 			delete(gh.hosts, node)
+			changed = true
 		}
+	}
+	if changed {
+		hosts := make([]string, 0, len(gh.hosts))
+		for node := range gh.hosts {
+			hosts = append(hosts, node)
+		}
+		sort.Strings(hosts)
+		c.log.Info("Host registry updated", "group", group, "hosts", hosts)
 	}
 	c.finishBarrierIfClearLocked(group, gh)
 }
@@ -276,6 +290,76 @@ func (c *Commander) Reachable(group, node string) bool {
 		}
 	}
 	return false
+}
+
+// Barrier is the running vacate barrier of a group, as the kill path sees it.
+type Barrier struct {
+	// NoticeAt is when the notice started, and Deadline is
+	// T = NoticeAt + NoticeWindow - KillBudget.
+	NoticeAt     time.Time
+	Deadline     time.Time
+	NoticeWindow time.Duration
+	KillBudget   time.Duration
+	// NotClear lists the hosts that have not acked the vacate, sorted by node.
+	NotClear []HostStatus
+}
+
+// HostStatus is one host that is not clear.
+type HostStatus struct {
+	Node  string
+	State State
+	// FailingSince is when the current run of failed commands to the host
+	// started, or zero if the last command reached it.
+	FailingSince time.Time
+}
+
+// Barrier returns the running vacate barrier of the group, if any.
+func (c *Commander) Barrier(group string) (Barrier, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	gh, ok := c.groups[group]
+	if !ok || gh.barrier == nil {
+		return Barrier{}, false
+	}
+	out := Barrier{
+		NoticeAt:     gh.barrier.noticeAt,
+		Deadline:     gh.barrier.deadline,
+		NoticeWindow: c.cfg.NoticeWindow,
+		KillBudget:   c.cfg.KillBudget,
+	}
+	for _, hst := range gh.hosts {
+		if hst.state == StateClear {
+			continue
+		}
+		out.NotClear = append(out.NotClear, HostStatus{Node: hst.node, State: hst.state, FailingSince: hst.failingSince})
+	}
+	sort.Slice(out.NotClear, func(i, j int) bool { return out.NotClear[i].Node < out.NotClear[j].Node })
+	return out, true
+}
+
+// ClearByOrchestrator marks a host clear without its ack, because the
+// orchestrator vacated it itself (how is "kill", "unconfirmed-kill" or
+// "no-live-guest"). The running command is stopped and fenced: a late ack of
+// it is ignored. The next Resume commands the host again as usual.
+func (c *Commander) ClearByOrchestrator(group, node, how string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	gh, ok := c.groups[group]
+	if !ok {
+		return
+	}
+	hst, ok := gh.hosts[node]
+	if !ok || hst.state == StateClear {
+		return
+	}
+	if hst.cancel != nil {
+		hst.cancel()
+		hst.cancel = nil
+	}
+	hst.epoch = c.epochs.Next()
+	hst.state = StateClear
+	c.log.Info("Host clear", "group", group, "node", node, "how", how, "epoch", hst.epoch)
+	c.finishBarrierIfClearLocked(group, gh)
 }
 
 // StartVacate starts the vacate barrier of a group for the notice that
@@ -493,8 +577,14 @@ func (c *Commander) handle(
 func (c *Commander) failedLocked(group string, hst *host, command string, err error) {
 	hst.failures++
 	if hst.failures == 1 {
+		hst.failingSince = time.Now()
 		c.log.Warn("Host command failed", "group", group, "node", hst.node, "command", command,
 			"epoch", hst.epoch, "error", err)
+		// The reconcile loop times the background liveness L from here
+		// (ORCH-A4 kill path).
+		if command == commandVacate && c.cfg.Enqueue != nil {
+			go c.cfg.Enqueue(group)
+		}
 	}
 }
 
@@ -504,6 +594,7 @@ func (c *Commander) reachableLocked(group string, hst *host) {
 			"failures", hst.failures)
 	}
 	hst.failures = 0
+	hst.failingSince = time.Time{}
 }
 
 // finishBarrierIfClearLocked ends the barrier once every host is clear and
@@ -522,8 +613,9 @@ func (c *Commander) finishBarrierIfClearLocked(group string, gh *groupHosts) {
 	}
 }
 
-// deadlinePassed logs every host that is not clear at T. This is the point
-// where the kill path (ORCH-A4) would act; this option does not kill.
+// deadlinePassed logs every host that is not clear at T and asks the reconcile
+// loop to look at the group: its kill path (ORCH-A4, controller/kill.go)
+// decides what happens to a host that is not clear at the deadline.
 func (c *Commander) deadlinePassed(group string, bar *barrier) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -538,6 +630,9 @@ func (c *Commander) deadlinePassed(group string, bar *barrier) {
 		hst.notClearLogged = true
 		c.log.Warn("Host not clear at deadline", "group", group, "node", hst.node, "epoch", hst.epoch,
 			"deadline", bar.deadline, "reachable", hst.failures == 0)
+	}
+	if c.cfg.Enqueue != nil {
+		go c.cfg.Enqueue(group)
 	}
 }
 

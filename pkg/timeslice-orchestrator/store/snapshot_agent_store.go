@@ -11,6 +11,7 @@ import (
 	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // SnapshotAgentStore defines the interface for communicating with snapshot agents.
@@ -20,6 +21,9 @@ type SnapshotAgentStore interface {
 	Snapshot(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.SnapshotResponse, error)
 	GetOperation(ctx context.Context, nodeName, operationID string) (*agentpb.GetOperationResponse, error)
 	Restore(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error)
+	// Kill asks the agent to kill jobID now, from any state, by deadline. It
+	// returns the kill operation to poll.
+	Kill(ctx context.Context, nodeName, jobID, reason string, deadline time.Time) (*agentpb.KillResponse, error)
 }
 
 type clientEntry struct {
@@ -201,6 +205,31 @@ func (s *GRPCSnapshotAgentStore) Restore(
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to trigger restore for job %s on agent at %s: %w", jobID, address, err)
+	}
+
+	return resp, nil
+}
+
+// Kill asks the agent on the node to kill a job by deadline. Kill has no epoch
+// and works from any state.
+func (s *GRPCSnapshotAgentStore) Kill(
+	ctx context.Context, nodeName, jobID, reason string, deadline time.Time,
+) (*agentpb.KillResponse, error) {
+	address := s.resolveNodeAddress(nodeName)
+	client, err := s.getClient(address)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := s.rpcContext(ctx)
+	defer cancel()
+	resp, err := client.Kill(ctx, &agentpb.KillRequest{
+		JobId:    jobID,
+		Deadline: timestamppb.New(deadline),
+		Reason:   reason,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to kill job %s on agent at %s: %w", jobID, address, err)
 	}
 
 	return resp, nil

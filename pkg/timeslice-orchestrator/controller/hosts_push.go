@@ -7,6 +7,7 @@ import (
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/hostcmd"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
 )
 
@@ -25,12 +26,20 @@ type HostCommander interface {
 	StartVacate(group string, noticeAt time.Time)
 	// Resume commands every host of the group to resume its guests.
 	Resume(group string)
+	// Barrier returns the running vacate barrier of the group, if any.
+	Barrier(group string) (hostcmd.Barrier, bool)
+	// ClearByOrchestrator marks a host clear without its ack, because the
+	// kill path vacated it (how names the way).
+	ClearByOrchestrator(group, node, how string)
 }
 
 // holdForHosts syncs the hosts of the group and reports whether the reconcile
 // must stop before promotion and node work because some host has not acked a
 // vacate (fail closed). When a foreground job waits or holds the lock, it
 // starts the vacate barrier.
+//
+// The kill path (killOverdueHosts, kill.go) runs just before, in
+// reconcileGroup, and may have cleared hosts itself.
 func (c *Controller) holdForHosts(ctx context.Context, group *store.Group) bool {
 	groupID := group.ID()
 	c.Hosts.SyncHosts(groupID, group.Status().Nodes())
@@ -79,6 +88,12 @@ func (c *Controller) resumeIfLent(ctx context.Context, group *store.Group) error
 	if !lendWanted(spec) || spec.ActiveJob() != "" || c.Hosts.Lent(group.ID()) {
 		return nil
 	}
+	if guest := c.unconfirmedGuestOn(ctx, group); guest.job != "" {
+		// A guest handed back after an unconfirmed Kill may still be on the
+		// node: do not lend it again until the agent says it is gone.
+		slog.WarnContext(ctx, "Not lending: an unconfirmed kill is not vacated yet", "job", guest.job, "node", guest.node)
+		return nil
+	}
 	busy, err := c.foregroundResident(ctx, group)
 	if err != nil {
 		return err
@@ -91,13 +106,16 @@ func (c *Controller) resumeIfLent(ctx context.Context, group *store.Group) error
 }
 
 // foregroundResident reports whether any foreground job is RUNNING or
-// TRANSITIONING on a node of the group.
+// TRANSITIONING on a node of the group. Guests do not count.
 func (c *Controller) foregroundResident(ctx context.Context, group *store.Group) (bool, error) {
 	jobs, err := c.jobStore.ListByGroup(ctx, group.ID())
 	if err != nil {
 		return false, fmt.Errorf("failed to list jobs for group %s: %w", group.ID(), err)
 	}
 	for _, job := range jobs {
+		if job.Background() {
+			continue
+		}
 		states := job.ContextState()
 		for _, node := range group.Status().Nodes() {
 			switch states[node] {
