@@ -40,6 +40,8 @@ spec:
             - --mirror-cpu-headroom=1
             - --mirror-memory-headroom=4Gi
             - --mirror-owner-ref=true
+            # M2 test hooks (force a guest's readiness, read its Ready edges); loopback only.
+            - --debug-addr=127.0.0.1:10261
           env:
             - name: HOST_IP
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
