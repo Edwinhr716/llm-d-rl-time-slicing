@@ -1,0 +1,365 @@
+//go:build evalwire
+
+// Package evalwire starts an in-process orchestrator for evaluation harnesses.
+// It is compiled only with the evalwire build tag and is never part of the
+// product binary.
+//
+// Start wires the stores, informers, work queue, rate limiter, controller,
+// workers and server options the same way cmd/timesliceorchestrator/main.go
+// does, from the same flag strings, on a caller-supplied clientset (usually
+// k8s.io/client-go/kubernetes/fake). Keep it in step with main.go: the test in
+// this package fails when the two flag sets differ.
+//
+// Differences from main.go, all needed to run in a test process:
+//   - The clientset comes from Config instead of a kubeconfig.
+//   - --port and --metrics-port are ignored; each Start picks free loopback
+//     ports and reports them in Orch.Addr and Orch.MetricsAddr.
+//   - Config.AgentPort, when non-zero, overrides --snapshot-agent-port.
+//   - The default slog logger is left to the caller. To get the group, job,
+//     node and operation IDs from the context on each record, as main.go
+//     does, wrap the handler with logging.NewContextHandler.
+//   - Metrics are registered once per process, so Start can run again.
+package evalwire
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/budget"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/infrastructure"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/workqueue"
+)
+
+// Config configures one in-process orchestrator.
+type Config struct {
+	// Clientset is the Kubernetes client the orchestrator watches and stores
+	// its lock ConfigMap in. Reuse it across Start calls to model a restart.
+	Clientset kubernetes.Interface
+	// AgentPort, when non-zero, overrides --snapshot-agent-port.
+	AgentPort int
+	// Args are flags as cmd/timesliceorchestrator accepts them, for example
+	// "--foreground-wait=async-requeue".
+	Args []string
+}
+
+// Orch is a running in-process orchestrator.
+type Orch struct {
+	// Addr is the gRPC address (host:port) of the orchestrator service.
+	Addr string
+	// MetricsAddr is the host:port serving /metrics.
+	MetricsAddr string
+	// Stop cancels the orchestrator and waits for it to shut down. Like a
+	// SIGTERM to the binary it stops gracefully, so it returns only after
+	// in-flight RPCs (a blocked Acquire, for example) end; cancel them on the
+	// client side first. After Stop, Start may run again on the same
+	// clientset.
+	Stop func()
+}
+
+// flagValues holds the parsed flags, one field per flag in main.go.
+type flagValues struct {
+	port                     int
+	metricsPort              int
+	kubeconfig               string
+	controllerWorkers        int
+	snapshotAgentPort        int
+	resyncPeriod             time.Duration
+	servingQuantum           time.Duration
+	budgetRedisAddr          string
+	budgetKey                string
+	budgetJob                string
+	budgetOpenDelay          time.Duration
+	budgetExternalRisingEdge bool
+	foregroundWait           string
+	foregroundOpTimeout      time.Duration
+	backgroundRole           bool
+	minBubble                time.Duration
+	noticeWindow             time.Duration
+	killBudget               time.Duration
+}
+
+// newFlagSet declares the flags of cmd/timesliceorchestrator/main.go with the
+// same names, defaults and environment overrides.
+func newFlagSet() (*flag.FlagSet, *flagValues) {
+	fv := &flagValues{}
+	fs := flag.NewFlagSet("evalwire", flag.ContinueOnError)
+	fs.IntVar(&fv.port, "port", 50051, "The server port (ignored: Start picks a free port)")
+	fs.IntVar(&fv.metricsPort, "metrics-port", 8080, "The metrics server port (ignored: Start picks a free port)")
+	fs.StringVar(&fv.kubeconfig, "kubeconfig", "", "Ignored: the clientset comes from Config")
+	fs.IntVar(&fv.controllerWorkers, "controller-workers", 1, "The number of workers for the controller")
+	fs.IntVar(&fv.snapshotAgentPort, "snapshot-agent-port", 9001, "The default port for snapshot agents")
+	fs.DurationVar(&fv.resyncPeriod, "resync-period", 30*time.Second, "The period for periodic resync of agent states")
+	fs.DurationVar(&fv.servingQuantum, "serving-quantum", envDuration("TIMESLICE_SERVING_QUANTUM", 0),
+		"Minimum run time after a restore before waiters are advertised")
+	fs.StringVar(&fv.budgetRedisAddr, "dispatch-budget-redis-addr", os.Getenv("TIMESLICE_DISPATCH_BUDGET_REDIS_ADDR"),
+		"host:port of the Redis to publish the dispatch budget to")
+	fs.StringVar(&fv.budgetKey, "dispatch-budget-key", envString("TIMESLICE_DISPATCH_BUDGET_KEY", budget.DefaultKey),
+		"Redis key of the dispatch budget")
+	fs.StringVar(&fv.budgetJob, "dispatch-budget-job", os.Getenv("TIMESLICE_DISPATCH_BUDGET_JOB"),
+		"job ID of the batch tenant whose availability is published")
+	fs.DurationVar(&fv.budgetOpenDelay, "dispatch-budget-open-delay",
+		envDuration("TIMESLICE_DISPATCH_BUDGET_OPEN_DELAY", 0), "Hold-down before publishing the rising edge")
+	fs.BoolVar(&fv.budgetExternalRisingEdge, "dispatch-budget-external-rising-edge",
+		envBool("TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE", false), "Publish only \"0\"")
+	fs.StringVar(&fv.foregroundWait, "foreground-wait", controller.ForegroundWaitBlocking,
+		"How reconcile waits on a foreground snapshot or restore")
+	fs.DurationVar(&fv.foregroundOpTimeout, "foreground-op-timeout", 10*time.Minute,
+		"Upper bound on each blocking wait for a foreground operation; 0 means unbounded")
+	fs.BoolVar(&fv.backgroundRole, "background-role", false, "Enable the background participant protocol")
+	fs.DurationVar(&fv.minBubble, "min-bubble", 0, "Smallest Yield expected_idle that records a lend hint")
+	fs.DurationVar(&fv.noticeWindow, "notice-window", server.DefaultNoticeWindow, "Notice window N")
+	fs.DurationVar(&fv.killBudget, "kill-budget", server.DefaultKillBudget, "Kill budget K")
+	return fs, fv
+}
+
+// validate applies the checks main.go runs after flag.Parse.
+func (fv *flagValues) validate() error {
+	if err := controller.ValidateForegroundWait(fv.foregroundWait); err != nil {
+		return fmt.Errorf("--foreground-wait: %w", err)
+	}
+	if fv.foregroundOpTimeout < 0 {
+		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", fv.foregroundOpTimeout)
+	}
+	if fv.minBubble < 0 {
+		return fmt.Errorf("--min-bubble must not be negative, got %v", fv.minBubble)
+	}
+	if fv.noticeWindow <= 0 || fv.killBudget <= 0 || fv.killBudget >= fv.noticeWindow {
+		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
+			fv.killBudget, fv.noticeWindow)
+	}
+	if fv.budgetRedisAddr != "" && fv.budgetJob == "" {
+		return errors.New("--dispatch-budget-job is required when --dispatch-budget-redis-addr is set")
+	}
+	return nil
+}
+
+var registerMetrics sync.Once
+
+// Start parses cfg.Args, wires an orchestrator as main.go does and starts it.
+// It returns once the gRPC and metrics ports accept connections.
+func Start(ctx context.Context, cfg Config) (*Orch, error) {
+	if cfg.Clientset == nil {
+		return nil, errors.New("evalwire: Config.Clientset is required")
+	}
+	fs, fv := newFlagSet()
+	if err := fs.Parse(cfg.Args); err != nil {
+		return nil, fmt.Errorf("evalwire: %w", err)
+	}
+	if fs.NArg() > 0 {
+		return nil, fmt.Errorf("evalwire: unexpected arguments %v", fs.Args())
+	}
+	if cfg.AgentPort != 0 {
+		fv.snapshotAgentPort = cfg.AgentPort
+	}
+	if err := fv.validate(); err != nil {
+		return nil, fmt.Errorf("evalwire: %w", err)
+	}
+
+	grpcPort, err := freePort(ctx)
+	if err != nil {
+		return nil, err
+	}
+	metricsPort, err := freePort(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	registerMetrics.Do(metrics.Register)
+
+	ctx, cancel := context.WithCancel(ctx)
+	clientset := cfg.Clientset
+
+	// From here on this mirrors run() in cmd/timesliceorchestrator/main.go.
+	nodeInformerFactory := informers.NewSharedInformerFactory(clientset, time.Minute*30)
+	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Minute*30,
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = "timeslice.io/group"
+		}),
+	)
+
+	lockStore := store.NewConfigMapLockStore(clientset)
+	groupStore := store.NewGroupStore(lockStore)
+	jobStore := store.NewJobStore()
+	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, fv.snapshotAgentPort)
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		workqueue.DefaultTypedControllerRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{
+			Name: "groups",
+		},
+	)
+
+	infraOrch := infrastructure.NewKubernetesOrchestrator(
+		nodeInformerFactory.Core().V1().Nodes(),
+		podInformerFactory.Core().V1().Pods(),
+		groupStore,
+		jobStore,
+		snapshotAgentStore,
+	)
+	if err := infraOrch.Start(ctx, queue); err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to start infrastructure orchestrator: %w", err)
+	}
+
+	ctrl := controller.NewController(
+		groupStore,
+		jobStore,
+		queue,
+		infraOrch,
+		snapshotAgentStore,
+	)
+	ctrl.ResyncPeriod = fv.resyncPeriod
+	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
+	ctrl.ForegroundWait = fv.foregroundWait
+
+	nodeInformerFactory.Start(ctx.Done())
+	podInformerFactory.Start(ctx.Done())
+
+	opts := []server.Option{
+		server.WithServingQuantum(fv.servingQuantum),
+		server.WithBackgroundRole(fv.backgroundRole),
+		server.WithMinBubble(fv.minBubble),
+		server.WithNoticeTiming(fv.noticeWindow, fv.killBudget),
+	}
+	var publisher *budget.Publisher
+	if fv.budgetRedisAddr != "" {
+		publisher = budget.NewPublisher(budget.NewRedisWriter(fv.budgetRedisAddr), fv.budgetKey, fv.budgetJob).
+			WithOpenDelay(fv.budgetOpenDelay).
+			WithExternalRisingEdge(fv.budgetExternalRisingEdge)
+		opts = append(opts, server.WithDispatchBudgetPublisher(publisher))
+	}
+
+	slog.InfoContext(ctx, "Starting TimeSlice Orchestrator server (evalwire)",
+		"grpcPort", grpcPort,
+		"metricsPort", metricsPort,
+		"foregroundWait", fv.foregroundWait,
+		"foregroundOpTimeout", fv.foregroundOpTimeout,
+		"controllerWorkers", fv.controllerWorkers,
+		"backgroundRole", fv.backgroundRole,
+		"minBubble", fv.minBubble,
+		"noticeWindow", fv.noticeWindow,
+		"killBudget", fv.killBudget,
+	)
+
+	// serveErr is written before exited is closed and read only after.
+	var serveErr error
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		serveErr = server.StartServer(ctx, grpcPort, metricsPort, ctrl, groupStore, jobStore, fv.controllerWorkers, opts...)
+	}()
+
+	orch := &Orch{
+		Addr:        net.JoinHostPort("127.0.0.1", strconv.Itoa(grpcPort)),
+		MetricsAddr: net.JoinHostPort("127.0.0.1", strconv.Itoa(metricsPort)),
+	}
+	var stopOnce sync.Once
+	orch.Stop = func() {
+		stopOnce.Do(func() {
+			cancel()
+			<-exited
+			if serveErr != nil {
+				slog.Error("evalwire: orchestrator stopped with an error", "error", serveErr)
+			}
+			if publisher != nil {
+				if err := publisher.Close(); err != nil {
+					slog.Error("evalwire: failed to close dispatch budget publisher", "error", err)
+				}
+			}
+		})
+	}
+
+	for _, addr := range []string{orch.Addr, orch.MetricsAddr} {
+		if err := waitListening(ctx, addr, exited); err != nil {
+			orch.Stop()
+			return nil, err
+		}
+	}
+	return orch, nil
+}
+
+// freePort returns a loopback TCP port that was free a moment ago.
+func freePort(ctx context.Context) (int, error) {
+	lis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("evalwire: pick a free port: %w", err)
+	}
+	addr := lis.Addr()
+	if err := lis.Close(); err != nil {
+		return 0, fmt.Errorf("evalwire: release port %v: %w", addr, err)
+	}
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("evalwire: unexpected listener address %v", addr)
+	}
+	return tcpAddr.Port, nil
+}
+
+// waitListening polls addr until it accepts a TCP connection, the server
+// exits or 10 s pass.
+func waitListening(ctx context.Context, addr string, exited <-chan struct{}) error {
+	deadline := time.Now().Add(10 * time.Second)
+	dialer := &net.Dialer{Timeout: 200 * time.Millisecond}
+	for {
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			return conn.Close()
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("evalwire: %s not listening after 10s: %w", addr, err)
+		}
+		select {
+		case <-exited:
+			return fmt.Errorf("evalwire: orchestrator exited before %s listened", addr)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// envString, envDuration and envBool match the helpers in main.go.
+func envString(name, def string) string {
+	if raw, ok := os.LookupEnv(name); ok && raw != "" {
+		return raw
+	}
+	return def
+}
+
+func envDuration(name string, def time.Duration) time.Duration {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+func envBool(name string, def bool) bool {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(raw)
+	if err != nil {
+		return def
+	}
+	return b
+}

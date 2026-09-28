@@ -15,7 +15,8 @@ func TestValidateForegroundWait(t *testing.T) {
 		wantErr bool
 	}{
 		{mode: ForegroundWaitBlocking},
-		{mode: ForegroundWaitAsync, wantErr: true},
+		{mode: ForegroundWaitAsyncRequeue},
+		{mode: ForegroundWaitAsync},
 		{mode: "", wantErr: true},
 		{mode: "other", wantErr: true},
 	}

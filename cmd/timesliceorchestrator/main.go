@@ -78,9 +78,10 @@ func run() error {
 			"declining to open it. Supersedes --dispatch-budget-open-delay. "+
 			"Overridable with the TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE environment variable.")
 	foregroundWait := flag.String("foreground-wait", controller.ForegroundWaitBlocking,
-		"How reconcile waits on a foreground snapshot or restore. \"blocking\" (option A, the default and the "+
-			"only mode implemented) blocks on the agent operation, bounded by --foreground-op-timeout. "+
-			"PENDING LEAD DECISION: option B (\"async\") is refused until decided.")
+		"How reconcile waits on a foreground snapshot or restore. \"blocking\" (option A, the default) blocks "+
+			"the worker on the agent operation, bounded by --foreground-op-timeout. \"async-requeue\" (option B; "+
+			"alias \"async\") starts the operation, keeps its ID in memory and checks it on a 1 s requeue, so no "+
+			"worker blocks; Acquire still returns once the operation has completed. PENDING LEAD DECISION D-ORCH-1.")
 	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
 		"Upper bound on each blocking wait for a foreground snapshot or restore operation. On expiry the "+
 			"reconcile is retried. 0 means unbounded.")
@@ -180,6 +181,7 @@ func run() error {
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
+	ctrl.ForegroundWait = *foregroundWait
 
 	// Start informers
 	nodeInformerFactory.Start(ctx.Done())

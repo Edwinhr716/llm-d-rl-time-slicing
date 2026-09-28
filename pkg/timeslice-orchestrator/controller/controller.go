@@ -22,27 +22,30 @@ const (
 
 // ForegroundWaitBlocking is option A for how reconcile waits on a foreground
 // snapshot or restore: it blocks on the agent operation, bounded by
-// Controller.ForegroundOpTimeout. It is the only mode implemented.
+// Controller.ForegroundOpTimeout. It is the default.
 //
-// PENDING LEAD DECISION (foreground wait, A or B): option B, which starts the
-// operation and checks it on a later requeue, is not implemented, and
-// ValidateForegroundWait refuses it until the lead decides.
+// PENDING LEAD DECISION D-ORCH-1 (foreground wait): this branch adds option B,
+// ForegroundWaitAsyncRequeue.
 const ForegroundWaitBlocking = "blocking"
 
-// ForegroundWaitAsync names option B. It is recognised only so that the
-// error can say why it is refused.
+// ForegroundWaitAsyncRequeue is option B (design section 6): reconcile starts
+// the foreground operation, keeps its ID in memory and checks it on a 1 s
+// requeue instead of blocking the worker. Acquire is unchanged and returns
+// once the operation has completed. See foreground_async.go.
+const ForegroundWaitAsyncRequeue = "async-requeue"
+
+// ForegroundWaitAsync is accepted as another name for
+// ForegroundWaitAsyncRequeue.
 const ForegroundWaitAsync = "async"
 
 // ValidateForegroundWait checks a --foreground-wait value.
 func ValidateForegroundWait(mode string) error {
 	switch mode {
-	case ForegroundWaitBlocking:
+	case ForegroundWaitBlocking, ForegroundWaitAsyncRequeue, ForegroundWaitAsync:
 		return nil
-	case ForegroundWaitAsync:
-		return fmt.Errorf("foreground wait %q (option B) is not implemented (PENDING LEAD DECISION); use %q",
-			mode, ForegroundWaitBlocking)
 	default:
-		return fmt.Errorf("unknown foreground wait %q: must be %q", mode, ForegroundWaitBlocking)
+		return fmt.Errorf("unknown foreground wait %q: must be %q or %q (alias %q)",
+			mode, ForegroundWaitBlocking, ForegroundWaitAsyncRequeue, ForegroundWaitAsync)
 	}
 }
 
@@ -133,6 +136,16 @@ type Controller struct {
 	// reconcile returns an error and is retried; the job then reports
 	// TRANSITIONING until the agent finishes. Zero means unbounded.
 	ForegroundOpTimeout time.Duration
+
+	// ForegroundWait selects how reconcile waits on a foreground operation:
+	// ForegroundWaitBlocking (default, also when empty) or
+	// ForegroundWaitAsyncRequeue. PENDING LEAD DECISION D-ORCH-1.
+	ForegroundWait string
+
+	// fgOps holds the in-flight foreground operations of the async mode,
+	// keyed by group and node. In memory only.
+	fgMu  sync.Mutex
+	fgOps map[string]*foregroundOp
 
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
@@ -240,7 +253,15 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 
 		cycleCtx := logging.WithGroupID(ctx, groupID)
 
-		if err := c.reconcileGroup(cycleCtx, groupID); err != nil {
+		err := c.reconcileGroup(cycleCtx, groupID)
+		if errors.Is(err, errForegroundPending) {
+			// Async foreground wait: not a failure, check again shortly.
+			c.queue.Forget(groupID)
+			c.requeueAfter(groupID, foregroundCheckInterval)
+			slog.InfoContext(cycleCtx, "Foreground operation in flight, requeued", "after", foregroundCheckInterval)
+			return nil
+		}
+		if err != nil {
 			c.queue.AddRateLimited(groupID)
 			return fmt.Errorf("error syncing '%s': %s, requeuing", groupID, err.Error())
 		}
@@ -293,8 +314,18 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 
 	// 3. Act
 	// TODO: add optional fan out parallelism for node reconciliation
-	for _, node := range group.Status().Nodes() {
+	nodes := group.Status().Nodes()
+	if c.asyncForeground() {
+		c.pruneForegroundOps(group.ID(), nodes)
+	}
+	pending := false
+	for _, node := range nodes {
 		if err := c.reconcileNode(ctx, group.ID(), node, activeJob); err != nil {
+			if errors.Is(err, errForegroundPending) {
+				// Async foreground wait: the other nodes still get their pass.
+				pending = true
+				continue
+			}
 			return fmt.Errorf("failed to reconcile node %s: %w", node, err)
 		}
 	}
@@ -306,24 +337,31 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 
 	metrics.QueueDepth.WithLabelValues(group.ID()).Set(float64(group.Snapshot().WaiterQueueDepth))
 
+	if pending {
+		return errForegroundPending
+	}
 	return nil
 }
 
 // reconcileNode reconciles the state of a single node for the active job.
 func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activeJobID string) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
-	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
+	agentJobStates, err := c.nodeJobStates(ctx, groupID, nodeName)
 	if err != nil {
-		return fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
+		return err
 	}
 
-	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
-	for _, job := range jobs {
-		state, ok := job.ContextState()[nodeName]
-		if !ok {
-			state = pb.SnapshotAgentJobState_STATE_UNSPECIFIED
+	// Foreground wait option B: check the node's in-flight operation first.
+	if c.asyncForeground() {
+		refreshed, err := c.checkForegroundOp(ctx, groupID, nodeName, agentJobStates)
+		if err != nil {
+			return err
 		}
-		agentJobStates[job.JobID()] = state
+		if refreshed {
+			if agentJobStates, err = c.nodeJobStates(ctx, groupID, nodeName); err != nil {
+				return err
+			}
+		}
 	}
 
 	slog.DebugContext(ctx, "Reconciling node", "activeJobID", activeJobID, "agentJobStates", agentJobStates)
@@ -362,6 +400,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 			if err != nil {
 				return fmt.Errorf("failed to trigger snapshot for job %s on node %s: %w", jobID, nodeName, err)
 			}
+			if c.asyncForeground() {
+				return c.startForegroundOp(ctx, groupID, jobID, nodeName, resp.OperationId, "snapshot")
+			}
 			if err := c.waitForOperation(ctx, groupID, jobID, nodeName, resp.OperationId, "snapshot"); err != nil {
 				return fmt.Errorf("failed while waiting for snapshot operation %s for job %s on node %s: %w",
 					resp.OperationId, jobID, nodeName, err)
@@ -396,6 +437,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 		return fmt.Errorf("failed to trigger restore for active job %s on node %s: %w",
 			activeJobID, nodeName, err)
 	}
+	if c.asyncForeground() {
+		return c.startForegroundOp(ctx, groupID, activeJobID, nodeName, resp.OperationId, "restore")
+	}
 	if err := c.waitForOperation(ctx, groupID, activeJobID, nodeName, resp.OperationId, "restore"); err != nil {
 		return fmt.Errorf("failed waiting for restore op %s for job %s on %s: %w",
 			resp.OperationId, activeJobID, nodeName, err)
@@ -405,6 +449,27 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 	}
 
 	return nil
+}
+
+// nodeJobStates returns the last observed context state of every job of the
+// group on the node, UNSPECIFIED where none was observed.
+func (c *Controller) nodeJobStates(ctx context.Context, groupID, nodeName string) (
+	map[string]pb.SnapshotAgentJobState_State, error,
+) {
+	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
+	}
+
+	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
+	for _, job := range jobs {
+		state, ok := job.ContextState()[nodeName]
+		if !ok {
+			state = pb.SnapshotAgentJobState_STATE_UNSPECIFIED
+		}
+		agentJobStates[job.JobID()] = state
+	}
+	return agentJobStates, nil
 }
 
 // waitForGrantSettlement holds promotion of the next waiter while the current
@@ -711,10 +776,13 @@ func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeN
 	defer ticker.Stop()
 
 	slog.InfoContext(ctx, "Waiting for agent operation to complete")
+	started := time.Now()
+	logForegroundStarted(ctx, groupID, jobID, nodeName, operationID, operationType)
 
 	for {
 		select {
 		case <-ctx.Done():
+			logForegroundFinished(ctx, groupID, jobID, nodeName, operationID, operationType, "timeout", time.Since(started))
 			return fmt.Errorf("context cancelled while waiting for operation %s: %w", operationID, ctx.Err())
 		case <-ticker.C:
 			resp, err := c.agentStore.GetOperation(ctx, nodeName, operationID)
@@ -728,12 +796,14 @@ func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeN
 				slog.InfoContext(ctx, "Operation completed successfully", "elapsedMs", resp.ElapsedMs)
 				durationSec := float64(resp.ElapsedMs) / 1000.0
 				metrics.AgentOperationDuration.WithLabelValues(groupID, jobID, nodeName, operationType).Observe(durationSec)
+				logForegroundFinished(ctx, groupID, jobID, nodeName, operationID, operationType, "complete", time.Since(started))
 				return nil
 			case agentpb.OperationStatus_OPERATION_STATUS_FAILED:
 				errStr := "unknown error"
 				if resp.Error != nil {
 					errStr = *resp.Error
 				}
+				logForegroundFinished(ctx, groupID, jobID, nodeName, operationID, operationType, "failed", time.Since(started))
 				return fmt.Errorf("operation %s failed: %s", operationID, errStr)
 			case agentpb.OperationStatus_OPERATION_STATUS_PENDING:
 				slog.DebugContext(ctx, "Operation still pending", "elapsedMs", resp.ElapsedMs)
