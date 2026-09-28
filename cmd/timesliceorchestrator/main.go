@@ -97,7 +97,18 @@ func run() error {
 	killBudget := flag.Duration("kill-budget", server.DefaultKillBudget,
 		"Kill budget K reserved at the end of the notice window; guests must vacate by T = notice + N - K. "+
 			"PENDING LEAD DECISION.")
+	nodeGroupLabels := flag.String("node-group-labels", infrastructure.NodeGroupLabelsPrefix,
+		"Which node labels put a node in a group. \"prefix\" (the default) reads group.timeslice.io/<group>=true; "+
+			"pair it with an empty --node-selector. \"ns\" reads timeslice.io/donor=true plus "+
+			"timeslice.io/group=<namespace>.<job-id>.<group> (the value the donor pods carry); pair it with "+
+			"--node-selector=timeslice.io/donor=true. \"either\" accepts both forms (a node whose two forms name "+
+			"different groups is in none); pair it with an empty --node-selector. In every mode a node naming "+
+			"more than one group, or a half-written label, is in no group. PENDING LEAD DECISION D-NS-1.")
 	flag.Parse()
+
+	if err := infrastructure.ValidateNodeGroupLabels(*nodeGroupLabels); err != nil {
+		return fmt.Errorf("--node-group-labels: %w", err)
+	}
 
 	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {
 		return fmt.Errorf("--foreground-wait: %w", err)
@@ -167,6 +178,9 @@ func run() error {
 		jobStore,
 		snapshotAgentStore,
 	)
+	if err := infraOrch.SetNodeGroupLabels(*nodeGroupLabels); err != nil {
+		return fmt.Errorf("--node-group-labels: %w", err)
+	}
 	if err := infraOrch.Start(ctx, queue); err != nil {
 		return fmt.Errorf("failed to start infrastructure orchestrator: %w", err)
 	}
@@ -216,6 +230,8 @@ func run() error {
 		"minBubble", *minBubble,
 		"noticeWindow", *noticeWindow,
 		"killBudget", *killBudget,
+		"nodeGroupLabels", *nodeGroupLabels,
+		"recommendedNodeSelector", infrastructure.RecommendedNodeSelector(*nodeGroupLabels),
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
 }

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
@@ -55,6 +56,25 @@ type KubernetesOrchestrator struct {
 	groupStore         *store.GroupStore
 	jobStore           *store.JobStore
 	snapshotAgentStore store.SnapshotAgentStore
+	nodeGroupLabels    string
+}
+
+// SetNodeGroupLabels selects which node labels define group membership
+// (NodeGroupLabelsPrefix, NodeGroupLabelsNS or NodeGroupLabelsEither). Call it
+// before Start. Unset means NodeGroupLabelsPrefix.
+func (k *KubernetesOrchestrator) SetNodeGroupLabels(mode string) error {
+	if err := ValidateNodeGroupLabels(mode); err != nil {
+		return err
+	}
+	k.nodeGroupLabels = mode
+	return nil
+}
+
+func (k *KubernetesOrchestrator) nodeGroupLabelMode() string {
+	if k.nodeGroupLabels == "" {
+		return NodeGroupLabelsPrefix
+	}
+	return k.nodeGroupLabels
 }
 
 // NewKubernetesOrchestrator creates a new KubernetesOrchestrator.
@@ -86,17 +106,20 @@ func (k *KubernetesOrchestrator) Init(ctx context.Context) error {
 	return nil
 }
 
-// getNodesForGroup returns the names of the nodes that belong to the given group.
+// getNodesForGroup returns the sorted names of the nodes that belong to the
+// given group: exactly the nodes for which NodeInGroup is true.
 func (k *KubernetesOrchestrator) getNodesForGroup(groupID string) ([]string, error) {
-	selector := labels.SelectorFromSet(labels.Set{NodeLabelPrefix + groupID: "true"})
-	nodes, err := k.nodeLister.List(selector)
+	nodes, err := k.nodeLister.List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
 	var groupNodes []string
 	for _, node := range nodes {
-		groupNodes = append(groupNodes, node.Name)
+		if NodeInGroup(k.nodeGroupLabelMode(), node.Labels, groupID) {
+			groupNodes = append(groupNodes, node.Name)
+		}
 	}
+	sort.Strings(groupNodes)
 	return groupNodes, nil
 }
 
@@ -175,7 +198,18 @@ func (k *KubernetesOrchestrator) updateGroupNodes(ctx context.Context, groupID s
 
 	g.Status().SetNodes(groupNodes)
 	slog.InfoContext(ctx, "Updated nodes for group", "nodes", groupNodes)
+	if len(removedNodes) > 0 || len(findRemovedNodes(groupNodes, oldNodes)) > 0 {
+		k.logGroupNodes(ctx, groupID, groupNodes)
+	}
 	return nil
+}
+
+// logGroupNodes logs a group's node set after it changed.
+func (k *KubernetesOrchestrator) logGroupNodes(ctx context.Context, groupID string, nodes []string) {
+	sorted := append([]string(nil), nodes...)
+	sort.Strings(sorted)
+	slog.InfoContext(ctx, "group nodes",
+		"group", groupID, "nodes", strings.Join(sorted, ","), "mode", k.nodeGroupLabelMode())
 }
 
 func (k *KubernetesOrchestrator) updateJobsAndPods(ctx context.Context, groupID string, pods []PodInfo) error {
@@ -235,6 +269,9 @@ func (k *KubernetesOrchestrator) cleanupGroup(ctx context.Context, groupID strin
 			if err := k.snapshotAgentStore.CloseClient(nodeName); err != nil {
 				slog.ErrorContext(ctx, "Failed to close snapshot agent client on group deletion", "error", err, "node", nodeName)
 			}
+		}
+		if len(oldGroup.Status().Nodes()) > 0 {
+			k.logGroupNodes(ctx, groupID, nil)
 		}
 	}
 
@@ -297,16 +334,7 @@ func (k *KubernetesOrchestrator) enqueueNode(ctx context.Context, obj interface{
 }
 
 func (k *KubernetesOrchestrator) getGroupsFromNode(node *corev1.Node) []string {
-	var groups []string
-	for k := range node.Labels {
-		if strings.HasPrefix(k, NodeLabelPrefix) {
-			group := strings.TrimPrefix(k, NodeLabelPrefix)
-			if group != "" {
-				groups = append(groups, group)
-			}
-		}
-	}
-	return groups
+	return GroupsFromNodeLabels(k.nodeGroupLabelMode(), node.Labels)
 }
 
 func (k *KubernetesOrchestrator) setupPodInformer(ctx context.Context, queue controller.WorkQueue) error {
