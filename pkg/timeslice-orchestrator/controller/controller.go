@@ -168,11 +168,27 @@ type Controller struct {
 	// context.
 	ForegroundOpTimeout time.Duration
 
+	// ForegroundOpTimeoutAction is what happens when a wait passes
+	// ForegroundOpTimeout: ForegroundOpTimeoutActionRetry (also when empty),
+	// ForegroundOpTimeoutActionFaulted or ForegroundOpTimeoutActionBounded.
+	// PENDING LEAD DECISION (D-ORCH-3).
+	ForegroundOpTimeoutAction string
+
+	// ForegroundOpTimeoutRetries is how many further timed-out waits on the
+	// same operation the bounded action retries before it marks the job
+	// FAULTED.
+	ForegroundOpTimeoutRetries int
+
 	// KillPollInterval is how often WaitForKillOperation polls.
 	KillPollInterval time.Duration
 
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
+
+	// timedOutOps holds, per group and node, a foreground operation that
+	// timed out and may still be pending on the agent. See resumeTimedOutOp.
+	timedOutMu  sync.Mutex
+	timedOutOps map[string]*timedOutOp
 }
 
 // settleEntry remembers when a group's active job was first seen holding an
@@ -200,6 +216,10 @@ func NewController(
 		SettleTimeout:     30 * time.Second,
 		KillPollInterval:  DefaultKillPollInterval,
 		settleSince:       make(map[string]settleEntry),
+
+		ForegroundOpTimeoutAction:  ForegroundOpTimeoutActionRetry,
+		ForegroundOpTimeoutRetries: DefaultForegroundOpTimeoutRetries,
+		timedOutOps:                make(map[string]*timedOutOp),
 	}
 }
 
@@ -366,20 +386,31 @@ func (c *Controller) requeueWhileHolderWaits(ctx context.Context, groupID string
 	if holder == "" || group.Status().LoadedJob() == holder {
 		return
 	}
-	slog.DebugContext(ctx, "Lock holder is not loaded yet, requeueing", "holder", holder, "after", c.HolderWaitRequeue)
+	slog.DebugContext(ctx, "Lock holder is not loaded yet, requeuing", "holder", holder, "after", c.HolderWaitRequeue)
 	c.queue.AddAfter(groupID, c.HolderWaitRequeue)
 }
 
 // reconcileNode reconciles the state of a single node for the active job.
 func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activeJobID string) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
+
+	// Never start an operation on a node while an earlier one that timed out
+	// may still be pending there.
+	if err := c.resumeTimedOutOp(ctx, groupID, nodeName); err != nil {
+		return err
+	}
+
 	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
 	if err != nil {
 		return fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
 	}
 
+	timeoutFaulted := make(map[string]bool)
 	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
 	for _, job := range jobs {
+		if _, ok := job.ForegroundTimeoutFault(nodeName); ok {
+			timeoutFaulted[job.JobID()] = true
+		}
 		state, ok := job.ContextState()[nodeName]
 		if !ok {
 			state = pb.SnapshotAgentJobState_STATE_UNSPECIFIED
@@ -416,6 +447,13 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 			continue
 		}
 
+		// A job marked FAULTED by a foreground operation timeout may still hold
+		// the accelerator: its operation never finished. Fail closed.
+		if timeoutFaulted[jobID] {
+			return fmt.Errorf("job %s is FAULTED by a foreground operation timeout on node %s, requires human intervention",
+				jobID, nodeName)
+		}
+
 		switch state {
 		case pb.SnapshotAgentJobState_STATE_RUNNING:
 			slog.InfoContext(ctx, "Triggering snapshot for job", "jobID", jobID, "state", state)
@@ -424,6 +462,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 				return fmt.Errorf("failed to trigger snapshot for job %s on node %s: %w", jobID, nodeName, err)
 			}
 			if err := c.waitForOperation(ctx, groupID, jobID, nodeName, resp.OperationId, "snapshot"); err != nil {
+				if isForegroundOpTimeout(ctx, err) {
+					return c.onForegroundOpTimeout(ctx, groupID, nodeName, jobID, resp.OperationId, "snapshot", err)
+				}
 				return fmt.Errorf("failed while waiting for snapshot operation %s for job %s on node %s: %w",
 					resp.OperationId, jobID, nodeName, err)
 			}
@@ -458,6 +499,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 			activeJobID, nodeName, err)
 	}
 	if err := c.waitForOperation(ctx, groupID, activeJobID, nodeName, resp.OperationId, "restore"); err != nil {
+		if isForegroundOpTimeout(ctx, err) {
+			return c.onForegroundOpTimeout(ctx, groupID, nodeName, activeJobID, resp.OperationId, "restore", err)
+		}
 		return fmt.Errorf("failed waiting for restore op %s for job %s on %s: %w",
 			resp.OperationId, activeJobID, nodeName, err)
 	}
@@ -767,8 +811,8 @@ func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeN
 	defer cancel()
 	err := c.pollOperation(opCtx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
 	if err != nil && ctx.Err() == nil && errors.Is(opCtx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("%s operation %s did not finish within the foreground operation timeout %s: %w",
-			operationType, operationID, c.ForegroundOpTimeout, err)
+		return fmt.Errorf("%s operation %s did not finish within the foreground operation timeout %s (%w): %w",
+			operationType, operationID, c.ForegroundOpTimeout, ErrForegroundOpTimeout, err)
 	}
 	return err
 }

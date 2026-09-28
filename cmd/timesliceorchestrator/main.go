@@ -84,8 +84,18 @@ func run() error {
 			"only mode implemented) blocks on the agent operation, bounded by --foreground-op-timeout. "+
 			"PENDING LEAD DECISION: option B (\"async\") is refused until decided.")
 	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
-		"Upper bound on each blocking wait for a foreground snapshot or restore operation. On expiry the "+
-			"reconcile is retried. 0 means unbounded.")
+		"Upper bound on each blocking wait for a foreground snapshot or restore operation. What happens on "+
+			"expiry is set by --foreground-op-timeout-action. 0 means unbounded.")
+	foregroundOpTimeoutAction := flag.String("foreground-op-timeout-action", controller.ForegroundOpTimeoutActionRetry,
+		"What happens when a foreground snapshot or restore passes --foreground-op-timeout. \"retry\" (the "+
+			"default) returns an error and the group is retried with the --retry-base-delay backoff, waiting on the "+
+			"same operation and never starting a new one while it is pending. \"faulted\" marks the job FAULTED on "+
+			"that node, so the group is faulted until the job's pods are replaced. \"bounded\" retries up to "+
+			"--foreground-op-timeout-retries more timeouts of the same operation, then marks the job FAULTED. "+
+			"PENDING LEAD DECISION (D-ORCH-3).")
+	foregroundOpTimeoutRetries := flag.Int("foreground-op-timeout-retries", controller.DefaultForegroundOpTimeoutRetries,
+		"With --foreground-op-timeout-action=bounded: how many more timed-out waits on the same operation are "+
+			"retried before the job is marked FAULTED.")
 	backgroundRole := flag.Bool("background-role", false,
 		"Enable the background participant protocol: Acquire/Yield with ROLE_BACKGROUND, participant_id "+
 			"heartbeats and GroupStatus.background_protocol = 1. Off (the default) reports "+
@@ -121,6 +131,12 @@ func run() error {
 	}
 	if *foregroundOpTimeout < 0 {
 		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", *foregroundOpTimeout)
+	}
+	if err := controller.ValidateForegroundOpTimeoutAction(*foregroundOpTimeoutAction); err != nil {
+		return fmt.Errorf("--foreground-op-timeout-action: %w", err)
+	}
+	if *foregroundOpTimeoutRetries < 0 {
+		return fmt.Errorf("--foreground-op-timeout-retries must not be negative, got %d", *foregroundOpTimeoutRetries)
 	}
 	if *minBubble < 0 {
 		return fmt.Errorf("--min-bubble must not be negative, got %v", *minBubble)
@@ -198,6 +214,8 @@ func run() error {
 	ctrl.ResyncPeriod = *resyncPeriod
 	ctrl.HolderWaitRequeue = *holderWaitRequeue
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
+	ctrl.ForegroundOpTimeoutAction = *foregroundOpTimeoutAction
+	ctrl.ForegroundOpTimeoutRetries = *foregroundOpTimeoutRetries
 	ctrl.KillPollInterval = *killPollInterval
 
 	// Start informers
@@ -231,6 +249,8 @@ func run() error {
 		"dispatchBudgetExternalRisingEdge", *budgetExternalRisingEdge,
 		"foregroundWait", *foregroundWait,
 		"foregroundOpTimeout", *foregroundOpTimeout,
+		"foregroundOpTimeoutAction", *foregroundOpTimeoutAction,
+		"foregroundOpTimeoutRetries", *foregroundOpTimeoutRetries,
 		"backgroundRole", *backgroundRole,
 		"minBubble", *minBubble,
 		"noticeWindow", *noticeWindow,
