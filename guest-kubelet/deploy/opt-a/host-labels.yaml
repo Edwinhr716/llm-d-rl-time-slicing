@@ -1,0 +1,16 @@
+# Marks the real host as a member of one RL group, in today's label form
+# group.timeslice.io/<group>=true (decision D-VK-3, option a). The guest-kubelet on that host reads
+# it (internal/group) and labels each mirror timeslice.io/group=<group>. The VK Node never gets it.
+#
+# Apply (replace __HOST__ and __GROUP__):
+#   sed -e 's|__HOST__|<host node>|' -e 's|__GROUP__|<group>|' host-labels.yaml > /tmp/host-labels.yaml
+#   kubectl patch node <host node> --type=merge --patch-file=/tmp/host-labels.yaml
+# Remove:
+#   kubectl label node <host node> group.timeslice.io/<group>-
+#
+# One group per host: a host with two group.timeslice.io/*=true labels is refused (no mirrors,
+# event GroupUnresolved). Any value other than "true" is not a membership.
+metadata:
+  name: __HOST__
+  labels:
+    group.timeslice.io/__GROUP__: "true"

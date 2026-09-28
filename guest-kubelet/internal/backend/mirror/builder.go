@@ -13,6 +13,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
 const (
@@ -58,6 +60,9 @@ type Config struct {
 	// mirror. With false, the mirror outlives a guest that is force-deleted (for example after
 	// the virtual Node is deleted) and a guest re-created with the same name re-adopts it.
 	OwnerRef bool
+	// Group is the host's resolved group, written to the mirror as timeslice.io/group. The backend
+	// fills it just before each create and refuses the create when it is empty (fail closed).
+	Group string
 }
 
 // Name returns the mirror's name for a guest.
@@ -145,16 +150,20 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 		})
 	}
 
+	// None of the guest's labels: Services, Jobs and ReplicaSets select the guest, and a
+	// mirror carrying its labels would be a second endpoint for one process.
+	labels := map[string]string{
+		LabelMirrorOf:   string(guest.UID),
+		LabelMirrorNode: cfg.VirtualNode,
+	}
+	if cfg.Group != "" {
+		labels[group.MirrorLabel] = cfg.Group
+	}
 	m := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      Name(guest.Name),
 			Namespace: guest.Namespace,
-			// None of the guest's labels: Services, Jobs and ReplicaSets select the guest, and a
-			// mirror carrying its labels would be a second endpoint for one process.
-			Labels: map[string]string{
-				LabelMirrorOf:   string(guest.UID),
-				LabelMirrorNode: cfg.VirtualNode,
-			},
+			Labels:    labels,
 			Annotations: map[string]string{
 				AnnotationGuestName:     guest.Name,
 				AnnotationGuestSpecHash: SpecHash(guest),

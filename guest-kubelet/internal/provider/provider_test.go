@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
@@ -9,6 +10,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
 func guestPod(name string) *corev1.Pod {
@@ -124,5 +127,15 @@ func TestNewNodeSpec(t *testing.T) {
 	}
 	if g := n.Status.Capacity[GPUResource]; g.Value() != 1 {
 		t.Errorf("gpu capacity: %v", g)
+	}
+}
+
+// Contract §3: the VK Node never carries a group label in any form (D-VK-3, metric M1d).
+func TestNodeSpecCarriesNoGroupLabels(t *testing.T) {
+	n := NewNodeSpec(NodeConfig{Name: "vk-x", InternalIP: "10.0.0.1"})
+	for k := range n.Labels {
+		if strings.HasPrefix(k, group.NodeLabelPrefix) || k == group.MirrorLabel || k == "timeslice.io/donor" {
+			t.Errorf("VK Node label %s", k)
+		}
 	}
 }

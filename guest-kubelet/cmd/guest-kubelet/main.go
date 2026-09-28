@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
 
@@ -217,6 +218,14 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	recorder := provider.GuestOnlyRecorder{
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
+
+	// The host's group (D-VK-3 option a: label group.timeslice.io/<group>=true on the host).
+	// Watched for the process's life; no single group means no mirror (fail closed).
+	groups := &group.Resolver{Host: o.hostNode, VirtualNode: o.nodeName, Recorder: recorder, Out: os.Stderr}
+	if err := groups.Start(ctx, client); err != nil {
+		return err
+	}
+	mopts.Group = groups.Group
 
 	var backend *mirror.Backend
 	n, err := nodeutil.NewNode(o.nodeName,

@@ -17,6 +17,8 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
 type harness struct {
@@ -262,5 +264,107 @@ func TestGuestRemovedWhenMirrorStops(t *testing.T) {
 	h.b.finishGuestDeletion(context.Background(), g)
 	if _, err := h.client.CoreV1().Pods("ns").Get(context.Background(), "vllm", metav1.GetOptions{}); err == nil {
 		t.Error("guest should be deleted once its mirror is gone")
+	}
+}
+
+// D-VK-3 option a: the host's group gates and labels every mirror.
+
+func groupOptions(g *string) Options {
+	o := testOptions()
+	o.Group = func() (string, group.Reason) {
+		if *g == "" {
+			return "", group.ReasonNoLabel
+		}
+		return *g, group.ReasonOK
+	}
+	return o
+}
+
+func TestCreateRefusedWithoutGroup(t *testing.T) {
+	g := ""
+	h := newHarness(t, groupOptions(&g))
+	guest := cpuGuest("g1")
+	h.addGuest(guest)
+	if err := h.b.Create(context.Background(), guest); err == nil {
+		t.Fatal("want an error while the host has no group")
+	}
+	if h.mirror("vllm-m") != nil {
+		t.Error("no mirror may exist without a group")
+	}
+	list, err := h.client.CoreV1().Pods("ns").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(list.Items) != 0 {
+		t.Errorf("pods created: %v %v", list, err)
+	}
+}
+
+func TestCreateLabelsMirrorWithCurrentGroup(t *testing.T) {
+	g := "g1"
+	h := newHarness(t, groupOptions(&g))
+	guest := cpuGuest("g1")
+	h.addGuest(guest)
+	if err := h.b.Create(context.Background(), guest); err != nil {
+		t.Fatal(err)
+	}
+	m := h.mirror("vllm-m")
+	if m.Labels["timeslice.io/group"] != "g1" || m.Labels[LabelMirrorOf] != "g1" {
+		t.Errorf("labels: %v", m.Labels)
+	}
+
+	// Relabelled host: the next create reads the group again, never the old one.
+	g = "g2"
+	other := cpuGuest("g2")
+	other.Name = "second"
+	h.addGuest(other)
+	if err := h.b.Create(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mirror("second-m"); m.Labels["timeslice.io/group"] != "g2" {
+		t.Errorf("second mirror group: %v", m.Labels)
+	}
+}
+
+func TestOrphanFromOtherGroupIsNotAdopted(t *testing.T) {
+	old := cpuGuest("old-uid")
+	cfg := testOptions().Config
+	cfg.Group = "g1"
+	orphan, err := Build(old, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan.UID = "mirror-uid"
+	orphan.Status.Phase = corev1.PodRunning
+	g := "g2"
+	h := newHarness(t, groupOptions(&g), orphan)
+
+	guest := cpuGuest("new-uid") // same name and containers, but the host changed group
+	h.addGuest(guest)
+	if err := h.b.Create(context.Background(), guest); err == nil {
+		t.Error("want a retry error while the old group's mirror is replaced")
+	}
+	if h.mirror("vllm-m") != nil {
+		t.Error("the old group's mirror should be deleted, not adopted")
+	}
+}
+
+func TestOrphanFromSameGroupIsAdopted(t *testing.T) {
+	old := cpuGuest("old-uid")
+	cfg := testOptions().Config
+	cfg.Group = "g1"
+	orphan, err := Build(old, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan.UID = "mirror-uid"
+	orphan.Status.Phase = corev1.PodRunning
+	g := "g1"
+	h := newHarness(t, groupOptions(&g), orphan)
+
+	guest := cpuGuest("new-uid")
+	h.addGuest(guest)
+	if err := h.b.Create(context.Background(), guest); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mirror("vllm-m"); m.UID != "mirror-uid" || m.Labels["timeslice.io/group"] != "g1" {
+		t.Errorf("want the same mirror re-adopted: %s %v", m.UID, m.Labels)
 	}
 }

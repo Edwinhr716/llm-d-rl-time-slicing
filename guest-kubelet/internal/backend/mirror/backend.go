@@ -17,6 +17,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
 // Options configures the backend beyond the pure builder config.
@@ -32,6 +34,10 @@ type Options struct {
 	OrphanGrace time.Duration
 	// Resync is the mirror informer's resync period.
 	Resync time.Duration
+	// Group returns the host's resolved group (internal/group) and a reason; "" means none. When set,
+	// Create refuses to build a mirror while it is "" and labels every mirror with it. main
+	// always sets it; nil only in tests that do not care about groups.
+	Group func() (string, group.Reason)
 }
 
 // Backend creates, watches and deletes mirror pods. It keeps no state of its own that matters
@@ -217,7 +223,16 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 // Create builds and creates the mirror. It is idempotent: an existing mirror for this guest is
 // fine; an orphaned mirror with the same name and the same containers is adopted.
 func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
-	want, err := Build(guest, b.opts.Config)
+	cfg := b.opts.Config
+	if b.opts.Group != nil {
+		// Checked just before the create: a relabelled host never gets a mirror with the old group.
+		g, reason := b.opts.Group()
+		if g == "" {
+			return fmt.Errorf("host node %s has no single group (%s); no mirror created", cfg.HostNode, reason)
+		}
+		cfg.Group = g
+	}
+	want, err := Build(guest, cfg)
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}
@@ -256,7 +271,9 @@ func (b *Backend) adoptOrReplace(ctx context.Context, guest, want *corev1.Pod) (
 	}
 	oldOwnerGone := cur.Labels[LabelMirrorOf] != "" && cur.Labels[LabelMirrorNode] == b.opts.VirtualNode &&
 		b.guestFor(cur) == nil
-	if oldOwnerGone && cur.DeletionTimestamp == nil && cur.Annotations[AnnotationGuestSpecHash] == SpecHash(guest) &&
+	// Same group too: an orphan from before a relabel belongs to the old group's era.
+	sameGroup := cur.Labels[group.MirrorLabel] == want.Labels[group.MirrorLabel]
+	if oldOwnerGone && sameGroup && cur.DeletionTimestamp == nil && cur.Annotations[AnnotationGuestSpecHash] == SpecHash(guest) &&
 		cur.Status.Phase != corev1.PodFailed && cur.Status.Phase != corev1.PodSucceeded {
 		upd := cur.DeepCopy()
 		upd.Labels[LabelMirrorOf] = string(guest.UID)

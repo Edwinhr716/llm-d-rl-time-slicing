@@ -187,3 +187,24 @@ func TestSpecHashIgnoresTokenMount(t *testing.T) {
 		t.Error("SpecHash modified the guest")
 	}
 }
+
+func TestBuildGroupLabel(t *testing.T) {
+	cfg := testConfig()
+	m, err := Build(testGuest(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Labels["timeslice.io/group"]; ok {
+		t.Errorf("no group configured, but the mirror has one: %v", m.Labels)
+	}
+	cfg.Group = "g1"
+	if m, err = Build(testGuest(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if m.Labels["timeslice.io/group"] != "g1" {
+		t.Errorf("group label: %v", m.Labels)
+	}
+	if m.Labels[LabelMirrorOf] != "guest-uid" || m.Labels[LabelMirrorNode] != "vk-x" || len(m.Labels) != 3 {
+		t.Errorf("mirror labels: %v", m.Labels)
+	}
+}
