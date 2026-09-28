@@ -1,0 +1,36 @@
+# What q5-measure reads: the guest, its Service and the Service's EndpointSlices.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: q5-measure
+  namespace: guest-kubelet-proto
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: q5-measure
+  namespace: guest-kubelet-proto
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: q5-measure
+  namespace: guest-kubelet-proto
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: q5-measure
+subjects:
+  - kind: ServiceAccount
+    name: q5-measure
+    namespace: guest-kubelet-proto

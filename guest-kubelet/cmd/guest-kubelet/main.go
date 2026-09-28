@@ -2,6 +2,9 @@
 //
 // M1: every guest bound to the virtual Node runs as a mirror pod on the real host (the node
 // this process runs on), and the mirror's real status is copied back to the guest.
+//
+// M2: the guest kubelet runs each guest container's readinessProbe itself (the mirror has none)
+// and reports the guest's Ready from the results.
 package main
 
 import (
@@ -35,6 +38,7 @@ import (
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
 	"github.com/edwinhr716/guest-kubelet/internal/group"
+	"github.com/edwinhr716/guest-kubelet/internal/probe"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
 
@@ -61,7 +65,13 @@ type options struct {
 
 	// D-VK-3 option b: where the real node's group is read (internal/group)
 	groupSource string
+	// M2: readiness
+	readinessProbes bool
+	debugAddr       string
 }
+
+// edgeLogSize is how many Ready edges per guest the debug endpoint keeps.
+const edgeLogSize = 256
 
 func main() {
 	var o options
@@ -96,6 +106,11 @@ func main() {
 	flag.StringVar(&o.groupSource, "group-source", group.SourceNS,
 		"host node labels that name its group: ns (timeslice.io/donor=true plus timeslice.io/group=<group>) or "+
 			"either (also group.timeslice.io/<group>=true; both forms must agree)")
+	flag.BoolVar(&o.readinessProbes, "readiness-probes", true,
+		"run the guests' readinessProbes (httpGet, tcpSocket) and report Ready from them; false copies the mirror's ready flags (M1)")
+	// Off by default. The endpoint can force a guest Ready, so only loopback addresses are accepted.
+	flag.StringVar(&o.debugAddr, "debug-addr", "",
+		"loopback host:port for the M2 test hooks (/debug/readiness, /debug/ready-edges); empty disables them")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -115,6 +130,9 @@ func run(ctx context.Context, o options) error {
 	if !group.ValidSource(o.groupSource) {
 		return fmt.Errorf("--group-source=%q: want one of %s", o.groupSource, strings.Join(group.Sources, ", "))
 	}
+	if err := o.checkDebug(); err != nil {
+		return err
+	}
 	if o.nodeName == "" {
 		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
 	}
@@ -126,6 +144,20 @@ func run(ctx context.Context, o options) error {
 		return runKubelet(ctx, client, o)
 	}
 	return runWithLeaderElection(ctx, client, o)
+}
+
+// checkDebug validates --debug-addr: loopback only, and only with the prober it drives.
+func (o *options) checkDebug() error {
+	if o.debugAddr == "" {
+		return nil
+	}
+	if err := probe.CheckLoopback(o.debugAddr); err != nil {
+		return err
+	}
+	if !o.readinessProbes {
+		return errors.New("--debug-addr needs --readiness-probes")
+	}
+	return nil
 }
 
 // runWithLeaderElection is LWS's (or any controller-runtime manager's) leader election, but
@@ -247,12 +279,33 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			"no mirror for guest %s/%s: host node %s resolves to no group (%s)", guest.Namespace, guest.Name, o.hostNode, reason)
 	}
 
+	// The prober reports verdict changes to the backend, which re-translates the guest's status.
 	var backend *mirror.Backend
+	var prober *probe.Manager
+	if o.readinessProbes {
+		prober = probe.NewManager(ctx, probe.Options{
+			OnChange: func(namespace, name string) {
+				if backend != nil {
+					backend.Refresh(namespace, name)
+				}
+			},
+			Recorder: recorder,
+		})
+		mopts.Prober = prober
+	}
+	var edges *probe.EdgeLog
+	if o.debugAddr != "" {
+		edges = probe.NewEdgeLog(edgeLogSize)
+	}
 	n, err := nodeutil.NewNode(o.nodeName,
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, mopts)
-			return provider.New(backend), provider.NodeProvider{}, nil
+			prov := provider.New(backend)
+			if edges != nil {
+				prov.SetNotifyHook(func(pod *corev1.Pod) { edges.Observe(pod) })
+			}
+			return prov, provider.NodeProvider{}, nil
 		},
 		nodeutil.WithClient(client),
 		func(c *nodeutil.NodeConfig) error {
@@ -275,6 +328,9 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	// GetPod for each guest must already find its mirror (re-adoption, no duplicate create).
 	if err := backend.Start(ctx); err != nil {
 		return err
+	}
+	if edges != nil {
+		go probe.Serve(ctx, o.debugAddr, probe.DebugHandler(prober, edges))
 	}
 	go func() {
 		if err := n.WaitReady(ctx, 0); err == nil {
