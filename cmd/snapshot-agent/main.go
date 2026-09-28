@@ -49,7 +49,18 @@ func main() {
 	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
 	reportResumed := flag.Bool("report-resumed-outcome", true,
 		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
+	// PENDING LEAD DECISION (D-AGENT-9): the default leaves a job FAULTED
+	// after a failed precondition; "unchanged" keeps its state before the
+	// operation.
+	preconditionRefusal := flag.String("precondition-refusal", statemachine.PreconditionRefusalFaulted,
+		"Job state after a Suspend or Resume fails a precondition: "+
+			"'faulted' or 'unchanged' (pending decision)")
 	flag.Parse()
+
+	if !statemachine.ValidPreconditionRefusal(*preconditionRefusal) {
+		slog.Error("Invalid --precondition-refusal, must be 'faulted' or 'unchanged'", "value", *preconditionRefusal)
+		os.Exit(1)
+	}
 
 	depMode := *deploymentMode
 	if envDepMode := os.Getenv("DEPLOYMENT_MODE"); envDepMode != "" {
@@ -162,10 +173,12 @@ func main() {
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed)
+		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed,
+		"preconditionRefusal", *preconditionRefusal)
 	err = server.StartServer(
 		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
-		statemachine.WithReportResumedOutcome(*reportResumed))
+		statemachine.WithReportResumedOutcome(*reportResumed),
+		statemachine.WithPreconditionRefusal(*preconditionRefusal))
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)

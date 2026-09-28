@@ -118,7 +118,9 @@ func ErrorReasonOf(err error) pb.ErrorReason {
 //     Kill, Snapshot or Restore with Aborted.
 //
 // A worker failure, or a worker that returns after the deadline, fails the
-// operation and leaves the job FAULTED; the kill path follows.
+// operation and leaves the job FAULTED; the kill path follows. Under
+// WithPreconditionRefusal(PreconditionRefusalUnchanged) a PRECONDITION_*
+// failure leaves the job in its state before the operation instead.
 func (sm *StateManager) StartGuestOp(
 	jobID string, intent OpType, epoch int64, deadline time.Time, worker GuestWorker,
 ) (string, error) {
@@ -261,13 +263,16 @@ func (sm *StateManager) startGuestLocked(
 	sm.operations[op.ID] = op
 	job.current = &runningOp{op: op, cancel: cancel}
 	job.lastGuestOp = op
+	// The state before the operation, for WithPreconditionRefusal. It is
+	// TRANSITIONING when this call preempted a running guest operation.
+	stateBefore := job.State
 	job.State = pb.JobState_JOB_STATE_TRANSITIONING
-	go sm.runGuest(ctx, cancel, job, op, worker)
+	go sm.runGuest(ctx, cancel, job, op, stateBefore, worker)
 	return op.ID
 }
 
 func (sm *StateManager) runGuest(
-	ctx context.Context, cancel context.CancelFunc, job *Job, op *Operation, worker GuestWorker,
+	ctx context.Context, cancel context.CancelFunc, job *Job, op *Operation, stateBefore pb.JobState, worker GuestWorker,
 ) {
 	defer cancel()
 	res, err := worker(ctx)
@@ -293,9 +298,7 @@ func (sm *StateManager) runGuest(
 		op.Status = pb.OperationStatus_OPERATION_STATUS_FAILED
 		op.Error = err.Error()
 		op.ErrorReason = failureReason(ctx, err)
-		job.State = pb.JobState_JOB_STATE_FAULTED
-		slog.Error("Guest operation failed; job is FAULTED",
-			"jobID", job.ID, "type", op.Type, "epoch", op.Epoch, "reason", op.ErrorReason, "error", err)
+		sm.failGuestLocked(job, op, stateBefore, err)
 		return
 	}
 
@@ -330,6 +333,44 @@ func failureReason(ctx context.Context, err error) pb.ErrorReason {
 		return pb.ErrorReason_DEADLINE_EXCEEDED
 	}
 	return pb.ErrorReason_BACKEND_ERROR
+}
+
+// failGuestLocked sets the job's state after its Suspend or Resume failed
+// with op.ErrorReason, per WithPreconditionRefusal. The operation is FAILED
+// with its reason in both modes.
+//   - PreconditionRefusalFaulted: the job goes FAULTED; the kill path
+//     follows.
+//   - PreconditionRefusalUnchanged: a PRECONDITION_* failure returns the
+//     job to stateBefore, the state it had when the operation started; the
+//     caller may retry or Kill. Other reasons still leave it FAULTED, and so
+//     does a stateBefore of TRANSITIONING (the operation preempted another
+//     one, which may have changed the guest).
+//
+// LastOutcome, PIDs, DeviceBytes and HostBytesPinned are never changed here.
+//
+// PENDING LEAD DECISION (D-AGENT-9): the collapse keeps one branch.
+func (sm *StateManager) failGuestLocked(job *Job, op *Operation, stateBefore pb.JobState, err error) {
+	stateAfter := pb.JobState_JOB_STATE_FAULTED
+	if sm.preconditionRefusal == PreconditionRefusalUnchanged && isPreconditionReason(op.ErrorReason) &&
+		stateBefore != pb.JobState_JOB_STATE_TRANSITIONING {
+		stateAfter = stateBefore
+	}
+	job.State = stateAfter
+	slog.Error("Guest operation failed",
+		"jobID", job.ID, "type", op.Type, "epoch", op.Epoch, "reason", op.ErrorReason,
+		"stateBefore", stateBefore, "stateAfter", stateAfter,
+		"preconditionRefusal", sm.preconditionRefusal, "error", err)
+}
+
+// isPreconditionReason reports whether reason is a PRECONDITION_* reason.
+func isPreconditionReason(reason pb.ErrorReason) bool {
+	switch reason {
+	case pb.ErrorReason_PRECONDITION_READINESS, pb.ErrorReason_PRECONDITION_PROBES,
+		pb.ErrorReason_PRECONDITION_MEMORY, pb.ErrorReason_PRECONDITION_NODE:
+		return true
+	default:
+		return false
+	}
 }
 
 // StartKill starts a Kill of a job and returns the operation ID to poll.

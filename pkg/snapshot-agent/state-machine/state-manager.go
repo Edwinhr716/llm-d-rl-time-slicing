@@ -116,6 +116,10 @@ type StateManager struct {
 	// reportResumed selects the outcome of a successful Resume:
 	// OUTCOME_RESUMED when true, OUTCOME_UNSPECIFIED when false.
 	reportResumed bool
+	// preconditionRefusal selects the job state after a Suspend or Resume
+	// fails a precondition: PreconditionRefusalFaulted or
+	// PreconditionRefusalUnchanged.
+	preconditionRefusal string
 }
 
 // Option configures a StateManager.
@@ -132,13 +136,52 @@ func WithReportResumedOutcome(report bool) Option {
 	}
 }
 
+// Values of WithPreconditionRefusal and the --precondition-refusal flag.
+const (
+	// PreconditionRefusalFaulted leaves the job FAULTED after any failed
+	// Suspend or Resume (the default).
+	PreconditionRefusalFaulted = "faulted"
+	// PreconditionRefusalUnchanged returns the job to its state before the
+	// operation when it failed a precondition.
+	PreconditionRefusalUnchanged = "unchanged"
+)
+
+// ValidPreconditionRefusal reports whether mode is a value
+// WithPreconditionRefusal accepts.
+func ValidPreconditionRefusal(mode string) bool {
+	return mode == PreconditionRefusalFaulted || mode == PreconditionRefusalUnchanged
+}
+
+// WithPreconditionRefusal selects the job state after a Suspend or Resume
+// worker fails with PRECONDITION_READINESS, _PROBES, _MEMORY or _NODE:
+//   - PreconditionRefusalFaulted (default): FAULTED, as for any failure;
+//   - PreconditionRefusalUnchanged: the state the job had when the
+//     operation started; the caller may retry or Kill.
+//
+// The operation is FAILED with the precondition reason in both modes, and
+// every other failure reason leaves the job FAULTED. Any other value behaves
+// as PreconditionRefusalFaulted; callers validate the value with
+// ValidPreconditionRefusal first.
+//
+// PENDING LEAD DECISION (D-AGENT-9): the default leaves the job FAULTED.
+func WithPreconditionRefusal(mode string) Option {
+	return func(sm *StateManager) {
+		if ValidPreconditionRefusal(mode) {
+			sm.preconditionRefusal = mode
+		} else {
+			sm.preconditionRefusal = PreconditionRefusalFaulted
+		}
+	}
+}
+
 // NewStateManager creates a new StateManager instance.
 func NewStateManager(opts ...Option) *StateManager {
 	sm := &StateManager{
-		jobs:          make(map[string]*Job),
-		operations:    make(map[string]*Operation),
-		now:           time.Now,
-		reportResumed: true,
+		jobs:                make(map[string]*Job),
+		operations:          make(map[string]*Operation),
+		now:                 time.Now,
+		reportResumed:       true,
+		preconditionRefusal: PreconditionRefusalFaulted,
 	}
 	for _, opt := range opts {
 		opt(sm)
