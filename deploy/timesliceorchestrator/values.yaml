@@ -27,9 +27,16 @@ lock:
 #     pods bound to them are ignored. Group membership still comes from the
 #     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
 #     with the pod-scheduling nodeSelector further down.
+#     The selector must select every real host that carries the group label;
+#     mirrors are bound there. See examples/ for the two label layouts.
+#   nodeSelectorExemptBackground: keep pods labelled timeslice.io/role=background
+#     in their group even when they are bound to a node outside nodeSelector.
+#     Only pods are exempt: such a node still contributes to no group. false =
+#     they are dropped like any other pod. No effect without nodeSelector.
 scope:
   watchNamespaces: []
   nodeSelector: ""
+  nodeSelectorExemptBackground: false
 
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator

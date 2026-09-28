@@ -45,6 +45,9 @@ spec:
             {{- with .Values.scope.nodeSelector }}
             - "--node-selector={{ . }}"
             {{- end }}
+            {{- if .Values.scope.nodeSelectorExemptBackground }}
+            - "--node-selector-exempt-background=true"
+            {{- end }}
           ports:
             - name: grpc
               containerPort: 50051
