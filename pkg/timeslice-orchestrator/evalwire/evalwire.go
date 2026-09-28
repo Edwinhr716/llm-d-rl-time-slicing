@@ -7,7 +7,8 @@
 // Start wires the stores, informers, work queue, rate limiter, controller,
 // workers and server options the same way cmd/timesliceorchestrator/main.go
 // does, from the same flag strings, on a caller-supplied clientset (usually
-// k8s.io/client-go/kubernetes/fake). Keep it in step with main.go.
+// k8s.io/client-go/kubernetes/fake). Keep it in step with main.go: the test in
+// this package fails when the two flag sets differ.
 //
 // Differences from main.go, all needed to run in a test process:
 //   - The clientset comes from Config instead of a kubeconfig.
@@ -34,7 +35,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +69,16 @@ type Config struct {
 	Args []string
 }
 
+// JobInfo is one job in a group's job store.
+type JobInfo struct {
+	// JobID is the timeslice.io/job-id of the job's pods.
+	JobID string
+	// Role is "background" when the job store holds the job as a background
+	// job (its pods carry timeslice.io/role=background), and "foreground"
+	// otherwise.
+	Role string
+}
+
 // Orch is a running in-process orchestrator.
 type Orch struct {
 	// Addr is the gRPC address (host:port) of the orchestrator service.
@@ -77,6 +90,9 @@ type Orch struct {
 	// Acquire, for example) are cut after the server stop grace. After Stop,
 	// Start may run again on the same clientset.
 	Stop func()
+	// GroupJobs returns the jobs the orchestrator's job store holds for the
+	// group right now, sorted by job ID.
+	GroupJobs func(group string) []JobInfo
 }
 
 // flagValues holds the parsed flags, one field per flag in main.go.
@@ -109,6 +125,10 @@ type flagValues struct {
 	lockConfigMap            string
 	watchNamespaces          string
 	nodeSelector             string
+
+	// nodeSelectorExemptBackground is decision D-ORCH-4 (false = match,
+	// true = exempt).
+	nodeSelectorExemptBackground bool
 }
 
 // newFlagSet declares the flags of cmd/timesliceorchestrator/main.go with the
@@ -155,6 +175,8 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.StringVar(&fv.lockConfigMap, "lock-configmap", store.ConfigMapName, "Name of the lock ConfigMap")
 	fs.StringVar(&fv.watchNamespaces, "watch-namespaces", "", "Comma-separated namespaces whose pods are watched; empty watches all")
 	fs.StringVar(&fv.nodeSelector, "node-selector", "", "Label selector limiting the nodes watched; empty watches all")
+	fs.BoolVar(&fv.nodeSelectorExemptBackground, "node-selector-exempt-background", false,
+		"Keep role=background pods bound to a node outside --node-selector")
 	return fs, fv
 }
 
@@ -247,6 +269,11 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	}
 	if !scope.AllNodes() {
 		infraOpts = append(infraOpts, infrastructure.WithNodeScopedPods())
+		if fv.nodeSelectorExemptBackground {
+			infraOpts = append(infraOpts, infrastructure.WithNodeSelectorExemptBackground())
+		}
+	} else if fv.nodeSelectorExemptBackground {
+		slog.Warn("--node-selector-exempt-background has no effect without --node-selector")
 	}
 	infraOrch := infrastructure.NewKubernetesOrchestrator(
 		informerFactories.Nodes.Core().V1().Nodes(),
@@ -314,6 +341,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,
+		"nodeSelectorExemptBackground", fv.nodeSelectorExemptBackground,
 	)
 
 	// serveErr is written before exited is closed and read only after.
@@ -327,6 +355,9 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	orch := &Orch{
 		Addr:        net.JoinHostPort("127.0.0.1", strconv.Itoa(grpcPort)),
 		MetricsAddr: net.JoinHostPort("127.0.0.1", strconv.Itoa(metricsPort)),
+	}
+	orch.GroupJobs = func(group string) []JobInfo {
+		return groupJobs(ctx, jobStore, group)
 	}
 	var stopOnce sync.Once
 	orch.Stop = func() {
@@ -351,6 +382,20 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		}
 	}
 	return orch, nil
+}
+
+// groupJobs lists the job store's jobs for group with their roles.
+func groupJobs(ctx context.Context, jobStore *store.JobStore, group string) []JobInfo {
+	jobs, err := jobStore.ListByGroup(ctx, group)
+	if err != nil {
+		return nil
+	}
+	out := make([]JobInfo, 0, len(jobs))
+	for _, job := range jobs {
+		out = append(out, JobInfo{JobID: job.JobID(), Role: job.Role().String()})
+	}
+	slices.SortFunc(out, func(a, b JobInfo) int { return strings.Compare(a.JobID, b.JobID) })
+	return out
 }
 
 // addressedAgentStore dials a node's snapshot agent at <node InternalIP>:port.
