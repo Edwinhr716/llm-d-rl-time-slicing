@@ -65,6 +65,18 @@ type options struct {
 	// M2: readiness
 	readinessProbes bool
 	debugAddr       string
+
+	// VK-A6: orchestrator loop
+	orchAddr         string
+	groupSource      string
+	freezer          string
+	liveness         time.Duration
+	orchPoll         time.Duration
+	vacateMargin     time.Duration
+	resumeBudget     time.Duration
+	orchRPCTimeout   time.Duration
+	fakeSuspendDelay time.Duration
+	fakeResumeDelay  time.Duration
 }
 
 // edgeLogSize is how many Ready edges per guest the debug endpoint keeps.
@@ -105,6 +117,21 @@ func main() {
 	// Off by default. The endpoint can force a guest Ready, so only loopback addresses are accepted.
 	flag.StringVar(&o.debugAddr, "debug-addr", "",
 		"loopback host:port for the M2 test hooks (/debug/readiness, /debug/ready-edges); empty disables them")
+	flag.StringVar(&o.orchAddr, "orchestrator-addr", "",
+		"orchestrator gRPC address (host:port); empty turns the orchestrator loop off and mirrors start at once (M1)")
+	flag.StringVar(&o.groupSource, "group-source", groupSourceNodeLabel,
+		"where the VK reads its time-slice group (decision O3): node-label = the real node's group.timeslice.io/<group>=true")
+	flag.StringVar(&o.freezer, "freezer", freezerDelete,
+		"how guests vacate the accelerator: delete = delete the mirror (re-created on the next grant); fake = test freezer")
+	flag.DurationVar(&o.liveness, "background-liveness", 3*time.Second,
+		"L: a grant is trusted only within L of a successful status poll")
+	flag.DurationVar(&o.orchPoll, "orchestrator-poll", 500*time.Millisecond, "GetGroupStatus period (the VK heartbeat)")
+	flag.DurationVar(&o.vacateMargin, "vacate-margin", 250*time.Millisecond, "taken off vacate_within for the status poll's latency")
+	flag.DurationVar(&o.resumeBudget, "resume-budget", 30*time.Second, "bound on each guest Resume")
+	flag.DurationVar(&o.orchRPCTimeout, "orchestrator-rpc-timeout", 5*time.Second, "timeout of each unary orchestrator RPC")
+	flag.DurationVar(&o.fakeSuspendDelay, "fake-freezer-suspend-delay", 12500*time.Millisecond,
+		"--freezer=fake: time a Suspend takes")
+	flag.DurationVar(&o.fakeResumeDelay, "fake-freezer-resume-delay", 6*time.Second, "--freezer=fake: time a Resume takes")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -229,6 +256,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey, OwnerRef: o.mirrorOwnerRef,
 		},
 		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
+		Gated: o.orchAddr != "",
 	}
 	if mopts.CPUHeadroom, err = resource.ParseQuantity(o.cpuHeadroom); err != nil {
 		return fmt.Errorf("--mirror-cpu-headroom: %w", err)
@@ -250,6 +278,12 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	recorder := provider.GuestOnlyRecorder{
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
+
+	orch, err := newOrchestratorWiring(client, &o)
+	if err != nil {
+		return err
+	}
+	defer orch.close(ctx)
 
 	// The prober reports verdict changes to the backend, which re-translates the guest's status.
 	var backend *mirror.Backend
@@ -273,7 +307,14 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, mopts)
+			owner, err := orch.build(backend)
+			if err != nil {
+				return nil, nil, err
+			}
 			prov := provider.New(backend)
+			if owner != nil {
+				prov = provider.NewWithCreateOwner(backend, owner)
+			}
 			if edges != nil {
 				prov.SetNotifyHook(func(pod *corev1.Pod) { edges.Observe(pod) })
 			}
@@ -304,6 +345,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if edges != nil {
 		go probe.Serve(ctx, o.debugAddr, probe.DebugHandler(prober, edges))
 	}
+	orch.start(ctx)
 	go func() {
 		if err := n.WaitReady(ctx, 0); err == nil {
 			log.G(ctx).WithField("node", o.nodeName).WithField("host", o.hostNode).

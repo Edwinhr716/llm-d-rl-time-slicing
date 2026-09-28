@@ -32,6 +32,10 @@ type Options struct {
 	OrphanGrace time.Duration
 	// Resync is the mirror informer's resync period.
 	Resync time.Duration
+	// Gated turns on orchestrator mode: a guest is held NotReady until the orchestrator loop
+	// releases it (after a grant, a Resume and the engine check), and is held again before
+	// each Suspend. Off, the guest's Ready follows its mirror as in M1.
+	Gated bool
 	// Prober runs the guests' readinessProbes and supplies the ready flags (M2). Nil keeps the
 	// M1 behaviour: the mirror's ready flags, which mean only "running", are copied.
 	Prober Prober
@@ -60,6 +64,7 @@ type Backend struct {
 	mu          sync.Mutex
 	onStatus    func(*corev1.Pod) // the library's notify callback, wrapped by the provider
 	orphanSince map[types.UID]time.Time
+	gate        gateState // orchestrator mode only; guarded by mu
 }
 
 // New builds the backend. guests must list the pods bound to the virtual node.
@@ -78,6 +83,7 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, opts Optio
 		client: client, opts: opts, guests: guests, factory: f,
 		mirrors: inf.Lister(), synced: inf.Informer().HasSynced,
 		orphanSince: map[types.UID]time.Time{},
+		gate:        newGateState(opts.Group),
 	}
 	_, _ = inf.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { b.mirrorChanged(obj) },
@@ -139,8 +145,8 @@ func (b *Backend) mirrorChanged(obj any) {
 	b.emit(b.translate(g, m))
 }
 
-// translate is TranslateStatusWith the configured prober, if any.
-func (b *Backend) translate(guest, m *corev1.Pod) *corev1.Pod {
+// translateProbed is TranslateStatusWith the configured prober, if any.
+func (b *Backend) translateProbed(guest, m *corev1.Pod) *corev1.Pod {
 	if b.opts.Prober == nil {
 		return TranslateStatus(guest, m)
 	}
@@ -173,6 +179,10 @@ func (b *Backend) mirrorDeleted(obj any) {
 	b.forgetProbes(m)
 	g := b.guestFor(m)
 	if g == nil {
+		return
+	}
+	if b.takeVacated(g.UID) {
+		b.emit(VacatedStatus(g))
 		return
 	}
 	if g.DeletionTimestamp == nil {
@@ -264,7 +274,7 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 // Create builds and creates the mirror. It is idempotent: an existing mirror for this guest is
 // fine; an orphaned mirror with the same name and the same containers is adopted.
 func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
-	want, err := Build(guest, b.opts.Config)
+	want, err := Build(guest, b.buildConfig(guest))
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}
