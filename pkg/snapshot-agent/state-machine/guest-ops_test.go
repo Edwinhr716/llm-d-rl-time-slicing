@@ -835,7 +835,7 @@ func TestKill(t *testing.T) {
 		waitStarted(t, killStub)
 
 		superseded := getOp(t, sm, suspendID)
-		checkFailed(t, superseded, pb.ErrorReason_ERROR_REASON_UNSPECIFIED)
+		checkFailed(t, superseded, pb.ErrorReason_SUPERSEDED)
 		if superseded.Error != "superseded by Kill: T reached" {
 			t.Errorf("unexpected supersede message %q", superseded.Error)
 		}

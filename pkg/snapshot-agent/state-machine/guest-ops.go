@@ -377,7 +377,11 @@ func (sm *StateManager) StartKill(jobID string, deadline time.Time, reason strin
 	slog.Warn("Kill requested", "jobID", jobID, "state", job.State, "reason", reason,
 		"deadline", deadline.Format(time.RFC3339Nano))
 	if job.current != nil {
-		sm.supersedeLocked(job, pb.ErrorReason_ERROR_REASON_UNSPECIFIED, "superseded by Kill: "+reason)
+		superseded := job.current.op
+		sm.supersedeLocked(job, pb.ErrorReason_SUPERSEDED, "superseded by Kill: "+reason)
+		slog.Warn("Kill superseded the running operation", "jobID", jobID,
+			"supersededOp", superseded.ID, "supersededType", superseded.Type,
+			"supersededReason", superseded.ErrorReason.String())
 	}
 
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
