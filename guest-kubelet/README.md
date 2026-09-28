@@ -4,7 +4,7 @@ A throwaway prototype of a *guest kubelet*: a [virtual-kubelet](https://github.c
 (v1.14.0) that registers a virtual Node (`vk-<host>`) next to a real GPU node and acts as the
 kubelet for the guest pods scheduled onto it.
 
-## Status: M2 (readiness)
+## Status: M2 (readiness) and M3 (suspend and resume, below)
 
 - Registers Node `vk-<host suffix>` (for example `vk-abcd`) with labels `type=virtual-kubelet`,
   `timeslice.io/virtual-node=true`, taint `timeslice.io/guest=true:NoSchedule`, capacity
@@ -39,6 +39,7 @@ kubelet for the guest pods scheduled onto it.
   `POST /debug/readiness?pod=ns/name&ready=true|false|clear` (an override
   that wins over the probes) and `GET /debug/ready-edges?pod=ns/name`
   (when the VK sent each Ready change). Only the Q5 measurement uses it.
+  The same address serves the M3 suspend and resume hooks (below).
 - Not yet: liveness and startup probes, logs/exec
   (use `kubectl logs <guest>-m`), stats.
 
@@ -56,12 +57,53 @@ internal/backend/mirror/claim.go     optional reservedFor write (kube-controller
 internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
 internal/probe/debug.go              debug endpoint: override, Ready edges
 cmd/q5-measure/main.go               Q5 timings; runs in a pod
+internal/backend/mirror/suspend.go   M3 suspend/resume, suspend state on the mirror, guest status overlay
+internal/backend/mirror/readiness.go MarkNotReady, the one NotReady signal; wait for NotReady in the API
+internal/backend/mirror/readycheck.go after a resume, run the guest readinessProbe until it passes
+internal/freeze/                     freeze.Backend; Cgroup: cgroup v2 freezer on the pod cgroup
+cmd/guest-kubelet/debug.go           the --debug-addr mux: M2 hooks plus POST /debug/suspend, /debug/resume
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
 deploy/m2/                           probed guests, pool, router, Q5 pods
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
+
+## M3: suspend and resume by cgroup freeze
+
+Interim step: the VK freezes the mirror's pod cgroup itself. It sits behind `freeze.Backend`
+(`internal/freeze`), so M4 swaps it for the snapshot agent's Suspend/Resume and the VK stops
+touching cgroups.
+
+- Suspend (`Backend.Suspend`), in this order: raise `timeslice.io/guest-epoch` and set
+  `timeslice.io/suspend-state=Suspending` on the mirror (compare-and-swap on its
+  resourceVersion); the guest turns NotReady (`MarkNotReady`, the same function the prober
+  uses for a failed probe, with reason `Suspending`); wait until the API shows the guest
+  NotReady (`--suspend-notready-timeout`); write `1` to `cgroup.freeze` on the pod-level
+  cgroup and wait for `frozen 1` in `cgroup.events` (`--freeze-timeout`); record `Suspended`.
+  No drain. If the wait or the freeze fails, the pod is thawed and put back to Running.
+- While frozen the guest shows phase Running, Ready=False, condition
+  `timeslice.io/suspended=True`, and its containers Waiting with reason `Suspended`, so
+  `kubectl get pods` prints `0/1 Suspended`. Restart counts do not change.
+- Resume (`Backend.Resume`): raise the epoch, record `Resuming` (still NotReady), thaw, run the
+  guest's httpGet/tcpSocket readinessProbe against the mirror (one attempt at a time with the
+  prober's HTTP and TCP semantics) until it passes (`--resume-ready-timeout`), then clear the
+  state; from then on the prober's verdict decides Ready, as for any guest. Any failure leaves it
+  `Resuming`, so it is never Ready on a process that did not come back.
+- The suspend state is applied after the prober's verdict, so a probe that still passes (or a
+  debug override) never shows a suspended guest Ready.
+- One suspend or resume per guest at a time. The state lives on the mirror, so a restarted VK
+  or a new leader derives the same guest status. Deleting a suspended guest thaws the mirror
+  first, so it can act on SIGTERM.
+- Deployment: the VK container is privileged, runs as root and mounts the host's
+  `/sys/fs/cgroup` read-write at `/host/cgroup` (`--cgroup-root`; empty disables suspend).
+  The cgroup is found under both kubelet cgroup drivers (systemd `kubepods.slice/...` and
+  cgroupfs `kubepods/...`). Mirror pods stay unprivileged.
+- Until the orchestrator loop (VK-A6) drives it, suspend and resume are triggered by hand
+  through `--debug-addr` (loopback only, for example `127.0.0.1:10261`, reached with
+  `kubectl port-forward` to the leader pod; it works with `--readiness-probes=false` too):
+  `POST /debug/suspend?namespace=<ns>&name=<guest>` and `POST /debug/resume?...`. The reply is the step timings as JSON.
+  It has no authentication: enable it only in test deployments.
 
 ## Build and deploy
 

@@ -1,4 +1,5 @@
 # M1: two replicas on the host node with leader election; only the Lease holder is the kubelet.
+# M3: privileged, root, host cgroup v2 tree at /host/cgroup (suspend = cgroup freeze).
 # `make deploy` replaces __IMAGE__ with the Artifact Registry image and __HOST__ with the host node.
 apiVersion: apps/v1
 kind: Deployment
@@ -28,8 +29,6 @@ spec:
         - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
         - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: guest-kubelet
@@ -40,7 +39,10 @@ spec:
             - --mirror-cpu-headroom=1
             - --mirror-memory-headroom=4Gi
             - --mirror-owner-ref=true
-            # M2 test hooks (force a guest's readiness, read its Ready edges); loopback only.
+            # M3: suspend/resume freezes the mirror's pod cgroup through this mount.
+            - --cgroup-root=/host/cgroup
+            # Test hooks (M2: force a guest's readiness, read its Ready edges; M3: suspend and
+            # resume by hand); loopback only.
             - --debug-addr=127.0.0.1:10261
           env:
             - name: HOST_IP
@@ -55,7 +57,15 @@ spec:
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: 100m, memory: 256Mi}
+          # M3 (interim until M4 hands suspend to the snapshot agent): writing cgroup.freeze
+          # on the host's pod cgroups needs root and a privileged container. Mirror pods stay
+          # unprivileged.
           securityContext:
-            allowPrivilegeEscalation: false
+            privileged: true
+            runAsUser: 0
             readOnlyRootFilesystem: true
-            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: host-cgroup, mountPath: /host/cgroup}
+      volumes:
+        - name: host-cgroup
+          hostPath: {path: /sys/fs/cgroup, type: Directory}

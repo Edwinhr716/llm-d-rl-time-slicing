@@ -12,6 +12,9 @@ import (
 const (
 	ReasonMirrorDeleted = "MirrorDeleted"
 	ReasonGuestDeleted  = "GuestKubeletPodDeleted"
+
+	// ReasonContainersNotReady is the kubelet's reason when a readiness probe has not passed.
+	ReasonContainersNotReady = "ContainersNotReady"
 )
 
 // Readiness is the guest kubelet's own readiness verdict per guest container (M2). The mirror
@@ -37,9 +40,9 @@ func TranslateStatus(guest, m *corev1.Pod) *corev1.Pod {
 // each container's ready flag comes from rd (and is false unless the container runs), and the
 // ContainersReady and Ready conditions are recomputed from those flags. A nil rd is M1: the
 // mirror's flags and conditions are copied as they are.
-func TranslateStatusWith(guest, m *corev1.Pod, rd Readiness) *corev1.Pod {
+func TranslateStatusWith(guest, mirrorPod *corev1.Pod, rd Readiness) *corev1.Pod {
 	out := guest.DeepCopy()
-	ms := m.Status.DeepCopy()
+	ms := mirrorPod.Status.DeepCopy()
 	st := corev1.PodStatus{
 		Phase:                 ms.Phase,
 		Reason:                ms.Reason,
@@ -74,6 +77,7 @@ func TranslateStatusWith(guest, m *corev1.Pod, rd Readiness) *corev1.Pod {
 			setReadyFalse(&st, guest, "ReadinessGatesNotReady")
 		}
 	}
+	applySuspendState(&st, guest, mirrorPod)
 	out.Status = st
 	return out
 }
@@ -169,13 +173,14 @@ func applyReadiness(st *corev1.PodStatus, guest *corev1.Pod, rd Readiness) {
 			unready = append(unready, name)
 		}
 	}
-	allReady := len(unready) == 0
-	msg := ""
-	if !allReady {
-		msg = fmt.Sprintf("containers with unready status: [%s]", strings.Join(unready, " "))
+	if len(unready) > 0 {
+		// The same NotReady as a suspend (M3), with the kubelet's reason and message.
+		msg := fmt.Sprintf("containers with unready status: [%s]", strings.Join(unready, " "))
+		MarkNotReady(st, guest.Status.Conditions, ReasonContainersNotReady, msg, metav1.Now())
+		return
 	}
-	setCondition(st, guest, corev1.ContainersReady, allReady, msg)
-	setCondition(st, guest, corev1.PodReady, allReady && st.Phase == corev1.PodRunning, msg)
+	setCondition(st, guest, corev1.ContainersReady, true, "")
+	setCondition(st, guest, corev1.PodReady, st.Phase == corev1.PodRunning, "")
 }
 
 func setCondition(st *corev1.PodStatus, guest *corev1.Pod, ct corev1.PodConditionType, isTrue bool, msg string) {
@@ -183,7 +188,7 @@ func setCondition(st *corev1.PodStatus, guest *corev1.Pod, ct corev1.PodConditio
 	if isTrue {
 		want.Status = corev1.ConditionTrue
 	} else {
-		want.Reason, want.Message = "ContainersNotReady", msg
+		want.Reason, want.Message = ReasonContainersNotReady, msg
 	}
 	want.LastTransitionTime = metav1.Now()
 	if prev := findCondition(guest.Status.Conditions, ct); prev != nil && prev.Status == want.Status {
