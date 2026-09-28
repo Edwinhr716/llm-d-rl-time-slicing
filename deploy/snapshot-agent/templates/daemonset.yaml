@@ -68,6 +68,9 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            # Kill writes cgroup.kill and reads cgroup.procs in the host cgroup v2 tree.
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
             {{- if .Values.nvidia.driver.enabled }}
             - name: nvidia-driver
               mountPath: {{ .Values.nvidia.driver.mountPath }}
@@ -78,6 +81,10 @@ spec:
               mountPath: {{ .Values.nvidia.devices.mountPath }}
             {{- end }}
       volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
         {{- if .Values.nvidia.driver.enabled }}
         - name: nvidia-driver
           hostPath:

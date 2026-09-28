@@ -66,6 +66,7 @@ func NewWatcher(clientset kubernetes.Interface, state *sm.StateManager) (*Watche
 	_, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    w.handlePodAdd,
 		UpdateFunc: w.handlePodUpdate,
+		DeleteFunc: w.handlePodDelete,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to add event handler to informer: %w", err)
@@ -101,6 +102,43 @@ func (w *Watcher) handlePodUpdate(oldObj, newObj interface{}) {
 		return
 	}
 	w.registerPodJob(pod)
+}
+
+// handlePodDelete forgets a job when its last local pod is gone. A FAULTED
+// job (for example after KILL_UNCONFIRMED) clears this way, and a new pod
+// with the same job ID starts clean. It unwraps the tombstone the informer
+// hands over when it missed the delete event.
+func (w *Watcher) handlePodDelete(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, isTombstone := obj.(cache.DeletedFinalStateUnknown)
+		if !isTombstone {
+			return
+		}
+		if pod, ok = tombstone.Obj.(*corev1.Pod); !ok {
+			return
+		}
+	}
+	jobID, hasJob := pod.Labels[podutils.JobIDLabel]
+	if !hasJob {
+		return
+	}
+	// The informer's store drops the pod before this handler runs; the UID
+	// check also covers a store that still holds it.
+	for _, other := range w.getLocalPodsForJob(jobID) {
+		if other.UID != pod.UID {
+			slog.Info("Pod deleted; the job has other local pods", "pod", pod.Name, "jobID", jobID)
+			return
+		}
+	}
+	slog.Info("Last local pod of job deleted; forgetting the job", "pod", pod.Name, "jobID", jobID)
+	w.state.RemoveJob(jobID)
+}
+
+// PodsForJob returns the pods on this node that carry jobID, from the
+// informer cache.
+func (w *Watcher) PodsForJob(jobID string) []*corev1.Pod {
+	return w.getLocalPodsForJob(jobID)
 }
 
 func (w *Watcher) registerPodJob(pod *corev1.Pod) {
@@ -152,6 +190,11 @@ func (w *Watcher) checkIdleJobs(ctx context.Context) {
 	statuses := w.state.GetJobStatus()
 	for _, status := range statuses {
 		if status.State != pb.JobState_JOB_STATE_IDLE {
+			continue
+		}
+		// A killed job stays IDLE with last outcome KILLED until its pod is
+		// gone; promoting it would hide that it was vacated.
+		if status.LastOutcome == pb.Outcome_OUTCOME_KILLED {
 			continue
 		}
 

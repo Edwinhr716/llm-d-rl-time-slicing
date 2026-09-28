@@ -30,6 +30,7 @@ type Server struct {
 	deploymentMode  string
 	channelRegistry *backends.ChannelRegistry
 	featureGates    features.Gates
+	killer          *killer
 }
 
 // NewServer creates a new Server instance. channelRegistry is shared with
@@ -53,6 +54,7 @@ func NewServer(
 		deploymentMode:  deploymentMode,
 		channelRegistry: channelRegistry,
 		featureGates:    featureGates,
+		killer:          newKiller(),
 	}
 }
 
@@ -571,6 +573,8 @@ func StartServer(
 	if err != nil {
 		return fmt.Errorf("failed to create watcher: %w", err)
 	}
+	// Kill finds the job's pods in the watcher's cache.
+	srv.killer.pods = watcher
 	watcher.Start(ctx)
 
 	s := grpc.NewServer()
