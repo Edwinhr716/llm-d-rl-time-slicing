@@ -57,6 +57,9 @@ type options struct {
 	leaderElect        bool
 	leaseNamespace     string
 	podName            string
+
+	// D-VK-2 option c: one-shot deregistration (end of an era).
+	deregister bool
 }
 
 func main() {
@@ -89,6 +92,8 @@ func main() {
 	flag.BoolVar(&o.leaderElect, "leader-elect", false, "run several replicas; only the Lease holder acts as the kubelet")
 	flag.StringVar(&o.leaseNamespace, "leader-elect-namespace", os.Getenv("POD_NAMESPACE"), "namespace of the leader-election Lease (env POD_NAMESPACE)")
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
+	flag.BoolVar(&o.deregister, "deregister", false,
+		"one-shot: delete the virtual Node, remove its finalizer and exit (end of an era; stop the serving VK first)")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -102,11 +107,14 @@ func main() {
 }
 
 func run(ctx context.Context, o options) error {
+	if o.deregister {
+		return deregister(ctx, o.nodeName, o.hostNode, o.kubeconfig)
+	}
 	if o.hostIP == "" || o.hostNode == "" {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
 	}
 	if o.nodeName == "" {
-		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
+		o.nodeName = defaultNodeName(o.hostNode)
 	}
 	client, err := nodeutil.ClientsetFromEnv(o.kubeconfig)
 	if err != nil {
@@ -116,6 +124,32 @@ func run(ctx context.Context, o options) error {
 		return runKubelet(ctx, client, o)
 	}
 	return runWithLeaderElection(ctx, client, o)
+}
+
+func defaultNodeName(hostNode string) string {
+	return "vk-" + hostNode[strings.LastIndex(hostNode, "-")+1:]
+}
+
+// deregister is the VK's own removal of its virtual Node at the end of an era: it deletes the
+// Node and removes the finalizer (reason deregister), then exits. Run it after the serving VK
+// has stopped, or its re-registration recreates the Node.
+func deregister(ctx context.Context, name, hostNode, kubeconfig string) error {
+	if name == "" && hostNode != "" {
+		name = defaultNodeName(hostNode)
+	}
+	if name == "" {
+		return fmt.Errorf("--deregister needs --node-name or --host-node")
+	}
+	client, err := nodeutil.ClientsetFromEnv(kubeconfig)
+	if err != nil {
+		return err
+	}
+	released, err := provider.ReleaseNode(ctx, client, name, provider.ReasonDeregister)
+	if err != nil {
+		return err
+	}
+	log.G(ctx).WithField("node", name).WithField("released", released).Info("deregistered")
+	return nil
 }
 
 // runWithLeaderElection is LWS's (or any controller-runtime manager's) leader election, but
@@ -178,6 +212,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	cfg := provider.NodeConfig{
 		Name: o.nodeName, InternalIP: o.hostIP, KubeletPort: int32(o.kubeletPort),
 		KubeletVersion: o.kubeletVersion, GPUs: o.gpus,
+		HostName: host.Name, HostUID: host.UID,
 	}
 	if o.providerIDFromHost {
 		cfg.ProviderID = host.Spec.ProviderID
@@ -206,6 +241,11 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 
 	nodeSpec := provider.NewNodeSpec(cfg)
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
+		return err
+	}
+	// D-VK-2 option c: register the Node ourselves with the finalizer and the ownerReference to
+	// the host (or add them to an existing Node), so the library finds it and only patches status.
+	if _, err := provider.EnsureNodeGuard(ctx, client, &nodeSpec); err != nil {
 		return err
 	}
 
@@ -293,7 +333,11 @@ func reRegisterOnNotFound(client kubernetes.Interface, spec *corev1.Node) node.E
 		log.G(ctx).WithField("node", spec.Name).Warn("Node object was deleted by someone else; re-registering")
 		fresh := spec.DeepCopy()
 		fresh.ResourceVersion = ""
-		_, err = client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{})
-		return err
+		if _, err := client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{}); err != nil {
+			return err
+		}
+		log.G(ctx).WithField("node", spec.Name).WithField("finalizer", provider.NodeFinalizer).
+			WithField("action", "re-registered").Info("node finalizer set")
+		return nil
 	}
 }

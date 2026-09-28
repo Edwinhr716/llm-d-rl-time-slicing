@@ -6,6 +6,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -15,6 +16,11 @@ const (
 	VirtualNodeLabel = "timeslice.io/virtual-node"
 	// GPUResource is advertised as plain capacity so the default scheduler can fit guests.
 	GPUResource corev1.ResourceName = "nvidia.com/gpu"
+	// NodeFinalizer holds the virtual Node while anyone but its owners deletes it (for example
+	// the cloud node lifecycle controller during a VK outage), so its guests are not
+	// garbage-collected. Only the donor controller (the host is gone) and the VK itself
+	// (deregistration) remove it; see ReleaseNode.
+	NodeFinalizer = "timeslice.io/virtual-node-protection"
 )
 
 // NodeConfig is everything needed to describe the virtual Node.
@@ -33,6 +39,18 @@ type NodeConfig struct {
 	// GKE denies it: the validate-node-providerid admission policy requires the providerID to
 	// end in "/<node name>". Empty on GKE.
 	ProviderID string
+	// HostName and HostUID identify the real Node. When HostUID is set, the virtual Node gets
+	// an ownerReference to it, so deleting the real Node also deletes the virtual one (the
+	// finalizer still holds it until the donor controller releases it).
+	HostName string
+	HostUID  types.UID
+}
+
+// HostOwnerRef is the ownerReference from the virtual Node to the real Node it runs on.
+// It is neither a controller nor blocking reference: the virtual Node never blocks the
+// deletion of the real one.
+func HostOwnerRef(name string, uid types.UID) metav1.OwnerReference {
+	return metav1.OwnerReference{APIVersion: "v1", Kind: "Node", Name: name, UID: uid}
 }
 
 // NewNodeSpec builds the Node object that the library registers once at startup.
@@ -50,9 +68,16 @@ func NewNodeSpec(cfg NodeConfig) corev1.Node {
 			LastHeartbeatTime: now, LastTransitionTime: now}
 	}
 
+	var owners []metav1.OwnerReference
+	if cfg.HostUID != "" {
+		owners = []metav1.OwnerReference{HostOwnerRef(cfg.HostName, cfg.HostUID)}
+	}
+
 	return corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: cfg.Name,
+			Name:            cfg.Name,
+			Finalizers:      []string{NodeFinalizer},
+			OwnerReferences: owners,
 			// Tells the cluster autoscaler never to pick this Node for scale-down. It matters
 			// if the Node ever carries the host's providerID (the autoscaler would then map it
 			// to the host's instance group); harmless otherwise.

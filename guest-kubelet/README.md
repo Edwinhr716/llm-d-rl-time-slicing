@@ -36,6 +36,9 @@ cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wi
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
 internal/provider/events.go          drops events about non-guest pods
+internal/provider/finalizer.go       Node finalizer, ownerRef to host, release
+internal/donorstandin/               donor stand-in: releases Node on host death
+cmd/donor-standin/main.go            its command (same image as the VK)
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
@@ -43,6 +46,7 @@ internal/backend/mirror/claim.go     optional reservedFor write (kube-controller
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
+deploy/opt-c/                        donor stand-in Deployment + RBAC
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
 
@@ -56,6 +60,24 @@ make gpu-guest    # claim + trainer stand-in, then the vLLM guest
 make status
 make undeploy
 ```
+
+## Outage guard: Node finalizer (option c of an open decision)
+
+The VK Node carries the finalizer `timeslice.io/virtual-node-protection`
+and an ownerReference to the real Node. When anyone else deletes the VK
+Node during a VK outage (for example the cloud node lifecycle
+controller), the finalizer holds it (Terminating), so its guests are not
+garbage-collected. Only two actors remove the finalizer:
+
+- the donor controller, when the real Node is gone (`deploy/opt-c/`, a
+  stand-in until the real controller exists; the VK cannot act on its
+  own host's death), and
+- the VK itself when it deregisters at the end of an era: stop the
+  serving VK, then run `guest-kubelet --deregister --node-name=<node>`.
+
+A Terminating Node cannot be un-deleted: it keeps serving, but stays
+Terminating until one of the two releases it. A plain
+`kubectl delete node` also stays Terminating.
 
 The plan and the notes explaining this code are kept outside this repository
 (prototype plan, milestones M0 and M1).

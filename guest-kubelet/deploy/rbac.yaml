@@ -4,9 +4,12 @@ kind: ClusterRole
 metadata:
   name: guest-kubelet-proto
 rules:
+  # update: add the timeslice.io/virtual-node-protection finalizer and the ownerReference to the
+  # host on an existing Node, and remove the finalizer on --deregister (D-VK-2 option c).
+  # delete: --deregister.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["nodes/status"]
     verbs: ["patch", "update"]
