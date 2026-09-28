@@ -30,6 +30,9 @@ type Server struct {
 	deploymentMode  string
 	channelRegistry *backends.ChannelRegistry
 	featureGates    features.Gates
+	// guest runs the Suspend and Resume pipelines; nil until StartServer
+	// wires it.
+	guest *guestPipeline
 }
 
 // NewServer creates a new Server instance. channelRegistry is shared with
@@ -539,8 +542,8 @@ func (h *HealthServer) Watch(req *grpc_health_v1.HealthCheckRequest, stream grpc
 }
 
 // StartServer starts the gRPC server on the specified port. featureGates
-// may be nil, which leaves every gate at its default. stateOpts configure
-// the StateManager.
+// may be nil, which leaves every gate at its default. guestCfg configures
+// the Suspend and Resume pipelines. stateOpts configure the StateManager.
 func StartServer(
 	ctx context.Context,
 	port int,
@@ -549,6 +552,7 @@ func StartServer(
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
 	featureGates features.Gates,
+	guestCfg GuestConfig,
 	stateOpts ...sm.Option,
 ) error {
 	lc := net.ListenConfig{}
@@ -572,6 +576,14 @@ func StartServer(
 		return fmt.Errorf("failed to create watcher: %w", err)
 	}
 	watcher.Start(ctx)
+
+	// 4. Wire the Suspend and Resume pipelines to the cuda-checkpoint
+	// backend, sharing its node lock with Snapshot and Restore.
+	if cuda, ok := backendMap[backends.BackendCuda].(*backends.CudaCheckpoint); ok {
+		srv.guest = newGuestPipeline(guestCfg, watcher, k8sClient, cuda)
+	} else {
+		slog.WarnContext(ctx, "cuda-checkpoint backend not registered; Suspend and Resume are unavailable")
+	}
 
 	s := grpc.NewServer()
 	pb.RegisterSnapshotAgentServiceServer(s, srv)

@@ -1,0 +1,680 @@
+// Copyright 2026 The llm-d Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
+	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/cgroup"
+	sm "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// Constants of the Suspend and Resume pipelines. They stay constants, not
+// flags, until they are measured.
+const (
+	// memoryHeadroom is the factor applied to a guest's device bytes in
+	// the memory precondition: the pod cgroup must have room for the
+	// checkpointed device memory plus 10%.
+	memoryHeadroom = 1.1
+	// suspendMargin is the slack planBudget keeps before the deadline.
+	suspendMargin = time.Second
+	// checkpointPerGB estimates a first checkpoint of a job with no
+	// measured one yet (12.5-13.3 s for 22.9 GB on L4).
+	checkpointPerGB = 600 * time.Millisecond
+	// freezeEstimate and verifyEstimate are the budget for the cgroup
+	// freeze and the NVML verify.
+	freezeEstimate = 500 * time.Millisecond
+	verifyEstimate = 500 * time.Millisecond
+)
+
+// DefaultVRAMZeroingQualified is the default --vram-zeroing-qualified: the
+// GPUs and driver branches on which process exit and cuda-checkpoint are
+// known to leave no VRAM behind.
+const DefaultVRAMZeroingQualified = "NVIDIA L4:580"
+
+// QualifiedGPU is one --vram-zeroing-qualified entry: a GPU name as NVML
+// reports it and a driver branch (the major version).
+type QualifiedGPU struct {
+	Name   string
+	Branch string
+}
+
+// ParseVRAMZeroingQualified parses a comma-separated list of
+// "<GPU name>:<driver branch>" entries, for example "NVIDIA L4:580".
+func ParseVRAMZeroingQualified(spec string) ([]QualifiedGPU, error) {
+	var out []QualifiedGPU
+	for _, entry := range strings.Split(spec, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		i := strings.LastIndex(entry, ":")
+		if i <= 0 || i == len(entry)-1 {
+			return nil, fmt.Errorf("invalid entry %q: want <GPU name>:<driver branch>", entry)
+		}
+		out = append(out, QualifiedGPU{Name: strings.TrimSpace(entry[:i]), Branch: strings.TrimSpace(entry[i+1:])})
+	}
+	return out, nil
+}
+
+// driverBranch returns the major version of an NVIDIA driver version
+// ("580.173.02" -> "580").
+func driverBranch(version string) string {
+	if i := strings.Index(version, "."); i >= 0 {
+		return version[:i]
+	}
+	return version
+}
+
+// GuestConfig configures the Suspend and Resume pipelines.
+type GuestConfig struct {
+	// VRAMZeroingQualified is the node precondition allowlist.
+	VRAMZeroingQualified []QualifiedGPU
+	// CgroupRoot is the host cgroup v2 mount; empty means /sys/fs/cgroup.
+	CgroupRoot string
+}
+
+// guestBackend is the part of the cuda-checkpoint backend the pipelines use.
+type guestBackend interface {
+	Available() error
+	GetState(ctx context.Context, pid int) (string, error)
+	GuestCheckpoint(ctx context.Context, pids []int, alreadyLocked map[int]bool, beforeRun func() error) error
+	GuestRestore(ctx context.Context, pids []int, states map[int]string) error
+}
+
+// gpuDevice is one GPU as NVML reports it.
+type gpuDevice struct {
+	Name          string
+	DriverVersion string
+}
+
+// gpuProcess is one process NVML lists on a GPU. UsedBytes is
+// nvmlNotAvailable when the driver does not report it.
+type gpuProcess struct {
+	PID       int
+	UsedBytes uint64
+}
+
+// nvmlNotAvailable is NVML's VALUE_NOT_AVAILABLE in an unsigned field.
+const nvmlNotAvailable = ^uint64(0)
+
+// gpuInspector queries NVML.
+type gpuInspector interface {
+	Devices() ([]gpuDevice, error)
+	// Processes lists the compute and graphics processes of every GPU.
+	Processes() ([]gpuProcess, error)
+}
+
+// guestPipeline runs the Suspend and Resume pipelines of guest jobs.
+type guestPipeline struct {
+	// mirror returns the job's mirror pod on this node from the watcher's
+	// cache.
+	mirror func(jobID string) (*corev1.Pod, bool)
+	// getPod reads one pod from the API server.
+	getPod    func(ctx context.Context, namespace, name string) (*corev1.Pod, error)
+	cgroups   *cgroup.Manager
+	backend   guestBackend
+	gpu       gpuInspector
+	qualified []QualifiedGPU
+	now       func() time.Time
+
+	mu      sync.Mutex
+	records map[string]*guestRecord
+}
+
+// guestRecord is what the pipelines remember about a job between calls.
+type guestRecord struct {
+	lastCheckpoint time.Duration
+	deviceBytes    int64
+}
+
+func (g *guestPipeline) record(jobID string) guestRecord {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if r, ok := g.records[jobID]; ok {
+		return *r
+	}
+	return guestRecord{}
+}
+
+func (g *guestPipeline) update(jobID string, f func(*guestRecord)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.records == nil {
+		g.records = map[string]*guestRecord{}
+	}
+	r, ok := g.records[jobID]
+	if !ok {
+		r = &guestRecord{}
+		g.records[jobID] = r
+	}
+	f(r)
+}
+
+// guestTarget is a job's mirror pod and its cgroups on this node.
+type guestTarget struct {
+	pod        *corev1.Pod
+	podDir     string
+	containers []string
+}
+
+// errGuestGone means the job has no mirror pod or pod cgroup on this node.
+var errGuestGone = errors.New("guest is gone")
+
+// resolve finds the job's mirror pod and cgroups.
+func (g *guestPipeline) resolve(jobID string) (*guestTarget, error) {
+	pod, ok := g.mirror(jobID)
+	if !ok {
+		return nil, fmt.Errorf("no mirror pod for job %s on this node: %w", jobID, errGuestGone)
+	}
+	podDir, err := g.cgroups.PodCgroupPath(string(pod.UID))
+	if errors.Is(err, cgroup.ErrNotFound) {
+		return nil, fmt.Errorf("pod %s/%s: %w: %w", pod.Namespace, pod.Name, errGuestGone, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	t := &guestTarget{pod: pod, podDir: podDir}
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.ContainerID == "" {
+			continue
+		}
+		dir, err := g.cgroups.ContainerCgroupPath(podDir, cs.ContainerID)
+		if errors.Is(err, cgroup.ErrNotFound) {
+			continue // the container exited and its cgroup is gone
+		}
+		if err != nil {
+			return nil, err
+		}
+		t.containers = append(t.containers, dir)
+	}
+	return t, nil
+}
+
+func (t *guestTarget) procs(m *cgroup.Manager) ([]int, error) {
+	if len(t.containers) == 0 {
+		return nil, nil
+	}
+	return m.Procs(t.containers...)
+}
+
+// Suspend makes a guest job give up its GPU: preconditions, deadline
+// budget, cuda-checkpoint (lock + checkpoint), cgroup freeze, verify. It
+// returns an operation ID at once; poll GetOperation for the outcome.
+func (s *Server) Suspend(ctx context.Context, req *pb.SuspendRequest) (*pb.SuspendResponse, error) {
+	ctx = logging.WithServerMethod(ctx, "Suspend")
+	if req.GetJobId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "job_id is required")
+	}
+	if s.guest == nil {
+		return nil, status.Error(codes.FailedPrecondition, "guest pipelines are not configured on this agent")
+	}
+	deadline := timestampTime(req.GetDeadline())
+	slog.InfoContext(ctx, "Suspend called", "jobID", req.GetJobId(), "epoch", req.GetEpoch(), "deadline", deadline)
+	worker := func(wctx context.Context) (sm.GuestResult, error) {
+		return s.guest.suspend(wctx, req.GetJobId(), deadline)
+	}
+	// The operation outlives the RPC: it runs under its own deadline context.
+	opID, err := s.state.StartGuestOp( //nolint:contextcheck // outlives the RPC by design
+		req.GetJobId(), sm.OpTypeSuspend, req.GetEpoch(), deadline, worker)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.SuspendResponse{OperationId: opID}, nil
+}
+
+// Resume gives a suspended guest job its GPU back: thaw, cuda-checkpoint
+// restore + unlock, verify. It returns an operation ID at once.
+func (s *Server) Resume(ctx context.Context, req *pb.ResumeRequest) (*pb.ResumeResponse, error) {
+	ctx = logging.WithServerMethod(ctx, "Resume")
+	if req.GetJobId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "job_id is required")
+	}
+	if s.guest == nil {
+		return nil, status.Error(codes.FailedPrecondition, "guest pipelines are not configured on this agent")
+	}
+	deadline := timestampTime(req.GetDeadline())
+	slog.InfoContext(ctx, "Resume called", "jobID", req.GetJobId(), "epoch", req.GetEpoch(), "deadline", deadline)
+	worker := func(wctx context.Context) (sm.GuestResult, error) {
+		return s.guest.resume(wctx, req.GetJobId())
+	}
+	// The operation outlives the RPC: it runs under its own deadline context.
+	opID, err := s.state.StartGuestOp( //nolint:contextcheck // outlives the RPC by design
+		req.GetJobId(), sm.OpTypeResume, req.GetEpoch(), deadline, worker)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ResumeResponse{OperationId: opID}, nil
+}
+
+// suspend is the Suspend pipeline.
+func (g *guestPipeline) suspend(ctx context.Context, jobID string, deadline time.Time) (sm.GuestResult, error) {
+	released := sm.GuestResult{Outcome: pb.Outcome_OUTCOME_RELEASED}
+	target, err := g.resolve(jobID)
+	if errors.Is(err, errGuestGone) {
+		slog.InfoContext(ctx, "Suspend: guest is gone; released", "jobID", jobID, "reason", err)
+		return released, nil
+	}
+	if err != nil {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
+	procs, err := target.procs(g.cgroups)
+	if err != nil {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
+	procSet := toSet(procs)
+
+	deviceBytes, err := g.deviceBytes(procSet)
+	if err != nil {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
+	if err := g.checkPreconditions(ctx, target, deviceBytes); err != nil {
+		return sm.GuestResult{}, err
+	}
+
+	frozen, err := g.cgroups.Frozen(target.podDir)
+	if err != nil {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
+	estimate := g.estimate(jobID, deviceBytes, frozen)
+	if err := g.checkBudget(deadline, estimate); err != nil {
+		return sm.GuestResult{}, err
+	}
+	if len(procs) == 0 {
+		slog.InfoContext(ctx, "Suspend: no process left; released", "jobID", jobID)
+		return released, nil
+	}
+
+	if !frozen {
+		if err := g.ensureCheckpointed(ctx, jobID, procs, deviceBytes, deadline); err != nil {
+			return sm.GuestResult{}, err
+		}
+	}
+	if err := g.cgroups.Freeze(ctx, target.podDir); err != nil {
+		return sm.GuestResult{}, backendError(ctx, fmt.Errorf("freeze: %w", err))
+	}
+	hostBytes, err := g.verifySuspended(target, procSet)
+	if err != nil {
+		return sm.GuestResult{}, err
+	}
+	if deviceBytes > 0 {
+		g.update(jobID, func(r *guestRecord) { r.deviceBytes = deviceBytes })
+	}
+	return sm.GuestResult{
+		Outcome:         pb.Outcome_OUTCOME_SUSPENDED,
+		DeviceBytes:     g.record(jobID).deviceBytes,
+		HostBytesPinned: hostBytes,
+	}, nil
+}
+
+// checkPreconditions checks readiness, probes, memory and node. A failure
+// fails the operation with the precondition's reason, and the job is left
+// FAULTED.
+func (g *guestPipeline) checkPreconditions(ctx context.Context, t *guestTarget, deviceBytes int64) error {
+	if err := g.checkReadiness(ctx, t.pod); err != nil {
+		return sm.NewOpError(pb.ErrorReason_PRECONDITION_READINESS, err)
+	}
+	if err := checkProbes(t.pod); err != nil {
+		return sm.NewOpError(pb.ErrorReason_PRECONDITION_PROBES, err)
+	}
+	if err := g.checkMemory(t.podDir, deviceBytes); err != nil {
+		return sm.NewOpError(pb.ErrorReason_PRECONDITION_MEMORY, err)
+	}
+	if err := g.checkNode(); err != nil {
+		return sm.NewOpError(pb.ErrorReason_PRECONDITION_NODE, err)
+	}
+	return nil
+}
+
+// checkReadiness reads the owner guest pod once: it must not be Ready, so
+// that no traffic is routed to the guest while it is frozen. A guest pod
+// that no longer exists receives no traffic either.
+func (g *guestPipeline) checkReadiness(ctx context.Context, mirror *corev1.Pod) error {
+	owner := ownerPod(mirror)
+	if owner == "" {
+		return fmt.Errorf("mirror %s/%s has no owner pod", mirror.Namespace, mirror.Name)
+	}
+	pod, err := g.getPod(ctx, mirror.Namespace, owner)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get guest pod %s/%s: %w", mirror.Namespace, owner, err)
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return fmt.Errorf("guest pod %s/%s is Ready; it must be made NotReady before Suspend", pod.Namespace, pod.Name)
+		}
+	}
+	return nil
+}
+
+// ownerPod returns the name of the pod that owns mirror, preferring the
+// controller reference.
+func ownerPod(mirror *corev1.Pod) string {
+	name := ""
+	for _, ref := range mirror.OwnerReferences {
+		if ref.Kind != "Pod" {
+			continue
+		}
+		if ref.Controller != nil && *ref.Controller {
+			return ref.Name
+		}
+		if name == "" {
+			name = ref.Name
+		}
+	}
+	return name
+}
+
+// checkProbes refuses a mirror with probes or readiness gates: the kubelet
+// would act on a frozen guest's failed probes.
+func checkProbes(pod *corev1.Pod) error {
+	if len(pod.Spec.ReadinessGates) > 0 {
+		return fmt.Errorf("mirror %s/%s has readinessGates", pod.Namespace, pod.Name)
+	}
+	containers := append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
+	for i := range containers {
+		c := &containers[i]
+		if c.LivenessProbe != nil || c.ReadinessProbe != nil || c.StartupProbe != nil {
+			return fmt.Errorf("mirror %s/%s container %s has probes", pod.Namespace, pod.Name, c.Name)
+		}
+	}
+	return nil
+}
+
+// checkMemory requires room in the pod cgroup for the device memory that
+// cuda-checkpoint moves to host memory, plus headroom. A pod without a
+// memory limit is refused: its checkpoint could push the node into OOM.
+func (g *guestPipeline) checkMemory(podDir string, deviceBytes int64) error {
+	if deviceBytes <= 0 {
+		return nil
+	}
+	limit, unlimited, err := g.cgroups.MemoryMax(podDir)
+	if err != nil {
+		return fmt.Errorf("read memory.max: %w", err)
+	}
+	if unlimited {
+		return errors.New("pod cgroup has no memory limit (memory.max is max)")
+	}
+	current, err := g.cgroups.MemoryCurrent(podDir)
+	if err != nil {
+		return fmt.Errorf("read memory.current: %w", err)
+	}
+	need := int64(float64(deviceBytes) * memoryHeadroom)
+	if free := limit - current; free < need {
+		return fmt.Errorf("pod cgroup has %d bytes free (memory.max %d - memory.current %d), need %d (device bytes %d x %.1f)",
+			free, limit, current, need, deviceBytes, memoryHeadroom)
+	}
+	return nil
+}
+
+// checkNode requires cgroup v2, the cuda-checkpoint binary and every GPU on
+// the --vram-zeroing-qualified allowlist.
+func (g *guestPipeline) checkNode() error {
+	if !g.cgroups.IsV2() {
+		return fmt.Errorf("%s is not a cgroup v2 hierarchy", g.cgroups.Root)
+	}
+	if err := g.backend.Available(); err != nil {
+		return err
+	}
+	devices, err := g.gpu.Devices()
+	if err != nil {
+		return fmt.Errorf("query GPUs: %w", err)
+	}
+	if len(devices) == 0 {
+		return errors.New("no GPU on this node")
+	}
+	for _, d := range devices {
+		if !g.isQualified(d) {
+			return fmt.Errorf("GPU %q with driver %s is not on --vram-zeroing-qualified", d.Name, d.DriverVersion)
+		}
+	}
+	return nil
+}
+
+func (g *guestPipeline) isQualified(d gpuDevice) bool {
+	branch := driverBranch(d.DriverVersion)
+	for _, q := range g.qualified {
+		if q.Name == d.Name && q.Branch == branch {
+			return true
+		}
+	}
+	return false
+}
+
+// estimate is the time a Suspend still needs: checkpoint (the job's last
+// measured checkpoint, or a per-GB estimate), freeze, verify and a margin.
+// A frozen guest is already checkpointed.
+func (g *guestPipeline) estimate(jobID string, deviceBytes int64, frozen bool) time.Duration {
+	est := freezeEstimate + verifyEstimate + suspendMargin
+	if frozen {
+		return est
+	}
+	if last := g.record(jobID).lastCheckpoint; last > 0 {
+		return est + last
+	}
+	return est + time.Duration(float64(deviceBytes)/(1<<30)*float64(checkpointPerGB))
+}
+
+// checkBudget refuses with DEADLINE_INFEASIBLE when the estimate does not
+// fit before the deadline.
+func (g *guestPipeline) checkBudget(deadline time.Time, estimate time.Duration) error {
+	if left := deadline.Sub(g.now()); left < estimate {
+		return sm.NewOpError(pb.ErrorReason_DEADLINE_INFEASIBLE,
+			fmt.Errorf("%s left before the deadline, suspend needs about %s", left.Round(time.Millisecond), estimate))
+	}
+	return nil
+}
+
+// ensureCheckpointed locks and checkpoints the guest's CUDA processes.
+// Processes without a CUDA context are skipped; checkpointed ones are left
+// alone. The budget is checked again once the node lock is held, since the
+// wait for it may have used the time.
+func (g *guestPipeline) ensureCheckpointed(
+	ctx context.Context, jobID string, procs []int, deviceBytes int64, deadline time.Time,
+) error {
+	var targets []int
+	locked := map[int]bool{}
+	for _, pid := range procs {
+		state, err := g.backend.GetState(ctx, pid)
+		if errors.Is(err, backends.ErrNotCudaProcess) {
+			continue
+		}
+		if err != nil {
+			return backendError(ctx, err)
+		}
+		switch state {
+		case backends.CudaStateRunning:
+			targets = append(targets, pid)
+		case backends.CudaStateLocked:
+			targets = append(targets, pid)
+			locked[pid] = true
+		case backends.CudaStateCheckpointed:
+		default:
+			return sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, fmt.Errorf("pid %d is in cuda-checkpoint state %q", pid, state))
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	t0 := time.Time{}
+	err := g.backend.GuestCheckpoint(ctx, targets, locked, func() error {
+		// The estimate here is the checkpoint itself plus what follows.
+		if err := g.checkBudget(deadline, g.estimate(jobID, deviceBytes, false)); err != nil {
+			return err
+		}
+		t0 = g.now()
+		return nil
+	})
+	if err != nil {
+		if sm.ErrorReasonOf(err) != pb.ErrorReason_ERROR_REASON_UNSPECIFIED {
+			return err
+		}
+		return backendError(ctx, err)
+	}
+	took := g.now().Sub(t0)
+	g.update(jobID, func(r *guestRecord) { r.lastCheckpoint = took })
+	slog.InfoContext(ctx, "Suspend: checkpointed", "jobID", jobID, "pids", targets, "duration", took, "deviceBytes", deviceBytes)
+	return nil
+}
+
+// verifySuspended checks with its own NVML query that no guest process
+// holds VRAM ("not available" counts as holding VRAM) and that the pod
+// cgroup is frozen. It returns the host bytes the frozen guest pins.
+func (g *guestPipeline) verifySuspended(target *guestTarget, procSet map[int]bool) (int64, error) {
+	gpuProcs, err := g.gpu.Processes()
+	if err != nil {
+		return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, fmt.Errorf("query GPU processes: %w", err))
+	}
+	for _, p := range gpuProcs {
+		if procSet[p.PID] && p.UsedBytes > 0 {
+			used := fmt.Sprint(p.UsedBytes)
+			if p.UsedBytes == nvmlNotAvailable {
+				used = "not available"
+			}
+			return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, fmt.Errorf("guest pid %d still holds VRAM (%s)", p.PID, used))
+		}
+	}
+	frozen, err := g.cgroups.Frozen(target.podDir)
+	if err != nil {
+		return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, fmt.Errorf("read pod cgroup freeze state: %w", err))
+	}
+	if !frozen {
+		return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, errors.New("pod cgroup is not frozen"))
+	}
+	stat, err := g.cgroups.MemoryStat(target.podDir)
+	if err != nil {
+		return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, fmt.Errorf("read memory.stat: %w", err))
+	}
+	return cgroup.HostBytes(stat), nil
+}
+
+// resume is the Resume pipeline: thaw first, then restore, then verify.
+// Toggling a frozen process blocks, so the thaw must come first.
+func (g *guestPipeline) resume(ctx context.Context, jobID string) (sm.GuestResult, error) {
+	t, err := g.resolve(jobID)
+	if err != nil {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
+	if err := g.cgroups.Thaw(ctx, t.podDir); err != nil {
+		return sm.GuestResult{}, backendError(ctx, fmt.Errorf("thaw: %w", err))
+	}
+	procs, err := t.procs(g.cgroups)
+	if err != nil {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
+	states := map[int]string{}
+	var cudaPIDs []int
+	for _, pid := range procs {
+		state, err := g.backend.GetState(ctx, pid)
+		if errors.Is(err, backends.ErrNotCudaProcess) {
+			continue
+		}
+		if err != nil {
+			return sm.GuestResult{}, backendError(ctx, err)
+		}
+		states[pid] = state
+		cudaPIDs = append(cudaPIDs, pid)
+	}
+	if len(cudaPIDs) > 0 {
+		if err := g.backend.GuestRestore(ctx, cudaPIDs, states); err != nil {
+			return sm.GuestResult{}, backendError(ctx, err)
+		}
+	}
+	deviceBytes, err := g.verifyResumed(toSet(cudaPIDs))
+	if err != nil {
+		return sm.GuestResult{}, err
+	}
+	slog.InfoContext(ctx, "Resume: restored", "jobID", jobID, "pids", cudaPIDs, "deviceBytes", deviceBytes)
+	return sm.GuestResult{DeviceBytes: deviceBytes}, nil
+}
+
+// verifyResumed checks that NVML lists a restored guest process again, and
+// returns the device bytes the guest holds.
+func (g *guestPipeline) verifyResumed(cudaSet map[int]bool) (int64, error) {
+	if len(cudaSet) == 0 {
+		return 0, nil
+	}
+	gpuProcs, err := g.gpu.Processes()
+	if err != nil {
+		return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, fmt.Errorf("query GPU processes: %w", err))
+	}
+	var total int64
+	found := false
+	for _, p := range gpuProcs {
+		if !cudaSet[p.PID] {
+			continue
+		}
+		found = true
+		if p.UsedBytes != nvmlNotAvailable {
+			total += int64(p.UsedBytes) //nolint:gosec // VRAM sizes fit in int64
+		}
+	}
+	if !found {
+		return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, errors.New("no restored guest process has a GPU context"))
+	}
+	return total, nil
+}
+
+// deviceBytes sums the VRAM NVML reports for the given processes.
+func (g *guestPipeline) deviceBytes(procSet map[int]bool) (int64, error) {
+	if len(procSet) == 0 {
+		return 0, nil
+	}
+	gpuProcs, err := g.gpu.Processes()
+	if err != nil {
+		return 0, fmt.Errorf("query GPU processes: %w", err)
+	}
+	var total int64
+	for _, p := range gpuProcs {
+		if procSet[p.PID] && p.UsedBytes != nvmlNotAvailable {
+			total += int64(p.UsedBytes) //nolint:gosec // VRAM sizes fit in int64
+		}
+	}
+	return total, nil
+}
+
+// backendError classifies a pipeline step failure: DEADLINE_EXCEEDED when
+// the deadline passed, BACKEND_ERROR otherwise.
+func backendError(ctx context.Context, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return sm.NewOpError(pb.ErrorReason_DEADLINE_EXCEEDED, err)
+	}
+	return sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+}
+
+func toSet(pids []int) map[int]bool {
+	set := make(map[int]bool, len(pids))
+	for _, p := range pids {
+		set[p] = true
+	}
+	return set
+}

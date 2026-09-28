@@ -49,7 +49,22 @@ func main() {
 	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
 	reportResumed := flag.Bool("report-resumed-outcome", true,
 		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
+	vramZeroingQualified := flag.String("vram-zeroing-qualified", server.DefaultVRAMZeroingQualified,
+		"Comma-separated '<GPU name>:<driver branch>' entries on which Suspend is allowed "+
+			"(the driver is known to leave no VRAM behind a checkpointed or exited process)")
 	flag.Parse()
+
+	// VRAM_ZEROING_QUALIFIED overrides the flag: the Helm chart configures
+	// the agent through env vars.
+	qualifiedSpec := *vramZeroingQualified
+	if env := os.Getenv("VRAM_ZEROING_QUALIFIED"); env != "" {
+		qualifiedSpec = env
+	}
+	qualified, err := server.ParseVRAMZeroingQualified(qualifiedSpec)
+	if err != nil {
+		slog.Error("Invalid --vram-zeroing-qualified", "value", qualifiedSpec, "error", err)
+		os.Exit(1)
+	}
 
 	depMode := *deploymentMode
 	if envDepMode := os.Getenv("DEPLOYMENT_MODE"); envDepMode != "" {
@@ -162,9 +177,11 @@ func main() {
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed)
+		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed,
+		"vramZeroingQualified", qualifiedSpec)
 	err = server.StartServer(
 		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
+		server.GuestConfig{VRAMZeroingQualified: qualified},
 		statemachine.WithReportResumedOutcome(*reportResumed))
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)

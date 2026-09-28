@@ -50,6 +50,18 @@ nvidia:
     hostPath: /dev
     mountPath: /dev
 
+# Host cgroup v2 hierarchy, mounted read-write at /sys/fs/cgroup. The Suspend
+# and Resume pipelines freeze, thaw and read the memory of guest pod cgroups.
+# cgroup v2 is required.
+cgroup:
+  enabled: true
+  hostPath: /sys/fs/cgroup
+
+# GPUs and driver branches on which Suspend is allowed, as comma-separated
+# "<GPU name>:<driver branch>" entries (the agent's --vram-zeroing-qualified).
+# Empty keeps the agent default, "NVIDIA L4:580".
+vramZeroingQualified: ""
+
 # Kubernetes-style feature gates (map of Name: bool), rendered into the
 # agent's FEATURE_GATES env var. Experimental capabilities are off by
 # default; requests selecting a gated backend fail with FAILED_PRECONDITION
