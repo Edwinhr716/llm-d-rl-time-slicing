@@ -125,17 +125,24 @@ class PhaseLocks:
                 f"context_restored={getattr(result, 'context_restored', '?')}"
             )
 
-    def drop_all(self) -> None:
-        """Release every held group. Idempotent; release errors are logged, not raised."""
+    def drop_all(self, expected_idle: float | None = None) -> None:
+        """Release every held group. Idempotent; release errors are logged, not raised.
+
+        `expected_idle` (seconds) is passed to the client's release() as the
+        Yield's expected_idle hint. None sends no hint and does not pass the
+        argument at all, so clients without it keep working.
+        """
         if not self.enabled:
             return
+        kwargs = {} if expected_idle is None else {"expected_idle": expected_idle}
+        hint = "" if expected_idle is None else f" expected_idle={expected_idle:.3f}s"
         for g in list(self._held):
             try:
-                result = self._client.release(group_id=g)
+                result = self._client.release(group_id=g, **kwargs)
                 _log(
                     f"job={self.job_id} RELEASE group={g} "
                     f"pending_waiters={getattr(result, 'pending_waiters', '?')} "
-                    f"snapshot_deferred={getattr(result, 'snapshot_deferred', '?')}"
+                    f"snapshot_deferred={getattr(result, 'snapshot_deferred', '?')}{hint}"
                 )
             except Exception as e:  # noqa: BLE001 - never let a release error kill the job
                 _log(f"job={self.job_id} RELEASE group={g} FAILED: {e}")

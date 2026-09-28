@@ -51,6 +51,7 @@ type Server struct {
 
 	// Background participant protocol (roles). See WithBackgroundRole.
 	backgroundRole bool
+	lendPolicy     string
 	minBubble      time.Duration
 	noticeWindow   time.Duration
 	killBudget     time.Duration
@@ -119,8 +120,9 @@ func WithBackgroundRole(enabled bool) Option {
 }
 
 // WithMinBubble sets the minimum expected_idle for which a foreground Yield
-// records a lend hint. Zero (the default) never records one, so the
-// accelerator is never lent and the group goes IDLE_YIELDED as before.
+// records a lend hint under LendPolicyHint. Zero (the default) never records
+// one, so the accelerator is never lent and the group goes IDLE_YIELDED as
+// before. LendPolicyAlways ignores it.
 func WithMinBubble(d time.Duration) Option {
 	return func(s *Server) {
 		if d > 0 {
@@ -152,6 +154,7 @@ func NewServer(ctrl *controller.Controller, groupStore GroupStore, jobStore JobS
 		acquirePollInterval: 1 * time.Second,
 		noticeWindow:        DefaultNoticeWindow,
 		killBudget:          DefaultKillBudget,
+		lendPolicy:          defaultLendPolicy(),
 	}
 	s.checkAcquire = s.defaultCheckAcquire
 	for _, opt := range opts {
@@ -293,7 +296,7 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 
 	// Validate the hint before anything changes, so a bad request is refused
 	// without yielding.
-	lendHint := false
+	var expectedIdle *time.Duration
 	if req.ExpectedIdle != nil {
 		if err := req.GetExpectedIdle().CheckValid(); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid expected_idle: %v", err)
@@ -302,7 +305,7 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 		if idle < 0 {
 			return nil, status.Errorf(codes.InvalidArgument, "expected_idle must not be negative, got %v", idle)
 		}
-		lendHint = s.minBubble > 0 && idle >= s.minBubble
+		expectedIdle = &idle
 	}
 
 	// 1. Get Group
@@ -332,6 +335,13 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 
 	// Record the lend hint only. The handler can run before the informers
 	// have synced, so it decides nothing; the reconcile loop does.
+	lendHint := lendDecision(s.lendPolicy, s.minBubble, expectedIdle)
+	idleAttr := "none"
+	if expectedIdle != nil {
+		idleAttr = expectedIdle.String()
+	}
+	slog.InfoContext(ctx, "Lend decision", "group", groupID, "job", jobID, "policy", s.lendPolicy,
+		"expected_idle", idleAttr, "min_bubble", s.minBubble.String(), "lend", lendHint)
 	group.Spec().SetLend(lendHint)
 
 	if s.ctrl != nil {

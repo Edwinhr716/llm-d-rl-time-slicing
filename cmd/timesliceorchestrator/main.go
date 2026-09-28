@@ -88,9 +88,14 @@ func run() error {
 		"Enable the background participant protocol: Acquire/Yield with ROLE_BACKGROUND, participant_id "+
 			"heartbeats and GroupStatus.background_protocol = 1. Off (the default) reports "+
 			"background_protocol = 0 and refuses ROLE_BACKGROUND; foreground callers are unaffected.")
+	lendPolicy := flag.String("lend-policy", envString(server.EnvLendPolicy, server.LendPolicyHint),
+		"When a foreground Yield records a lend hint. \"hint\" (the default) only when the Yield carries "+
+			"expected_idle >= --min-bubble. \"always\" on every foreground Yield, with or without expected_idle; "+
+			"--min-bubble is ignored. PENDING LEAD DECISION (D-NS-17). "+
+			"Overridable with the TIMESLICE_LEND_POLICY environment variable.")
 	minBubble := flag.Duration("min-bubble", 0,
-		"Smallest Yield expected_idle that records a lend hint. 0 (the default) never lends: the group goes "+
-			"IDLE_YIELDED as before. PENDING LEAD DECISION: suggested demo value 30s.")
+		"Smallest Yield expected_idle that records a lend hint under --lend-policy=hint. 0 (the default) never "+
+			"lends: the group goes IDLE_YIELDED as before. PENDING LEAD DECISION: suggested demo value 30s.")
 	noticeWindow := flag.Duration("notice-window", server.DefaultNoticeWindow,
 		"Notice window N: time from a foreground Acquire to the foreground getting the accelerator back while "+
 			"background guests hold it. PENDING LEAD DECISION.")
@@ -107,6 +112,12 @@ func run() error {
 	}
 	if *minBubble < 0 {
 		return fmt.Errorf("--min-bubble must not be negative, got %v", *minBubble)
+	}
+	if err := server.ValidateLendPolicy(*lendPolicy); err != nil {
+		return fmt.Errorf("--lend-policy: %w", err)
+	}
+	if *lendPolicy == server.LendPolicyAlways && *minBubble > 0 {
+		slog.Warn("--min-bubble is ignored when --lend-policy=always", "minBubble", *minBubble)
 	}
 	if *noticeWindow <= 0 || *killBudget <= 0 || *killBudget >= *noticeWindow {
 		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
@@ -188,6 +199,7 @@ func run() error {
 	opts := []server.Option{
 		server.WithServingQuantum(*servingQuantum),
 		server.WithBackgroundRole(*backgroundRole),
+		server.WithLendPolicy(*lendPolicy),
 		server.WithMinBubble(*minBubble),
 		server.WithNoticeTiming(*noticeWindow, *killBudget),
 	}
@@ -213,6 +225,7 @@ func run() error {
 		"foregroundWait", *foregroundWait,
 		"foregroundOpTimeout", *foregroundOpTimeout,
 		"backgroundRole", *backgroundRole,
+		"lendPolicy", *lendPolicy,
 		"minBubble", *minBubble,
 		"noticeWindow", *noticeWindow,
 		"killBudget", *killBudget,
