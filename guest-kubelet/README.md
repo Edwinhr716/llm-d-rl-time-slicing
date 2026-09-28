@@ -26,6 +26,10 @@ kubelet for the guest pods scheduled onto it.
 - `--mirror-owner-ref=false` lets mirrors outlive guests that were force-deleted after a Node
   deletion. A guest re-created with the same name and the same containers re-adopts the mirror
   (same UID and IP). Orphans are deleted after `--orphan-grace`.
+- The real node's labels `timeslice.io/donor=true` and `timeslice.io/group=<group>` name its group
+  (`--group-source=ns`, default; `either` also accepts `group.timeslice.io/<group>=true`). Mirrors
+  carry `timeslice.io/group`. With no single group (missing, half-written or two groups) no mirror
+  is created and the virtual Node gets a `GroupUnresolved` event.
 - Not yet: probes (a guest is Ready when its container starts), logs/exec (use `kubectl logs
   <guest>-m`), stats.
 
@@ -36,11 +40,13 @@ cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wi
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
 internal/provider/events.go          drops events about non-guest pods
+internal/group/                      the host node's group (timeslice.io/donor + timeslice.io/group), host watch
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
 internal/backend/mirror/claim.go     optional reservedFor write (kube-controller-manager also does it)
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
+deploy/opt-b/host-labels.yaml        the donor/group node labels as a kubectl merge patch
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)

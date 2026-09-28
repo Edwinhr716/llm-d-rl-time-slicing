@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
 // Options configures the backend beyond the pure builder config.
@@ -32,7 +35,16 @@ type Options struct {
 	OrphanGrace time.Duration
 	// Resync is the mirror informer's resync period.
 	Resync time.Duration
+	// Group returns the host node's current group (internal/group). When set, a mirror is
+	// created only while it resolves to exactly one group, and carries that group; otherwise
+	// Create fails (the library retries) and OnUnresolved is called. Nil: no group gating.
+	Group func() group.Result
+	// OnUnresolved is told about each create refused for lack of a group.
+	OnUnresolved func(guest *corev1.Pod, reason string)
 }
+
+// ErrGroupUnresolved is returned by Create while the host node resolves to no group.
+var ErrGroupUnresolved = errors.New("no mirror: the host node's group is unresolved")
 
 // Backend creates, watches and deletes mirror pods. It keeps no state of its own that matters
 // across a restart: the mirrors in the API are the state, found again through the informer.
@@ -217,7 +229,20 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 // Create builds and creates the mirror. It is idempotent: an existing mirror for this guest is
 // fine; an orphaned mirror with the same name and the same containers is adopted.
 func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
-	want, err := Build(guest, b.opts.Config)
+	cfg := b.opts.Config
+	if b.opts.Group != nil {
+		res := b.opts.Group()
+		g, ok := res.Group()
+		if !ok {
+			// Fail closed: no mirror runs for a group the node does not clearly yield to.
+			if b.opts.OnUnresolved != nil {
+				b.opts.OnUnresolved(guest, res.Reason)
+			}
+			return fmt.Errorf("%w: host %s: %s", ErrGroupUnresolved, cfg.HostNode, res.Reason)
+		}
+		cfg.Group = g
+	}
+	want, err := Build(guest, cfg)
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}
@@ -260,6 +285,9 @@ func (b *Backend) adoptOrReplace(ctx context.Context, guest, want *corev1.Pod) (
 		cur.Status.Phase != corev1.PodFailed && cur.Status.Phase != corev1.PodSucceeded {
 		upd := cur.DeepCopy()
 		upd.Labels[LabelMirrorOf] = string(guest.UID)
+		if g, ok := want.Labels[LabelGroup]; ok {
+			upd.Labels[LabelGroup] = g // the group now, not the one at the orphan's creation
+		}
 		upd.OwnerReferences = nil
 		if b.opts.OwnerRef {
 			upd.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}

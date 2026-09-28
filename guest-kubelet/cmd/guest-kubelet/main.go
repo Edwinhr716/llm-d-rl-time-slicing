@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/group"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
 
@@ -57,6 +58,9 @@ type options struct {
 	leaderElect        bool
 	leaseNamespace     string
 	podName            string
+
+	// D-VK-3 option b: where the real node's group is read (internal/group)
+	groupSource string
 }
 
 func main() {
@@ -89,6 +93,9 @@ func main() {
 	flag.BoolVar(&o.leaderElect, "leader-elect", false, "run several replicas; only the Lease holder acts as the kubelet")
 	flag.StringVar(&o.leaseNamespace, "leader-elect-namespace", os.Getenv("POD_NAMESPACE"), "namespace of the leader-election Lease (env POD_NAMESPACE)")
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
+	flag.StringVar(&o.groupSource, "group-source", group.SourceNS,
+		"host node labels that name its group: ns (timeslice.io/donor=true plus timeslice.io/group=<group>) or "+
+			"either (also group.timeslice.io/<group>=true; both forms must agree)")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -104,6 +111,9 @@ func main() {
 func run(ctx context.Context, o options) error {
 	if o.hostIP == "" || o.hostNode == "" {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
+	}
+	if !group.ValidSource(o.groupSource) {
+		return fmt.Errorf("--group-source=%q: want one of %s", o.groupSource, strings.Join(group.Sources, ", "))
 	}
 	if o.nodeName == "" {
 		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
@@ -216,6 +226,25 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	defer eb.Shutdown()
 	recorder := provider.GuestOnlyRecorder{
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
+	}
+
+	// D-VK-3: the host node's labels name the group. Resolved at start and on every label
+	// change; while there is none, no mirror is created and the VK Node gets GroupUnresolved.
+	vkNodeRef := &corev1.ObjectReference{Kind: "Node", Name: o.nodeName, UID: types.UID(o.nodeName)}
+	resolver := group.NewResolver(o.hostNode, o.groupSource, os.Stderr)
+	resolver.OnChange = func(res group.Result) {
+		if _, ok := res.Group(); !ok {
+			recorder.Eventf(vkNodeRef, corev1.EventTypeWarning, group.EventGroupUnresolved,
+				"host node %s resolves to no group (%s, --group-source=%s); no mirror will be created", o.hostNode, res.Reason, o.groupSource)
+		}
+	}
+	if err := resolver.Start(ctx, client); err != nil {
+		return err
+	}
+	mopts.Group = resolver.Current
+	mopts.OnUnresolved = func(guest *corev1.Pod, reason string) {
+		recorder.Eventf(vkNodeRef, corev1.EventTypeWarning, group.EventGroupUnresolved,
+			"no mirror for guest %s/%s: host node %s resolves to no group (%s)", guest.Namespace, guest.Name, o.hostNode, reason)
 	}
 
 	var backend *mirror.Backend
