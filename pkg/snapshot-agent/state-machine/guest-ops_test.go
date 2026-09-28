@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/refusalclient"
 	statemachine "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -151,9 +152,12 @@ func requireRefusal(t *testing.T, err error, code codes.Code, reason pb.ErrorRea
 	if got := statemachine.ErrorReasonOf(err); got != reason {
 		t.Errorf("expected reason %s, got %s (%v)", reason, got, err)
 	}
-	if reason != pb.ErrorReason_ERROR_REASON_UNSPECIFIED &&
-		!strings.HasPrefix(status.Convert(err).Message(), reason.String()+": ") {
-		t.Errorf("status message %q does not start with %s", status.Convert(err).Message(), reason)
+	want := reason.String()
+	if reason == pb.ErrorReason_ERROR_REASON_UNSPECIFIED {
+		want = ""
+	}
+	if got := refusalclient.Reason(err); got != want {
+		t.Errorf("status ErrorInfo reason: got %q, want %q (%v)", got, want, err)
 	}
 }
 
