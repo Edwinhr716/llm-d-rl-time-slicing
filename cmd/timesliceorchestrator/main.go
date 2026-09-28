@@ -180,6 +180,8 @@ func run() error {
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
+	ctrl.NoticeWindow = *noticeWindow
+	ctrl.KillBudget = *killBudget
 
 	// Start informers
 	nodeInformerFactory.Start(ctx.Done())

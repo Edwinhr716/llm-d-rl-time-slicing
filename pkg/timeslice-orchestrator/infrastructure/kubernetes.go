@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
@@ -36,12 +37,20 @@ const (
 	NodeLabelPrefix = "group.timeslice.io/"
 	PodLabelKey     = "timeslice.io/group"
 	JobLabelKey     = "timeslice.io/job-id"
+	// RoleLabelKey is written by the VK on mirror pods; its value
+	// RoleBackground marks a guest's mirror job.
+	RoleLabelKey   = "timeslice.io/role"
+	RoleBackground = "background"
 )
 
 // PodInfo contains simplified information about a pod.
 type PodInfo struct {
 	UID   string
 	JobID string
+	// Background is true for a mirror pod (label timeslice.io/role=background).
+	Background bool
+	// NodeName is the node the pod is bound to, if any.
+	NodeName string
 }
 
 // KubernetesOrchestrator implements controller.InfrastructureOrchestrator for Kubernetes.
@@ -113,9 +122,17 @@ func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, err
 		if jobID == "" {
 			continue
 		}
+		background := pod.Labels[RoleLabelKey] == RoleBackground
+		// A mirror pod in a terminal phase counts as gone: its guest holds
+		// nothing. A pod that is only being deleted still counts as live.
+		if background && (pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed) {
+			continue
+		}
 		podInfos = append(podInfos, PodInfo{
-			UID:   string(pod.UID),
-			JobID: jobID,
+			UID:        string(pod.UID),
+			JobID:      jobID,
+			Background: background,
+			NodeName:   pod.Spec.NodeName,
 		})
 	}
 	return podInfos, nil
@@ -180,8 +197,16 @@ func (k *KubernetesOrchestrator) updateGroupNodes(ctx context.Context, groupID s
 
 func (k *KubernetesOrchestrator) updateJobsAndPods(ctx context.Context, groupID string, pods []PodInfo) error {
 	jobPods := make(map[string][]string)
+	jobBackground := make(map[string]bool)
+	jobNodes := make(map[string][]string)
 	for _, pod := range pods {
 		jobPods[pod.JobID] = append(jobPods[pod.JobID], pod.UID)
+		if pod.Background {
+			jobBackground[pod.JobID] = true
+			if pod.NodeName != "" && !slices.Contains(jobNodes[pod.JobID], pod.NodeName) {
+				jobNodes[pod.JobID] = append(jobNodes[pod.JobID], pod.NodeName)
+			}
+		}
 	}
 
 	// Update or create jobs
@@ -195,6 +220,8 @@ func (k *KubernetesOrchestrator) updateJobsAndPods(ctx context.Context, groupID 
 			}
 		}
 		job.SetPods(uids)
+		job.SetBackground(jobBackground[jobID])
+		job.SetPodNodes(jobNodes[jobID])
 		if err := k.jobStore.Put(ctx, job); err != nil {
 			return err
 		}

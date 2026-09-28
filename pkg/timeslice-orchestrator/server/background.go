@@ -174,8 +174,8 @@ func (s *Server) startNoticeIfBackgroundHeld(ctx context.Context, group *store.G
 	}
 	now := time.Now()
 	if noticeAt := spec.EnsureNotice(now); noticeAt.Equal(now) {
-		slog.InfoContext(ctx, "Foreground Acquire started a notice to the background",
-			"vacateWithin", s.vacateWithin(noticeAt, now))
+		slog.InfoContext(ctx, "Vacate started", "group", group.ID(), "hosts", spec.HeldNodes(),
+			"deadline", noticeAt.Add(s.noticeWindow-s.killBudget), "vacateWithin", s.vacateWithin(noticeAt, now))
 		if s.ctrl != nil {
 			s.ctrl.EnqueueWork(group.ID())
 		}

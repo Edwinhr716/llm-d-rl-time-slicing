@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -47,6 +48,13 @@ type GroupSpec struct {
 	// noticeAt is when the current notice to the background started. Zero
 	// when no notice runs.
 	noticeAt time.Time
+	// noticeHosts are the nodes that had to vacate during the current
+	// notice: those held when it started, plus those the reconcile loop
+	// found busy while it ran.
+	noticeHosts map[string]bool
+	// noticeYielded are the notice hosts whose participant handed its grant
+	// or claim back with a background Yield during the current notice.
+	noticeYielded map[string]bool
 }
 
 // participant is the in-memory record of a node's background participant.
@@ -478,6 +486,9 @@ func (s *GroupSpec) ClearGrant(node string) bool {
 		return false
 	}
 	held := p.holds()
+	if held && !s.noticeAt.IsZero() {
+		s.noticeYielded[node] = true
+	}
 	p.granted = false
 	p.claimed = false
 	if !p.blocked {
@@ -493,6 +504,37 @@ func (s *GroupSpec) Granted(node string) bool {
 	defer s.mu.RUnlock()
 	p, ok := s.participants[node]
 	return ok && p.granted
+}
+
+// ParticipantBlocked reports whether node's participant waits in
+// Acquire(ROLE_BACKGROUND).
+func (s *GroupSpec) ParticipantBlocked(node string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.participants[node]
+	return ok && p.blocked
+}
+
+// NodeHeld reports whether node's participant holds a grant or a claim.
+func (s *GroupSpec) NodeHeld(node string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.participants[node]
+	return ok && p.holds()
+}
+
+// HeldNodes returns the nodes whose participant holds a grant or a claim.
+func (s *GroupSpec) HeldNodes() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var nodes []string
+	for node, p := range s.participants {
+		if p.holds() {
+			nodes = append(nodes, node)
+		}
+	}
+	slices.Sort(nodes)
+	return nodes
 }
 
 // BackgroundHeld reports whether any node's participant holds a grant or a
@@ -520,8 +562,46 @@ func (s *GroupSpec) EnsureNotice(now time.Time) time.Time {
 	defer s.mu.Unlock()
 	if s.noticeAt.IsZero() {
 		s.noticeAt = now
+		s.noticeHosts = make(map[string]bool)
+		s.noticeYielded = make(map[string]bool)
+		for node, p := range s.participants {
+			if p.holds() {
+				s.noticeHosts[node] = true
+			}
+		}
 	}
 	return s.noticeAt
+}
+
+// AddNoticeHost records node as a host of the current notice. It does nothing
+// when no notice runs.
+func (s *GroupSpec) AddNoticeHost(node string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.noticeAt.IsZero() {
+		return
+	}
+	s.noticeHosts[node] = true
+}
+
+// NoticeHosts returns the hosts of the current notice, sorted.
+func (s *GroupSpec) NoticeHosts() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	nodes := make([]string, 0, len(s.noticeHosts))
+	for node := range s.noticeHosts {
+		nodes = append(nodes, node)
+	}
+	slices.Sort(nodes)
+	return nodes
+}
+
+// YieldedInNotice reports whether node's participant handed its grant or
+// claim back with a background Yield during the current notice.
+func (s *GroupSpec) YieldedInNotice(node string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.noticeYielded[node]
 }
 
 // ClearNotice ends the current notice, if any.
@@ -529,6 +609,8 @@ func (s *GroupSpec) ClearNotice() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.noticeAt = time.Time{}
+	s.noticeHosts = nil
+	s.noticeYielded = nil
 }
 
 // NoticeAt returns when the current notice started, or zero.

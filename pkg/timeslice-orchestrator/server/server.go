@@ -250,6 +250,8 @@ func (s *Server) defaultCheckAcquire(
 		// The accelerator is back with the foreground: any notice is over.
 		group.Spec().ClearNotice()
 		slog.InfoContext(ctx, "Acquire succeeded, job loaded and lock held")
+		slog.InfoContext(ctx, "Foreground granted", "group", groupID, "job", jobID,
+			"waited_ms", time.Since(startTime).Milliseconds())
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
 			Success:         true,
@@ -267,6 +269,11 @@ func (s *Server) isGroupFaulted(ctx context.Context, groupID string) (bool, erro
 		return false, err
 	}
 	for _, job := range jobs {
+		// A background guest's mirror job never faults the group: its node's
+		// participant owns it.
+		if job.Background() {
+			continue
+		}
 		for _, state := range job.ContextState() {
 			if state == pb.SnapshotAgentJobState_STATE_FAULTED {
 				return true, nil
@@ -625,7 +632,7 @@ func StartServer(
 		}
 	case <-ctx.Done():
 		slog.InfoContext(ctx, "Context canceled, shutting down servers gracefully")
-		s.GracefulStop()
+		stopGRPC(ctx, s)
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			slog.ErrorContext(ctx, "HTTP metrics server shutdown error", "error", err)
@@ -636,4 +643,25 @@ func StartServer(
 	}
 
 	return nil
+}
+
+// grpcStopGrace bounds GracefulStop: a blocked Acquire (foreground, or a
+// background participant waiting for the lend) never ends on its own, so a
+// graceful stop could otherwise wait forever.
+const grpcStopGrace = 5 * time.Second
+
+// stopGRPC stops the server gracefully, and forcibly after grpcStopGrace.
+func stopGRPC(ctx context.Context, s *grpc.Server) {
+	done := make(chan struct{})
+	go func() {
+		s.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(grpcStopGrace):
+		slog.WarnContext(ctx, "Graceful gRPC stop timed out, stopping", "grace", grpcStopGrace)
+		s.Stop()
+		<-done
+	}
 }
