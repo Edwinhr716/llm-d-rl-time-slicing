@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/keeper"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
 
@@ -57,6 +58,17 @@ type options struct {
 	leaderElect        bool
 	leaseNamespace     string
 	podName            string
+
+	// VK-A7: admission and mirror memory
+	gpuAllowlist       string
+	gpuMemory          string
+	mirrorMemoryFactor float64
+
+	// VK-A7: outage guard (a separate process of the same binary)
+	nodeKeeper        bool
+	keeperStaleAfter  time.Duration
+	keeperOutageGrace time.Duration
+	keeperInterval    time.Duration
 }
 
 func main() {
@@ -89,6 +101,23 @@ func main() {
 	flag.BoolVar(&o.leaderElect, "leader-elect", false, "run several replicas; only the Lease holder acts as the kubelet")
 	flag.StringVar(&o.leaseNamespace, "leader-elect-namespace", os.Getenv("POD_NAMESPACE"), "namespace of the leader-election Lease (env POD_NAMESPACE)")
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
+
+	flag.StringVar(&o.gpuAllowlist, "gpu-allowlist", "nvidia-l4",
+		"comma-separated GPU models guests may use; a GPU guest is rejected unless the host Node's model label "+
+			"(cloud.google.com/gke-accelerator or nvidia.com/gpu.product) is listed")
+	flag.StringVar(&o.gpuMemory, "gpu-memory", "23034Mi",
+		"device memory of one host GPU (L4: 23034Mi); the device reserve is this times --mirror-memory-factor")
+	flag.Float64Var(&o.mirrorMemoryFactor, "mirror-memory-factor", 1.1,
+		"a GPU mirror container's memory limit = its limit + ceil(--gpu-memory x factor), "+
+			"so Suspend can hold the device memory in the cgroup")
+
+	flag.BoolVar(&o.nodeKeeper, "node-keeper", false,
+		"run as the outage guard instead of the kubelet: keep the virtual Node's Lease fresh while every guest-kubelet replica is down")
+	flag.DurationVar(&o.keeperStaleAfter, "keeper-stale-after", 15*time.Second,
+		"node keeper: renew the Lease once the guest kubelet has not renewed it for this long")
+	flag.DurationVar(&o.keeperOutageGrace, "keeper-outage-grace", 15*time.Minute,
+		"node keeper: stop renewing this long after the guest kubelet was last seen, so a dead guest kubelet still ends in NotReady")
+	flag.DurationVar(&o.keeperInterval, "keeper-interval", 5*time.Second, "node keeper: time between checks")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -102,7 +131,7 @@ func main() {
 }
 
 func run(ctx context.Context, o options) error {
-	if o.hostIP == "" || o.hostNode == "" {
+	if o.hostNode == "" || (o.hostIP == "" && !o.nodeKeeper) {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
 	}
 	if o.nodeName == "" {
@@ -111,6 +140,9 @@ func run(ctx context.Context, o options) error {
 	client, err := nodeutil.ClientsetFromEnv(o.kubeconfig)
 	if err != nil {
 		return err
+	}
+	if o.nodeKeeper {
+		return runNodeKeeper(ctx, client, o.keeperConfig())
 	}
 	if !o.leaderElect {
 		return runKubelet(ctx, client, o)
@@ -203,6 +235,19 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if mopts.MemoryHeadroom, err = resource.ParseQuantity(o.memHeadroom); err != nil {
 		return fmt.Errorf("--mirror-memory-headroom: %w", err)
 	}
+	gpuMem, err := resource.ParseQuantity(o.gpuMemory)
+	if err != nil {
+		return fmt.Errorf("--gpu-memory: %w", err)
+	}
+	if mopts.DeviceMemoryReserve, err = mirror.DeviceReserve(gpuMem, o.mirrorMemoryFactor); err != nil {
+		return fmt.Errorf("--mirror-memory-factor: %w", err)
+	}
+	policy := provider.AdmissionPolicy{
+		GPUAllowlist: provider.ParseGPUAllowlist(o.gpuAllowlist),
+		HostGPUModel: provider.HostGPUModel(host),
+	}
+	log.G(ctx).WithField("hostGPUModel", policy.HostGPUModel).WithField("gpuAllowlist", policy.GPUAllowlist).
+		WithField("deviceMemoryReserve", mopts.DeviceMemoryReserve.String()).Info("admission and mirror memory settings")
 
 	nodeSpec := provider.NewNodeSpec(cfg)
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
@@ -210,11 +255,14 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	}
 
 	// Our own event broadcaster, so the recorder can be wrapped: the library would otherwise
-	// record ProviderCreateSuccess on DaemonSet pods that CreatePod ignored.
+	// record ProviderCreateSuccess on DaemonSet pods that CreatePod ignored, and on guests that
+	// admission rejected.
 	eb := record.NewBroadcaster()
 	eb.StartRecordingToSink(&corev1client.EventSinkImpl{Interface: client.CoreV1().Events(corev1.NamespaceAll)})
 	defer eb.Shutdown()
+	rejected := provider.NewRejectedSet()
 	recorder := provider.GuestOnlyRecorder{
+		Rejected:      rejected,
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
 
@@ -223,7 +271,8 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, mopts)
-			return provider.New(backend), provider.NodeProvider{}, nil
+			p := provider.New(backend).WithAdmission(&provider.Admission{Policy: policy, Recorder: recorder, Rejected: rejected})
+			return p, provider.NodeProvider{}, nil
 		},
 		nodeutil.WithClient(client),
 		func(c *nodeutil.NodeConfig) error {
@@ -296,4 +345,31 @@ func reRegisterOnNotFound(client kubernetes.Interface, spec *corev1.Node) node.E
 		_, err = client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{})
 		return err
 	}
+}
+
+// keeperConfig is the node keeper's part of the flags.
+func (o *options) keeperConfig() keeper.Config {
+	return keeper.Config{
+		HostNode:    o.hostNode,
+		VirtualNode: o.nodeName,
+		StaleAfter:  o.keeperStaleAfter,
+		OutageGrace: o.keeperOutageGrace,
+		Interval:    o.keeperInterval,
+	}
+}
+
+// runNodeKeeper is the outage guard (--node-keeper): a separate Deployment of this binary,
+// pinned to the host, that keeps the virtual Node's Lease fresh while every guest-kubelet
+// replica is down, for at most --keeper-outage-grace. See internal/keeper.
+func runNodeKeeper(ctx context.Context, client kubernetes.Interface, cfg keeper.Config) error {
+	log.G(ctx).WithField("node", cfg.VirtualNode).WithField("host", cfg.HostNode).
+		WithField("staleAfter", cfg.StaleAfter.String()).WithField("outageGrace", cfg.OutageGrace.String()).
+		Info("node keeper started")
+	return keeper.New(client, cfg).Run(ctx, func(msg string, kv ...any) {
+		entry := log.G(ctx).WithField("node", cfg.VirtualNode)
+		for i := 0; i+1 < len(kv); i += 2 {
+			entry = entry.WithField(fmt.Sprint(kv[i]), kv[i+1])
+		}
+		entry.Info(msg)
+	})
 }

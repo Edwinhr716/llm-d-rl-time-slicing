@@ -4,7 +4,7 @@ A throwaway prototype of a *guest kubelet*: a [virtual-kubelet](https://github.c
 (v1.14.0) that registers a virtual Node (`vk-<host>`) next to a real GPU node and acts as the
 kubelet for the guest pods scheduled onto it.
 
-## Status: M1 (mirror pods)
+## Status: M2 (readiness)
 
 - Registers Node `vk-<host suffix>` (for example `vk-abcd`) with labels `type=virtual-kubelet`,
   `timeslice.io/virtual-node=true`, taint `timeslice.io/guest=true:NoSchedule`, capacity
@@ -26,8 +26,40 @@ kubelet for the guest pods scheduled onto it.
 - `--mirror-owner-ref=false` lets mirrors outlive guests that were force-deleted after a Node
   deletion. A guest re-created with the same name and the same containers re-adopts the mirror
   (same UID and IP). Orphans are deleted after `--orphan-grace`.
-- Not yet: probes (a guest is Ready when its container starts), logs/exec (use `kubectl logs
-  <guest>-m`), stats.
+- M2: the VK runs the guest's readinessProbe itself (`internal/probe`)
+  against the mirror's IP, with kubelet semantics: period, timeout and
+  thresholds with the kubelet's defaults; a verdict that starts not ready
+  and starts over when the container restarts; HTTP 200-399 without
+  keep-alive or redirects; named ports. The guest's ContainersReady and
+  Ready follow the verdicts (reason `ContainersNotReady`). httpGet and
+  tcpSocket only: a container with an exec or gRPC readiness probe stays
+  not ready, with one `ReadinessProbeUnsupported` Warning event.
+  `--readiness-probes=false` restores M1 (Ready follows the mirror).
+- `--debug-addr` (off by default, loopback only) serves
+  `POST /debug/readiness?pod=ns/name&ready=true|false|clear` (an override
+  that wins over the probes) and `GET /debug/ready-edges?pod=ns/name`
+  (when the VK sent each Ready change). Only the Q5 measurement uses it.
+- Admission (VK-A7) refuses a guest before it gets a mirror: a liveness
+  or startup probe, an exec or grpc readiness probe, readiness gates (an
+  httpGet or tcpSocket readinessProbe is allowed), a GPU resource other
+  than `nvidia.com/gpu`, or a GPU guest on a host whose model label is
+  not in `--gpu-allowlist` (default `nvidia-l4`; no label fails closed).
+  The guest gets a Warning event `GuestRejected` naming the rule and goes
+  `Failed` with reason `GuestRejected`.
+- A GPU mirror container's memory limit is its limit (or request) plus
+  the device reserve, `ceil(--gpu-memory x --mirror-memory-factor)`
+  (defaults `23034Mi` x `1.1`, about 24.7 GiB).
+- Outage guard (VK-A7): `deploy/guard/node-keeper.yaml` runs the same
+  binary with `--node-keeper` (1 replica, Recreate, pinned to the host).
+  While the host is Ready and the guest kubelet was seen within
+  `--keeper-outage-grace` (15m), it renews the virtual Node's Lease
+  whenever the guest kubelet has not for `--keeper-stale-after` (15s).
+  The Node stays Ready through a guest-kubelet outage, so it is not
+  deleted and its guests and mirrors keep running. Past the grace it
+  stops and the Node goes NotReady as before.
+- Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Liveness and
+  startup probes are refused by admission (above), so an exec or gRPC
+  readinessProbe never reaches the prober.
 
 ## Layout
 
@@ -35,14 +67,21 @@ kubelet for the guest pods scheduled onto it.
 cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wiring; own event recorder
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
+internal/provider/admission.go       admission: probes, gates, GPU allowlist
 internal/provider/events.go          drops events about non-guest pods
+internal/keeper/keeper.go            outage guard (keeps the Node Lease fresh)
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
 internal/backend/mirror/claim.go     optional reservedFor write (kube-controller-manager also does it)
+internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
+internal/probe/debug.go              debug endpoint: override, Ready edges
+cmd/q5-measure/main.go               Q5 timings; runs in a pod
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
+deploy/guard/                        node keeper Deployment (outage guard)
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
+deploy/m2/                           probed guests, pool, router, Q5 pods
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
 
@@ -50,15 +89,64 @@ cloudbuild.yaml                      tidy check, vet, test, build, image push (n
 
 ```
 make build        # Cloud Build: tidy check, go vet, go test -race, image -> Artifact Registry
-make deploy       # namespace, RBAC, Deployment on the test cluster (HOST=<real node>)
+make deploy       # namespace, RBAC, Deployment, node keeper (HOST=<real node>)
 make test-guest   # CPU guest + Service
 make gpu-guest    # claim + trainer stand-in, then the vLLM guest
+make m2-deploy    # probed guests, pool, EPP, router, RBAC
+make q5-force     # Q5 run, readiness forced via the debug endpoint
+make q5-toggle    # Q5 run, a real probe flipped by the guest
 make status
 make undeploy
 ```
 
 The plan and the notes explaining this code are kept outside this repository
-(prototype plan, milestones M0 and M1).
+(prototype plan, milestones M0 to M2).
+
+## M2 results (the test cluster, 2026-09-28)
+
+Q5 spans in seconds, p50 / p90 / max, 25 edges each way per run
+(`make q5-force`, `make q5-toggle`):
+
+- notify: trigger -> the VK calls NotifyPods;
+- e1: notify -> pod status seen in a watch;
+- e2: pod Ready -> EndpointSlice endpoint ready;
+- e3: EndpointSlice -> first ClusterIP request with the new outcome;
+- pool: pod Ready -> first router (InferencePool) request with the new
+  outcome.
+
+Force mode (readiness forced through the debug endpoint):
+
+| span | rising | falling |
+| --- | --- | --- |
+| notify | 0.000 / 0.000 / 0.001 | 0.000 / 0.000 / 0.000 |
+| e1 | 0.036 / 0.042 / 0.247 | 0.036 / 0.044 / 0.045 |
+| e2 | 0.028 / 0.048 / 0.061 | 0.028 / 0.035 / 0.039 |
+| e3 | 7.042 / 7.352 / 7.445 | 5.848 / 6.422 / 6.592 |
+| pool | 0.005 / 0.016 / 0.025 | 0.007 / 0.017 / 0.019 |
+
+Probe mode (a real readinessProbe, period 1 s, flipped by the guest):
+
+| span | rising | falling |
+| --- | --- | --- |
+| notify | 0.457 / 0.959 / 0.977 | 0.432 / 0.884 / 0.995 |
+| e1 | 0.035 / 0.040 / 0.045 | 0.036 / 0.039 / 0.042 |
+| e2 | 0.026 / 0.030 / 0.030 | 0.025 / 0.029 / 0.031 |
+| e3 | 6.458 / 6.981 / 8.228 | 5.396 / 6.142 / 6.269 |
+
+- The guest's Ready follows the VK's probe: the inference simulator's
+  guest turned Ready about 9 s after creation, when `/metrics` first
+  answered, not when its container started.
+- notify in probe mode is the probe period (1 s) plus the probe itself.
+- e3 is the node's kube-proxy, which syncs rules at most once every 10 s
+  on the test cluster (`--iptables-min-sync-period=10s`). These runs flip
+  readiness every 4 to 10 s, so most changes wait for the next allowed
+  sync. A third force run with 12 s between edges (20 each way,
+  `--settle=12s`) gave e3 p50 0.517 s rising (bounded by the 0.5 s
+  request timeout) and 0.027 s falling. The router does not go through
+  the ClusterIP: its endpoint picker watches the pods, so a Ready change
+  reaches it in tens of milliseconds. Router requests are timed from when
+  they were sent, so a request sent just before the watch saw the change
+  can give a slightly negative span.
 
 ## M1 results (the test cluster, 2026-09-25)
 

@@ -6,12 +6,14 @@ package provider
 import (
 	"context"
 	"io"
+	"sync"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/tools/record"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
@@ -28,11 +30,34 @@ type Backend interface {
 
 // Provider implements nodeutil.Provider and node.PodNotifier on top of a Backend.
 type Provider struct {
-	backend Backend
+	backend   Backend
+	admission *Admission
+
+	mu     sync.Mutex
+	notify func(*corev1.Pod) // the library's status callback, set by NotifyPods
 }
 
-// New returns a provider backed by b.
+// Admission is the check CreatePod runs before a guest gets a mirror.
+type Admission struct {
+	Policy AdmissionPolicy
+	// Recorder gets one Warning event (reason GuestRejected) per refused guest.
+	Recorder record.EventRecorder
+	// Rejected is shared with GuestOnlyRecorder, which then drops the library's
+	// "ProviderCreateSuccess" for refused guests.
+	Rejected *RejectedSet
+}
+
+// New returns a provider backed by b, with no admission check.
 func New(b Backend) *Provider { return &Provider{backend: b} }
+
+// WithAdmission turns on the admission check.
+func (p *Provider) WithAdmission(a *Admission) *Provider {
+	if a.Rejected == nil {
+		a.Rejected = NewRejectedSet()
+	}
+	p.admission = a
+	return p
+}
 
 // IsGuest reports whether a pod is meant for this node: it must tolerate the guest taint
 // by key. System DaemonSets that tolerate everything ({operator: Exists}, no key) do not count,
@@ -51,6 +76,9 @@ func key(p *corev1.Pod) string { return p.Namespace + "/" + p.Name }
 // NotifyPods is called once by the pod controller at startup. From then on, every mirror change
 // the backend sees is translated and written to the guest through cb.
 func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
+	p.mu.Lock()
+	p.notify = cb
+	p.mu.Unlock()
 	p.backend.SetStatusCallback(func(pod *corev1.Pod) {
 		if IsGuest(pod) {
 			cb(pod)
@@ -58,13 +86,42 @@ func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
 	})
 }
 
-// CreatePod creates the guest's mirror. Non-guests are ignored and stay Pending.
+// CreatePod creates the guest's mirror. Non-guests are ignored and stay Pending. A guest that
+// admission refuses gets no mirror: it gets a Warning event and goes Failed with reason
+// GuestRejected, as a pod the real kubelet refuses at admission does.
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if !IsGuest(pod) {
 		log.G(ctx).WithField("pod", key(pod)).Debug("ignoring non-guest pod")
 		return nil
 	}
+	if p.admission != nil {
+		if r := Admit(pod, p.admission.Policy); r != nil {
+			p.reject(ctx, pod, r)
+			return nil
+		}
+	}
 	return p.backend.Create(ctx, pod)
+}
+
+// reject records the event once per guest and reports the guest Failed through the library's
+// status callback. Returning nil (not an error) keeps the library from retrying the create;
+// once the guest is Failed the library never offers it again.
+func (p *Provider) reject(ctx context.Context, pod *corev1.Pod, r *Rejection) {
+	log.G(ctx).WithField("pod", key(pod)).WithField("rule", r.Rule).Warn("guest rejected: " + r.Message)
+	if p.admission.Rejected.Add(pod.UID) && p.admission.Recorder != nil {
+		p.admission.Recorder.Event(pod, corev1.EventTypeWarning, ReasonGuestRejected, r.String())
+	}
+	out := pod.DeepCopy()
+	out.Status.Phase = corev1.PodFailed
+	out.Status.Reason = ReasonGuestRejected
+	out.Status.Message = "Pod was rejected by the guest kubelet: " + r.String()
+	p.mu.Lock()
+	cb := p.notify
+	p.mu.Unlock()
+	if cb != nil {
+		// The callback may wait for the library's pod cache; never block the create worker.
+		go cb(out)
+	}
 }
 
 // UpdatePod is called when the guest's labels, annotations, tolerations or images change.
@@ -83,6 +140,9 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if !IsGuest(pod) {
 		return errdefs.NotFoundf("pod %q is not a guest", key(pod))
+	}
+	if p.admission != nil {
+		p.admission.Rejected.Remove(pod.UID)
 	}
 	return p.backend.Delete(ctx, pod)
 }
