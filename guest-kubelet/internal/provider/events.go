@@ -6,7 +6,8 @@ import (
 	"k8s.io/client-go/tools/record"
 )
 
-// GuestOnlyRecorder drops events about pods that are not guests. The library records
+// GuestOnlyRecorder drops events about pods that are not guests (by the active --guest-marker,
+// the same predicate as the provider). The library records
 // "ProviderCreateSuccess" whenever CreatePod returns nil, including for the DaemonSet pods our
 // CreatePod ignores, which made them look started (an M0 finding). Events about other objects
 // (the Node) pass through.
@@ -16,7 +17,7 @@ type GuestOnlyRecorder struct {
 
 func keep(obj runtime.Object) bool {
 	pod, ok := obj.(*corev1.Pod)
-	return !ok || IsGuest(pod)
+	return !ok || isGuest(pod)
 }
 
 func (r GuestOnlyRecorder) Event(obj runtime.Object, eventtype, reason, message string) {

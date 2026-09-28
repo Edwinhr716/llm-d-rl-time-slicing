@@ -1,11 +1,13 @@
 // Package provider is the guest-kubelet's pod provider. M1: guests run for real, as mirror pods
 // on the host node (internal/backend/mirror). The provider only decides which pods are guests
-// and hands them to the backend; it holds no pod state, so a restart loses nothing.
+// and hands them to the backend; it holds no pod state (only which verdict lines it has logged),
+// so a restart loses nothing.
 package provider
 
 import (
 	"context"
 	"io"
+	"sync"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
@@ -29,14 +31,17 @@ type Backend interface {
 // Provider implements nodeutil.Provider and node.PodNotifier on top of a Backend.
 type Provider struct {
 	backend Backend
+	// logged holds "<uid>/<message>" for the once-per-pod guest verdict lines.
+	logged sync.Map
 }
 
 // New returns a provider backed by b.
 func New(b Backend) *Provider { return &Provider{backend: b} }
 
-// IsGuest reports whether a pod is meant for this node: it must tolerate the guest taint
-// by key. System DaemonSets that tolerate everything ({operator: Exists}, no key) do not count,
-// so they never get a mirror.
+// IsGuest reports whether a pod tolerates the guest taint by key: the toleration marker, the
+// default of --guest-marker (marker.go). System DaemonSets that tolerate everything
+// ({operator: Exists}, no key) do not count, so they never get a mirror. The provider asks the
+// active marker (isGuest), not this function.
 func IsGuest(pod *corev1.Pod) bool {
 	for _, t := range pod.Spec.Tolerations {
 		if t.Key == GuestTaintKey {
@@ -48,11 +53,25 @@ func IsGuest(pod *corev1.Pod) bool {
 
 func key(p *corev1.Pod) string { return p.Namespace + "/" + p.Name }
 
+// The guest verdict lines (hook H5 of the D-VK-4 evaluation), each logged once per pod UID.
+const (
+	msgAccepted = "guest accepted"
+	msgIgnored  = "ignoring non-guest pod"
+)
+
+// logOnce logs msg at Info the first time it is said about this pod UID.
+func (p *Provider) logOnce(ctx context.Context, pod *corev1.Pod, msg, field, value string) {
+	if _, dup := p.logged.LoadOrStore(string(pod.UID)+"/"+msg, struct{}{}); dup {
+		return
+	}
+	log.G(ctx).WithField("pod", key(pod)).WithField("uid", string(pod.UID)).WithField(field, value).Info(msg)
+}
+
 // NotifyPods is called once by the pod controller at startup. From then on, every mirror change
 // the backend sees is translated and written to the guest through cb.
 func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
 	p.backend.SetStatusCallback(func(pod *corev1.Pod) {
-		if IsGuest(pod) {
+		if isGuest(pod) {
 			cb(pod)
 		}
 	})
@@ -60,10 +79,12 @@ func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
 
 // CreatePod creates the guest's mirror. Non-guests are ignored and stay Pending.
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
-	if !IsGuest(pod) {
-		log.G(ctx).WithField("pod", key(pod)).Debug("ignoring non-guest pod")
+	by := matchGuest(pod)
+	if by == "" {
+		p.logOnce(ctx, pod, msgIgnored, "marker", GuestMarker())
 		return nil
 	}
+	p.logOnce(ctx, pod, msgAccepted, "by", by)
 	return p.backend.Create(ctx, pod)
 }
 
@@ -71,7 +92,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 // Labels and annotations are not copied to the mirror, so there is nothing to do; changing a
 // running guest's image is not supported in M1 (a real kubelet would restart the container).
 func (p *Provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
-	if IsGuest(pod) {
+	if isGuest(pod) {
 		log.G(ctx).WithField("pod", key(pod)).Debug("guest spec update ignored (M1)")
 	}
 	return nil
@@ -81,7 +102,9 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 // reports the containers terminating, and once they have stopped the library removes the
 // guest object. If there is no mirror, the guest is reported terminated at once.
 func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
-	if !IsGuest(pod) {
+	p.logged.Delete(string(pod.UID) + "/" + msgIgnored)
+	p.logged.Delete(string(pod.UID) + "/" + msgAccepted)
+	if !isGuest(pod) {
 		return errdefs.NotFoundf("pod %q is not a guest", key(pod))
 	}
 	return p.backend.Delete(ctx, pod)
