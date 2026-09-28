@@ -116,6 +116,9 @@ type StateManager struct {
 	// reportResumed selects the outcome of a successful Resume:
 	// OUTCOME_RESUMED when true, OUTCOME_UNSPECIFIED when false.
 	reportResumed bool
+	// higherEpoch is the higher-epoch policy (HigherEpochAbort or
+	// HigherEpochAborted); see WithHigherEpoch.
+	higherEpoch string
 }
 
 // Option configures a StateManager.
@@ -139,6 +142,7 @@ func NewStateManager(opts ...Option) *StateManager {
 		operations:    make(map[string]*Operation),
 		now:           time.Now,
 		reportResumed: true,
+		higherEpoch:   HigherEpochAbort,
 	}
 	for _, opt := range opts {
 		opt(sm)

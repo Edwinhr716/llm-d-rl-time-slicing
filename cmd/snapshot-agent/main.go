@@ -49,7 +49,17 @@ func main() {
 	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
 	reportResumed := flag.Bool("report-resumed-outcome", true,
 		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
+	// PENDING LEAD DECISION D-AGENT-3: the default aborts a running guest
+	// operation when a higher epoch arrives; "aborted" refuses the new call.
+	higherEpoch := flag.String("higher-epoch", statemachine.HigherEpochAbort,
+		"Higher-epoch Suspend or Resume while one runs: 'abort' aborts the running operation, "+
+			"'aborted' refuses the new call with Aborted (pending decision)")
 	flag.Parse()
+
+	if err := statemachine.ValidateHigherEpoch(*higherEpoch); err != nil {
+		slog.Error("Invalid --higher-epoch", "error", err)
+		os.Exit(1)
+	}
 
 	depMode := *deploymentMode
 	if envDepMode := os.Getenv("DEPLOYMENT_MODE"); envDepMode != "" {
@@ -162,10 +172,11 @@ func main() {
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed)
+		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed, "higherEpoch", *higherEpoch)
 	err = server.StartServer(
 		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
-		statemachine.WithReportResumedOutcome(*reportResumed))
+		statemachine.WithReportResumedOutcome(*reportResumed),
+		statemachine.WithHigherEpoch(*higherEpoch))
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)

@@ -106,6 +106,8 @@ func ErrorReasonOf(err error) pb.ErrorReason {
 //   - a higher epoch while a Suspend or Resume runs aborts the running
 //     operation (FAILED with STALE_EPOCH, context cancelled) and starts
 //     this call's worker, which observes the node and continues from there.
+//     With WithHigherEpoch(HigherEpochAborted) the call is refused with
+//     Aborted instead and the running operation continues.
 //
 // A call that passes fencing is then answered by job state:
 //   - Suspend runs the worker from RUNNING, SAVED, SUSPENDED and IDLE (the
@@ -187,12 +189,10 @@ func (sm *StateManager) preemptLocked(
 	if err := sm.checkDeadline(job.ID, intent, deadline); err != nil {
 		return "", err
 	}
-	slog.Warn("Aborting running guest operation for a higher epoch",
-		"jobID", job.ID, "aborted", running.Type, "abortedEpoch", running.Epoch,
-		"intent", intent, "epoch", epoch)
-	sm.supersedeLocked(job, pb.ErrorReason_STALE_EPOCH,
-		fmt.Sprintf("aborted by %s with epoch %d", intent, epoch))
-	return sm.startGuestLocked(job, intent, epoch, deadline, worker), nil
+	if sm.higherEpoch == HigherEpochAborted {
+		return "", sm.refuseHigherEpochLocked(job, intent, epoch)
+	}
+	return sm.abortRunningLocked(job, intent, epoch, deadline, worker), nil
 }
 
 // answerByStateLocked answers a guest call that passed fencing when the job
