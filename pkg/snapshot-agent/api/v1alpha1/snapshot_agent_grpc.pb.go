@@ -27,6 +27,8 @@ const (
 	SnapshotAgentService_Suspend_FullMethodName         = "/snapshot_agent.v1alpha1.SnapshotAgentService/Suspend"
 	SnapshotAgentService_Resume_FullMethodName          = "/snapshot_agent.v1alpha1.SnapshotAgentService/Resume"
 	SnapshotAgentService_Kill_FullMethodName            = "/snapshot_agent.v1alpha1.SnapshotAgentService/Kill"
+	SnapshotAgentService_SuspendAll_FullMethodName      = "/snapshot_agent.v1alpha1.SnapshotAgentService/SuspendAll"
+	SnapshotAgentService_ResumeAll_FullMethodName       = "/snapshot_agent.v1alpha1.SnapshotAgentService/ResumeAll"
 )
 
 // SnapshotAgentServiceClient is the client API for SnapshotAgentService service.
@@ -65,6 +67,22 @@ type SnapshotAgentServiceClient interface {
 	// free, from any job state. It carries no epoch and supersedes any running
 	// operation of the job. Asynchronous: returns an operation ID.
 	Kill(ctx context.Context, in *KillRequest, opts ...grpc.CallOption) (*KillResponse, error)
+	// SuspendAll suspends every job of one role (the guests: "background") on
+	// this node. The agent finds its targets itself when the call arrives: the
+	// pods on its node that carry the label timeslice.io/role=<role> and a
+	// timeslice.io/job-id label.
+	// Each target then gets the same rules as a Suspend with the request's
+	// epoch and deadline, and the targets run in parallel. Asynchronous: returns
+	// one operation ID; GetOperation reports one result per target in
+	// `targets`. The operation is COMPLETE only when every target is SUSPENDED
+	// or RELEASED (also when there was no target): that is what "the host is
+	// clear" means. Fenced by epoch (see SuspendAllRequest). Kill stays per job
+	// and is the fallback for a target that failed.
+	SuspendAll(ctx context.Context, in *SuspendAllRequest, opts ...grpc.CallOption) (*SuspendAllResponse, error)
+	// ResumeAll resumes every job of one role on this node, found and
+	// fenced as for SuspendAll. The operation is COMPLETE only when every
+	// target resumed.
+	ResumeAll(ctx context.Context, in *ResumeAllRequest, opts ...grpc.CallOption) (*ResumeAllResponse, error)
 }
 
 type snapshotAgentServiceClient struct {
@@ -158,6 +176,26 @@ func (c *snapshotAgentServiceClient) Kill(ctx context.Context, in *KillRequest, 
 	return out, nil
 }
 
+func (c *snapshotAgentServiceClient) SuspendAll(ctx context.Context, in *SuspendAllRequest, opts ...grpc.CallOption) (*SuspendAllResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SuspendAllResponse)
+	err := c.cc.Invoke(ctx, SnapshotAgentService_SuspendAll_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotAgentServiceClient) ResumeAll(ctx context.Context, in *ResumeAllRequest, opts ...grpc.CallOption) (*ResumeAllResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResumeAllResponse)
+	err := c.cc.Invoke(ctx, SnapshotAgentService_ResumeAll_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SnapshotAgentServiceServer is the server API for SnapshotAgentService service.
 // All implementations must embed UnimplementedSnapshotAgentServiceServer
 // for forward compatibility.
@@ -194,6 +232,22 @@ type SnapshotAgentServiceServer interface {
 	// free, from any job state. It carries no epoch and supersedes any running
 	// operation of the job. Asynchronous: returns an operation ID.
 	Kill(context.Context, *KillRequest) (*KillResponse, error)
+	// SuspendAll suspends every job of one role (the guests: "background") on
+	// this node. The agent finds its targets itself when the call arrives: the
+	// pods on its node that carry the label timeslice.io/role=<role> and a
+	// timeslice.io/job-id label.
+	// Each target then gets the same rules as a Suspend with the request's
+	// epoch and deadline, and the targets run in parallel. Asynchronous: returns
+	// one operation ID; GetOperation reports one result per target in
+	// `targets`. The operation is COMPLETE only when every target is SUSPENDED
+	// or RELEASED (also when there was no target): that is what "the host is
+	// clear" means. Fenced by epoch (see SuspendAllRequest). Kill stays per job
+	// and is the fallback for a target that failed.
+	SuspendAll(context.Context, *SuspendAllRequest) (*SuspendAllResponse, error)
+	// ResumeAll resumes every job of one role on this node, found and
+	// fenced as for SuspendAll. The operation is COMPLETE only when every
+	// target resumed.
+	ResumeAll(context.Context, *ResumeAllRequest) (*ResumeAllResponse, error)
 	mustEmbedUnimplementedSnapshotAgentServiceServer()
 }
 
@@ -227,6 +281,12 @@ func (UnimplementedSnapshotAgentServiceServer) Resume(context.Context, *ResumeRe
 }
 func (UnimplementedSnapshotAgentServiceServer) Kill(context.Context, *KillRequest) (*KillResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Kill not implemented")
+}
+func (UnimplementedSnapshotAgentServiceServer) SuspendAll(context.Context, *SuspendAllRequest) (*SuspendAllResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SuspendAll not implemented")
+}
+func (UnimplementedSnapshotAgentServiceServer) ResumeAll(context.Context, *ResumeAllRequest) (*ResumeAllResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeAll not implemented")
 }
 func (UnimplementedSnapshotAgentServiceServer) mustEmbedUnimplementedSnapshotAgentServiceServer() {}
 func (UnimplementedSnapshotAgentServiceServer) testEmbeddedByValue()                              {}
@@ -382,6 +442,42 @@ func _SnapshotAgentService_Kill_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SnapshotAgentService_SuspendAll_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SuspendAllRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotAgentServiceServer).SuspendAll(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotAgentService_SuspendAll_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotAgentServiceServer).SuspendAll(ctx, req.(*SuspendAllRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotAgentService_ResumeAll_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeAllRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotAgentServiceServer).ResumeAll(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotAgentService_ResumeAll_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotAgentServiceServer).ResumeAll(ctx, req.(*ResumeAllRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SnapshotAgentService_ServiceDesc is the grpc.ServiceDesc for SnapshotAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -416,6 +512,14 @@ var SnapshotAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Kill",
 			Handler:    _SnapshotAgentService_Kill_Handler,
+		},
+		{
+			MethodName: "SuspendAll",
+			Handler:    _SnapshotAgentService_SuspendAll_Handler,
+		},
+		{
+			MethodName: "ResumeAll",
+			Handler:    _SnapshotAgentService_ResumeAll_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

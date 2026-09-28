@@ -18,6 +18,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -313,4 +314,85 @@ func waitForEpoch(t *testing.T, state *sm.StateManager, want int64) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("expected epoch %d, got %d", want, got)
+}
+
+func TestHostOp_WatcherLabelledJobs(t *testing.T) {
+	origGetK8sClient := podutils.GetK8sClient
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() {
+		podutils.GetK8sClient = origGetK8sClient
+		podutils.GetPodPIDs = origGetPodPIDs
+	}()
+	t.Setenv("NODE_NAME", "test-node")
+
+	fakeClient := fakek8s.NewSimpleClientset()
+	podutils.GetK8sClient = func() (kubernetes.Interface, error) {
+		return fakeClient, nil
+	}
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) {
+		return nil, nil
+	}
+
+	watcher, err := server.NewWatcher(fakeClient, sm.NewStateManager())
+	if err != nil {
+		t.Fatalf("Failed to create watcher: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+
+	pod := func(name, node, role, jobID string, phase corev1.PodPhase, deleting bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{}},
+			Spec:       corev1.PodSpec{NodeName: node},
+			Status:     corev1.PodStatus{Phase: phase},
+		}
+		if role != "" {
+			p.Labels[podutils.RoleLabel] = role
+		}
+		if jobID != "" {
+			p.Labels[podutils.JobIDLabel] = jobID
+		}
+		if deleting {
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+			p.Finalizers = []string{"test/hold"}
+		}
+		return p
+	}
+	for _, p := range []*corev1.Pod{
+		pod("trainer", "test-node", "foreground", "trainer-1", corev1.PodRunning, false),
+		pod("mirror-done", "test-node", "background", "guest-done", corev1.PodSucceeded, false),
+		pod("mirror-failed", "test-node", "background", "guest-failed", corev1.PodFailed, false),
+		pod("mirror-other-node", "other-node", "background", "guest-other", corev1.PodRunning, false),
+		pod("mirror-no-job", "test-node", "background", "", corev1.PodRunning, false),
+		pod("mirror-b", "test-node", "background", "guest-b", corev1.PodRunning, false),
+		pod("mirror-a", "test-node", "background", "guest-a", corev1.PodPending, false),
+		pod("mirror-deleting", "test-node", "background", "guest-deleting", corev1.PodRunning, true),
+	} {
+		if _, err := fakeClient.CoreV1().Pods("default").Create(ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create pod %s: %v", p.Name, err)
+		}
+	}
+
+	want := []string{"guest-a", "guest-b", "guest-deleting"}
+	deadline := time.Now().Add(2 * time.Second)
+	var got []string
+	for time.Now().Before(deadline) {
+		got = watcher.LabelledJobs("background")
+		sort.Strings(got)
+		if reflect.DeepEqual(got, want) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("LabelledJobs(background): expected %v, got %v", want, got)
+	}
+	if got := watcher.LabelledJobs("foreground"); !reflect.DeepEqual(got, []string{"trainer-1"}) {
+		t.Errorf("LabelledJobs(foreground): expected [trainer-1], got %v", got)
+	}
+	if got := watcher.LabelledJobs("none"); len(got) != 0 {
+		t.Errorf("LabelledJobs(none): expected nothing, got %v", got)
+	}
 }

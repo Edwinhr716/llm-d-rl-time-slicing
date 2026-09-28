@@ -45,6 +45,24 @@ service SnapshotAgentService {
   // free, from any job state. It carries no epoch and supersedes any running
   // operation of the job. Asynchronous: returns an operation ID.
   rpc Kill(KillRequest) returns (KillResponse);
+
+  // SuspendAll suspends every job of one role (the guests: "background") on
+  // this node. The agent finds its targets itself when the call arrives: the
+  // pods on its node that carry the label timeslice.io/role=<role> and a
+  // timeslice.io/job-id label.
+  // Each target then gets the same rules as a Suspend with the request's
+  // epoch and deadline, and the targets run in parallel. Asynchronous: returns
+  // one operation ID; GetOperation reports one result per target in
+  // `targets`. The operation is COMPLETE only when every target is SUSPENDED
+  // or RELEASED (also when there was no target): that is what "the host is
+  // clear" means. Fenced by epoch (see SuspendAllRequest). Kill stays per job
+  // and is the fallback for a target that failed.
+  rpc SuspendAll(SuspendAllRequest) returns (SuspendAllResponse);
+
+  // ResumeAll resumes every job of one role on this node, found and
+  // fenced as for SuspendAll. The operation is COMPLETE only when every
+  // target resumed.
+  rpc ResumeAll(ResumeAllRequest) returns (ResumeAllResponse);
 }
 
 enum Backend {
@@ -345,6 +363,48 @@ message KillResponse {
   string operation_id = 1;
 }
 
+// SuspendAllRequest asks the agent to suspend every job on its node whose pod
+// carries the label timeslice.io/role=<role>.
+//
+// Epoch fencing is per role and follows the SuspendRequest rules: a lower
+// epoch than the last one seen for the role is refused with STALE_EPOCH and
+// nothing is acted on; the same epoch and the same call returns the
+// same operation_id; the same epoch with a different call is refused with
+// STALE_EPOCH. Each target is then fenced on its own last epoch as well: a
+// target that has seen a higher epoch is reported FAILED with STALE_EPOCH and
+// is not acted on, and a target running an operation with a lower epoch has
+// that operation aborted.
+message SuspendAllRequest {
+  // role is the value of the timeslice.io/role label that selects the
+  // targets, for example "background". Required.
+  string role = 1;
+  // epoch fences late or duplicate calls (see above).
+  int64 epoch = 2;
+  // deadline is the absolute time by which every target must finish.
+  google.protobuf.Timestamp deadline = 3;
+}
+
+message SuspendAllResponse {
+  string operation_id = 1;
+}
+
+// ResumeAllRequest asks the agent to resume every job on its node whose pod
+// carries the label timeslice.io/role=<role>. Fencing is the same as for
+// SuspendAllRequest.
+message ResumeAllRequest {
+  // role is the value of the timeslice.io/role label that selects the
+  // targets. Required.
+  string role = 1;
+  // epoch fences late or duplicate calls (see SuspendAllRequest).
+  int64 epoch = 2;
+  // deadline is the absolute time by which every target must finish.
+  google.protobuf.Timestamp deadline = 3;
+}
+
+message ResumeAllResponse {
+  string operation_id = 1;
+}
+
 // Outcome is the result of a completed Suspend, Resume or Kill operation.
 enum Outcome {
   OUTCOME_UNSPECIFIED = 0;
@@ -399,6 +459,24 @@ message GetOperationResponse {
   ErrorReason error_reason = 7;
   // host_bytes_pinned is the host memory the job holds after the operation.
   int64 host_bytes_pinned = 8;
+  // targets is set for SuspendAll and ResumeAll operations: one entry per job
+  // the agent found on its node when the call arrived.
+  repeated TargetResult targets = 9;
+}
+
+// TargetResult is the result for one target of a SuspendAll or ResumeAll
+// operation.
+message TargetResult {
+  // job_id is the target's timeslice.io/job-id.
+  string job_id = 1;
+  // status is PENDING while the target runs, then COMPLETE or FAILED.
+  OperationStatus status = 2;
+  // outcome is set on COMPLETE.
+  Outcome outcome = 3;
+  // error_reason is set on FAILED.
+  ErrorReason error_reason = 4;
+  // error is set on FAILED.
+  string error = 5;
 }
 
 message StatusRequest {}

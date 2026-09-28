@@ -2109,6 +2109,236 @@ func (x *KillResponse) GetOperationId() string {
 	return ""
 }
 
+// SuspendAllRequest asks the agent to suspend every job on its node whose pod
+// carries the label timeslice.io/role=<role>.
+//
+// Epoch fencing is per role and follows the SuspendRequest rules: a lower
+// epoch than the last one seen for the role is refused with STALE_EPOCH and
+// nothing is acted on; the same epoch and the same call returns the
+// same operation_id; the same epoch with a different call is refused with
+// STALE_EPOCH. Each target is then fenced on its own last epoch as well: a
+// target that has seen a higher epoch is reported FAILED with STALE_EPOCH and
+// is not acted on, and a target running an operation with a lower epoch has
+// that operation aborted.
+type SuspendAllRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// role is the value of the timeslice.io/role label that selects the
+	// targets, for example "background". Required.
+	Role string `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"`
+	// epoch fences late or duplicate calls (see above).
+	Epoch int64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	// deadline is the absolute time by which every target must finish.
+	Deadline      *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=deadline,proto3" json:"deadline,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SuspendAllRequest) Reset() {
+	*x = SuspendAllRequest{}
+	mi := &file_snapshot_agent_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SuspendAllRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SuspendAllRequest) ProtoMessage() {}
+
+func (x *SuspendAllRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_snapshot_agent_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SuspendAllRequest.ProtoReflect.Descriptor instead.
+func (*SuspendAllRequest) Descriptor() ([]byte, []int) {
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *SuspendAllRequest) GetRole() string {
+	if x != nil {
+		return x.Role
+	}
+	return ""
+}
+
+func (x *SuspendAllRequest) GetEpoch() int64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *SuspendAllRequest) GetDeadline() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Deadline
+	}
+	return nil
+}
+
+type SuspendAllResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	OperationId   string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SuspendAllResponse) Reset() {
+	*x = SuspendAllResponse{}
+	mi := &file_snapshot_agent_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SuspendAllResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SuspendAllResponse) ProtoMessage() {}
+
+func (x *SuspendAllResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_snapshot_agent_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SuspendAllResponse.ProtoReflect.Descriptor instead.
+func (*SuspendAllResponse) Descriptor() ([]byte, []int) {
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *SuspendAllResponse) GetOperationId() string {
+	if x != nil {
+		return x.OperationId
+	}
+	return ""
+}
+
+// ResumeAllRequest asks the agent to resume every job on its node whose pod
+// carries the label timeslice.io/role=<role>. Fencing is the same as for
+// SuspendAllRequest.
+type ResumeAllRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// role is the value of the timeslice.io/role label that selects the
+	// targets. Required.
+	Role string `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"`
+	// epoch fences late or duplicate calls (see SuspendAllRequest).
+	Epoch int64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	// deadline is the absolute time by which every target must finish.
+	Deadline      *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=deadline,proto3" json:"deadline,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResumeAllRequest) Reset() {
+	*x = ResumeAllRequest{}
+	mi := &file_snapshot_agent_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResumeAllRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResumeAllRequest) ProtoMessage() {}
+
+func (x *ResumeAllRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_snapshot_agent_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResumeAllRequest.ProtoReflect.Descriptor instead.
+func (*ResumeAllRequest) Descriptor() ([]byte, []int) {
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *ResumeAllRequest) GetRole() string {
+	if x != nil {
+		return x.Role
+	}
+	return ""
+}
+
+func (x *ResumeAllRequest) GetEpoch() int64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *ResumeAllRequest) GetDeadline() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Deadline
+	}
+	return nil
+}
+
+type ResumeAllResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	OperationId   string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResumeAllResponse) Reset() {
+	*x = ResumeAllResponse{}
+	mi := &file_snapshot_agent_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResumeAllResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResumeAllResponse) ProtoMessage() {}
+
+func (x *ResumeAllResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_snapshot_agent_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResumeAllResponse.ProtoReflect.Descriptor instead.
+func (*ResumeAllResponse) Descriptor() ([]byte, []int) {
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *ResumeAllResponse) GetOperationId() string {
+	if x != nil {
+		return x.OperationId
+	}
+	return ""
+}
+
 type GetOperationRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	OperationId   string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
@@ -2118,7 +2348,7 @@ type GetOperationRequest struct {
 
 func (x *GetOperationRequest) Reset() {
 	*x = GetOperationRequest{}
-	mi := &file_snapshot_agent_proto_msgTypes[26]
+	mi := &file_snapshot_agent_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2130,7 +2360,7 @@ func (x *GetOperationRequest) String() string {
 func (*GetOperationRequest) ProtoMessage() {}
 
 func (x *GetOperationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_snapshot_agent_proto_msgTypes[26]
+	mi := &file_snapshot_agent_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2143,7 +2373,7 @@ func (x *GetOperationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetOperationRequest.ProtoReflect.Descriptor instead.
 func (*GetOperationRequest) Descriptor() ([]byte, []int) {
-	return file_snapshot_agent_proto_rawDescGZIP(), []int{26}
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *GetOperationRequest) GetOperationId() string {
@@ -2169,13 +2399,16 @@ type GetOperationResponse struct {
 	ErrorReason ErrorReason `protobuf:"varint,7,opt,name=error_reason,json=errorReason,proto3,enum=snapshot_agent.v1alpha1.ErrorReason" json:"error_reason,omitempty"`
 	// host_bytes_pinned is the host memory the job holds after the operation.
 	HostBytesPinned int64 `protobuf:"varint,8,opt,name=host_bytes_pinned,json=hostBytesPinned,proto3" json:"host_bytes_pinned,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// targets is set for SuspendAll and ResumeAll operations: one entry per job
+	// the agent found on its node when the call arrived.
+	Targets       []*TargetResult `protobuf:"bytes,9,rep,name=targets,proto3" json:"targets,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetOperationResponse) Reset() {
 	*x = GetOperationResponse{}
-	mi := &file_snapshot_agent_proto_msgTypes[27]
+	mi := &file_snapshot_agent_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2187,7 +2420,7 @@ func (x *GetOperationResponse) String() string {
 func (*GetOperationResponse) ProtoMessage() {}
 
 func (x *GetOperationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_snapshot_agent_proto_msgTypes[27]
+	mi := &file_snapshot_agent_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2200,7 +2433,7 @@ func (x *GetOperationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetOperationResponse.ProtoReflect.Descriptor instead.
 func (*GetOperationResponse) Descriptor() ([]byte, []int) {
-	return file_snapshot_agent_proto_rawDescGZIP(), []int{27}
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *GetOperationResponse) GetStatus() OperationStatus {
@@ -2259,6 +2492,96 @@ func (x *GetOperationResponse) GetHostBytesPinned() int64 {
 	return 0
 }
 
+func (x *GetOperationResponse) GetTargets() []*TargetResult {
+	if x != nil {
+		return x.Targets
+	}
+	return nil
+}
+
+// TargetResult is the result for one target of a SuspendAll or ResumeAll
+// operation.
+type TargetResult struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// job_id is the target's timeslice.io/job-id.
+	JobId string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	// status is PENDING while the target runs, then COMPLETE or FAILED.
+	Status OperationStatus `protobuf:"varint,2,opt,name=status,proto3,enum=snapshot_agent.v1alpha1.OperationStatus" json:"status,omitempty"`
+	// outcome is set on COMPLETE.
+	Outcome Outcome `protobuf:"varint,3,opt,name=outcome,proto3,enum=snapshot_agent.v1alpha1.Outcome" json:"outcome,omitempty"`
+	// error_reason is set on FAILED.
+	ErrorReason ErrorReason `protobuf:"varint,4,opt,name=error_reason,json=errorReason,proto3,enum=snapshot_agent.v1alpha1.ErrorReason" json:"error_reason,omitempty"`
+	// error is set on FAILED.
+	Error         string `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TargetResult) Reset() {
+	*x = TargetResult{}
+	mi := &file_snapshot_agent_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TargetResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TargetResult) ProtoMessage() {}
+
+func (x *TargetResult) ProtoReflect() protoreflect.Message {
+	mi := &file_snapshot_agent_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TargetResult.ProtoReflect.Descriptor instead.
+func (*TargetResult) Descriptor() ([]byte, []int) {
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *TargetResult) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *TargetResult) GetStatus() OperationStatus {
+	if x != nil {
+		return x.Status
+	}
+	return OperationStatus_OPERATION_STATUS_UNSPECIFIED
+}
+
+func (x *TargetResult) GetOutcome() Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return Outcome_OUTCOME_UNSPECIFIED
+}
+
+func (x *TargetResult) GetErrorReason() ErrorReason {
+	if x != nil {
+		return x.ErrorReason
+	}
+	return ErrorReason_ERROR_REASON_UNSPECIFIED
+}
+
+func (x *TargetResult) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 type StatusRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -2267,7 +2590,7 @@ type StatusRequest struct {
 
 func (x *StatusRequest) Reset() {
 	*x = StatusRequest{}
-	mi := &file_snapshot_agent_proto_msgTypes[28]
+	mi := &file_snapshot_agent_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2279,7 +2602,7 @@ func (x *StatusRequest) String() string {
 func (*StatusRequest) ProtoMessage() {}
 
 func (x *StatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_snapshot_agent_proto_msgTypes[28]
+	mi := &file_snapshot_agent_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2292,7 +2615,7 @@ func (x *StatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
 func (*StatusRequest) Descriptor() ([]byte, []int) {
-	return file_snapshot_agent_proto_rawDescGZIP(), []int{28}
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{33}
 }
 
 type JobStatus struct {
@@ -2312,7 +2635,7 @@ type JobStatus struct {
 
 func (x *JobStatus) Reset() {
 	*x = JobStatus{}
-	mi := &file_snapshot_agent_proto_msgTypes[29]
+	mi := &file_snapshot_agent_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2324,7 +2647,7 @@ func (x *JobStatus) String() string {
 func (*JobStatus) ProtoMessage() {}
 
 func (x *JobStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_snapshot_agent_proto_msgTypes[29]
+	mi := &file_snapshot_agent_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2337,7 +2660,7 @@ func (x *JobStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobStatus.ProtoReflect.Descriptor instead.
 func (*JobStatus) Descriptor() ([]byte, []int) {
-	return file_snapshot_agent_proto_rawDescGZIP(), []int{29}
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *JobStatus) GetJobId() string {
@@ -2393,7 +2716,7 @@ type AcceleratorStatus struct {
 
 func (x *AcceleratorStatus) Reset() {
 	*x = AcceleratorStatus{}
-	mi := &file_snapshot_agent_proto_msgTypes[30]
+	mi := &file_snapshot_agent_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2405,7 +2728,7 @@ func (x *AcceleratorStatus) String() string {
 func (*AcceleratorStatus) ProtoMessage() {}
 
 func (x *AcceleratorStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_snapshot_agent_proto_msgTypes[30]
+	mi := &file_snapshot_agent_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2418,7 +2741,7 @@ func (x *AcceleratorStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcceleratorStatus.ProtoReflect.Descriptor instead.
 func (*AcceleratorStatus) Descriptor() ([]byte, []int) {
-	return file_snapshot_agent_proto_rawDescGZIP(), []int{30}
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *AcceleratorStatus) GetId() string {
@@ -2452,7 +2775,7 @@ type StatusResponse struct {
 
 func (x *StatusResponse) Reset() {
 	*x = StatusResponse{}
-	mi := &file_snapshot_agent_proto_msgTypes[31]
+	mi := &file_snapshot_agent_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2464,7 +2787,7 @@ func (x *StatusResponse) String() string {
 func (*StatusResponse) ProtoMessage() {}
 
 func (x *StatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_snapshot_agent_proto_msgTypes[31]
+	mi := &file_snapshot_agent_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2477,7 +2800,7 @@ func (x *StatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
 func (*StatusResponse) Descriptor() ([]byte, []int) {
-	return file_snapshot_agent_proto_rawDescGZIP(), []int{31}
+	return file_snapshot_agent_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *StatusResponse) GetJobStatuses() []*JobStatus {
@@ -2593,9 +2916,21 @@ const file_snapshot_agent_proto_rawDesc = "" +
 	"\bdeadline\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\bdeadline\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\"1\n" +
 	"\fKillResponse\x12!\n" +
+	"\foperation_id\x18\x01 \x01(\tR\voperationId\"u\n" +
+	"\x11SuspendAllRequest\x12\x12\n" +
+	"\x04role\x18\x01 \x01(\tR\x04role\x12\x14\n" +
+	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x126\n" +
+	"\bdeadline\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\bdeadline\"7\n" +
+	"\x12SuspendAllResponse\x12!\n" +
+	"\foperation_id\x18\x01 \x01(\tR\voperationId\"t\n" +
+	"\x10ResumeAllRequest\x12\x12\n" +
+	"\x04role\x18\x01 \x01(\tR\x04role\x12\x14\n" +
+	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x126\n" +
+	"\bdeadline\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\bdeadline\"6\n" +
+	"\x11ResumeAllResponse\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\"8\n" +
 	"\x13GetOperationRequest\x12!\n" +
-	"\foperation_id\x18\x01 \x01(\tR\voperationId\"\xdc\x03\n" +
+	"\foperation_id\x18\x01 \x01(\tR\voperationId\"\x9d\x04\n" +
 	"\x14GetOperationResponse\x12@\n" +
 	"\x06status\x18\x01 \x01(\x0e2(.snapshot_agent.v1alpha1.OperationStatusR\x06status\x12(\n" +
 	"\rstorage_bytes\x18\x02 \x01(\x03H\x00R\fstorageBytes\x88\x01\x01\x127\n" +
@@ -2605,10 +2940,17 @@ const file_snapshot_agent_proto_rawDesc = "" +
 	"\x05error\x18\x05 \x01(\tH\x02R\x05error\x88\x01\x01\x12:\n" +
 	"\aoutcome\x18\x06 \x01(\x0e2 .snapshot_agent.v1alpha1.OutcomeR\aoutcome\x12G\n" +
 	"\ferror_reason\x18\a \x01(\x0e2$.snapshot_agent.v1alpha1.ErrorReasonR\verrorReason\x12*\n" +
-	"\x11host_bytes_pinned\x18\b \x01(\x03R\x0fhostBytesPinnedB\x10\n" +
+	"\x11host_bytes_pinned\x18\b \x01(\x03R\x0fhostBytesPinned\x12?\n" +
+	"\atargets\x18\t \x03(\v2%.snapshot_agent.v1alpha1.TargetResultR\atargetsB\x10\n" +
 	"\x0e_storage_bytesB\x18\n" +
 	"\x16_snapshot_device_bytesB\b\n" +
-	"\x06_error\"\x0f\n" +
+	"\x06_error\"\x82\x02\n" +
+	"\fTargetResult\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12@\n" +
+	"\x06status\x18\x02 \x01(\x0e2(.snapshot_agent.v1alpha1.OperationStatusR\x06status\x12:\n" +
+	"\aoutcome\x18\x03 \x01(\x0e2 .snapshot_agent.v1alpha1.OutcomeR\aoutcome\x12G\n" +
+	"\ferror_reason\x18\x04 \x01(\x0e2$.snapshot_agent.v1alpha1.ErrorReasonR\verrorReason\x12\x14\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error\"\x0f\n" +
 	"\rStatusRequest\"\x85\x02\n" +
 	"\tJobStatus\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x127\n" +
@@ -2667,7 +3009,7 @@ const file_snapshot_agent_proto_rawDesc = "" +
 	"\x17JOB_STATE_TRANSITIONING\x10\x03\x12\x13\n" +
 	"\x0fJOB_STATE_SAVED\x10\x04\x12\x15\n" +
 	"\x11JOB_STATE_FAULTED\x10\x05\x12\x17\n" +
-	"\x13JOB_STATE_SUSPENDED\x10\x062\x93\x06\n" +
+	"\x13JOB_STATE_SUSPENDED\x10\x062\xde\a\n" +
 	"\x14SnapshotAgentService\x12_\n" +
 	"\bSnapshot\x12(.snapshot_agent.v1alpha1.SnapshotRequest\x1a).snapshot_agent.v1alpha1.SnapshotResponse\x12\\\n" +
 	"\aRestore\x12'.snapshot_agent.v1alpha1.RestoreRequest\x1a(.snapshot_agent.v1alpha1.RestoreResponse\x12k\n" +
@@ -2676,7 +3018,10 @@ const file_snapshot_agent_proto_rawDesc = "" +
 	"\x0fWorkloadChannel\x12(.snapshot_agent.v1alpha1.WorkloadMessage\x1a%.snapshot_agent.v1alpha1.AgentCommand(\x010\x01\x12\\\n" +
 	"\aSuspend\x12'.snapshot_agent.v1alpha1.SuspendRequest\x1a(.snapshot_agent.v1alpha1.SuspendResponse\x12Y\n" +
 	"\x06Resume\x12&.snapshot_agent.v1alpha1.ResumeRequest\x1a'.snapshot_agent.v1alpha1.ResumeResponse\x12S\n" +
-	"\x04Kill\x12$.snapshot_agent.v1alpha1.KillRequest\x1a%.snapshot_agent.v1alpha1.KillResponseB\\ZZgithub.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1;v1alpha1b\x06proto3"
+	"\x04Kill\x12$.snapshot_agent.v1alpha1.KillRequest\x1a%.snapshot_agent.v1alpha1.KillResponse\x12e\n" +
+	"\n" +
+	"SuspendAll\x12*.snapshot_agent.v1alpha1.SuspendAllRequest\x1a+.snapshot_agent.v1alpha1.SuspendAllResponse\x12b\n" +
+	"\tResumeAll\x12).snapshot_agent.v1alpha1.ResumeAllRequest\x1a*.snapshot_agent.v1alpha1.ResumeAllResponseB\\ZZgithub.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_snapshot_agent_proto_rawDescOnce sync.Once
@@ -2691,7 +3036,7 @@ func file_snapshot_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_snapshot_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_snapshot_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
+var file_snapshot_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
 var file_snapshot_agent_proto_goTypes = []any{
 	(Backend)(0),                       // 0: snapshot_agent.v1alpha1.Backend
 	(App)(0),                           // 1: snapshot_agent.v1alpha1.App
@@ -2726,13 +3071,18 @@ var file_snapshot_agent_proto_goTypes = []any{
 	(*ResumeResponse)(nil),             // 30: snapshot_agent.v1alpha1.ResumeResponse
 	(*KillRequest)(nil),                // 31: snapshot_agent.v1alpha1.KillRequest
 	(*KillResponse)(nil),               // 32: snapshot_agent.v1alpha1.KillResponse
-	(*GetOperationRequest)(nil),        // 33: snapshot_agent.v1alpha1.GetOperationRequest
-	(*GetOperationResponse)(nil),       // 34: snapshot_agent.v1alpha1.GetOperationResponse
-	(*StatusRequest)(nil),              // 35: snapshot_agent.v1alpha1.StatusRequest
-	(*JobStatus)(nil),                  // 36: snapshot_agent.v1alpha1.JobStatus
-	(*AcceleratorStatus)(nil),          // 37: snapshot_agent.v1alpha1.AcceleratorStatus
-	(*StatusResponse)(nil),             // 38: snapshot_agent.v1alpha1.StatusResponse
-	(*timestamppb.Timestamp)(nil),      // 39: google.protobuf.Timestamp
+	(*SuspendAllRequest)(nil),          // 33: snapshot_agent.v1alpha1.SuspendAllRequest
+	(*SuspendAllResponse)(nil),         // 34: snapshot_agent.v1alpha1.SuspendAllResponse
+	(*ResumeAllRequest)(nil),           // 35: snapshot_agent.v1alpha1.ResumeAllRequest
+	(*ResumeAllResponse)(nil),          // 36: snapshot_agent.v1alpha1.ResumeAllResponse
+	(*GetOperationRequest)(nil),        // 37: snapshot_agent.v1alpha1.GetOperationRequest
+	(*GetOperationResponse)(nil),       // 38: snapshot_agent.v1alpha1.GetOperationResponse
+	(*TargetResult)(nil),               // 39: snapshot_agent.v1alpha1.TargetResult
+	(*StatusRequest)(nil),              // 40: snapshot_agent.v1alpha1.StatusRequest
+	(*JobStatus)(nil),                  // 41: snapshot_agent.v1alpha1.JobStatus
+	(*AcceleratorStatus)(nil),          // 42: snapshot_agent.v1alpha1.AcceleratorStatus
+	(*StatusResponse)(nil),             // 43: snapshot_agent.v1alpha1.StatusResponse
+	(*timestamppb.Timestamp)(nil),      // 44: google.protobuf.Timestamp
 }
 var file_snapshot_agent_proto_depIdxs = []int32{
 	7,  // 0: snapshot_agent.v1alpha1.CudaBackendConfig.explicit_target:type_name -> snapshot_agent.v1alpha1.ProcessTarget
@@ -2758,41 +3108,51 @@ var file_snapshot_agent_proto_depIdxs = []int32{
 	21, // 20: snapshot_agent.v1alpha1.AgentCommand.restore:type_name -> snapshot_agent.v1alpha1.RestoreCommand
 	0,  // 21: snapshot_agent.v1alpha1.SnapshotRequest.backend:type_name -> snapshot_agent.v1alpha1.Backend
 	15, // 22: snapshot_agent.v1alpha1.SnapshotRequest.backend_config:type_name -> snapshot_agent.v1alpha1.BackendConfig
-	39, // 23: snapshot_agent.v1alpha1.SnapshotRequest.deadline:type_name -> google.protobuf.Timestamp
+	44, // 23: snapshot_agent.v1alpha1.SnapshotRequest.deadline:type_name -> google.protobuf.Timestamp
 	0,  // 24: snapshot_agent.v1alpha1.RestoreRequest.backend:type_name -> snapshot_agent.v1alpha1.Backend
 	15, // 25: snapshot_agent.v1alpha1.RestoreRequest.backend_config:type_name -> snapshot_agent.v1alpha1.BackendConfig
-	39, // 26: snapshot_agent.v1alpha1.RestoreRequest.deadline:type_name -> google.protobuf.Timestamp
-	39, // 27: snapshot_agent.v1alpha1.SuspendRequest.deadline:type_name -> google.protobuf.Timestamp
-	39, // 28: snapshot_agent.v1alpha1.ResumeRequest.deadline:type_name -> google.protobuf.Timestamp
-	39, // 29: snapshot_agent.v1alpha1.KillRequest.deadline:type_name -> google.protobuf.Timestamp
-	5,  // 30: snapshot_agent.v1alpha1.GetOperationResponse.status:type_name -> snapshot_agent.v1alpha1.OperationStatus
-	3,  // 31: snapshot_agent.v1alpha1.GetOperationResponse.outcome:type_name -> snapshot_agent.v1alpha1.Outcome
-	4,  // 32: snapshot_agent.v1alpha1.GetOperationResponse.error_reason:type_name -> snapshot_agent.v1alpha1.ErrorReason
-	6,  // 33: snapshot_agent.v1alpha1.JobStatus.state:type_name -> snapshot_agent.v1alpha1.JobState
-	3,  // 34: snapshot_agent.v1alpha1.JobStatus.last_outcome:type_name -> snapshot_agent.v1alpha1.Outcome
-	36, // 35: snapshot_agent.v1alpha1.StatusResponse.job_statuses:type_name -> snapshot_agent.v1alpha1.JobStatus
-	37, // 36: snapshot_agent.v1alpha1.StatusResponse.accelerator_statuses:type_name -> snapshot_agent.v1alpha1.AcceleratorStatus
-	23, // 37: snapshot_agent.v1alpha1.SnapshotAgentService.Snapshot:input_type -> snapshot_agent.v1alpha1.SnapshotRequest
-	25, // 38: snapshot_agent.v1alpha1.SnapshotAgentService.Restore:input_type -> snapshot_agent.v1alpha1.RestoreRequest
-	33, // 39: snapshot_agent.v1alpha1.SnapshotAgentService.GetOperation:input_type -> snapshot_agent.v1alpha1.GetOperationRequest
-	35, // 40: snapshot_agent.v1alpha1.SnapshotAgentService.Status:input_type -> snapshot_agent.v1alpha1.StatusRequest
-	19, // 41: snapshot_agent.v1alpha1.SnapshotAgentService.WorkloadChannel:input_type -> snapshot_agent.v1alpha1.WorkloadMessage
-	27, // 42: snapshot_agent.v1alpha1.SnapshotAgentService.Suspend:input_type -> snapshot_agent.v1alpha1.SuspendRequest
-	29, // 43: snapshot_agent.v1alpha1.SnapshotAgentService.Resume:input_type -> snapshot_agent.v1alpha1.ResumeRequest
-	31, // 44: snapshot_agent.v1alpha1.SnapshotAgentService.Kill:input_type -> snapshot_agent.v1alpha1.KillRequest
-	24, // 45: snapshot_agent.v1alpha1.SnapshotAgentService.Snapshot:output_type -> snapshot_agent.v1alpha1.SnapshotResponse
-	26, // 46: snapshot_agent.v1alpha1.SnapshotAgentService.Restore:output_type -> snapshot_agent.v1alpha1.RestoreResponse
-	34, // 47: snapshot_agent.v1alpha1.SnapshotAgentService.GetOperation:output_type -> snapshot_agent.v1alpha1.GetOperationResponse
-	38, // 48: snapshot_agent.v1alpha1.SnapshotAgentService.Status:output_type -> snapshot_agent.v1alpha1.StatusResponse
-	22, // 49: snapshot_agent.v1alpha1.SnapshotAgentService.WorkloadChannel:output_type -> snapshot_agent.v1alpha1.AgentCommand
-	28, // 50: snapshot_agent.v1alpha1.SnapshotAgentService.Suspend:output_type -> snapshot_agent.v1alpha1.SuspendResponse
-	30, // 51: snapshot_agent.v1alpha1.SnapshotAgentService.Resume:output_type -> snapshot_agent.v1alpha1.ResumeResponse
-	32, // 52: snapshot_agent.v1alpha1.SnapshotAgentService.Kill:output_type -> snapshot_agent.v1alpha1.KillResponse
-	45, // [45:53] is the sub-list for method output_type
-	37, // [37:45] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	44, // 26: snapshot_agent.v1alpha1.RestoreRequest.deadline:type_name -> google.protobuf.Timestamp
+	44, // 27: snapshot_agent.v1alpha1.SuspendRequest.deadline:type_name -> google.protobuf.Timestamp
+	44, // 28: snapshot_agent.v1alpha1.ResumeRequest.deadline:type_name -> google.protobuf.Timestamp
+	44, // 29: snapshot_agent.v1alpha1.KillRequest.deadline:type_name -> google.protobuf.Timestamp
+	44, // 30: snapshot_agent.v1alpha1.SuspendAllRequest.deadline:type_name -> google.protobuf.Timestamp
+	44, // 31: snapshot_agent.v1alpha1.ResumeAllRequest.deadline:type_name -> google.protobuf.Timestamp
+	5,  // 32: snapshot_agent.v1alpha1.GetOperationResponse.status:type_name -> snapshot_agent.v1alpha1.OperationStatus
+	3,  // 33: snapshot_agent.v1alpha1.GetOperationResponse.outcome:type_name -> snapshot_agent.v1alpha1.Outcome
+	4,  // 34: snapshot_agent.v1alpha1.GetOperationResponse.error_reason:type_name -> snapshot_agent.v1alpha1.ErrorReason
+	39, // 35: snapshot_agent.v1alpha1.GetOperationResponse.targets:type_name -> snapshot_agent.v1alpha1.TargetResult
+	5,  // 36: snapshot_agent.v1alpha1.TargetResult.status:type_name -> snapshot_agent.v1alpha1.OperationStatus
+	3,  // 37: snapshot_agent.v1alpha1.TargetResult.outcome:type_name -> snapshot_agent.v1alpha1.Outcome
+	4,  // 38: snapshot_agent.v1alpha1.TargetResult.error_reason:type_name -> snapshot_agent.v1alpha1.ErrorReason
+	6,  // 39: snapshot_agent.v1alpha1.JobStatus.state:type_name -> snapshot_agent.v1alpha1.JobState
+	3,  // 40: snapshot_agent.v1alpha1.JobStatus.last_outcome:type_name -> snapshot_agent.v1alpha1.Outcome
+	41, // 41: snapshot_agent.v1alpha1.StatusResponse.job_statuses:type_name -> snapshot_agent.v1alpha1.JobStatus
+	42, // 42: snapshot_agent.v1alpha1.StatusResponse.accelerator_statuses:type_name -> snapshot_agent.v1alpha1.AcceleratorStatus
+	23, // 43: snapshot_agent.v1alpha1.SnapshotAgentService.Snapshot:input_type -> snapshot_agent.v1alpha1.SnapshotRequest
+	25, // 44: snapshot_agent.v1alpha1.SnapshotAgentService.Restore:input_type -> snapshot_agent.v1alpha1.RestoreRequest
+	37, // 45: snapshot_agent.v1alpha1.SnapshotAgentService.GetOperation:input_type -> snapshot_agent.v1alpha1.GetOperationRequest
+	40, // 46: snapshot_agent.v1alpha1.SnapshotAgentService.Status:input_type -> snapshot_agent.v1alpha1.StatusRequest
+	19, // 47: snapshot_agent.v1alpha1.SnapshotAgentService.WorkloadChannel:input_type -> snapshot_agent.v1alpha1.WorkloadMessage
+	27, // 48: snapshot_agent.v1alpha1.SnapshotAgentService.Suspend:input_type -> snapshot_agent.v1alpha1.SuspendRequest
+	29, // 49: snapshot_agent.v1alpha1.SnapshotAgentService.Resume:input_type -> snapshot_agent.v1alpha1.ResumeRequest
+	31, // 50: snapshot_agent.v1alpha1.SnapshotAgentService.Kill:input_type -> snapshot_agent.v1alpha1.KillRequest
+	33, // 51: snapshot_agent.v1alpha1.SnapshotAgentService.SuspendAll:input_type -> snapshot_agent.v1alpha1.SuspendAllRequest
+	35, // 52: snapshot_agent.v1alpha1.SnapshotAgentService.ResumeAll:input_type -> snapshot_agent.v1alpha1.ResumeAllRequest
+	24, // 53: snapshot_agent.v1alpha1.SnapshotAgentService.Snapshot:output_type -> snapshot_agent.v1alpha1.SnapshotResponse
+	26, // 54: snapshot_agent.v1alpha1.SnapshotAgentService.Restore:output_type -> snapshot_agent.v1alpha1.RestoreResponse
+	38, // 55: snapshot_agent.v1alpha1.SnapshotAgentService.GetOperation:output_type -> snapshot_agent.v1alpha1.GetOperationResponse
+	43, // 56: snapshot_agent.v1alpha1.SnapshotAgentService.Status:output_type -> snapshot_agent.v1alpha1.StatusResponse
+	22, // 57: snapshot_agent.v1alpha1.SnapshotAgentService.WorkloadChannel:output_type -> snapshot_agent.v1alpha1.AgentCommand
+	28, // 58: snapshot_agent.v1alpha1.SnapshotAgentService.Suspend:output_type -> snapshot_agent.v1alpha1.SuspendResponse
+	30, // 59: snapshot_agent.v1alpha1.SnapshotAgentService.Resume:output_type -> snapshot_agent.v1alpha1.ResumeResponse
+	32, // 60: snapshot_agent.v1alpha1.SnapshotAgentService.Kill:output_type -> snapshot_agent.v1alpha1.KillResponse
+	34, // 61: snapshot_agent.v1alpha1.SnapshotAgentService.SuspendAll:output_type -> snapshot_agent.v1alpha1.SuspendAllResponse
+	36, // 62: snapshot_agent.v1alpha1.SnapshotAgentService.ResumeAll:output_type -> snapshot_agent.v1alpha1.ResumeAllResponse
+	53, // [53:63] is the sub-list for method output_type
+	43, // [43:53] is the sub-list for method input_type
+	43, // [43:43] is the sub-list for extension type_name
+	43, // [43:43] is the sub-list for extension extendee
+	0,  // [0:43] is the sub-list for field type_name
 }
 
 func init() { file_snapshot_agent_proto_init() }
@@ -2816,14 +3176,14 @@ func file_snapshot_agent_proto_init() {
 		(*AgentCommand_Snapshot)(nil),
 		(*AgentCommand_Restore)(nil),
 	}
-	file_snapshot_agent_proto_msgTypes[27].OneofWrappers = []any{}
+	file_snapshot_agent_proto_msgTypes[31].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_snapshot_agent_proto_rawDesc), len(file_snapshot_agent_proto_rawDesc)),
 			NumEnums:      7,
-			NumMessages:   32,
+			NumMessages:   37,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

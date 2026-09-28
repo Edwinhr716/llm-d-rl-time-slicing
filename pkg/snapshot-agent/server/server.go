@@ -478,6 +478,15 @@ func (s *Server) GetOperation(ctx context.Context, req *pb.GetOperationRequest) 
 		errStr := op.Error
 		resp.Error = &errStr
 	}
+	for _, t := range op.Targets {
+		resp.Targets = append(resp.Targets, &pb.TargetResult{
+			JobId:       t.JobID,
+			Status:      t.Status,
+			Outcome:     t.Outcome,
+			ErrorReason: t.ErrorReason,
+			Error:       t.Error,
+		})
+	}
 
 	return resp, nil
 }
@@ -571,6 +580,9 @@ func StartServer(
 	if err != nil {
 		return fmt.Errorf("failed to create watcher: %w", err)
 	}
+	// SuspendAll and ResumeAll find their targets in the watcher's
+	// node-scoped pod cache. Set before the server serves any call.
+	sm.WithTargetLister(watcher.LabelledJobs)(srv.state)
 	watcher.Start(ctx)
 
 	s := grpc.NewServer()
