@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package snapshot_agent.v1alpha1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1;v1alpha1";
+
+// HostCommandService is the host-level command endpoint of the snapshot
+// agent. The agent serves it next to SnapshotAgentService, on the same port.
+// The orchestrator is the only caller: on a foreground Acquire it tells every
+// host of the group to vacate by a deadline and grants only after every host
+// acked; on a foreground Yield that lends the accelerator it tells every host
+// to resume.
+//
+// The agent enumerates its targets on its own node at command time (pods
+// with the requested role). It never decides; it only executes and acks.
+//
+// Both calls block until the host has finished the command (or the caller
+// gives up). The response is the ack. Calling again with the same epoch and
+// the same command joins the running command, or returns the recorded ack
+// if it already finished.
+//
+// Epoch fencing, per host:
+//   - epoch lower than the highest seen: STALE_EPOCH, nothing runs;
+//   - same epoch, same command: join or replay (idempotent);
+//   - same epoch, other command: STALE_EPOCH;
+//   - higher epoch, same command while one runs: the running command is
+//     adopted by the new epoch (it keeps running; the deadline is replaced);
+//   - higher epoch, other command while one runs: the new command starts
+//     once the running one has finished (a half-done checkpoint or restore
+//     is never cancelled).
+service HostCommandService {
+  // SuspendAll suspends every target on the host. The host runs, per target
+  // and one at a time: mark the target not ready and wait for the
+  // confirmation, then suspend it. HOST_COMMAND_OUTCOME_CLEAR means no target
+  // on the host holds the accelerator: this is what "host is clear" means to
+  // the orchestrator.
+  rpc SuspendAll(SuspendAllRequest) returns (HostCommandAck);
+
+  // ResumeAll resumes every suspended target on the host: resume, then mark
+  // it ready.
+  rpc ResumeAll(ResumeAllRequest) returns (HostCommandAck);
+}
+
+// HostRole selects which pods on the node a host command targets.
+enum HostRole {
+  HOST_ROLE_UNSPECIFIED = 0;
+  // Pods of the foreground (donor) job.
+  HOST_ROLE_FOREGROUND = 1;
+  // Background (guest) pods.
+  HOST_ROLE_BACKGROUND = 2;
+}
+
+message SuspendAllRequest {
+  // group is the time-slice group the command is issued for.
+  string group = 1;
+  // role selects the targets. UNSPECIFIED is treated as BACKGROUND.
+  HostRole role = 2;
+  // epoch fences the command; see HostCommandService.
+  int64 epoch = 3;
+  // deadline is absolute. Every target should be suspended by then.
+  google.protobuf.Timestamp deadline = 4;
+}
+
+message ResumeAllRequest {
+  string group = 1;
+  HostRole role = 2;
+  int64 epoch = 3;
+  google.protobuf.Timestamp deadline = 4;
+}
+
+enum HostCommandOutcome {
+  HOST_COMMAND_OUTCOME_UNSPECIFIED = 0;
+  // SuspendAll finished: no target holds the accelerator (also when the host
+  // had no target).
+  HOST_COMMAND_OUTCOME_CLEAR = 1;
+  // ResumeAll finished: every target resumed.
+  HOST_COMMAND_OUTCOME_RESUMED = 2;
+  // At least one target failed; see targets.
+  HOST_COMMAND_OUTCOME_FAILED = 3;
+  // The epoch was fenced off; nothing ran.
+  HOST_COMMAND_OUTCOME_STALE_EPOCH = 4;
+}
+
+// TargetResult reports one target of a host command.
+message TargetResult {
+  // target names the target (the guest).
+  string target = 1;
+  // error is empty when the target succeeded.
+  string error = 2;
+}
+
+// HostCommandAck is the host's answer to a host command.
+message HostCommandAck {
+  // epoch is the epoch this ack is for. The caller drops an ack whose epoch
+  // is not the one it is waiting for.
+  int64 epoch = 1;
+  HostCommandOutcome outcome = 2;
+  repeated TargetResult targets = 3;
+  // error summarises a FAILED or STALE_EPOCH outcome.
+  string error = 4;
+}

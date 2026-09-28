@@ -100,6 +100,22 @@ func (k *KubernetesOrchestrator) getNodesForGroup(groupID string) ([]string, err
 	return groupNodes, nil
 }
 
+// NodeAddress returns the address the orchestrator reaches the host of the
+// named node at: its InternalIP, or the node name when the node is unknown or
+// has no InternalIP.
+func (k *KubernetesOrchestrator) NodeAddress(name string) string {
+	node, err := k.nodeLister.Get(name)
+	if err != nil {
+		return name
+	}
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+			return addr.Address
+		}
+	}
+	return name
+}
+
 // getPodsForGroup returns the pods that are tied to the given group.
 func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, error) {
 	selector := labels.SelectorFromSet(labels.Set{PodLabelKey: groupID})

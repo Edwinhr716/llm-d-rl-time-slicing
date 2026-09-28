@@ -267,3 +267,33 @@ func TestObserveGroupState_UpdateJobsAndPods(t *testing.T) {
 		t.Errorf("Expected job-b to not exist in store, got: %v", err)
 	}
 }
+
+func TestNS4_Push_NodeAddressUsesInternalIP(t *testing.T) {
+	clientset := fake.NewClientset(
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-ip"},
+			Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeHostName, Address: "host-a"},
+				{Type: corev1.NodeInternalIP, Address: "10.0.0.7"},
+			}},
+		},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-noip"}},
+	)
+	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
+	infraOrch := infrastructure.NewKubernetesOrchestrator(informerFactory.Core().V1().Nodes(),
+		informerFactory.Core().V1().Pods(), store.NewGroupStore(store.NewMemLockStore()), store.NewJobStore(),
+		&fakeSnapshotAgentStore{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	informerFactory.Start(ctx.Done())
+	if err := infraOrch.Init(ctx); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	for name, want := range map[string]string{"node-ip": "10.0.0.7", "node-noip": "node-noip", "absent": "absent"} {
+		if got := infraOrch.NodeAddress(name); got != want {
+			t.Errorf("NodeAddress(%q) = %q, want %q", name, got, want)
+		}
+	}
+}

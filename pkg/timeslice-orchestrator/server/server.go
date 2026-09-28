@@ -244,12 +244,20 @@ func (s *Server) defaultCheckAcquire(
 		return nil, nil, false //nolint:nilnil // returning nil, nil is intended when done is false
 	}
 
+	// Fail closed (D-NS-4 ns-push-agent): never grant before every host of
+	// the group acked the vacate command.
+	if s.ctrl != nil && !s.ctrl.HostsClear(groupID) {
+		return nil, nil, false //nolint:nilnil // returning nil, nil is intended when done is false
+	}
+
 	// Check if we are the lock holder AND the context is loaded
 	// (fixes premature success bug)
 	if group.Spec().LockingJob() == jobID && group.Status().LoadedJob() == jobID {
 		// The accelerator is back with the foreground: any notice is over.
 		group.Spec().ClearNotice()
 		slog.InfoContext(ctx, "Acquire succeeded, job loaded and lock held")
+		slog.InfoContext(ctx, "Foreground granted", "group", groupID, "job", jobID,
+			"waited_ms", time.Since(startTime).Milliseconds())
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
 			Success:         true,
@@ -571,16 +579,39 @@ func StartServer(
 	workers int,
 	opts ...Option,
 ) error {
-	lis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
+	metricsLis, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", metricsPort))
+	if err != nil {
+		_ = lis.Close()
+		return fmt.Errorf("failed to listen for metrics: %w", err)
+	}
+	return Serve(ctx, lis, metricsLis, ctrl, groupStore, jobStore, workers, opts...)
+}
 
+// serverStopGrace bounds the graceful gRPC stop on shutdown. RPCs still in
+// flight after it (a blocked Acquire, for example) are cut.
+const serverStopGrace = 5 * time.Second
+
+// Serve runs the controller, the gRPC server on lis and the metrics server on
+// metricsLis until ctx is done. It returns once all three have stopped.
+func Serve(
+	ctx context.Context,
+	lis net.Listener,
+	metricsLis net.Listener,
+	ctrl *controller.Controller,
+	groupStore GroupStore,
+	jobStore JobStore,
+	workers int,
+	opts ...Option,
+) error {
 	// Start HTTP metrics server
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	httpServer := &http.Server{
-		Addr:              fmt.Sprintf(":%d", metricsPort),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -588,31 +619,33 @@ func StartServer(
 		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
-		slog.InfoContext(ctx, "Starting HTTP metrics server", "port", metricsPort)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.InfoContext(ctx, "Starting HTTP metrics server", "addr", metricsLis.Addr().String())
+		if err := httpServer.Serve(metricsLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.ErrorContext(ctx, "HTTP metrics server failed", "error", err)
 		}
 	}()
 
 	// Start controller in background
+	ctrlDone := make(chan struct{})
 	go func() {
+		defer close(ctrlDone)
 		slog.InfoContext(ctx, "Starting controller from server", "workers", workers)
 		if err := ctrl.Run(ctx, workers); err != nil {
 			slog.ErrorContext(ctx, "Error running controller", "error", err)
 		}
 	}()
 
-	s := grpc.NewServer()
+	grpcServer := grpc.NewServer()
 	orchServer := NewServer(ctrl, groupStore, jobStore, opts...)
 	if orchServer.budget != nil {
 		go orchServer.runBudgetPublisher(ctx)
 	}
-	pb.RegisterTimeSliceOrchestratorServiceServer(s, orchServer)
+	pb.RegisterTimeSliceOrchestratorServiceServer(grpcServer, orchServer)
 
 	errChan := make(chan error, 1)
 	go func() {
-		slog.InfoContext(ctx, "Starting gRPC server", "port", port)
-		if err := s.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+		slog.InfoContext(ctx, "Starting gRPC server", "addr", lis.Addr().String())
+		if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			errChan <- fmt.Errorf("failed to serve: %w", err)
 		}
 		close(errChan)
@@ -620,18 +653,30 @@ func StartServer(
 
 	select {
 	case err := <-errChan:
+		_ = httpServer.Close()
 		if err != nil {
 			return err
 		}
 	case <-ctx.Done():
 		slog.InfoContext(ctx, "Context canceled, shutting down servers gracefully")
-		s.GracefulStop()
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		stopped := make(chan struct{})
+		go func() {
+			grpcServer.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(serverStopGrace):
+			grpcServer.Stop()
+			<-stopped
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serverStopGrace)
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			slog.ErrorContext(ctx, "HTTP metrics server shutdown error", "error", err)
 		}
 		cancel()
 		<-errChan
+		<-ctrlDone
 		slog.InfoContext(ctx, "Server stopped")
 	}
 
