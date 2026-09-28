@@ -78,9 +78,11 @@ func run() error {
 			"declining to open it. Supersedes --dispatch-budget-open-delay. "+
 			"Overridable with the TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE environment variable.")
 	foregroundWait := flag.String("foreground-wait", controller.ForegroundWaitBlocking,
-		"How reconcile waits on a foreground snapshot or restore. \"blocking\" (option A, the default and the "+
-			"only mode implemented) blocks on the agent operation, bounded by --foreground-op-timeout. "+
-			"PENDING LEAD DECISION: option B (\"async\") is refused until decided.")
+		"How a foreground Acquire waits. \"blocking\" (option A, the default): Acquire blocks until the job holds "+
+			"the lock with its context loaded, and reconcile blocks on the agent operation, bounded by "+
+			"--foreground-op-timeout. \"async-poll\": an Acquire that carries the request metadata "+
+			"x-timeslice-acquire-mode=poll returns at once (success=false until granted) and the client polls; "+
+			"callers without it keep the blocking Acquire. PENDING LEAD DECISION D-ORCH-1: \"async\" is refused.")
 	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
 		"Upper bound on each blocking wait for a foreground snapshot or restore operation. On expiry the "+
 			"reconcile is retried. 0 means unbounded.")
@@ -190,6 +192,7 @@ func run() error {
 		server.WithBackgroundRole(*backgroundRole),
 		server.WithMinBubble(*minBubble),
 		server.WithNoticeTiming(*noticeWindow, *killBudget),
+		server.WithForegroundWait(*foregroundWait),
 	}
 	if *budgetRedisAddr != "" {
 		publisher := budget.NewPublisher(budget.NewRedisWriter(*budgetRedisAddr), *budgetKey, *budgetJob).

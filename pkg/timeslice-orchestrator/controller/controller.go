@@ -20,29 +20,36 @@ const (
 	operationPollInterval = 1 * time.Second
 )
 
-// ForegroundWaitBlocking is option A for how reconcile waits on a foreground
-// snapshot or restore: it blocks on the agent operation, bounded by
-// Controller.ForegroundOpTimeout. It is the only mode implemented.
-//
-// PENDING LEAD DECISION (foreground wait, A or B): option B, which starts the
-// operation and checks it on a later requeue, is not implemented, and
-// ValidateForegroundWait refuses it until the lead decides.
+// ForegroundWaitBlocking is option A for how a foreground Acquire waits: the
+// Acquire RPC blocks until the job holds the lock with its context loaded, and
+// reconcile blocks on the agent operation, bounded by
+// Controller.ForegroundOpTimeout. It is the default.
 const ForegroundWaitBlocking = "blocking"
 
-// ForegroundWaitAsync names option B. It is recognised only so that the
-// error can say why it is refused.
+// ForegroundWaitAsyncPoll is option B as the decision entry words it
+// (PENDING LEAD DECISION D-ORCH-1, option async-poll): an Acquire from a
+// client that opts in with the acquire-mode request metadata returns at once,
+// with success=false until the job is granted, and the client polls. Callers
+// without that metadata (older clients) keep the blocking Acquire. Reconcile
+// is unchanged.
+const ForegroundWaitAsyncPoll = "async-poll"
+
+// ForegroundWaitAsync names the design's option B (reconcile checks the
+// operation on requeue). It is not built on this branch, and is recognised
+// only so that the error can say why it is refused.
 const ForegroundWaitAsync = "async"
 
 // ValidateForegroundWait checks a --foreground-wait value.
 func ValidateForegroundWait(mode string) error {
 	switch mode {
-	case ForegroundWaitBlocking:
+	case ForegroundWaitBlocking, ForegroundWaitAsyncPoll:
 		return nil
 	case ForegroundWaitAsync:
-		return fmt.Errorf("foreground wait %q (option B) is not implemented (PENDING LEAD DECISION); use %q",
-			mode, ForegroundWaitBlocking)
+		return fmt.Errorf("foreground wait %q (option B, requeue) is not implemented (PENDING LEAD DECISION); use %q or %q",
+			mode, ForegroundWaitBlocking, ForegroundWaitAsyncPoll)
 	default:
-		return fmt.Errorf("unknown foreground wait %q: must be %q", mode, ForegroundWaitBlocking)
+		return fmt.Errorf("unknown foreground wait %q: must be %q or %q",
+			mode, ForegroundWaitBlocking, ForegroundWaitAsyncPoll)
 	}
 }
 
@@ -696,11 +703,45 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 	}
 }
 
-// waitForOperation blocks until the given operation on the node completes or fails.
+// Outcomes logged on "Foreground operation finished".
+const (
+	foregroundOutcomeComplete  = "complete"
+	foregroundOutcomeFailed    = "failed"
+	foregroundOutcomeTimeout   = "timeout"
+	foregroundOutcomeCancelled = "cancelled"
+)
+
+// waitForOperation blocks until the given operation on the node completes or
+// fails, bounded by ForegroundOpTimeout (--foreground-wait=blocking). It logs
+// "Foreground operation started" and "Foreground operation finished" around
+// the wait.
 func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
 	ctx = logging.WithOperationID(ctx, operationID)
 
+	slog.InfoContext(ctx, "Foreground operation started",
+		"group", groupID, "job", jobID, "operation_id", operationID, "type", operationType)
+
+	err := c.pollOperation(ctx, groupID, jobID, nodeName, operationID, operationType)
+
+	outcome := foregroundOutcomeComplete
+	switch {
+	case err == nil:
+	case errors.Is(err, context.DeadlineExceeded):
+		outcome = foregroundOutcomeTimeout
+	case errors.Is(err, context.Canceled):
+		outcome = foregroundOutcomeCancelled
+	default:
+		outcome = foregroundOutcomeFailed
+	}
+	slog.InfoContext(ctx, "Foreground operation finished",
+		"group", groupID, "job", jobID, "operation_id", operationID, "type", operationType, "outcome", outcome)
+	return err
+}
+
+// pollOperation polls the agent until the operation completes or fails, or
+// until ForegroundOpTimeout or ctx ends.
+func (c *Controller) pollOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
 	if c.ForegroundOpTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.ForegroundOpTimeout)
