@@ -35,12 +35,15 @@ kubelet for the guest pods scheduled onto it.
 cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wiring; own event recorder
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
+internal/provider/marker.go          --guest-marker: what makes a pod a guest
 internal/provider/events.go          drops events about non-guest pods
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
 internal/backend/mirror/claim.go     optional reservedFor write (kube-controller-manager also does it)
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
+deploy/guests/                       guest manifests: today, ns
+deploy/admission/                    W9 policies, one per guest marker
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
@@ -59,6 +62,54 @@ make undeploy
 
 The plan and the notes explaining this code are kept outside this repository
 (prototype plan, milestones M0 and M1).
+
+## Guest steering options (pending decisions D-NS-2, D-VK-4, D-NS-3)
+
+Three pending lead decisions choose how a guest finds the virtual Node and
+what makes a pod a guest. Every option ships; flags and manifests pick one.
+The defaults are today's behaviour.
+
+- D-NS-2, labels of the virtual Node: `--guest-node-label`.
+  - `false` (default): `timeslice.io/virtual-node=true` only.
+  - `true`: also `timeslice.io/guest=true`.
+- D-VK-4, what makes a pod a guest: `--guest-marker`.
+  - `toleration` (default): the pod tolerates `timeslice.io/guest` by key.
+  - `label`: the pod carries the label `timeslice.io/guest=true`.
+  - `both`: either one.
+- D-NS-3, how a guest steers: the manifest in `deploy/guests/`.
+  - `guest-today.yaml`: the toleration and the nodeSelector
+    `timeslice.io/virtual-node: "true"`. It waits Pending when no
+    virtual Node exists or has room.
+  - `guest-ns.yaml`: the label `timeslice.io/guest=true`, the toleration and
+    a preferred node affinity (weight 100) on `timeslice.io/guest=true`.
+    It falls back to real nodes.
+- W9 for each marker: `deploy/admission/w9-<variant>.yaml`, a
+  ValidatingAdmissionPolicy and binding. It rejects `timeslice.io/group`,
+  `timeslice.io/job-id` and `timeslice.io/role` on guests and allows
+  `timeslice.io/guest`. The variants are `toleration`, `label`, `both`
+  (one per marker) and `either` (toleration or label, whatever the marker).
+
+Combinations that work together:
+
+- today: `--guest-node-label=false --guest-marker=toleration`,
+  `guest-today.yaml`, `w9-toleration.yaml`.
+- north star: `--guest-node-label=true --guest-marker=label`,
+  `guest-ns.yaml`, `w9-label.yaml`.
+- both forms (the D-NS-3 flag option): `--guest-node-label=true
+  --guest-marker=both`, either manifest, `w9-both.yaml`.
+
+`guest-ns.yaml` without `--guest-node-label=true` is admitted and runs,
+but has nothing to prefer: the scheduler puts it on any node that fits.
+The two flags need no new RBAC: the Node label is set when the Node is
+created. A cluster admin applies the W9 policies, one copy per namespace:
+
+```sh
+sed 's/__NS__/<namespace>/g' deploy/admission/w9-label.yaml | kubectl apply -f -
+```
+
+The `isGuest` CEL variable of each policy is the guest predicate of the
+matching `--guest-marker`. `internal/provider/guests_internal_test.go`
+checks that they agree and that both manifests steer as described.
 
 ## M1 results (the test cluster, 2026-09-25)
 
