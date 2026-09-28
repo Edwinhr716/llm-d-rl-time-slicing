@@ -3,9 +3,13 @@ package provider
 import (
 	"context"
 
+	"github.com/virtual-kubelet/virtual-kubelet/log"
+	"github.com/virtual-kubelet/virtual-kubelet/node"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 const (
@@ -112,3 +116,19 @@ func (NodeProvider) Ping(ctx context.Context) error { return ctx.Err() }
 
 // NotifyNodeStatus would push status changes (capacity, cordon) to the library. M0 has none.
 func (NodeProvider) NotifyNodeStatus(context.Context, func(*corev1.Node)) {}
+
+// ReRegisterOnNotFound recreates the Node if someone deleted it (for example the cloud node
+// lifecycle controller). template returns the Node to create; with --cordon-while-held it
+// carries the current cordon. The loud log line is how we record that it happened.
+func ReRegisterOnNotFound(client kubernetes.Interface, template func() *corev1.Node) node.ErrorHandler {
+	return func(ctx context.Context, err error) error {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		fresh := template()
+		log.G(ctx).WithField("node", fresh.Name).Warn("Node object was deleted by someone else; re-registering")
+		fresh.ResourceVersion = ""
+		_, err = client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{})
+		return err
+	}
+}
