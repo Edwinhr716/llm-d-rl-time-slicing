@@ -45,6 +45,11 @@ type options struct {
 	kubeconfig                                 string
 	workers                                    int
 
+	// Guest CPU/RAM budget (PENDING LEAD DECISION D-NS-9)
+	guestBudget                      string
+	budgetMarginCPU, budgetMarginMem string
+	budgetRefresh                    time.Duration
+
 	// M1: mirror backend
 	cpuHeadroom, memHeadroom string
 	gpuClaim                 string
@@ -70,6 +75,12 @@ func main() {
 	flag.StringVar(&o.memory, "memory", "32Gi", "advertised memory capacity")
 	flag.StringVar(&o.pods, "pods", "20", "advertised pod capacity")
 	flag.Int64Var(&o.gpus, "gpus", 1, "advertised nvidia.com/gpu capacity")
+	flag.StringVar(&o.guestBudget, "guest-budget", provider.BudgetStatic,
+		"static: advertise --cpu/--memory and cap mirror requests at the headroom flags; "+
+			"computed: advertise host allocatable minus resident requests minus the margin, mirrors keep the guest's requests")
+	flag.StringVar(&o.budgetMarginCPU, "budget-margin-cpu", "250m", "computed budget: cpu kept free on the host")
+	flag.StringVar(&o.budgetMarginMem, "budget-margin-memory", "1Gi", "computed budget: memory kept free on the host")
+	flag.DurationVar(&o.budgetRefresh, "budget-refresh", 30*time.Second, "computed budget: recompute interval (0 = once at start)")
 	flag.StringVar(&o.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "kubeconfig path; empty means in-cluster")
 	flag.IntVar(&o.workers, "workers", 4, "pod sync workers")
 
@@ -203,8 +214,20 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if mopts.MemoryHeadroom, err = resource.ParseQuantity(o.memHeadroom); err != nil {
 		return fmt.Errorf("--mirror-memory-headroom: %w", err)
 	}
+	bo := provider.BudgetOptions{Mode: o.guestBudget, Refresh: o.budgetRefresh}
+	if bo.MarginCPU, err = resource.ParseQuantity(o.budgetMarginCPU); err != nil {
+		return fmt.Errorf("--budget-margin-cpu: %w", err)
+	}
+	if bo.MarginMemory, err = resource.ParseQuantity(o.budgetMarginMem); err != nil {
+		return fmt.Errorf("--budget-margin-memory: %w", err)
+	}
+	mopts.RealRequests = bo.Mode == provider.BudgetComputed
 
-	nodeSpec := provider.NewNodeSpec(cfg)
+	nodeProvider, err := provider.SetupNode(ctx, client, host, &cfg, &bo)
+	if err != nil {
+		return err
+	}
+	nodeSpec := *nodeProvider.Node()
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
 		return err
 	}
@@ -223,7 +246,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, mopts)
-			return provider.New(backend), provider.NodeProvider{}, nil
+			return provider.New(backend), nodeProvider, nil
 		},
 		nodeutil.WithClient(client),
 		func(c *nodeutil.NodeConfig) error {
@@ -235,7 +258,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			// the mirror, so the guest kubelet never needs it.
 			c.SkipDownwardAPIResolution = true
 			c.HTTPListenAddr = fmt.Sprintf(":%d", o.kubeletPort) // no TLS config, so no server starts yet
-			c.NodeStatusUpdateErrorHandler = reRegisterOnNotFound(client, &nodeSpec)
+			c.NodeStatusUpdateErrorHandler = reRegisterOnNotFound(client, nodeProvider.Node)
 			return nil
 		},
 	)
@@ -285,13 +308,13 @@ func ensureProviderID(ctx context.Context, client kubernetes.Interface, name, id
 
 // reRegisterOnNotFound recreates the Node if someone deleted it (for example the cloud
 // node lifecycle controller). The loud log line is how we record that it happened.
-func reRegisterOnNotFound(client kubernetes.Interface, spec *corev1.Node) node.ErrorHandler {
+func reRegisterOnNotFound(client kubernetes.Interface, current func() *corev1.Node) node.ErrorHandler {
 	return func(ctx context.Context, err error) error {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
-		log.G(ctx).WithField("node", spec.Name).Warn("Node object was deleted by someone else; re-registering")
-		fresh := spec.DeepCopy()
+		fresh := current() // the template, with the current budget
+		log.G(ctx).WithField("node", fresh.Name).Warn("Node object was deleted by someone else; re-registering")
 		fresh.ResourceVersion = ""
 		_, err = client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{})
 		return err

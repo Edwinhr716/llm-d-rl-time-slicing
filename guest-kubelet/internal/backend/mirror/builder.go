@@ -46,6 +46,11 @@ type Config struct {
 	// is rejected (OutOfcpu/OutOfmemory) on a full trainer node. Zero means "do not cap".
 	CPUHeadroom    resource.Quantity
 	MemoryHeadroom resource.Quantity
+	// RealRequests (--guest-budget=computed, PENDING LEAD DECISION D-NS-9) gives each mirror
+	// container the guest's requests unchanged and ignores the headroom caps: the VK Node then
+	// advertises only what the host can hold, so the real kubelet's fit check passes. False is
+	// today's behaviour (--guest-budget=static): requests capped at the headroom.
+	RealRequests bool
 	// GPUClaim is the ResourceClaim (in the guest's namespace) that replaces nvidia.com/gpu.
 	// Empty means guests asking for a GPU are refused.
 	GPUClaim string
@@ -203,9 +208,9 @@ func tolerated(tols []corev1.Toleration, want corev1.Toleration) bool {
 	return false
 }
 
-// mirrorResources caps requests at the headroom and swaps the GPU for the claim. Limits are
-// kept (a memory limit is what protects the trainer from the guest), except that a capped
-// request never exceeds its limit.
+// mirrorResources caps requests at the headroom (static mode; computed mode keeps the guest's
+// requests) and swaps the GPU for the claim. Limits are kept (a memory limit is what protects
+// the trainer from the guest), except that a capped request never exceeds its limit.
 func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev1.ResourceRequirements {
 	out := *in.DeepCopy()
 	delete(out.Requests, GPUResource)
@@ -223,8 +228,11 @@ func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev
 			out.Requests[name] = lim.DeepCopy()
 		}
 	}
-	capAt(out.Requests, corev1.ResourceCPU, cfg.CPUHeadroom)
-	capAt(out.Requests, corev1.ResourceMemory, cfg.MemoryHeadroom)
+	if !cfg.RealRequests {
+		// --guest-budget=static
+		capAt(out.Requests, corev1.ResourceCPU, cfg.CPUHeadroom)
+		capAt(out.Requests, corev1.ResourceMemory, cfg.MemoryHeadroom)
+	}
 	if gpu {
 		out.Claims = append(out.Claims, corev1.ResourceClaim{Name: ClaimRefName})
 	}
@@ -272,4 +280,37 @@ func rewriteDownwardEnv(env []corev1.EnvVar, guest *corev1.Pod) []corev1.EnvVar 
 		env[i].Value, env[i].ValueFrom = val, nil
 	}
 	return env
+}
+
+// Resources is what the "mirror resources" log line reports for one mirror.
+type Resources struct {
+	ReqCPU, ReqMemory, LimMemory resource.Quantity
+	// Capped is true when any container's request is below the guest's (its request, or its
+	// limit when it has none): the static-mode cap applied.
+	Capped bool
+}
+
+// ResourceSummary sums the mirror's container requests and memory limits.
+func ResourceSummary(guest, mirrorPod *corev1.Pod) *Resources {
+	out := &Resources{}
+	for i := range mirrorPod.Spec.Containers {
+		got := mirrorPod.Spec.Containers[i].Resources
+		out.ReqCPU.Add(got.Requests[corev1.ResourceCPU])
+		out.ReqMemory.Add(got.Requests[corev1.ResourceMemory])
+		out.LimMemory.Add(got.Limits[corev1.ResourceMemory])
+		if i >= len(guest.Spec.Containers) {
+			continue
+		}
+		in := guest.Spec.Containers[i].Resources
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			want, ok := in.Requests[name]
+			if !ok {
+				want, ok = in.Limits[name]
+			}
+			if req := got.Requests[name]; ok && req.Cmp(want) < 0 {
+				out.Capped = true
+			}
+		}
+	}
+	return out
 }

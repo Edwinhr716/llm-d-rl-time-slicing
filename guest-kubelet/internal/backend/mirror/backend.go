@@ -227,6 +227,7 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	switch {
 	case err == nil:
 		logger.WithField("mirrorUID", m.UID).Info("mirror created")
+		logResources(logger, ResourceSummary(guest, m))
 	case apierrors.IsAlreadyExists(err):
 		if m, err = b.adoptOrReplace(ctx, guest, want); err != nil {
 			return err
@@ -242,6 +243,14 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	}
 	b.emit(TranslateStatus(guest, m))
 	return nil
+}
+
+// logResources is the "mirror resources" line: what the mirror requests and whether the
+// static-mode cap applied.
+func logResources(logger log.Logger, res *Resources) {
+	logger.WithField("req_cpu", res.ReqCPU.String()).WithField("req_memory", res.ReqMemory.String()).
+		WithField("lim_memory", res.LimMemory.String()).WithField("capped", res.Capped).
+		Info("mirror resources")
 }
 
 // adoptOrReplace handles a name clash with an existing mirror.
