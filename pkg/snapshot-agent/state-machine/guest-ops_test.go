@@ -103,9 +103,9 @@ func future() time.Time {
 }
 
 // newGuestSM returns a StateManager with guestJob registered in state.
-func newGuestSM(t *testing.T, state pb.JobState, opts ...statemachine.Option) *statemachine.StateManager {
+func newGuestSM(t *testing.T, state pb.JobState) *statemachine.StateManager {
 	t.Helper()
-	sm := statemachine.NewStateManager(opts...)
+	sm := statemachine.NewStateManager()
 	setJob(t, sm, state, pb.Outcome_OUTCOME_UNSPECIFIED)
 	return sm
 }
@@ -573,36 +573,15 @@ func TestGuestOp_JobStatusFields(t *testing.T) {
 	}
 }
 
-func TestGuestOp_ReportResumedOutcome(t *testing.T) {
-	tests := []struct {
-		name string
-		opts []statemachine.Option
-		want pb.Outcome
-	}{
-		{name: "default keeps RESUMED", want: pb.Outcome_OUTCOME_RESUMED},
-		{
-			name: "explicit true",
-			opts: []statemachine.Option{statemachine.WithReportResumedOutcome(true)},
-			want: pb.Outcome_OUTCOME_RESUMED,
-		},
-		{
-			name: "false reports no outcome",
-			opts: []statemachine.Option{statemachine.WithReportResumedOutcome(false)},
-			want: pb.Outcome_OUTCOME_UNSPECIFIED,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sm := newGuestSM(t, pb.JobState_JOB_STATE_SUSPENDED, tt.opts...)
-			opID := startGuest(t, sm, statemachine.OpTypeResume, 1, instant(statemachine.GuestResult{}, nil))
-			checkComplete(t, waitForOperation(t, sm, opID), tt.want)
-			checkJobState(t, sm, guestJob, pb.JobState_JOB_STATE_RUNNING)
+func TestGuestOp_ResumeReportsResumed(t *testing.T) {
+	sm := newGuestSM(t, pb.JobState_JOB_STATE_SUSPENDED)
+	opID := startGuest(t, sm, statemachine.OpTypeResume, 1, instant(statemachine.GuestResult{}, nil))
+	checkComplete(t, waitForOperation(t, sm, opID), pb.Outcome_OUTCOME_RESUMED)
+	checkJobState(t, sm, guestJob, pb.JobState_JOB_STATE_RUNNING)
 
-			// A Resume of a RUNNING job completes at once with the same outcome.
-			opID = startGuest(t, sm, statemachine.OpTypeResume, 2, mustNotRun(t))
-			checkComplete(t, waitForOperation(t, sm, opID), tt.want)
-		})
-	}
+	// A Resume of a RUNNING job completes at once with the same outcome.
+	opID = startGuest(t, sm, statemachine.OpTypeResume, 2, mustNotRun(t))
+	checkComplete(t, waitForOperation(t, sm, opID), pb.Outcome_OUTCOME_RESUMED)
 }
 
 func TestGuestOp_Deadlines(t *testing.T) {

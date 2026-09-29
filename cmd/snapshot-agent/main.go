@@ -27,7 +27,6 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/gpucr"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
-	statemachine "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/tpu"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
@@ -45,10 +44,6 @@ func main() {
 	defaultBackend := flag.String("default-backend", string(backends.BackendCuda),
 		"Backend used when a request carries no backend_config (the orchestrator never sends one, "+
 			"so this selects the backend for orchestrator-driven snapshots/restores)")
-	// PENDING LEAD DECISION ("drop RESUMED" scope): the default keeps
-	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
-	reportResumed := flag.Bool("report-resumed-outcome", true,
-		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
 	flag.Parse()
 
 	depMode := *deploymentMode
@@ -162,10 +157,9 @@ func main() {
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed)
+		"featureGates", featureGates.String())
 	err = server.StartServer(
-		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
-		statemachine.WithReportResumedOutcome(*reportResumed))
+		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)

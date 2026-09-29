@@ -203,7 +203,7 @@ func (sm *StateManager) answerByStateLocked(
 	switch job.State {
 	case pb.JobState_JOB_STATE_RUNNING:
 		if intent == OpTypeResume {
-			return sm.completeGuestLocked(job, intent, epoch, sm.resumedOutcome()), nil
+			return sm.completeGuestLocked(job, intent, epoch, pb.Outcome_OUTCOME_RESUMED), nil
 		}
 	case pb.JobState_JOB_STATE_SAVED, pb.JobState_JOB_STATE_SUSPENDED:
 		// Both calls run their pipeline; every step observes first.
@@ -306,7 +306,7 @@ func (sm *StateManager) runGuest(
 	job.HostBytesPinned = res.HostBytesPinned
 	switch {
 	case op.Type == OpTypeResume:
-		op.Outcome = sm.resumedOutcome()
+		op.Outcome = pb.Outcome_OUTCOME_RESUMED
 		job.State = pb.JobState_JOB_STATE_RUNNING
 	case res.Outcome == pb.Outcome_OUTCOME_SUSPENDED:
 		op.Outcome = res.Outcome
@@ -509,13 +509,6 @@ func (sm *StateManager) newCompletedOpLocked(jobID string, opType OpType, outcom
 	}
 	sm.operations[op.ID] = op
 	return op
-}
-
-func (sm *StateManager) resumedOutcome() pb.Outcome {
-	if sm.reportResumed {
-		return pb.Outcome_OUTCOME_RESUMED
-	}
-	return pb.Outcome_OUTCOME_UNSPECIFIED
 }
 
 // expired reports whether a finished operation is past OperationTTL.
