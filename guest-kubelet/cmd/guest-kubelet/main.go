@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/era"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
 
@@ -61,6 +63,10 @@ type options struct {
 	// D-VK-2 option c: one-shot deregistration (end of an era).
 	deregister bool
 }
+
+// eraFlags holds the D-NS-13 option ns-era flags: end the era after a TTL (--era-ttl=0 = never,
+// today's behaviour). runEras fills in the host and virtual Node names.
+var eraFlags era.Config
 
 func main() {
 	var o options
@@ -94,6 +100,16 @@ func main() {
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
 	flag.BoolVar(&o.deregister, "deregister", false,
 		"one-shot: delete the virtual Node, remove its finalizer and exit (end of an era; stop the serving VK first)")
+	flag.DurationVar(&eraFlags.EraTTL, "era-ttl", 0,
+		"end the era after this long with no donor pods on the host and no lock activity: expire guests, deregister the Node, "+
+			"wait for a donor pod (0 = never, keep the Node and guests)")
+	flag.StringVar(&eraFlags.Trigger, "era-trigger", era.TriggerEither,
+		"what ends the era: ttl, label (the host loses its group label) or either")
+	flag.StringVar(&eraFlags.LabelKeys, "era-label-keys", era.LabelKeysPrefix,
+		"host group label form: prefix (group.timeslice.io/<group>=true) or ns (timeslice.io/group=<group>)")
+	flag.StringVar(&eraFlags.Group, "era-group", "", "group the host yields to (empty: read from the host's labels each era)")
+	flag.StringVar(&eraFlags.DonorSelector, "donor-selector", era.DefaultDonorSelector,
+		"label selector for donor pods on the host; while one runs, the era does not count down")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -203,8 +219,111 @@ func runWithLeaderElection(ctx context.Context, client kubernetes.Interface, o o
 	return nil
 }
 
-// runKubelet is the M0 wiring plus the mirror backend.
+// runKubelet runs the kubelet role. With --era-ttl=0 it is one node run for the life of the
+// process (today's behaviour); otherwise the era controller stops and restarts node runs.
 func runKubelet(ctx context.Context, client kubernetes.Interface, o options) error {
+	if eraFlags.EraTTL <= 0 {
+		return runNode(ctx, client, &o, nil)
+	}
+	return runEras(ctx, client, &o)
+}
+
+// eraGate is what a node run needs from the era controller.
+type eraGate interface {
+	provider.Gate
+	MirrorDeletedReason() string
+}
+
+// nodeRunner starts and stops node runs for the era controller (D-NS-13 hooks Start and Stop).
+type nodeRunner struct {
+	client kubernetes.Interface
+	o      *options
+	gate   eraGate
+	errs   chan error // a node run that ended on its own
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (r *nodeRunner) Start(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cancel != nil {
+		return nil // already running
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	r.cancel, r.done = cancel, done
+	go func() {
+		defer close(done)
+		err := runNode(runCtx, r.client, r.o, r.gate)
+		if runCtx.Err() != nil {
+			return // stopped by Stop or shutdown
+		}
+		if err == nil {
+			err = errors.New("node run ended")
+		}
+		select {
+		case r.errs <- err:
+		default:
+		}
+	}()
+	return nil
+}
+
+func (r *nodeRunner) Stop(ctx context.Context) {
+	r.mu.Lock()
+	cancel, done := r.cancel, r.done
+	r.cancel, r.done = nil, nil
+	r.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
+	log.G(ctx).WithField("node", r.o.nodeName).Info("node controllers stopped")
+}
+
+// runEras runs the era controller (D-NS-13 option ns-era) around node runs.
+func runEras(ctx context.Context, client kubernetes.Interface, o *options) error {
+	eb := record.NewBroadcaster()
+	eb.StartRecordingToSink(&corev1client.EventSinkImpl{Interface: client.CoreV1().Events(corev1.NamespaceAll)})
+	defer eb.Shutdown()
+	recorder := eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "era")})
+
+	r := &nodeRunner{client: client, o: o, errs: make(chan error, 1)}
+	// No orchestrator client on this base: the lock source is nil, so only donor pods and the
+	// host label count. The VK-A6 poll loop supplies it after the rebase.
+	cfg := eraFlags
+	cfg.Host, cfg.VKNode = o.hostNode, o.nodeName
+	c, err := era.New(client, nil, time.Now, &cfg, era.Hooks{Start: r.Start, Stop: r.Stop, Recorder: recorder})
+	if err != nil {
+		return err
+	}
+	r.gate = c
+	defer r.Stop(ctx)
+	if err := r.Start(ctx); err != nil {
+		return err
+	}
+	eraErr := make(chan error, 1)
+	go func() { eraErr <- c.Run(ctx) }()
+	select {
+	case err := <-r.errs:
+		return err
+	case err := <-eraErr:
+		if err == nil {
+			err = ctx.Err()
+		}
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// runNode is one node run: the M0 wiring plus the mirror backend. gate is nil with
+// --era-ttl=0, so today's path is unchanged.
+func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate eraGate) error {
 	host, err := client.CoreV1().Nodes().Get(ctx, o.hostNode, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get host node %s: %w", o.hostNode, err)
@@ -263,7 +382,12 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, mopts)
-			return provider.New(backend), provider.NodeProvider{}, nil
+			p := provider.New(backend)
+			if gate != nil {
+				p.WithGate(gate)
+				backend.SetDeletedReason(gate.MirrorDeletedReason)
+			}
+			return p, provider.NodeProvider{}, nil
 		},
 		nodeutil.WithClient(client),
 		func(c *nodeutil.NodeConfig) error {

@@ -76,6 +76,28 @@ func TestCreateAndDeleteOnlyGuests(t *testing.T) {
 	}
 }
 
+type closedGate struct{ refused []string }
+
+func (g *closedGate) Admit(_ context.Context, pod *corev1.Pod) bool {
+	g.refused = append(g.refused, pod.Name)
+	return false
+}
+
+func TestCreatePodGate(t *testing.T) {
+	b := &fakeBackend{}
+	g := &closedGate{}
+	p := New(b).WithGate(g)
+	if err := p.CreatePod(context.Background(), guestPod("g")); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.created) != 0 || len(g.refused) != 1 {
+		t.Errorf("closed gate: created %v refused %v", b.created, g.refused)
+	}
+	if err := New(b).WithGate(nil).CreatePod(context.Background(), guestPod("g")); err != nil || len(b.created) != 1 {
+		t.Errorf("no gate: err %v created %v", err, b.created)
+	}
+}
+
 func TestNotifyPodsFiltersNonGuests(t *testing.T) {
 	b := &fakeBackend{}
 	p := New(b)

@@ -26,13 +26,26 @@ type Backend interface {
 	SetStatusCallback(func(*corev1.Pod))
 }
 
+// Gate decides whether a guest may get a mirror. The era (D-NS-13) closes it at era end: a
+// refused guest gets no mirror, and the gate is responsible for its status.
+type Gate interface {
+	Admit(ctx context.Context, pod *corev1.Pod) bool
+}
+
 // Provider implements nodeutil.Provider and node.PodNotifier on top of a Backend.
 type Provider struct {
 	backend Backend
+	gate    Gate
 }
 
 // New returns a provider backed by b.
 func New(b Backend) *Provider { return &Provider{backend: b} }
+
+// WithGate sets the admission gate (nil: every guest is admitted) and returns p.
+func (p *Provider) WithGate(g Gate) *Provider {
+	p.gate = g
+	return p
+}
 
 // IsGuest reports whether a pod is meant for this node: it must tolerate the guest taint
 // by key. System DaemonSets that tolerate everything ({operator: Exists}, no key) do not count,
@@ -62,6 +75,10 @@ func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if !IsGuest(pod) {
 		log.G(ctx).WithField("pod", key(pod)).Debug("ignoring non-guest pod")
+		return nil
+	}
+	if p.gate != nil && !p.gate.Admit(ctx, pod) {
+		log.G(ctx).WithField("pod", key(pod)).Info("guest refused: the era has ended")
 		return nil
 	}
 	return p.backend.Create(ctx, pod)

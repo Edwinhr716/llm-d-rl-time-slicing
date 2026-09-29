@@ -264,3 +264,30 @@ func TestGuestRemovedWhenMirrorStops(t *testing.T) {
 		t.Error("guest should be deleted once its mirror is gone")
 	}
 }
+
+func TestMirrorDeletedReasonHook(t *testing.T) {
+	h := newHarness(t, testOptions())
+	g := cpuGuest("g1")
+	h.addGuest(g)
+	m, err := Build(g, testOptions().Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := func() *corev1.Pod { e := h.emittedPods(); return e[len(e)-1] }
+
+	h.b.mirrorDeleted(m)
+	if r := last().Status.Reason; r != ReasonMirrorDeleted {
+		t.Errorf("no hook: reason %q", r)
+	}
+	reason := ""
+	h.b.SetDeletedReason(func() string { return reason })
+	h.b.mirrorDeleted(m)
+	if r := last().Status.Reason; r != ReasonMirrorDeleted {
+		t.Errorf("empty answer: reason %q", r)
+	}
+	reason = "EraEnded"
+	h.b.mirrorDeleted(m)
+	if p := last(); p.Status.Reason != "EraEnded" || p.Status.Phase != corev1.PodFailed {
+		t.Errorf("hook: reason %q phase %s", p.Status.Reason, p.Status.Phase)
+	}
+}

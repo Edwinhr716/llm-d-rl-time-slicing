@@ -45,9 +45,31 @@ type Backend struct {
 	mirrors corev1listers.PodLister
 	synced  cache.InformerSynced
 
-	mu          sync.Mutex
-	onStatus    func(*corev1.Pod) // the library's notify callback, wrapped by the provider
-	orphanSince map[types.UID]time.Time
+	mu            sync.Mutex
+	onStatus      func(*corev1.Pod) // the library's notify callback, wrapped by the provider
+	orphanSince   map[types.UID]time.Time
+	deletedReason func() string // overrides ReasonMirrorDeleted when it returns non-empty
+}
+
+// SetDeletedReason installs fn, asked for the guest's status reason when its mirror is deleted
+// by someone other than the guest's own deletion. An empty answer keeps ReasonMirrorDeleted.
+// The era (D-NS-13) answers EraEnded while it expires guests.
+func (b *Backend) SetDeletedReason(fn func() string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deletedReason = fn
+}
+
+func (b *Backend) mirrorDeletedReason() string {
+	b.mu.Lock()
+	fn := b.deletedReason
+	b.mu.Unlock()
+	if fn != nil {
+		if r := fn(); r != "" {
+			return r
+		}
+	}
+	return ReasonMirrorDeleted
 }
 
 // New builds the backend. guests must list the pods bound to the virtual node.
@@ -138,7 +160,7 @@ func (b *Backend) mirrorDeleted(obj any) {
 		return
 	}
 	if g.DeletionTimestamp == nil {
-		b.emit(TerminalStatus(g, m, ReasonMirrorDeleted))
+		b.emit(TerminalStatus(g, m, b.mirrorDeletedReason()))
 		return
 	}
 	b.emit(TerminalStatus(g, m, ReasonGuestDeleted))
