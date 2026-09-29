@@ -264,3 +264,38 @@ func TestGuestRemovedWhenMirrorStops(t *testing.T) {
 		t.Error("guest should be deleted once its mirror is gone")
 	}
 }
+
+// Lead decision D-VK-5 option c: a readiness-gate change on the guest re-emits its status at
+// once, without a mirror event.
+func TestGuestProbePolicy_C_WatchReadinessGates(t *testing.T) {
+	harn := newHarness(t, testOptions())
+	guest := cpuGuest("g1") // gate timeslice.io/serving, not set
+	ctx := t.Context()
+	if _, err := harn.client.CoreV1().Pods("ns").Create(ctx, guest, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	harn.addGuest(guest)
+	if err := harn.b.Create(ctx, guest); err != nil {
+		t.Fatal(err)
+	}
+	harn.waitInformer("g1")
+	if err := harn.b.WatchReadinessGates(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := len(harn.emittedPods())
+	updated := guest.DeepCopy()
+	updated.Status.Conditions = []corev1.PodCondition{{Type: "timeslice.io/serving", Status: corev1.ConditionTrue}}
+	if _, err := harn.client.CoreV1().Pods("ns").UpdateStatus(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, pod := range harn.emittedPods()[before:] {
+			if c := findCondition(pod.Status.Conditions, "timeslice.io/serving"); c != nil && c.Status == corev1.ConditionTrue {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("a gate change must re-emit the guest's status with the new gate")
+}

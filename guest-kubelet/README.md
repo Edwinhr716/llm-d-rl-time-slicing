@@ -46,6 +46,14 @@ kubelet for the guest pods scheduled onto it.
   not in `--gpu-allowlist` (default `nvidia-l4`; no label fails closed).
   The guest gets a Warning event `GuestRejected` naming the rule and goes
   `Failed` with reason `GuestRejected`.
+- Which probes a guest may carry is lead decision D-VK-5, selected with
+  `--guest-probe-policy` (default `a`, the rule above). `b` refuses every
+  probe and readiness gates. `c` refuses none: liveness probes are dropped,
+  the VK runs readiness and startup probes of any kind (exec through
+  `pods/exec` on the mirror, gRPC health), holds Ready false until the
+  startup probe passes and until every readiness gate is true, and its
+  status writes keep the gate conditions (`internal/backend/mirror/gates.go`).
+  The mirror carries no probes under every policy.
 - A GPU mirror container's memory limit is its limit (or request) plus
   the device reserve, `ceil(--gpu-memory x --mirror-memory-factor)`
   (defaults `23034Mi` x `1.1`, about 24.7 GiB).
@@ -68,6 +76,7 @@ cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wi
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
 internal/provider/admission.go       admission: probes, gates, GPU allowlist
+internal/provider/probepolicy.go     --guest-probe-policy (D-VK-5 a, b, c); probes_b.go
 internal/provider/events.go          drops events about non-guest pods
 internal/keeper/keeper.go            outage guard (keeps the Node Lease fresh)
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
@@ -75,6 +84,9 @@ internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
 internal/backend/mirror/claim.go     optional reservedFor write (kube-controller-manager also does it)
 internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
+internal/probe/startup.go            startup gate (D-VK-5 c)
+internal/probe/handlers.go           exec and gRPC probes (D-VK-5 c)
+internal/backend/mirror/gates.go     readiness gates kept on status writes (D-VK-5 c)
 internal/probe/debug.go              debug endpoint: override, Ready edges
 cmd/q5-measure/main.go               Q5 timings; runs in a pod
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service

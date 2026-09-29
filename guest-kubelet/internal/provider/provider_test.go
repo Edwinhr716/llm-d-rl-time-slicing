@@ -291,3 +291,102 @@ func TestCreatePodRejects(t *testing.T) {
 		t.Errorf("an admitted guest keeps its ProviderCreateSuccess; events=%d", n)
 	}
 }
+
+// Lead decision D-VK-5 (--guest-probe-policy). Each case is one probe shape; want holds the rule
+// each option rejects it with ("" = admitted), in the order a, b, c.
+
+func grpcProbe() *corev1.Probe {
+	return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 9000}}}
+}
+
+type probeCase struct {
+	name string
+	mut  func(*corev1.Pod)
+	want [3]string
+}
+
+func probeCases() []probeCase {
+	return []probeCase{
+		{"no probes", func(*corev1.Pod) {}, [3]string{"", "", ""}},
+		{"httpGet readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = httpProbe() },
+			[3]string{"", "readiness-probe", ""}},
+		{"tcpSocket readiness", func(p *corev1.Pod) {
+			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{}}}
+		}, [3]string{"", "readiness-probe", ""}},
+		{"exec readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = execProbe() },
+			[3]string{"readiness-probe-exec", "readiness-probe", ""}},
+		{"grpc readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = grpcProbe() },
+			[3]string{"readiness-probe-grpc", "readiness-probe", ""}},
+		{"liveness", func(p *corev1.Pod) { p.Spec.Containers[0].LivenessProbe = httpProbe() },
+			[3]string{"liveness-probe", "liveness-probe", ""}},
+		{"startup", func(p *corev1.Pod) { p.Spec.Containers[0].StartupProbe = httpProbe() },
+			[3]string{"startup-probe", "startup-probe", ""}},
+		{"stock chart: startup, liveness and readiness", func(p *corev1.Pod) {
+			p.Spec.Containers[0].StartupProbe = httpProbe()
+			p.Spec.Containers[0].LivenessProbe = httpProbe()
+			p.Spec.Containers[0].ReadinessProbe = httpProbe()
+		}, [3]string{"liveness-probe", "liveness-probe", ""}},
+		{"sidecar readiness", func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "side", ReadinessProbe: httpProbe()}}
+		}, [3]string{"", "readiness-probe", ""}},
+		{"readiness gate", func(p *corev1.Pod) {
+			p.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: "x/ready"}}
+		}, [3]string{"readiness-gates", "readiness-gates", ""}},
+	}
+}
+
+func checkProbeCases(t *testing.T, pol ProbePolicy, idx int) {
+	t.Helper()
+	for _, tc := range probeCases() {
+		pod := guestPod("g")
+		tc.mut(pod)
+		policy := l4Policy()
+		policy.Probes = pol
+		rej, want := Admit(pod, policy), tc.want[idx]
+		switch {
+		case want == "" && rej != nil:
+			t.Errorf("policy %q, %s: rejected (%v), want admitted", pol, tc.name, rej)
+		case want != "" && (rej == nil || rej.Rule != want):
+			t.Errorf("policy %q, %s: got %v, want rule %s", pol, tc.name, rej, want)
+		}
+	}
+}
+
+func TestGuestProbePolicy_A_Admit(t *testing.T) {
+	checkProbeCases(t, ProbePolicyA, 0)
+	checkProbeCases(t, "", 0) // unset is the default, option a
+}
+
+func TestGuestProbePolicy_B_Admit(t *testing.T) {
+	checkProbeCases(t, ProbePolicyB, 1)
+	pod := guestPod("g")
+	pod.Spec.Containers[0].ReadinessProbe = httpProbe()
+	policy := l4Policy()
+	policy.Probes = ProbePolicyB
+	if rej := Admit(pod, policy); rej == nil || !strings.Contains(rej.Message, `container "c" has a readinessProbe`) {
+		t.Errorf("the message must name the container and the field: %v", rej)
+	}
+}
+
+func TestGuestProbePolicy_C_Admit(t *testing.T) {
+	checkProbeCases(t, ProbePolicyC, 2)
+	// Option c still applies the GPU rules.
+	policy := l4Policy()
+	policy.Probes = ProbePolicyC
+	if rej := Admit(withGPU(guestPod("g"), "nvidia.com/mig-1g.10gb"), policy); rej == nil {
+		t.Error("option c must not bypass the GPU checks")
+	}
+}
+
+func TestGuestProbePolicy_Parse(t *testing.T) {
+	for in, want := range map[string]ProbePolicy{"": ProbePolicyA, "a": ProbePolicyA, "b": ProbePolicyB, "c": ProbePolicyC} {
+		if got, err := ParseProbePolicy(in); err != nil || got != want {
+			t.Errorf("%q: got %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"A", "d", "none"} {
+		if _, err := ParseProbePolicy(in); err == nil {
+			t.Errorf("%q must be refused", in)
+		}
+	}
+}

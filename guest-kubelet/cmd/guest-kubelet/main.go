@@ -77,6 +77,9 @@ type options struct {
 	// M2: readiness
 	readinessProbes bool
 	debugAddr       string
+
+	// D-VK-5: which probes a guest may carry
+	guestProbePolicy string
 }
 
 // edgeLogSize is how many Ready edges per guest the debug endpoint keeps.
@@ -135,6 +138,10 @@ func main() {
 	// Off by default. The endpoint can force a guest Ready, so only loopback addresses are accepted.
 	flag.StringVar(&o.debugAddr, "debug-addr", "",
 		"loopback host:port for the M2 test hooks (/debug/readiness, /debug/ready-edges); empty disables them")
+	flag.StringVar(&o.guestProbePolicy, "guest-probe-policy", string(provider.ProbePolicyA),
+		"which probes a guest may carry (lead decision D-VK-5): a = only an httpGet or tcpSocket readinessProbe; "+
+			"b = no probes; c = all (liveness dropped, the guest kubelet runs readiness and startup probes of any kind "+
+			"and honours readinessGates)")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -151,7 +158,7 @@ func run(ctx context.Context, o options) error {
 	if o.hostNode == "" || (o.hostIP == "" && !o.nodeKeeper) {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
 	}
-	if err := o.checkDebug(); err != nil {
+	if err := errors.Join(o.checkDebug(), o.checkProbePolicy()); err != nil {
 		return err
 	}
 	if o.nodeName == "" {
@@ -276,11 +283,17 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if mopts.DeviceMemoryReserve, err = mirror.DeviceReserve(gpuMem, o.mirrorMemoryFactor); err != nil {
 		return fmt.Errorf("--mirror-memory-factor: %w", err)
 	}
+	probePolicy, err := o.probePolicy()
+	if err != nil {
+		return err
+	}
 	policy := provider.AdmissionPolicy{
 		GPUAllowlist: provider.ParseGPUAllowlist(o.gpuAllowlist),
 		HostGPUModel: provider.HostGPUModel(host),
+		Probes:       probePolicy,
 	}
 	log.G(ctx).WithField("hostGPUModel", policy.HostGPUModel).WithField("gpuAllowlist", policy.GPUAllowlist).
+		WithField("guestProbePolicy", string(probePolicy)).
 		WithField("deviceMemoryReserve", mopts.DeviceMemoryReserve.String()).Info("admission and mirror memory settings")
 
 	nodeSpec := provider.NewNodeSpec(cfg)
@@ -304,15 +317,27 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	var backend *mirror.Backend
 	var prober *probe.Manager
 	if o.readinessProbes {
-		prober = probe.NewManager(ctx, probe.Options{
+		popts := probe.Options{
 			OnChange: func(namespace, name string) {
 				if backend != nil {
 					backend.Refresh(namespace, name)
 				}
 			},
 			Recorder: recorder,
-		})
+		}
+		if probePolicy == provider.ProbePolicyC {
+			if err := proberOptionsC(&popts, o.kubeconfig, client); err != nil {
+				return err
+			}
+		}
+		prober = probe.NewManager(ctx, popts)
 		mopts.Prober = prober
+	}
+	// D-VK-5 c admits guests with readinessGates: the library's status writes must keep the gate
+	// conditions their owner wrote.
+	libClient := client
+	if probePolicy == provider.ProbePolicyC {
+		libClient = mirror.GateKeepingClient(client)
 	}
 	var edges *probe.EdgeLog
 	if o.debugAddr != "" {
@@ -328,7 +353,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			}
 			return prov, provider.NodeProvider{}, nil
 		},
-		nodeutil.WithClient(client),
+		nodeutil.WithClient(libClient),
 		func(c *nodeutil.NodeConfig) error {
 			c.NodeSpec = nodeSpec
 			c.NumWorkers = o.workers
@@ -349,6 +374,11 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	// GetPod for each guest must already find its mirror (re-adoption, no duplicate create).
 	if err := backend.Start(ctx); err != nil {
 		return err
+	}
+	if probePolicy == provider.ProbePolicyC {
+		if err := backend.WatchReadinessGates(ctx); err != nil {
+			return err
+		}
 	}
 	if edges != nil {
 		go probe.Serve(ctx, o.debugAddr, probe.DebugHandler(prober, edges))
