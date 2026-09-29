@@ -384,6 +384,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		server.WithLendPolicy(fv.lendPolicy),
 		server.WithMinBubble(fv.minBubble),
 		server.WithNoticeTiming(fv.noticeWindow, fv.killBudget),
+		server.WithForegroundWait(fv.foregroundWait),
 	}
 	var hosts *hostcmd.Commander
 	if fv.hostCommandPort > 0 {

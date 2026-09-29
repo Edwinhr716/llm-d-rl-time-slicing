@@ -39,29 +39,36 @@ const (
 	rateLimiterBurst = 100
 )
 
-// ForegroundWaitBlocking is option A for how reconcile waits on a foreground
-// snapshot or restore: it blocks on the agent operation, bounded by
-// Controller.ForegroundOpTimeout. It is the only mode implemented.
-//
-// PENDING LEAD DECISION (foreground wait, A or B): option B, which starts the
-// operation and checks it on a later requeue, is not implemented, and
-// ValidateForegroundWait refuses it until the lead decides.
+// ForegroundWaitBlocking is option A for how a foreground Acquire waits: the
+// Acquire RPC blocks until the job holds the lock with its context loaded, and
+// reconcile blocks on the agent operation, bounded by
+// Controller.ForegroundOpTimeout. It is the default.
 const ForegroundWaitBlocking = "blocking"
 
-// ForegroundWaitAsync names option B. It is recognised only so that the
-// error can say why it is refused.
+// ForegroundWaitAsyncPoll is option B as the decision entry words it
+// (PENDING LEAD DECISION D-ORCH-1, option async-poll): an Acquire from a
+// client that opts in with the acquire-mode request metadata returns at once,
+// with success=false until the job is granted, and the client polls. Callers
+// without that metadata (older clients) keep the blocking Acquire. Reconcile
+// is unchanged.
+const ForegroundWaitAsyncPoll = "async-poll"
+
+// ForegroundWaitAsync names the design's option B (reconcile checks the
+// operation on requeue). It is not built on this branch, and is recognised
+// only so that the error can say why it is refused.
 const ForegroundWaitAsync = "async"
 
 // ValidateForegroundWait checks a --foreground-wait value.
 func ValidateForegroundWait(mode string) error {
 	switch mode {
-	case ForegroundWaitBlocking:
+	case ForegroundWaitBlocking, ForegroundWaitAsyncPoll:
 		return nil
 	case ForegroundWaitAsync:
-		return fmt.Errorf("foreground wait %q (option B) is not implemented (PENDING LEAD DECISION); use %q",
-			mode, ForegroundWaitBlocking)
+		return fmt.Errorf("foreground wait %q (option B, requeue) is not implemented (PENDING LEAD DECISION); use %q or %q",
+			mode, ForegroundWaitBlocking, ForegroundWaitAsyncPoll)
 	default:
-		return fmt.Errorf("unknown foreground wait %q: must be %q", mode, ForegroundWaitBlocking)
+		return fmt.Errorf("unknown foreground wait %q: must be %q or %q",
+			mode, ForegroundWaitBlocking, ForegroundWaitAsyncPoll)
 	}
 }
 
@@ -913,9 +920,44 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 	}
 }
 
+// Outcomes logged on "Foreground operation finished".
+const (
+	foregroundOutcomeComplete  = "complete"
+	foregroundOutcomeFailed    = "failed"
+	foregroundOutcomeTimeout   = "timeout"
+	foregroundOutcomeCancelled = "cancelled"
+)
+
 // waitForOperation blocks until the given snapshot or restore operation on the
-// node completes or fails, or until ForegroundOpTimeout passes.
+// node completes or fails, or until ForegroundOpTimeout passes. It logs
+// "Foreground operation started" and "Foreground operation finished" around
+// the wait (eval hooks, D-ORCH-1).
 func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
+	logCtx := logging.WithOperationID(logging.WithNodeName(ctx, nodeName), operationID)
+	slog.InfoContext(logCtx, "Foreground operation started",
+		"group", groupID, "job", jobID, "operation_id", operationID, "type", operationType)
+
+	err := c.waitForForegroundOperation(ctx, groupID, jobID, nodeName, operationID, operationType)
+
+	outcome := foregroundOutcomeComplete
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrForegroundOpTimeout), errors.Is(err, context.DeadlineExceeded):
+		outcome = foregroundOutcomeTimeout
+	case errors.Is(err, context.Canceled):
+		outcome = foregroundOutcomeCancelled
+	default:
+		outcome = foregroundOutcomeFailed
+	}
+	slog.InfoContext(logCtx, "Foreground operation finished",
+		"group", groupID, "job", jobID, "operation_id", operationID, "type", operationType, "outcome", outcome)
+	return err
+}
+
+// waitForForegroundOperation is waitForOperation without the log lines.
+func (c *Controller) waitForForegroundOperation(
+	ctx context.Context, groupID, jobID, nodeName, operationID, operationType string,
+) error {
 	if c.ForegroundOpTimeout <= 0 {
 		return c.pollOperation(ctx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
 	}

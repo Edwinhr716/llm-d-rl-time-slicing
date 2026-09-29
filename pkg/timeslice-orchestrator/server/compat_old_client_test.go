@@ -172,13 +172,25 @@ func unknownFieldNumbers(t *testing.T, m protoreflect.Message) []protowire.Numbe
 }
 
 func TestCompat_OldClient(t *testing.T) {
+	testOldClient(t)
+}
+
+// TestCompat_OldClient_AsyncPollServer runs the same checks against a server
+// started with --foreground-wait=async-poll: an old client sends no poll
+// metadata, so its Acquire still blocks.
+func TestCompat_OldClient_AsyncPollServer(t *testing.T) {
+	testOldClient(t, asyncPoll())
+}
+
+func testOldClient(t *testing.T, mode ...server.Option) {
+	t.Helper()
 	schema := oldSchema(t)
 
 	t.Run("acquire and yield behave as foreground", func(t *testing.T) {
 		gs, group := backgroundGroup(t, "job-1", true)
 		// The new server runs with every new feature on.
 		oc := &oldClient{t: t, schema: schema, conn: dialServer(t, gs,
-			server.WithBackgroundRole(true), server.WithMinBubble(time.Second))}
+			append([]server.Option{server.WithBackgroundRole(true), server.WithMinBubble(time.Second)}, mode...)...)}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		ids := map[string]string{"job_id": "job-1", "group_id": bgGroup}
@@ -206,7 +218,8 @@ func TestCompat_OldClient(t *testing.T) {
 
 	t.Run("status with new states and fields decodes", func(t *testing.T) {
 		gs, group := backgroundGroup(t, "job-1", true)
-		oc := &oldClient{t: t, schema: schema, conn: dialServer(t, gs, server.WithBackgroundRole(true))}
+		oc := &oldClient{t: t, schema: schema, conn: dialServer(t, gs,
+			append([]server.Option{server.WithBackgroundRole(true)}, mode...)...)}
 		group.Spec().RegisterParticipant(bgNode, bgParticipant, time.Now())
 		group.Spec().Grant(bgNode)
 		group.Spec().UnregisterParticipant(bgNode)

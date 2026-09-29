@@ -58,6 +58,10 @@ type Server struct {
 
 	// Host commands (D-NS-4 ns-push-vk). See WithHostCommander.
 	hosts HostCommander
+
+	// Foreground wait option async-poll. See WithForegroundWait.
+	acquirePoll bool
+	polls       pollTracker
 }
 
 // BackgroundProtocolVersion is the value of GroupStatus.background_protocol
@@ -197,11 +201,17 @@ func (s *Server) Acquire(ctx context.Context, req *pb.AcquireRequest) (*pb.Acqui
 
 	// 2. Request Lock
 	group.Spec().RequestLock(jobID)
-	// Foreground wait, option A: a foreground Acquire while background guests
-	// hold the accelerator starts the notice and keeps blocking below until
-	// they are gone (see defaultCheckAcquire).
+	// A foreground Acquire while background guests hold the accelerator starts
+	// the notice. The blocking wait below, or each poll, keeps failing closed
+	// until they are gone (see defaultCheckAcquire).
 	s.startNoticeIfBackgroundHeld(ctx, group)
 	s.startNoticeIfHostsNotClear(ctx, group)
+
+	// Foreground wait option async-poll: answer at once and let the client poll.
+	if s.acquirePoll && wantsPoll(ctx) {
+		return s.acquirePollOnce(ctx, groupID, jobID, startTime)
+	}
+
 	if s.ctrl != nil {
 		s.ctrl.EnqueueWork(groupID)
 	}
@@ -398,6 +408,9 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 	if role == pb.Role_ROLE_BACKGROUND {
 		return s.yieldBackground(ctx, group, jobID)
 	}
+
+	// A job that yields is not waiting in a poll any more.
+	s.polls.clear(groupID, jobID)
 
 	// 2. Take Snapshot BEFORE Yield
 	snap := group.Snapshot()
