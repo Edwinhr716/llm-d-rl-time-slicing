@@ -131,6 +131,21 @@ func New(config *Config) (*Loop, error) {
 // ParticipantID is the VK's job id and participant id.
 func (l *Loop) ParticipantID() string { return "vk/" + l.cfg.Node }
 
+// Adopt records what a restarted guest kubelet found for a guest (M5), before Run: a suspended
+// guest is resumed at the next grant, a released one is not released again. The mirrors in
+// the API stay the source of truth; this only restores the loop's view of them.
+func (l *Loop) Adopt(guest types.UID, suspended, released bool) {
+	l.guestMu.Lock()
+	defer l.guestMu.Unlock()
+	delete(l.suspended, guest)
+	delete(l.released, guest)
+	if suspended {
+		l.suspended[guest] = true
+	} else if released {
+		l.released[guest] = true
+	}
+}
+
 // GuestWaiting implements provider.CreateOwner: a guest without a mirror arrived. The loop
 // creates its mirror at the next serve pass under a grant.
 func (l *Loop) GuestWaiting(*corev1.Pod) {

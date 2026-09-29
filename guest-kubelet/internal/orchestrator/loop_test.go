@@ -468,3 +468,52 @@ func TestNew_RequiresClientGroupAndHost(t *testing.T) {
 		t.Fatal("New must refuse a config without Client, Group and Host")
 	}
 }
+
+// withMirror gives the test guest a running mirror without a create event, as a restarted
+// guest kubelet finds it (M5).
+func (h *fakeHost) withMirror() types.UID {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	g := h.guests[testGuest]
+	g.Pod.Status.Phase = corev1.PodRunning
+	g.Mirror = &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: testGuest + "-m", Namespace: "ns", UID: types.UID(testGuest + "-m-uid")},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		}},
+	}
+	return g.Pod.UID
+}
+
+func TestLoop_AdoptedSuspendedGuestIsResumedNotCreated(t *testing.T) {
+	fix := newRig(t, 1)
+	fix.host.addGuest()
+	fix.loop.Adopt(fix.host.withMirror(), true, false)
+	fix.start(t)
+	waitEvent(t, fix.ev, "acquire")
+	fix.orch.grant()
+	waitEvent(t, fix.ev, "ready g")
+	before(t, fix.ev, "granted", "resume g-m 1")
+	before(t, fix.ev, "resume g-m 1", "ready g")
+	if fix.ev.count("create") != 0 {
+		t.Errorf("an adopted suspended guest must be resumed, not re-created; events: %v", fix.ev.list())
+	}
+}
+
+func TestLoop_AdoptedReleasedGuestIsNotReleasedAgain(t *testing.T) {
+	fix := newRig(t, 1)
+	fix.host.addGuest()
+	fix.loop.Adopt(fix.host.withMirror(), false, true)
+	fix.start(t)
+	waitEvent(t, fix.ev, "acquire")
+	fix.orch.grant()
+	waitEvent(t, fix.ev, "granted")
+	time.Sleep(300 * time.Millisecond)
+	if n := fix.ev.count("create") + fix.ev.count("ready") + fix.ev.count("resume"); n != 0 {
+		t.Errorf("an adopted released guest needs no create, resume or release; events: %v", fix.ev.list())
+	}
+	// It is still vacated at the next notice.
+	fix.orch.setNotice(2 * time.Second)
+	waitEvent(t, fix.ev, "yield")
+	before(t, fix.ev, "confirm g", "suspend g-m 1")
+}

@@ -2,6 +2,9 @@ package mirror
 
 import (
 	"context"
+	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,13 +23,16 @@ import (
 )
 
 type harness struct {
-	t       *testing.T
-	client  *fake.Clientset
-	guests  cache.Indexer
-	b       *Backend
+	t      *testing.T
+	client *fake.Clientset
+	guests cache.Indexer
+	b      *Backend
 
 	mu      sync.Mutex // the informer goroutine emits too
 	emitted []*corev1.Pod
+	// writeBack stores every emitted guest in the guest lister, as the library's status
+	// write plus its informer would.
+	writeBack bool
 }
 
 func (h *harness) emittedPods() []*corev1.Pod {
@@ -53,6 +59,11 @@ func newHarness(t *testing.T, opts Options, objs ...runtime.Object) *harness {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		h.emitted = append(h.emitted, p)
+		if h.writeBack {
+			if err := idx.Update(p); err != nil {
+				t.Error(err)
+			}
+		}
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -262,5 +273,274 @@ func TestGuestRemovedWhenMirrorStops(t *testing.T) {
 	h.b.finishGuestDeletion(context.Background(), g)
 	if _, err := h.client.CoreV1().Pods("ns").Get(context.Background(), "vllm", metav1.GetOptions{}); err == nil {
 		t.Error("guest should be deleted once its mirror is gone")
+	}
+}
+
+// fakeFreezer records calls and, at each Suspend, whether the guest was already NotReady in
+// the guest lister.
+type fakeFreezer struct {
+	mu          sync.Mutex
+	calls       []string
+	suspendErr  error
+	resumeErr   error
+	readyAtCall []bool
+	guestReady  func() bool
+}
+
+func (f *fakeFreezer) Suspend(_ context.Context, _ *corev1.Pod, epoch int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "freeze:"+strconv.FormatInt(epoch, 10))
+	f.readyAtCall = append(f.readyAtCall, f.guestReady())
+	return f.suspendErr
+}
+
+func (f *fakeFreezer) Resume(_ context.Context, _ *corev1.Pod, epoch int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "thaw:"+strconv.FormatInt(epoch, 10))
+	return f.resumeErr
+}
+
+func (f *fakeFreezer) Frozen(*corev1.Pod) (bool, error) { return false, nil }
+
+func (f *fakeFreezer) record(s string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, s)
+}
+
+func (f *fakeFreezer) callList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+// suspendHarness runs a Ready CPU guest with a running mirror and a fake freezer.
+func suspendHarness(t *testing.T) (*harness, *fakeFreezer) {
+	t.Helper()
+	ff := &fakeFreezer{}
+	opts := testOptions()
+	opts.Suspend = SuspendOptions{
+		Freezer: ff, NotReadyTimeout: 2 * time.Second, FreezeTimeout: time.Second, ReadyTimeout: time.Second,
+		ReadyCheck: func(context.Context, *corev1.Pod, *corev1.Pod) error { ff.record("readycheck"); return nil },
+	}
+	hrn := newHarness(t, opts)
+	guest := cpuGuest("g1")
+	guest.Spec.ReadinessGates = nil // an unset gate would hold Ready false throughout
+	hrn.addGuest(guest)
+	ff.guestReady = func() bool {
+		cur, err := hrn.b.guests.Pods("ns").Get("vllm")
+		return err == nil && IsReady(cur)
+	}
+	if err := hrn.b.Create(context.Background(), guest); err != nil {
+		t.Fatal(err)
+	}
+	mirrorPod := hrn.mirror("vllm-m")
+	mirrorPod.Status = runningMirror().Status
+	if _, err := hrn.client.CoreV1().Pods("ns").UpdateStatus(context.Background(), mirrorPod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if cur, err := hrn.b.mirrors.Pods("ns").Get("vllm-m"); err == nil && cur.Status.PodIP != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			hrn.t.Fatal("informer never saw the running mirror")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// From here on the guest lister follows what the backend emits. Start from Ready, as the
+	// library last wrote it.
+	hrn.mu.Lock()
+	defer hrn.mu.Unlock()
+	ready := guest.DeepCopy()
+	ready.Status = runningMirror().Status
+	if err := hrn.guests.Update(ready); err != nil {
+		t.Fatal(err)
+	}
+	hrn.writeBack = true
+	return hrn, ff
+}
+
+// settled waits until the last emitted guest satisfies ok and returns it. The informer delivers
+// the mirror updates asynchronously, so the last status is only final once it has caught up.
+func (h *harness) settled(what string, ok func(*corev1.Pod) bool) *corev1.Pod {
+	h.t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if e := h.emittedPods(); len(e) > 0 && ok(e[len(e)-1]) {
+			return e[len(e)-1]
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("last emitted guest never became %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func notReady(p *corev1.Pod) bool { return !IsReady(p) }
+
+func TestSuspendResume_NotReadyBeforeFreeze(t *testing.T) {
+	hrn, ff := suspendHarness(t)
+	res, err := hrn.b.Suspend(context.Background(), "ns", "vllm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.State != StateSuspended || res.Epoch != 1 {
+		t.Fatalf("suspend result: %+v", res)
+	}
+	if len(ff.readyAtCall) != 1 || ff.readyAtCall[0] {
+		t.Fatalf("the freeze must come after NotReady is visible: ready at freeze = %v", ff.readyAtCall)
+	}
+	mirrorPod := hrn.mirror("vllm-m")
+	if mirrorPod.Annotations[AnnotationSuspendState] != StateSuspended || mirrorPod.Annotations[AnnotationGuestEpoch] != "1" ||
+		mirrorPod.Annotations[AnnotationSuspendStateSince] == "" {
+		t.Fatalf("mirror annotations: %v", mirrorPod.Annotations)
+	}
+	st := hrn.settled("suspended", func(p *corev1.Pod) bool {
+		c := findCondition(p.Status.Conditions, ConditionSuspended)
+		return c != nil && c.Status == corev1.ConditionTrue
+	}).Status
+	if IsReady(&corev1.Pod{Status: st}) || st.Phase != corev1.PodRunning {
+		t.Fatalf("suspended guest must be Running and NotReady: %+v", st)
+	}
+	cs := st.ContainerStatuses[0]
+	if cs.Ready || cs.State.Waiting == nil || cs.State.Waiting.Reason != StateSuspended || cs.RestartCount != 2 {
+		t.Fatalf("container status: %+v", cs)
+	}
+	if c := findCondition(st.Conditions, ConditionSuspended); c == nil || c.Status != corev1.ConditionTrue {
+		t.Fatalf("condition %s: %+v", ConditionSuspended, st.Conditions)
+	}
+
+	// A second suspend is a no-op.
+	if res, err := hrn.b.Suspend(context.Background(), "ns", "vllm"); err != nil || !res.Noop {
+		t.Fatalf("second suspend: %+v %v", res, err)
+	}
+
+	res, err = hrn.b.Resume(context.Background(), "ns", "vllm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Epoch != 2 || res.State != "Running" {
+		t.Fatalf("resume result: %+v", res)
+	}
+	if got, want := strings.Join(ff.callList(), ","), "freeze:1,thaw:2,readycheck"; got != want {
+		t.Fatalf("calls = %s, want %s", got, want)
+	}
+	mirrorPod = hrn.mirror("vllm-m")
+	if _, ok := mirrorPod.Annotations[AnnotationSuspendState]; ok || mirrorPod.Annotations[AnnotationGuestEpoch] != "2" {
+		t.Fatalf("mirror annotations after resume: %v", mirrorPod.Annotations)
+	}
+	st = hrn.settled("ready", IsReady).Status
+	if !IsReady(&corev1.Pod{Status: st}) || st.ContainerStatuses[0].State.Running == nil ||
+		findCondition(st.Conditions, ConditionSuspended) != nil {
+		t.Fatalf("resumed guest must be Ready and running: %+v", st)
+	}
+}
+
+func TestSuspend_FreezeFailureRevertsToRunning(t *testing.T) {
+	h, ff := suspendHarness(t)
+	ff.suspendErr = errors.New("stuck task")
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err == nil {
+		t.Fatal("want an error")
+	}
+	if got := strings.Join(ff.callList(), ","); got != "freeze:1,thaw:1" {
+		t.Fatalf("a failed freeze must be undone with a thaw: calls = %s", got)
+	}
+	m := h.mirror("vllm-m")
+	if _, ok := m.Annotations[AnnotationSuspendState]; ok {
+		t.Fatalf("state must be cleared: %v", m.Annotations)
+	}
+	h.settled("ready again", IsReady)
+}
+
+func TestSuspend_ThawFailureAfterFreezeFailureStaysNotReady(t *testing.T) {
+	h, ff := suspendHarness(t)
+	ff.suspendErr, ff.resumeErr = errors.New("stuck task"), errors.New("no thaw")
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err == nil {
+		t.Fatal("want an error")
+	}
+	if s := h.mirror("vllm-m").Annotations[AnnotationSuspendState]; s != StateSuspending {
+		t.Fatalf("state = %q, want %s", s, StateSuspending)
+	}
+	h.settled("NotReady", notReady)
+}
+
+func TestResume_ReadyCheckFailureStaysNotReady(t *testing.T) {
+	h, _ := suspendHarness(t)
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err != nil {
+		t.Fatal(err)
+	}
+	h.b.opts.Suspend.ReadyCheck = func(context.Context, *corev1.Pod, *corev1.Pod) error { return errors.New("503") }
+	if _, err := h.b.Resume(context.Background(), "ns", "vllm"); err == nil {
+		t.Fatal("want an error")
+	}
+	if s := h.mirror("vllm-m").Annotations[AnnotationSuspendState]; s != StateResuming {
+		t.Fatalf("state = %q, want %s", s, StateResuming)
+	}
+	h.settled("NotReady", notReady)
+}
+
+// Suspend and Resume return only once the informer shows their final state, so a call issued
+// right after one is judged on that state (a resume right after a suspend is not refused as
+// still Suspending).
+func TestSuspendResume_InformerShowsTheFinalStateOnReturn(t *testing.T) {
+	hrn, _ := suspendHarness(t)
+	informerState := func() string {
+		m, err := hrn.b.mirrors.Pods("ns").Get("vllm-m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.Annotations[AnnotationSuspendState]
+	}
+	for i := range 5 {
+		if _, err := hrn.b.Suspend(context.Background(), "ns", "vllm"); err != nil {
+			t.Fatalf("suspend %d: %v", i, err)
+		}
+		if got := informerState(); got != StateSuspended {
+			t.Fatalf("after suspend %d the informer shows %q, want %s", i, got, StateSuspended)
+		}
+		if _, err := hrn.b.Resume(context.Background(), "ns", "vllm"); err != nil {
+			t.Fatalf("resume right after suspend %d: %v", i, err)
+		}
+		if got := informerState(); got != "" {
+			t.Fatalf("after resume %d the informer shows %q, want running", i, got)
+		}
+	}
+}
+
+func TestSuspend_NoFreezerConfigured(t *testing.T) {
+	h := newHarness(t, testOptions())
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err == nil {
+		t.Fatal("want an error without a freeze backend")
+	}
+}
+
+func TestDelete_ThawsSuspendedMirrorFirst(t *testing.T) {
+	h, ff := suspendHarness(t)
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if m, err := h.b.mirrors.Pods("ns").Get("vllm-m"); err == nil && m.Annotations[AnnotationSuspendState] == StateSuspended {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("informer never saw Suspended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	g, err := h.b.guests.Pods("ns").Get("vllm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.b.Delete(context.Background(), g.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(ff.callList(), ","); got != "freeze:1,thaw:1" {
+		t.Fatalf("calls = %s, want the delete to thaw first", got)
 	}
 }

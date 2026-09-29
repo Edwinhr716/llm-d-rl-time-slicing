@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/freeze"
 	"github.com/edwinhr716/guest-kubelet/internal/probe"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
@@ -64,7 +65,15 @@ type options struct {
 
 	// M2: readiness
 	readinessProbes bool
-	debugAddr       string
+
+	// M3: suspend and resume by cgroup freeze
+	cgroupRoot         string
+	notReadyTimeout    time.Duration
+	freezeTimeout      time.Duration
+	resumeReadyTimeout time.Duration
+
+	// M2 and M3 test hooks
+	debugAddr string
 
 	// VK-A6: orchestrator loop
 	orchAddr         string
@@ -114,15 +123,25 @@ func main() {
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
 	flag.BoolVar(&o.readinessProbes, "readiness-probes", true,
 		"run the guests' readinessProbes (httpGet, tcpSocket) and report Ready from them; false copies the mirror's ready flags (M1)")
-	// Off by default. The endpoint can force a guest Ready, so only loopback addresses are accepted.
+	flag.StringVar(&o.cgroupRoot, "cgroup-root", "/host/cgroup",
+		"host cgroup v2 hierarchy as mounted in this container; empty disables suspend/resume")
+	flag.DurationVar(&o.notReadyTimeout, "suspend-notready-timeout", 5*time.Second,
+		"how long a suspend waits for the guest's Ready=False to reach the API before freezing")
+	flag.DurationVar(&o.freezeTimeout, "freeze-timeout", 10*time.Second, "deadline for each cgroup freeze or thaw")
+	flag.DurationVar(&o.resumeReadyTimeout, "resume-ready-timeout", 60*time.Second,
+		"how long a resume waits for the guest's readiness probe to pass after the thaw")
+	// Off by default. The endpoint can force a guest Ready or freeze it, so only loopback addresses
+	// are accepted.
 	flag.StringVar(&o.debugAddr, "debug-addr", "",
-		"loopback host:port for the M2 test hooks (/debug/readiness, /debug/ready-edges); empty disables them")
+		"loopback host:port for the test hooks (M2: /debug/readiness, /debug/ready-edges; "+
+			"M3: /debug/suspend, /debug/resume); empty disables them")
 	flag.StringVar(&o.orchAddr, "orchestrator-addr", "",
 		"orchestrator gRPC address (host:port); empty turns the orchestrator loop off and mirrors start at once (M1)")
 	flag.StringVar(&o.groupSource, "group-source", groupSourceNodeLabel,
 		"where the VK reads its time-slice group (decision O3): node-label = the real node's group.timeslice.io/<group>=true")
 	flag.StringVar(&o.freezer, "freezer", freezerDelete,
-		"how guests vacate the accelerator: delete = delete the mirror (re-created on the next grant); fake = test freezer")
+		"how guests vacate the accelerator: delete = delete the mirror (re-created on the next grant); "+
+			"fake = test freezer; cgroup = freeze the mirror cgroup (M3, needs --cgroup-root)")
 	flag.DurationVar(&o.liveness, "background-liveness", 3*time.Second,
 		"L: a grant is trusted only within L of a successful status poll")
 	flag.DurationVar(&o.orchPoll, "orchestrator-poll", 500*time.Millisecond, "GetGroupStatus period (the VK heartbeat)")
@@ -164,16 +183,14 @@ func run(ctx context.Context, o options) error {
 	return runWithLeaderElection(ctx, client, o)
 }
 
-// checkDebug validates --debug-addr: loopback only, and only with the prober it drives.
+// checkDebug validates --debug-addr: loopback only. Without --readiness-probes it serves only the
+// M3 hooks.
 func (o *options) checkDebug() error {
 	if o.debugAddr == "" {
 		return nil
 	}
 	if err := probe.CheckLoopback(o.debugAddr); err != nil {
 		return err
-	}
-	if !o.readinessProbes {
-		return errors.New("--debug-addr needs --readiness-probes")
 	}
 	return nil
 }
@@ -278,6 +295,18 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	recorder := provider.GuestOnlyRecorder{
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
+	if o.cgroupRoot != "" {
+		// M3: the guest kubelet freezes the mirror's cgroup itself. M4 swaps this backend for
+		// the snapshot agent.
+		mopts.Suspend = mirror.SuspendOptions{
+			Freezer:         &freeze.Cgroup{Root: o.cgroupRoot},
+			NotReadyTimeout: o.notReadyTimeout,
+			FreezeTimeout:   o.freezeTimeout,
+			ReadyCheck:      mirror.ProbeUntilReady(100*time.Millisecond, probeOnce),
+			ReadyTimeout:    o.resumeReadyTimeout,
+			Recorder:        recorder,
+		}
+	}
 
 	orch, err := newOrchestratorWiring(client, &o)
 	if err != nil {
@@ -300,7 +329,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		mopts.Prober = prober
 	}
 	var edges *probe.EdgeLog
-	if o.debugAddr != "" {
+	if o.debugAddr != "" && prober != nil {
 		edges = probe.NewEdgeLog(edgeLogSize)
 	}
 	n, err := nodeutil.NewNode(o.nodeName,
@@ -342,8 +371,13 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if err := backend.Start(ctx); err != nil {
 		return err
 	}
-	if edges != nil {
-		go probe.Serve(ctx, o.debugAddr, probe.DebugHandler(prober, edges))
+	// M5: rebuild the suspend state, attempt counters and Ready gates a restart lost, from the
+	// API and the host, before the pod controller and the loop act on any guest.
+	if err := orch.relist(ctx, backend); err != nil {
+		return err
+	}
+	if o.debugAddr != "" {
+		go probe.Serve(ctx, o.debugAddr, debugHandler(backend, prober, edges))
 	}
 	orch.start(ctx)
 	go func() {
@@ -395,4 +429,9 @@ func reRegisterOnNotFound(client kubernetes.Interface, spec *corev1.Node) node.E
 		_, err = client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{})
 		return err
 	}
+}
+
+// probeOnce is one readiness probe attempt with the M2 prober's semantics (the resume check).
+func probeOnce(ctx context.Context, podIP string, c *corev1.Container) error {
+	return probe.NetProber{}.Probe(ctx, probe.Target{PodIP: podIP, Container: c})
 }

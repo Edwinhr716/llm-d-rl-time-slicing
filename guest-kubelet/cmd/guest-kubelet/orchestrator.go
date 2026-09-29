@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 
 	pb "github.com/edwinhr716/guest-kubelet/api/timeslice_orchestrator/v1alpha1"
@@ -20,6 +22,7 @@ const (
 	groupSourceNodeLabel = "node-label"
 	freezerDelete        = "delete"
 	freezerFake          = "fake"
+	freezerCgroup        = "cgroup"
 )
 
 // orchestratorWiring builds and runs the orchestrator loop (VK-A6) when --orchestrator-addr
@@ -32,22 +35,28 @@ type orchestratorWiring struct {
 }
 
 func newOrchestratorWiring(client kubernetes.Interface, opts *options) (*orchestratorWiring, error) {
-	w := &orchestratorWiring{client: client, o: opts}
+	wiring := &orchestratorWiring{client: client, o: opts}
 	if opts.orchAddr == "" {
-		return w, nil
+		return wiring, nil
 	}
 	if opts.groupSource != groupSourceNodeLabel {
 		return nil, fmt.Errorf("--group-source=%q: only %q is implemented", opts.groupSource, groupSourceNodeLabel)
 	}
-	if opts.freezer != freezerDelete && opts.freezer != freezerFake {
-		return nil, fmt.Errorf("--freezer=%q: want %q or %q", opts.freezer, freezerDelete, freezerFake)
+	switch opts.freezer {
+	case freezerDelete, freezerFake:
+	case freezerCgroup:
+		if opts.cgroupRoot == "" {
+			return nil, fmt.Errorf("--freezer=%s needs --cgroup-root", freezerCgroup)
+		}
+	default:
+		return nil, fmt.Errorf("--freezer=%q: want %q, %q or %q", opts.freezer, freezerDelete, freezerFake, freezerCgroup)
 	}
 	conn, err := grpc.NewClient(opts.orchAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("dial orchestrator %s: %w", opts.orchAddr, err)
 	}
-	w.conn = conn
-	return w, nil
+	wiring.conn = conn
+	return wiring, nil
 }
 
 // build creates the loop on top of the mirror backend. It returns nil when the loop is off.
@@ -56,10 +65,17 @@ func (w *orchestratorWiring) build(backend *mirror.Backend) (*orchestrator.Loop,
 		return nil, nil //nolint:nilnil // nil loop means the loop is off
 	}
 	var freezer orchestrator.Freezer
-	if w.o.freezer == freezerFake {
+	switch w.o.freezer {
+	case freezerFake:
 		freezer = &orchestrator.FakeFreezer{
 			SuspendDelay: w.o.fakeSuspendDelay, ResumeDelay: w.o.fakeResumeDelay, Annotate: backend.AnnotateMirror,
 		}
+	case freezerCgroup:
+		lf, err := backend.LoopFreezer()
+		if err != nil {
+			return nil, fmt.Errorf("--freezer=%s: %w", freezerCgroup, err)
+		}
+		freezer = lf
 	}
 	loop, err := orchestrator.New(&orchestrator.Config{
 		Node:         w.o.hostNode,
@@ -102,4 +118,37 @@ func (w *orchestratorWiring) close(ctx context.Context) {
 	if err := w.conn.Close(); err != nil {
 		log.G(ctx).WithError(err).Warn("closing the orchestrator connection failed")
 	}
+}
+
+// relist is M5: relist this node's mirrors and rebuild what a restart lost, before the pod
+// controller and the loop start. Only the leader gets here. An error stops the guest kubelet
+// (fail closed): a guest adopted without its suspended state would be served frozen.
+func (w *orchestratorWiring) relist(ctx context.Context, backend *mirror.Backend) error {
+	opts := provider.RecoverOptions{}
+	switch {
+	case w.conn != nil && w.o.freezer == freezerFake:
+		opts.Frozen = func(m *corev1.Pod) (bool, error) {
+			return m.Annotations[orchestrator.AnnotationFakeFreezer] == orchestrator.FakeSuspended, nil
+		}
+	case w.conn != nil && w.o.freezer == freezerDelete:
+		// Mirrors are deleted to vacate, never frozen: no host fact to read.
+	case w.o.cgroupRoot != "":
+		// --freezer=cgroup, or M3 without the loop: the cgroup freezer writes the suspend
+		// state, so the host fact corrects it. Without the host cgroup tree there is no fact.
+		if _, err := os.Stat(w.o.cgroupRoot); err == nil {
+			opts.Frozen = backend.HostFrozen
+			opts.RecordState = true
+		} else {
+			log.G(ctx).WithError(err).Warn("recover: no host cgroup tree; trusting the recorded suspend state")
+		}
+	}
+	if w.loop != nil {
+		opts.OnAdopt = func(a provider.Adopted) { w.loop.Adopt(a.Guest.UID, a.Suspended, a.Released) }
+	}
+	adopted, err := provider.Recover(ctx, backend, opts)
+	if err != nil {
+		return fmt.Errorf("recover: %w", err)
+	}
+	log.G(ctx).WithField("adopted", len(adopted)).Info("recover: relist done")
+	return nil
 }
