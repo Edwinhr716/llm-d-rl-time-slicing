@@ -9,7 +9,7 @@ HOST    ?= YOUR_GPU_NODE
 VNODE   ?= vk-$(lastword $(subst -, ,$(HOST)))
 SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|'
 
-.PHONY: build deploy test-guest gpu-guest m2-deploy q5-force q5-toggle status undeploy
+.PHONY: build deploy deploy-ds test-guest gpu-guest m2-deploy q5-force q5-toggle status undeploy
 
 build: ## vet, test, build and push the image remotely
 	gcloud builds submit --project=$(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
@@ -19,6 +19,11 @@ deploy: ## namespace, RBAC, Deployment and the outage guard (image tag = TAG)
 	$(SUBST) deploy/deployment.yaml | $(KUBECTL) apply -f -
 	$(SUBST) deploy/guard/node-keeper.yaml | $(KUBECTL) apply -f -
 | $(KUBECTL) apply -f -
+
+deploy-ds: ## D-NS-11 ns-ds: namespace, RBAC, DaemonSets (VK, outage guard) on nodes labelled timeslice.io/donor=true
+	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
+	$(SUBST) deploy/daemonset.yaml | $(KUBECTL) apply -f -
+	$(SUBST) deploy/guard/node-keeper-daemonset.yaml | $(KUBECTL) apply -f -
 
 test-guest: ## step one: CPU-only guest and a Service selecting it
 	$(SUBST) deploy/test-guest.yaml | $(KUBECTL) apply -f -

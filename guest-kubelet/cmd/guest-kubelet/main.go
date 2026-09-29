@@ -244,7 +244,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx, o); err != nil && !errors.Is(err, context.Canceled) {
+	err := run(ctx, o)
+	logStop(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.G(ctx).WithError(err).Error("guest-kubelet exited")
 		os.Exit(1)
 	}
@@ -263,7 +265,7 @@ func run(ctx context.Context, o options) error {
 	if o.nodeName == "" {
 		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
 	}
-	client, err := nodeutil.ClientsetFromEnv(o.kubeconfig)
+	client, err := vkClient(ctx, &o)
 	if err != nil {
 		return err
 	}
