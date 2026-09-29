@@ -1,0 +1,158 @@
+# D-VK-7 option "rule" (PENDING LEAD DECISION): a mutating admission webhook that adds
+#   {key: timeslice.io/virtual-node, operator: DoesNotExist}
+# to every required nodeSelectorTerm of every DaemonSet pod template (one term if there is no
+# node affinity), on CREATE and UPDATE, so no DaemonSet pod is placed on a virtual node.
+#
+# Install with install.sh (renders this file, waits until the rule is active). Placeholders:
+#   __NS__           namespace of the guest-kubelet (the webhook runs there)
+#   __IMAGE__        the guest-kubelet image (the webhook is its daemonset-rule-webhook subcommand)
+#   __HOST__         node the webhook pods run on
+#   __SCOPE_KEY__    namespace label key/value that limits where the rule acts;
+#   __SCOPE_VALUE__  install.sh drops the selector when SCOPE_KEY is empty (all namespaces)
+#
+# Uses admissionregistration.k8s.io/v1 only (no MutatingAdmissionPolicy). The webhook makes its
+# own self-signed certificate (Secret daemonset-rule-tls) and writes its caBundle below: no
+# manual certificate step. failurePolicy Ignore: while the webhook is down, DaemonSet writes
+# are not blocked, and a DaemonSet written meanwhile is fixed by its next update.
+# Cluster-scoped names carry the namespace, so several installs do not collide.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: daemonset-rule
+  namespace: __NS__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: __NS__-daemonset-rule
+rules:
+  # Only its own webhook configuration, to write the caBundle.
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    resourceNames: ["__NS__-daemonset-rule"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: __NS__-daemonset-rule
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: __NS__-daemonset-rule
+subjects:
+  - kind: ServiceAccount
+    name: daemonset-rule
+    namespace: __NS__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: daemonset-rule
+  namespace: __NS__
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["daemonset-rule-tls"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: daemonset-rule
+  namespace: __NS__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: daemonset-rule
+subjects:
+  - kind: ServiceAccount
+    name: daemonset-rule
+    namespace: __NS__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: daemonset-rule
+  namespace: __NS__
+spec:
+  selector: {app: daemonset-rule}
+  ports:
+    # 10250 in the pod (not the host; no hostNetwork): one of the two ports GKE's default
+    # firewall opens from the control plane to nodes, so it also works without Konnectivity.
+    - {name: https, port: 443, targetPort: 10250}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: daemonset-rule
+  namespace: __NS__
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: daemonset-rule}
+  template:
+    metadata:
+      labels: {app: daemonset-rule}
+    spec:
+      serviceAccountName: daemonset-rule
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        kubernetes.io/hostname: __HOST__
+      tolerations:
+        - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: webhook
+          image: __IMAGE__
+          args:
+            - daemonset-rule-webhook
+            - --webhook-config=__NS__-daemonset-rule
+            - --listen=:10250
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {name: https, containerPort: 10250}
+          # Ready only once the caBundle is written (the server starts after that).
+          readinessProbe:
+            httpGet: {path: /healthz, port: https, scheme: HTTPS}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {cpu: 100m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: __NS__-daemonset-rule
+webhooks:
+  - name: daemonset-rule.timeslice.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    matchPolicy: Equivalent
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchExpressions:
+        - {key: __SCOPE_KEY__, operator: In, values: ["__SCOPE_VALUE__"]}
+    rules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        resources: ["daemonsets"]
+        operations: ["CREATE", "UPDATE"]
+        scope: Namespaced
+    clientConfig:
+      service: {name: daemonset-rule, namespace: __NS__, path: /mutate, port: 443}

@@ -59,7 +59,16 @@ type options struct {
 	podName            string
 }
 
+// daemonSetPolicy is --daemonset-policy, D-VK-7 (PENDING LEAD DECISION): rule (default) or fake-ready.
+// Kept outside options so options (passed by value) does not grow.
+var daemonSetPolicy string
+
 func main() {
+	// `guest-kubelet daemonset-rule-webhook ...` serves the D-VK-7 "rule" webhook from the same
+	// image (deploy/daemonset-rule).
+	if len(os.Args) > 1 && os.Args[1] == "daemonset-rule-webhook" {
+		os.Exit(runRuleWebhook(os.Args[2:]))
+	}
 	var o options
 	flag.StringVar(&o.hostNode, "host-node", os.Getenv("NODE_NAME"), "real node the guests run on (env NODE_NAME, downward API spec.nodeName)")
 	flag.StringVar(&o.nodeName, "node-name", "", "name of the virtual Node; default vk-<last part of --host-node>")
@@ -89,6 +98,9 @@ func main() {
 	flag.BoolVar(&o.leaderElect, "leader-elect", false, "run several replicas; only the Lease holder acts as the kubelet")
 	flag.StringVar(&o.leaseNamespace, "leader-elect-namespace", os.Getenv("POD_NAMESPACE"), "namespace of the leader-election Lease (env POD_NAMESPACE)")
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
+	flag.StringVar(&daemonSetPolicy, "daemonset-policy", string(provider.DaemonSetPolicyRule),
+		"DaemonSet pods on the virtual Node: rule (ignored, Pending; deploy/daemonset-rule keeps DaemonSets off virtual nodes)"+
+			" or fake-ready (reported Running and Ready without running)")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -104,6 +116,9 @@ func main() {
 func run(ctx context.Context, o options) error {
 	if o.hostIP == "" || o.hostNode == "" {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
+	}
+	if _, err := provider.ParseDaemonSetPolicy(daemonSetPolicy); err != nil {
+		return err
 	}
 	if o.nodeName == "" {
 		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
@@ -171,6 +186,11 @@ func runWithLeaderElection(ctx context.Context, client kubernetes.Interface, o o
 
 // runKubelet is the M0 wiring plus the mirror backend.
 func runKubelet(ctx context.Context, client kubernetes.Interface, o options) error {
+	policy, err := provider.ParseDaemonSetPolicy(daemonSetPolicy)
+	if err != nil {
+		return err
+	}
+	log.G(ctx).WithField("daemonsetPolicy", string(policy)).Info("DaemonSet policy (D-VK-7)")
 	host, err := client.CoreV1().Nodes().Get(ctx, o.hostNode, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get host node %s: %w", o.hostNode, err)
@@ -223,7 +243,11 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, mopts)
-			return provider.New(backend), provider.NodeProvider{}, nil
+			p := provider.New(backend)
+			if policy == provider.DaemonSetPolicyFakeReady {
+				p.WithFakeReady(provider.NewFakeReady(o.nodeName, o.hostIP, deletePodNow(client)))
+			}
+			return p, provider.NodeProvider{}, nil
 		},
 		nodeutil.WithClient(client),
 		func(c *nodeutil.NodeConfig) error {

@@ -6,6 +6,7 @@ package provider
 import (
 	"context"
 	"io"
+	"sync"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
@@ -29,10 +30,34 @@ type Backend interface {
 // Provider implements nodeutil.Provider and node.PodNotifier on top of a Backend.
 type Provider struct {
 	backend Backend
+	// fake is set only with --daemonset-policy=fake-ready (D-VK-7); nil means the default
+	// "rule" policy: non-guest pods are ignored.
+	fake *FakeReady
+
+	mu     sync.Mutex
+	notify func(*corev1.Pod) // the library's status callback, set by NotifyPods
 }
 
 // New returns a provider backed by b.
 func New(b Backend) *Provider { return &Provider{backend: b} }
+
+// WithFakeReady turns on the fake-ready DaemonSet policy (D-VK-7) and returns p.
+func (p *Provider) WithFakeReady(f *FakeReady) *Provider {
+	p.fake = f
+	return p
+}
+
+// faked reports whether the fake-ready policy owns this pod.
+func (p *Provider) faked(pod *corev1.Pod) bool { return p.fake != nil && p.fake.Handles(pod) }
+
+func (p *Provider) emit(pod *corev1.Pod) {
+	p.mu.Lock()
+	cb := p.notify
+	p.mu.Unlock()
+	if cb != nil {
+		cb(pod)
+	}
+}
 
 // IsGuest reports whether a pod is meant for this node: it must tolerate the guest taint
 // by key. System DaemonSets that tolerate everything ({operator: Exists}, no key) do not count,
@@ -51,6 +76,9 @@ func key(p *corev1.Pod) string { return p.Namespace + "/" + p.Name }
 // NotifyPods is called once by the pod controller at startup. From then on, every mirror change
 // the backend sees is translated and written to the guest through cb.
 func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
+	p.mu.Lock()
+	p.notify = cb
+	p.mu.Unlock()
 	p.backend.SetStatusCallback(func(pod *corev1.Pod) {
 		if IsGuest(pod) {
 			cb(pod)
@@ -58,8 +86,13 @@ func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
 	})
 }
 
-// CreatePod creates the guest's mirror. Non-guests are ignored and stay Pending.
+// CreatePod creates the guest's mirror. Non-guests are ignored and stay Pending, except
+// DaemonSet pods under --daemonset-policy=fake-ready, which are reported Ready (FakeReady).
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
+	if p.faked(pod) {
+		p.fake.Create(ctx, pod, p.emit)
+		return nil
+	}
 	if !IsGuest(pod) {
 		log.G(ctx).WithField("pod", key(pod)).Debug("ignoring non-guest pod")
 		return nil
@@ -71,6 +104,10 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 // Labels and annotations are not copied to the mirror, so there is nothing to do; changing a
 // running guest's image is not supported in M1 (a real kubelet would restart the container).
 func (p *Provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
+	if p.faked(pod) {
+		p.fake.Update(pod)
+		return nil
+	}
 	if IsGuest(pod) {
 		log.G(ctx).WithField("pod", key(pod)).Debug("guest spec update ignored (M1)")
 	}
@@ -81,6 +118,10 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 // reports the containers terminating, and once they have stopped the library removes the
 // guest object. If there is no mirror, the guest is reported terminated at once.
 func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
+	if p.faked(pod) {
+		p.fake.Delete(ctx, pod, p.emit)
+		return nil
+	}
 	if !IsGuest(pod) {
 		return errdefs.NotFoundf("pod %q is not a guest", key(pod))
 	}
@@ -88,8 +129,14 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 }
 
 // GetPod returns the guest with its mirror's status, or errdefs.NotFound. Non-guests are
-// always NotFound, so the library keeps offering them to CreatePod, which ignores them.
+// always NotFound, so the library keeps offering them to CreatePod, which ignores them. Under
+// fake-ready, a faked pod is returned with its faked status.
 func (p *Provider) GetPod(_ context.Context, namespace, name string) (*corev1.Pod, error) {
+	if p.fake != nil {
+		if pod, ok := p.fake.Get(namespace, name); ok {
+			return pod, nil
+		}
+	}
 	return p.backend.Get(namespace, name)
 }
 
@@ -104,7 +151,13 @@ func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*c
 
 // GetPods lists the guests that have a mirror. At startup the library deletes (through
 // DeletePod) any of these that the API no longer has.
-func (p *Provider) GetPods(context.Context) ([]*corev1.Pod, error) { return p.backend.List() }
+func (p *Provider) GetPods(context.Context) ([]*corev1.Pod, error) {
+	pods, err := p.backend.List()
+	if err != nil || p.fake == nil {
+		return pods, err
+	}
+	return append(pods, p.fake.List()...), nil
+}
 
 // The methods below back kubectl logs/exec/attach/port-forward and the stats endpoints.
 // Until M2 proxies them to the mirror, use kubectl logs <guest>-m.
