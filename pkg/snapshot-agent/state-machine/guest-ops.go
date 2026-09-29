@@ -134,7 +134,14 @@ func (sm *StateManager) StartGuestOp(
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.gcLocked()
+	return sm.startGuestOpLocked(jobID, intent, epoch, deadline, worker)
+}
 
+// startGuestOpLocked is StartGuestOp after argument checks, with sm.mu held
+// for writing.
+func (sm *StateManager) startGuestOpLocked(
+	jobID string, intent OpType, epoch int64, deadline time.Time, worker GuestWorker,
+) (string, error) {
 	job, ok := sm.jobs[jobID]
 	if !ok {
 		if intent == OpTypeResume {
@@ -276,6 +283,9 @@ func (sm *StateManager) runGuest(
 	defer sm.mu.Unlock()
 	job.mu.Lock()
 	defer job.mu.Unlock()
+	// Runs first of the deferred calls, with both locks held: a host
+	// operation waiting on this one sees its result.
+	defer sm.notifyHostOpsLocked(op)
 
 	if !sm.finishCurrentLocked(job, op) {
 		return
@@ -467,6 +477,7 @@ func (sm *StateManager) supersedeLocked(job *Job, reason pb.ErrorReason, msg str
 		running.cancel()
 	}
 	job.current = nil
+	sm.notifyHostOpsLocked(running.op)
 }
 
 // finishCurrentLocked is called when op's worker returns. It reports

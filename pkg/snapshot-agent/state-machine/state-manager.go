@@ -100,6 +100,18 @@ type Operation struct {
 	Epoch int64
 	// Deadline is the absolute deadline of a Suspend, Resume or Kill.
 	Deadline time.Time
+
+	// Role is the role label value a SuspendAll or ResumeAll operation
+	// selected its targets by.
+	Role string
+	// Targets holds one result per target of a SuspendAll or ResumeAll
+	// operation, in job ID order. Nil for other operations.
+	Targets []TargetResult
+
+	// targets are the targets of a host operation (SuspendAll, ResumeAll).
+	targets []hostTarget
+	// hostOps are the host operations waiting on this per-job operation.
+	hostOps []*Operation
 }
 
 // StateManager handles thread-safe job transitions and operation tracking.
@@ -116,6 +128,15 @@ type StateManager struct {
 	// reportResumed selects the outcome of a successful Resume:
 	// OUTCOME_RESUMED when true, OUTCOME_UNSPECIFIED when false.
 	reportResumed bool
+
+	// targetLister returns the job IDs of the pods on this node that carry
+	// a role label, read at call time. Nil: SuspendAll and ResumeAll are
+	// refused.
+	targetLister TargetLister
+	// hostEpochs is the last epoch seen per role by SuspendAll and
+	// ResumeAll, and lastHostOps the last host operation per role.
+	hostEpochs  map[string]int64
+	lastHostOps map[string]*Operation
 }
 
 // Option configures a StateManager.
@@ -353,6 +374,7 @@ func (sm *StateManager) GetOperation(opID string) (*Operation, bool) {
 	}
 	// Return a copy to avoid race conditions
 	copyOp := *op
+	copyOp.Targets = sm.targetResultsLocked(op)
 	return &copyOp, true
 }
 

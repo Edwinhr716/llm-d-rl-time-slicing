@@ -19,6 +19,9 @@ const (
 	// JobIDLabel is the label used to identify pods by their job ID.
 	JobIDLabel = "timeslice.io/job-id"
 	GroupLabel = "timeslice.io/group"
+	// RoleLabel selects the targets of SuspendAll and ResumeAll, for example
+	// timeslice.io/role=background on a guest's mirror pod.
+	RoleLabel = "timeslice.io/role"
 	// GuestEpochAnnotation is written on a guest's mirror pod by the virtual
 	// kubelet, before each Suspend or Resume, with that call's epoch.
 	GuestEpochAnnotation = "timeslice.io/guest-epoch"

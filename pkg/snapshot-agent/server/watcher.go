@@ -190,3 +190,26 @@ func (w *Watcher) getLocalPodsForJob(jobID string) []*corev1.Pod {
 	}
 	return localPods
 }
+
+// LabelledJobs returns the job IDs of the pods on this node that carry the
+// label timeslice.io/role=<role> and a job ID, read from the pod cache when
+// it is called. It is the target lister of SuspendAll and ResumeAll. A pod
+// that has terminated (Succeeded or Failed) is skipped: it no longer runs on
+// the accelerator. A pod with a deletionTimestamp is still listed; it may
+// still be running.
+func (w *Watcher) LabelledJobs(role string) []string {
+	var jobIDs []string
+	for _, obj := range w.informer.GetStore().List() {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok || pod.Spec.NodeName != w.nodeName || pod.Labels[podutils.RoleLabel] != role {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if jobID := pod.Labels[podutils.JobIDLabel]; jobID != "" {
+			jobIDs = append(jobIDs, jobID)
+		}
+	}
+	return jobIDs
+}
