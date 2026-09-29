@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/virtual-kubelet/virtual-kubelet/log"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -239,6 +240,16 @@ func (b *Backend) VacateMirror(ctx context.Context, guest, m *corev1.Pod) error 
 	b.gate.vacated[guest.UID] = true
 	b.gate.attempts[guest.UID]++
 	b.mu.Unlock()
+	// Marked on the mirror too, so a restart before its delete event still reports the guest
+	// vacated, not failed (M5). Best effort: the mark in memory covers the run without a restart.
+	if upd, err := b.updateMirror(ctx, m, func(cur *corev1.Pod) error {
+		cur.Annotations[AnnotationVacated] = "true"
+		return nil
+	}); err == nil {
+		m = upd
+	} else {
+		log.G(ctx).WithError(err).WithField("mirror", m.Name).Warn("vacated mark not written on the mirror")
+	}
 	if err := b.deleteMirror(ctx, m); err != nil {
 		b.mu.Lock()
 		delete(b.gate.vacated, guest.UID)

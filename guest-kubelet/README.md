@@ -4,7 +4,7 @@ A throwaway prototype of a *guest kubelet*: a [virtual-kubelet](https://github.c
 (v1.14.0) that registers a virtual Node (`vk-<host>`) next to a real GPU node and acts as the
 kubelet for the guest pods scheduled onto it.
 
-## Status: M2 (readiness)
+## Status: M2 (readiness) and M3 (suspend and resume, below)
 
 - Registers Node `vk-<host suffix>` (for example `vk-abcd`) with labels `type=virtual-kubelet`,
   `timeslice.io/virtual-node=true`, taint `timeslice.io/guest=true:NoSchedule`, capacity
@@ -43,6 +43,7 @@ kubelet for the guest pods scheduled onto it.
   `POST /debug/readiness?pod=ns/name&ready=true|false|clear` (an override
   that wins over the probes) and `GET /debug/ready-edges?pod=ns/name`
   (when the VK sent each Ready change). Only the Q5 measurement uses it.
+  The same address serves the M3 suspend and resume hooks (below).
 - Host commands (`--host-command-port`, off by default): the VK serves the
   orchestrator's `HostCommandService` (`api/hostcommand/v1alpha1`) on
   `--host-ip:<port>` and never reads the orchestrator's lock. No mirror is
@@ -61,8 +62,21 @@ kubelet for the guest pods scheduled onto it.
   `delete` (default: delete the mirror, re-create it on the next Resume) or
   `fake` (test freezer that only annotates the mirror). `--host-command-allow`
   limits the callers.
-- Not yet: liveness and startup probes, logs/exec
-  (use `kubectl logs <guest>-m`), stats.
+- Admission (VK-A7) refuses a guest before it gets a mirror: a liveness
+  or startup probe, an exec or grpc readiness probe, readiness gates (an
+  httpGet or tcpSocket readinessProbe is allowed), a GPU resource other
+  than `nvidia.com/gpu`, or a GPU guest on a host whose model label is
+  not in `--gpu-allowlist` (default `nvidia-l4`; no label fails closed).
+  The guest gets a Warning event `GuestRejected` naming the rule and goes
+  `Failed` with reason `GuestRejected`.
+- A GPU mirror container's memory limit is its limit (or request) plus
+  the device reserve, `ceil(--gpu-memory x --mirror-memory-factor)`
+  (defaults `23034Mi` x `1.1`, about 24.7 GiB).
+- Outage (VK-A7 on this branch): the Node finalizer below holds the
+  virtual Node through a guest-kubelet outage; no keeper process.
+- Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Liveness and
+  startup probes are refused by admission (above), so an exec or gRPC
+  readinessProbe never reaches the prober.
 
 ## Layout
 
@@ -70,8 +84,13 @@ kubelet for the guest pods scheduled onto it.
 cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wiring; own event recorder
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
+internal/provider/marker.go          --guest-marker: what makes a pod a guest
+internal/provider/admission.go       admission: probes, gates, GPU allowlist
 internal/provider/events.go          drops events about non-guest pods
 internal/group/                      the host node's group (timeslice.io/donor + timeslice.io/group), host watch
+internal/provider/finalizer.go       Node finalizer, ownerRef to host, release
+internal/donorstandin/               donor stand-in: releases Node on host death
+cmd/donor-standin/main.go            its command (same image as the VK)
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
@@ -82,13 +101,116 @@ api/                                 copied protos, generated code
 internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
 internal/probe/debug.go              debug endpoint: override, Ready edges
 cmd/q5-measure/main.go               Q5 timings; runs in a pod
-deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
 deploy/opt-b/host-labels.yaml        the donor/group node labels as a kubectl merge patch
+internal/backend/mirror/suspend.go   M3 suspend/resume, state, status overlay
+internal/backend/mirror/readiness.go MarkNotReady; wait for NotReady
+internal/backend/mirror/readycheck.go resume check: probe until Ready
+internal/freeze/                     cgroup v2 freezer (freeze.Backend)
+internal/backend/mirror/hold.go      Hold: any guest suspended (cordon)
+internal/provider/cordon.go          --cordon-while-held (D-NS-8)
+cmd/guest-kubelet/debug.go           --debug-addr: M2 hooks, suspend, resume
+deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
+deploy/guests/                       guest manifests: today, ns
+deploy/admission/                    W9 policies, one per guest marker
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
+deploy/opt-c/                        donor stand-in Deployment + RBAC
 deploy/m2/                           probed guests, pool, router, Q5 pods
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
+
+## M3: suspend and resume by cgroup freeze
+
+Interim step: the VK freezes the mirror's pod cgroup itself. It sits behind
+`freeze.Backend` (`internal/freeze`), so M4 swaps it for the snapshot agent's
+Suspend/Resume and the VK stops touching cgroups.
+
+- Suspend (`Backend.Suspend`), in this order: raise `timeslice.io/guest-epoch`
+  and set `timeslice.io/suspend-state=Suspending` on the mirror
+  (compare-and-swap on its resourceVersion); the guest turns NotReady
+  (`MarkNotReady`, the same function the prober uses for a failed probe, with
+  reason `Suspending`); wait until the API shows the guest NotReady
+  (`--suspend-notready-timeout`); write `1` to `cgroup.freeze` on the
+  pod-level cgroup and wait for `frozen 1` in `cgroup.events`
+  (`--freeze-timeout`); record `Suspended`. No drain. If the wait or the
+  freeze fails, the pod is thawed and put back to Running.
+- While frozen the guest shows phase Running, Ready=False, condition
+  `timeslice.io/suspended=True`, and its containers Waiting with reason
+  `Suspended`, so `kubectl get pods` prints `0/1 Suspended`. Restart counts
+  do not change.
+- Resume (`Backend.Resume`): raise the epoch, record `Resuming` (still
+  NotReady), thaw, run the guest's httpGet/tcpSocket readinessProbe against
+  the mirror (one attempt at a time with the prober's HTTP and TCP semantics)
+  until it passes (`--resume-ready-timeout`), then clear the state; from then
+  on the prober's verdict decides Ready, as for any guest. Any failure leaves
+  it `Resuming`, so it is never Ready on a process that did not come back.
+- The suspend state is applied after the prober's verdict, so a probe that
+  still passes (or a debug override) never shows a suspended guest Ready.
+- One suspend or resume per guest at a time. The state lives on the mirror,
+  so a restarted VK or a new leader derives the same guest status. Deleting a
+  suspended guest thaws the mirror first, so it can act on SIGTERM.
+- Deployment: the VK container is privileged, runs as root and mounts the
+  host's `/sys/fs/cgroup` read-write at `/host/cgroup` (`--cgroup-root`;
+  empty disables suspend). The cgroup is found under both kubelet cgroup
+  drivers (systemd `kubepods.slice/...` and cgroupfs `kubepods/...`). Mirror
+  pods stay unprivileged.
+- Until the orchestrator loop (VK-A6) drives it, suspend and resume are
+  triggered by hand through `--debug-addr` (loopback only, for example
+  `127.0.0.1:10261`, reached with `kubectl port-forward` to the leader pod;
+  it works with `--readiness-probes=false` too):
+  `POST /debug/suspend?namespace=<ns>&name=<guest>` and
+  `POST /debug/resume?...`. The reply is the step timings as JSON. It has no
+  authentication: enable it only in test deployments.
+- Cordon while held (`--cordon-while-held`, pending decision D-NS-8; default
+  true = option ns-cordon, false = option skip): while at least one guest of
+  the virtual Node is `Suspending` or `Suspended` (the donor has the GPU),
+  the VK sets `spec.unschedulable` on its Node, so `kubectl get nodes` shows
+  `SchedulingDisabled` and no new guest binds to it. `Resuming` is not held.
+  The hold is read from the mirrors (so a restarted VK decides the same),
+  re-checked on every suspend-state change and every 0.5 s, and the Node is
+  re-read every 5 s to repair a lost cordon. The VK patches only
+  `spec.unschedulable` and its own annotation
+  `timeslice.io/cordoned-by=guest-kubelet`, and only removes a cordon
+  carrying that annotation, so an admin `kubectl cordon` is left alone.
+  Guests already bound stay bound and resident. The orchestrator loop
+  (VK-A6) can feed the same cordoner from the group state.
+
+## M5: restart and relist
+
+Nothing in memory survives a guest-kubelet restart. Before the pod
+controller and the host command server start, `provider.Recover`
+(`internal/provider/recover.go`) lists the pods bound to the virtual node
+and their mirrors from the API and re-derives what the process held:
+
+- Per-guest suspend state lives on each mirror (`timeslice.io/suspend-state`
+  plus `timeslice.io/guest-epoch`), written before and after every freeze and
+  thaw in both the M3 and the host command paths. The cordon while held
+  counts these mirrors, so it comes back on its own.
+- Host command mode keeps a journal on the virtual Node, annotation
+  `timeslice.io/host-command` (last accepted command, epoch, deadline, phase,
+  outcome, mirror attempt counters). It is written before a command acts and
+  when it is done. After a restart:
+  - the epoch fence is the journal's epoch (older commands are stale);
+  - a command that succeeded is answered from the journal on a retry with
+    the same epoch, without acting again; a failed or aborted one runs again;
+  - an unfinished command runs again with its epoch once the pod controller
+    is ready, and the orchestrator's retry joins it; each guest step is
+    idempotent on the mirror's suspend state, and a freezer that can report
+    its state (`Frozen`) wins over a half-written record;
+  - after a Resume the node is lent again; a running, Ready guest stays Ready;
+  - no journal (first start, or the Node was deleted): fail closed, held
+    until the first command.
+- M3 path: `ReconcileSuspend` makes each mirror's recorded state agree with
+  the cgroup freezer (the host wins).
+- A mirror deleted to vacate is marked `timeslice.io/vacated`, so a delete
+  seen only after the restart reports the guest vacated, not failed.
+- Attempt counters are restored from the mirrors and the journal, so no job
+  id repeats.
+- Commands wait until the pod controller is ready (`Config.Ready`).
+
+Limits: journal and suspend-state writes are best effort (a failed write is
+logged; the restart after it knows less and fails closed). The readiness
+probe verdict is re-learned after a restart.
 
 ## Build and deploy
 
@@ -103,6 +225,35 @@ make q5-toggle    # Q5 run, a real probe flipped by the guest
 make status
 make undeploy
 ```
+
+## Outage guard: Node finalizer (option c of an open decision)
+
+The VK Node carries the finalizer `timeslice.io/virtual-node-protection`
+and an ownerReference to the real Node. When anyone else deletes the VK
+Node during a VK outage (for example the cloud node lifecycle
+controller), the finalizer holds it (Terminating), so its guests are not
+garbage-collected. Only the VK and the donor controller remove the
+finalizer:
+
+- the donor controller, when the real Node is gone (`deploy/opt-c/`, a
+  stand-in until the real controller exists; the VK cannot act on its
+  own host's death);
+- the VK itself when it deregisters at the end of an era: stop the
+  serving VK, then run `guest-kubelet --deregister --node-name=<node>`;
+- the VK itself when it returns and finds its Node Terminating on a live
+  host (`--reclaim-terminating-node`, default true). A Terminating Node
+  cannot be un-deleted, so the VK removes its finalizer, waits for the
+  old object to go and registers the Node again (same name, new UID)
+  before the kubelet role starts. Guests are bound by Node name and pod
+  GC waits 40 s before it treats a Node as missing, so guests and mirrors
+  are untouched. It reclaims only a Node whose only finalizer is ours and
+  whose ownerReference names the host this VK runs on; a Node from a
+  recreated host stays held for the donor controller.
+
+With `--reclaim-terminating-node=false` a held Node keeps serving but
+stays Terminating until the donor controller or a deregistration
+releases it. A `kubectl delete node` made while the VK is down is also
+undone by the next start; use `--deregister` to remove the Node.
 
 The plan and the notes explaining this code are kept outside this repository
 (prototype plan, milestones M0 to M2).
@@ -152,6 +303,54 @@ Probe mode (a real readinessProbe, period 1 s, flipped by the guest):
   reaches it in tens of milliseconds. Router requests are timed from when
   they were sent, so a request sent just before the watch saw the change
   can give a slightly negative span.
+
+## Guest steering options (pending decisions D-NS-2, D-VK-4, D-NS-3)
+
+Three pending lead decisions choose how a guest finds the virtual Node and
+what makes a pod a guest. Every option ships; flags and manifests pick one.
+The defaults are today's behaviour.
+
+- D-NS-2, labels of the virtual Node: `--guest-node-label`.
+  - `false` (default): `timeslice.io/virtual-node=true` only.
+  - `true`: also `timeslice.io/guest=true`.
+- D-VK-4, what makes a pod a guest: `--guest-marker`.
+  - `toleration` (default): the pod tolerates `timeslice.io/guest` by key.
+  - `label`: the pod carries the label `timeslice.io/guest=true`.
+  - `both`: either one.
+- D-NS-3, how a guest steers: the manifest in `deploy/guests/`.
+  - `guest-today.yaml`: the toleration and the nodeSelector
+    `timeslice.io/virtual-node: "true"`. It waits Pending when no
+    virtual Node exists or has room.
+  - `guest-ns.yaml`: the label `timeslice.io/guest=true`, the toleration and
+    a preferred node affinity (weight 100) on `timeslice.io/guest=true`.
+    It falls back to real nodes.
+- W9 for each marker: `deploy/admission/w9-<variant>.yaml`, a
+  ValidatingAdmissionPolicy and binding. It rejects `timeslice.io/group`,
+  `timeslice.io/job-id` and `timeslice.io/role` on guests and allows
+  `timeslice.io/guest`. The variants are `toleration`, `label`, `both`
+  (one per marker) and `either` (toleration or label, whatever the marker).
+
+Combinations that work together:
+
+- today: `--guest-node-label=false --guest-marker=toleration`,
+  `guest-today.yaml`, `w9-toleration.yaml`.
+- north star: `--guest-node-label=true --guest-marker=label`,
+  `guest-ns.yaml`, `w9-label.yaml`.
+- both forms (the D-NS-3 flag option): `--guest-node-label=true
+  --guest-marker=both`, either manifest, `w9-both.yaml`.
+
+`guest-ns.yaml` without `--guest-node-label=true` is admitted and runs,
+but has nothing to prefer: the scheduler puts it on any node that fits.
+The two flags need no new RBAC: the Node label is set when the Node is
+created. A cluster admin applies the W9 policies, one copy per namespace:
+
+```sh
+sed 's/__NS__/<namespace>/g' deploy/admission/w9-label.yaml | kubectl apply -f -
+```
+
+The `isGuest` CEL variable of each policy is the guest predicate of the
+matching `--guest-marker`. `internal/provider/guests_internal_test.go`
+checks that they agree and that both manifests steer as described.
 
 ## M1 results (the test cluster, 2026-09-25)
 

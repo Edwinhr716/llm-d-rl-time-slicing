@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -61,11 +62,11 @@ func (e *events) count(prefix string) int {
 type fakeHost struct {
 	ev *events
 
-	mu      sync.Mutex
-	guests  map[string]*mirror.Guest
-	epoch   int64
-	gone    chan struct{} // if set, deleted mirrors disappear only when it is closed
-	neverUp bool          // mirrors never become ready
+	mu        sync.Mutex
+	guests    map[string]*mirror.Guest
+	gone      chan struct{} // if set, deleted mirrors disappear only when it is closed
+	neverUp   bool          // mirrors never become ready
+	failState error         // if set, SetMirrorSuspendState fails with it
 }
 
 func newHost(ev *events) *fakeHost { return &fakeHost{ev: ev, guests: map[string]*mirror.Guest{}} }
@@ -202,17 +203,50 @@ func (h *fakeHost) WaitMirrorGone(ctx context.Context, m *corev1.Pod) error {
 	}
 }
 
-func (h *fakeHost) BumpEpoch(_ context.Context, m *corev1.Pod) (*corev1.Pod, int64, error) {
+// SetMirrorSuspendState records the state and epoch on the mirror, as the real backend does.
+// Events: "epoch N" for a bump, "annotate <mirror> guest-epoch=N" for a given value, and
+// "state <mirror> <state>" ("running" for a cleared state).
+func (h *fakeHost) SetMirrorSuspendState(
+	_ context.Context, m *corev1.Pod, state string, epoch int64,
+) (*corev1.Pod, int64, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.epoch++
-	h.ev.add("epoch %d", h.epoch)
-	return m, h.epoch, nil
-}
-
-func (h *fakeHost) AnnotateMirror(_ context.Context, m *corev1.Pod, key, value string) error {
-	h.ev.add("annotate %s %s=%s", m.Name, key, value)
-	return nil
+	if h.failState != nil {
+		return nil, 0, h.failState
+	}
+	var owner *mirror.Guest
+	for _, x := range h.guests {
+		if x.Mirror != nil && x.Mirror.UID == m.UID {
+			owner = x
+		}
+	}
+	if owner == nil {
+		return nil, 0, mirror.ErrMirrorReplaced
+	}
+	cur := owner.Mirror.DeepCopy()
+	if cur.Annotations == nil {
+		cur.Annotations = map[string]string{}
+	}
+	_, out := mirror.SuspendState(cur)
+	switch {
+	case epoch > 0:
+		out = epoch
+		h.ev.add("annotate %s %s=%d", cur.Name, mirror.AnnotationGuestEpoch, epoch)
+	case epoch == mirror.EpochBump:
+		out++
+		h.ev.add("epoch %d", out)
+	}
+	cur.Annotations[mirror.AnnotationGuestEpoch] = strconv.FormatInt(out, 10)
+	shown := state
+	if state == "" {
+		delete(cur.Annotations, mirror.AnnotationSuspendState)
+		shown = "running"
+	} else {
+		cur.Annotations[mirror.AnnotationSuspendState] = state
+	}
+	h.ev.add("state %s %s", cur.Name, shown)
+	owner.Mirror = cur
+	return cur.DeepCopy(), out, nil
 }
 
 // testFreezer records suspend and resume in the shared event log.
@@ -224,6 +258,25 @@ type testFreezer struct {
 	suspendFor  time.Duration
 	resumeFor   time.Duration
 	kills       int
+	frozen      map[string]bool // mirror name -> stopped now
+}
+
+func (f *testFreezer) setFrozen(name string, frozen bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.frozen == nil {
+		f.frozen = map[string]bool{}
+	}
+	f.frozen[name] = frozen
+}
+
+// reportingFreezer is testFreezer that also answers Frozen, as freeze.Backend and FakeFreezer do.
+type reportingFreezer struct{ *testFreezer }
+
+func (f reportingFreezer) Frozen(m *corev1.Pod) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.frozen[m.Name], nil
 }
 
 func (f *testFreezer) Suspend(ctx context.Context, m *corev1.Pod, epoch int64) error {
@@ -240,16 +293,21 @@ func (f *testFreezer) Suspend(ctx context.Context, m *corev1.Pod, epoch int64) e
 		return ctx.Err()
 	case <-time.After(delay):
 	}
+	f.setFrozen(m.Name, true)
 	f.ev.add("suspend %s %d", m.Name, epoch)
 	return nil
 }
 
 func (f *testFreezer) Resume(ctx context.Context, m *corev1.Pod, epoch int64) error {
+	f.mu.Lock()
+	delay := f.resumeFor
+	f.mu.Unlock()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(f.resumeFor):
+	case <-time.After(delay):
 	}
+	f.setFrozen(m.Name, false)
 	f.ev.add("resume %s %d", m.Name, epoch)
 	return nil
 }
@@ -268,6 +326,7 @@ type rig struct {
 	freezer *testFreezer
 	srv     *hostcmd.Server
 	group   string
+	cancel  context.CancelFunc // stops srv
 }
 
 type rigOpt func(*hostcmd.Config, *rig)
@@ -278,30 +337,43 @@ func newRig(t *testing.T, opts ...rigOpt) *rig {
 	t.Helper()
 	ev := &events{}
 	fix := &rig{ev: ev, host: newHost(ev), freezer: &testFreezer{ev: ev}, group: testGroup}
+	fix.start(t, opts...)
+	return fix
+}
+
+// start creates the server on the rig's host and freezer. Called again after stop, it is a
+// guest-kubelet restart: the host (the API) and the freezer (the node) keep their state.
+func (r *rig) start(t *testing.T, opts ...rigOpt) {
+	t.Helper()
 	cfg := &hostcmd.Config{
 		Node:          testNode,
-		Group:         func() (string, bool) { return fix.group, fix.group != "" },
-		Host:          fix.host,
-		Freezer:       fix.freezer,
+		Group:         func() (string, bool) { return r.group, r.group != "" },
+		Host:          r.host,
+		Freezer:       r.freezer,
 		VacateMargin:  10 * time.Millisecond,
 		ServeInterval: 20 * time.Millisecond,
 		PollInterval:  5 * time.Millisecond,
 		KillTimeout:   time.Second,
 	}
 	for _, o := range opts {
-		o(cfg, fix)
+		o(cfg, r)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	srv, err := hostcmd.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fix.srv = srv
+	r.srv, r.cancel = srv, cancel
 	t.Cleanup(func() {
 		cancel()
 		srv.Wait()
 	})
-	return fix
+}
+
+// stop kills the server as a crash would: its detached work ends with it.
+func (r *rig) stop() {
+	r.cancel()
+	r.srv.Wait()
 }
 
 func (r *rig) vacate(t *testing.T, epoch int64, within time.Duration) *hcpb.HostAck {

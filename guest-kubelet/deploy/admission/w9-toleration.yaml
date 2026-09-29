@@ -1,0 +1,44 @@
+# W9 (guests carry no training-job labels) as a ValidatingAdmissionPolicy, variant toleration:
+# a guest is a pod that tolerates the timeslice.io/guest taint by key
+# (the guest predicate of --guest-marker=toleration).
+# Pending lead decisions D-NS-3 and D-VK-4. The guest check is the one CEL variable isGuest.
+# Replace __NS__ with the namespace to enforce it in (every name carries it, so each namespace
+# gets its own policy and binding), then apply as a cluster admin:
+#   sed 's/__NS__/<namespace>/g' w9-toleration.yaml | kubectl apply -f -
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: w9-toleration-__NS__
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  variables:
+    - name: isGuest
+      expression: >-
+        object.spec.?tolerations.orValue([]).exists(t, t.?key.orValue('') == 'timeslice.io/guest')
+  validations:
+    - expression: >-
+        !variables.isGuest ||
+        !['timeslice.io/group', 'timeslice.io/job-id', 'timeslice.io/role'].exists(k,
+        k in object.metadata.?labels.orValue({}))
+      message: >-
+        W9: a guest pod must not carry timeslice.io/group, timeslice.io/job-id or
+        timeslice.io/role (timeslice.io/guest is allowed)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: w9-toleration-__NS__
+spec:
+  policyName: w9-toleration-__NS__
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: __NS__

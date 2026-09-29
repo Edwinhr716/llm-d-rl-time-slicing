@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/freeze"
 	"github.com/edwinhr716/guest-kubelet/internal/group"
 	"github.com/edwinhr716/guest-kubelet/internal/probe"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
@@ -65,9 +66,32 @@ type options struct {
 
 	// D-VK-3 option b: where the real node's group is read (internal/group)
 	groupSource string
+	// D-VK-2 option c: one-shot deregistration (end of an era).
+	deregister bool
+	// VK-A7 on D-VK-2 c: replace a Node held Terminating by the finalizer when the VK returns.
+	reclaimNode bool
+
 	// M2: readiness
 	readinessProbes bool
-	debugAddr       string
+	// Pending lead decision D-NS-2: false = keep (today), true = ns-label.
+	guestNodeLabel bool
+
+	// VK-A7: admission and mirror memory
+	gpuAllowlist       string
+	gpuMemory          string
+	mirrorMemoryFactor float64
+
+	// M3: suspend and resume by cgroup freeze
+	cgroupRoot         string
+	notReadyTimeout    time.Duration
+	freezeTimeout      time.Duration
+	resumeReadyTimeout time.Duration
+
+	// Pending lead decision D-NS-8: true = ns-cordon (NS stack default), false = skip (today).
+	cordonWhileHeld bool
+
+	// M2 and M3 test hooks
+	debugAddr string
 
 	// VK-A6: host command server (D-NS-4 ns-push-vk)
 	hostCommandPort  int
@@ -84,6 +108,12 @@ type options struct {
 
 // edgeLogSize is how many Ready edges per guest the debug endpoint keeps.
 const edgeLogSize = 256
+
+// cordonPoll is how often the ns-cordon loop re-reads the hold, besides the pokes.
+const cordonPoll = 500 * time.Millisecond
+
+// reclaimTimeout bounds the wait for a Terminating Node to go once its finalizer is removed.
+const reclaimTimeout = 30 * time.Second
 
 func main() {
 	var o options
@@ -118,11 +148,6 @@ func main() {
 	flag.StringVar(&o.groupSource, "group-source", group.SourceNS,
 		"host node labels that name its group: ns (timeslice.io/donor=true plus timeslice.io/group=<group>) or "+
 			"either (also group.timeslice.io/<group>=true; both forms must agree)")
-	flag.BoolVar(&o.readinessProbes, "readiness-probes", true,
-		"run the guests' readinessProbes (httpGet, tcpSocket) and report Ready from them; false copies the mirror's ready flags (M1)")
-	// Off by default. The endpoint can force a guest Ready, so only loopback addresses are accepted.
-	flag.StringVar(&o.debugAddr, "debug-addr", "",
-		"loopback host:port for the M2 test hooks (/debug/readiness, /debug/ready-edges); empty disables them")
 	flag.IntVar(&o.hostCommandPort, "host-command-port", 0, "port on --host-ip where the VK serves the orchestrator's "+
 		"Vacate and Resume commands; 0 turns host commands off and mirrors start at once (M1)")
 	flag.StringVar(&o.hostCommandAllow, "host-command-allow", "",
@@ -139,6 +164,39 @@ func main() {
 	flag.DurationVar(&o.fakeSuspendDelay, "fake-freezer-suspend-delay", 12500*time.Millisecond,
 		"--freezer=fake: time a Suspend takes")
 	flag.DurationVar(&o.fakeResumeDelay, "fake-freezer-resume-delay", 6*time.Second, "--freezer=fake: time a Resume takes")
+	flag.BoolVar(&o.deregister, "deregister", false,
+		"one-shot: delete the virtual Node, remove its finalizer and exit (end of an era; stop the serving VK first)")
+	flag.BoolVar(&o.reclaimNode, "reclaim-terminating-node", true,
+		"on start, replace the virtual Node if a delete (for example GKE during a VK outage) holds it Terminating: "+
+			"remove our finalizer and register it again; guests stay bound by name. false leaves it Terminating")
+	flag.BoolVar(&o.readinessProbes, "readiness-probes", true,
+		"run the guests' readinessProbes (httpGet, tcpSocket) and report Ready from them; false copies the mirror's ready flags (M1)")
+	flag.StringVar(&o.cgroupRoot, "cgroup-root", "/host/cgroup",
+		"host cgroup v2 hierarchy as mounted in this container; empty disables suspend/resume")
+	flag.DurationVar(&o.notReadyTimeout, "suspend-notready-timeout", 5*time.Second,
+		"how long a suspend waits for the guest's Ready=False to reach the API before freezing")
+	flag.DurationVar(&o.freezeTimeout, "freeze-timeout", 10*time.Second, "deadline for each cgroup freeze or thaw")
+	flag.DurationVar(&o.resumeReadyTimeout, "resume-ready-timeout", 60*time.Second,
+		"how long a resume waits for the guest's readiness probe to pass after the thaw")
+	flag.BoolVar(&o.cordonWhileHeld, "cordon-while-held", true,
+		"set spec.unschedulable on the virtual Node while the donor holds the GPU (M3: while a guest is suspending "+
+			"or suspended), so no new guest lands on it; false never touches spec.unschedulable")
+	// Off by default. The endpoint can force a guest Ready or freeze it, so only loopback addresses
+	// are accepted.
+	flag.StringVar(&o.debugAddr, "debug-addr", "",
+		"loopback host:port for the test hooks (M2: /debug/readiness, /debug/ready-edges; "+
+			"M3: /debug/suspend, /debug/resume); empty disables them")
+	flag.BoolVar(&o.guestNodeLabel, "guest-node-label", false,
+		"also label the virtual Node timeslice.io/guest=true, for guests with a preferred node affinity (virtual-node=true stays)")
+
+	flag.StringVar(&o.gpuAllowlist, "gpu-allowlist", "nvidia-l4",
+		"comma-separated GPU models guests may use; a GPU guest is rejected unless the host Node's model label "+
+			"(cloud.google.com/gke-accelerator or nvidia.com/gpu.product) is listed")
+	flag.StringVar(&o.gpuMemory, "gpu-memory", "23034Mi",
+		"device memory of one host GPU (L4: 23034Mi); the device reserve is this times --mirror-memory-factor")
+	flag.Float64Var(&o.mirrorMemoryFactor, "mirror-memory-factor", 1.1,
+		"a GPU mirror container's memory limit = its limit + ceil(--gpu-memory x factor), "+
+			"so Suspend can hold the device memory in the cgroup")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -151,39 +209,66 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, o *options) error {
-	if o.hostIP == "" || o.hostNode == "" {
+func run(ctx context.Context, opts *options) error {
+	if opts.deregister {
+		return deregister(ctx, opts.nodeName, opts.hostNode, opts.kubeconfig)
+	}
+	if opts.hostIP == "" || opts.hostNode == "" {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
 	}
-	if !group.ValidSource(o.groupSource) {
-		return fmt.Errorf("--group-source=%q: want one of %s", o.groupSource, strings.Join(group.Sources, ", "))
+	if !group.ValidSource(opts.groupSource) {
+		return fmt.Errorf("--group-source=%q: want one of %s", opts.groupSource, strings.Join(group.Sources, ", "))
 	}
-	if err := o.checkDebug(); err != nil {
+	if err := opts.checkDebug(); err != nil {
 		return err
 	}
-	if o.nodeName == "" {
-		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
+	if opts.nodeName == "" {
+		opts.nodeName = defaultNodeName(opts.hostNode)
 	}
-	client, err := nodeutil.ClientsetFromEnv(o.kubeconfig)
+	client, err := nodeutil.ClientsetFromEnv(opts.kubeconfig)
 	if err != nil {
 		return err
 	}
-	if !o.leaderElect {
-		return runKubelet(ctx, client, o)
+	if !opts.leaderElect {
+		return runKubelet(ctx, client, opts)
 	}
-	return runWithLeaderElection(ctx, client, o)
+	return runWithLeaderElection(ctx, client, opts)
 }
 
-// checkDebug validates --debug-addr: loopback only, and only with the prober it drives.
+func defaultNodeName(hostNode string) string {
+	return "vk-" + hostNode[strings.LastIndex(hostNode, "-")+1:]
+}
+
+// deregister is the VK's own removal of its virtual Node at the end of an era: it deletes the
+// Node and removes the finalizer (reason deregister), then exits. Run it after the serving VK
+// has stopped, or its re-registration recreates the Node.
+func deregister(ctx context.Context, name, hostNode, kubeconfig string) error {
+	if name == "" && hostNode != "" {
+		name = defaultNodeName(hostNode)
+	}
+	if name == "" {
+		return fmt.Errorf("--deregister needs --node-name or --host-node")
+	}
+	client, err := nodeutil.ClientsetFromEnv(kubeconfig)
+	if err != nil {
+		return err
+	}
+	released, err := provider.ReleaseNode(ctx, client, name, provider.ReasonDeregister)
+	if err != nil {
+		return err
+	}
+	log.G(ctx).WithField("node", name).WithField("released", released).Info("deregistered")
+	return nil
+}
+
+// checkDebug validates --debug-addr: loopback only. Without --readiness-probes it serves only the
+// M3 hooks.
 func (o *options) checkDebug() error {
 	if o.debugAddr == "" {
 		return nil
 	}
 	if err := probe.CheckLoopback(o.debugAddr); err != nil {
 		return err
-	}
-	if !o.readinessProbes {
-		return errors.New("--debug-addr needs --readiness-probes")
 	}
 	return nil
 }
@@ -247,7 +332,8 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o *options) er
 	}
 	cfg := provider.NodeConfig{
 		Name: o.nodeName, InternalIP: o.hostIP, KubeletPort: int32(o.kubeletPort),
-		KubeletVersion: o.kubeletVersion, GPUs: o.gpus,
+		KubeletVersion: o.kubeletVersion, GPUs: o.gpus, GuestNodeLabel: o.guestNodeLabel,
+		HostName: host.Name, HostUID: host.UID,
 	}
 	if o.providerIDFromHost {
 		cfg.ProviderID = host.Spec.ProviderID
@@ -274,19 +360,76 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o *options) er
 	if mopts.MemoryHeadroom, err = resource.ParseQuantity(o.memHeadroom); err != nil {
 		return fmt.Errorf("--mirror-memory-headroom: %w", err)
 	}
+	gpuMem, err := resource.ParseQuantity(o.gpuMemory)
+	if err != nil {
+		return fmt.Errorf("--gpu-memory: %w", err)
+	}
+	if mopts.DeviceMemoryReserve, err = mirror.DeviceReserve(gpuMem, o.mirrorMemoryFactor); err != nil {
+		return fmt.Errorf("--mirror-memory-factor: %w", err)
+	}
+	policy := provider.AdmissionPolicy{
+		GPUAllowlist: provider.ParseGPUAllowlist(o.gpuAllowlist),
+		HostGPUModel: provider.HostGPUModel(host),
+	}
+	log.G(ctx).WithField("hostGPUModel", policy.HostGPUModel).WithField("gpuAllowlist", policy.GPUAllowlist).
+		WithField("deviceMemoryReserve", mopts.DeviceMemoryReserve.String()).Info("admission and mirror memory settings")
 
 	nodeSpec := provider.NewNodeSpec(cfg)
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
 		return err
 	}
+	// D-VK-2 option c: register the Node ourselves with the finalizer and the ownerReference to
+	// the host (or add them to an existing Node), so the library finds it and only patches status.
+	action, err := provider.EnsureNodeGuard(ctx, client, &nodeSpec)
+	if err != nil {
+		return err
+	}
+	// VK-A7: a Terminating Node cannot be un-deleted. On a live host (we run on it), swap it for
+	// a fresh one before the library starts, so the outage leaves no trace on the Node.
+	if action == provider.GuardTerminating && o.reclaimNode {
+		if _, err := provider.ReclaimNode(ctx, client, &nodeSpec, reclaimTimeout); err != nil {
+			return err
+		}
+		if _, err := provider.EnsureNodeGuard(ctx, client, &nodeSpec); err != nil {
+			return err
+		}
+	}
 
 	// Our own event broadcaster, so the recorder can be wrapped: the library would otherwise
-	// record ProviderCreateSuccess on DaemonSet pods that CreatePod ignored.
+	// record ProviderCreateSuccess on DaemonSet pods that CreatePod ignored, and on guests that
+	// admission rejected.
 	eb := record.NewBroadcaster()
 	eb.StartRecordingToSink(&corev1client.EventSinkImpl{Interface: client.CoreV1().Events(corev1.NamespaceAll)})
 	defer eb.Shutdown()
+	rejected := provider.NewRejectedSet()
 	recorder := provider.GuestOnlyRecorder{
+		Rejected:      rejected,
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
+	}
+	if o.cgroupRoot != "" {
+		// M3: the guest kubelet freezes the mirror's cgroup itself. M4 swaps this backend for
+		// the snapshot agent.
+		mopts.Suspend = mirror.SuspendOptions{
+			Freezer:         &freeze.Cgroup{Root: o.cgroupRoot},
+			NotReadyTimeout: o.notReadyTimeout,
+			FreezeTimeout:   o.freezeTimeout,
+			ReadyCheck:      mirror.ProbeUntilReady(100*time.Millisecond, probeOnce),
+			ReadyTimeout:    o.resumeReadyTimeout,
+			Recorder:        recorder,
+		}
+	}
+	// D-NS-8 ns-cordon: poked by every suspend-state change, polled every cordonPoll.
+	var cordonPoke chan struct{}
+	// Both suspend paths record the state on the mirror (M3 here, host commands in hostcmd), so
+	// the cordon follows either, and re-derives from the mirrors after a restart (M5).
+	if o.cordonWhileHeld && (o.cgroupRoot != "" || o.hostCommandPort > 0) {
+		cordonPoke = make(chan struct{}, 1)
+		mopts.Suspend.OnHoldChange = func() {
+			select {
+			case cordonPoke <- struct{}{}:
+			default: // a poke is already pending
+			}
+		}
 	}
 
 	// D-VK-3: the host node's labels name the group. Resolved at start and on every label
@@ -328,14 +471,14 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o *options) er
 		mopts.Prober = prober
 	}
 	var edges *probe.EdgeLog
-	if o.debugAddr != "" {
+	if o.debugAddr != "" && prober != nil {
 		edges = probe.NewEdgeLog(edgeLogSize)
 	}
 	n, err := nodeutil.NewNode(o.nodeName,
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, &mopts)
-			owner, err := hc.build(ctx, backend, resolver)
+			owner, err := hc.build(ctx, backend, resolver, client.CoreV1().Nodes())
 			if err != nil {
 				return nil, nil, err
 			}
@@ -343,6 +486,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o *options) er
 			if owner != nil {
 				prov = provider.NewWithCreateOwner(backend, owner)
 			}
+			prov = prov.WithAdmission(&provider.Admission{Policy: policy, Recorder: recorder, Rejected: rejected})
 			if edges != nil {
 				prov.SetNotifyHook(func(pod *corev1.Pod) { edges.Observe(pod) })
 			}
@@ -370,16 +514,33 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o *options) er
 	if err := backend.Start(ctx); err != nil {
 		return err
 	}
-	if edges != nil {
-		go probe.Serve(ctx, o.debugAddr, probe.DebugHandler(prober, edges))
+	if o.debugAddr != "" {
+		go probe.Serve(ctx, o.debugAddr, debugHandler(backend, prober, edges))
+	}
+	// M5: relist the guests and restore what lived only in memory before anything acts on them.
+	if _, err := provider.Recover(ctx, &provider.RecoverConfig{
+		Pods: client.CoreV1().Pods(corev1.NamespaceAll), NodeName: o.nodeName, Host: backend,
+		Server: hc.server(), Journal: hc.journal, IsGuest: provider.MatchesGuest,
+		Kill: hc.killer(), KillBudget: o.killTimeout,
+	}); err != nil {
+		return err
 	}
 	if err := hc.start(ctx); err != nil {
 		return err
 	}
+	if cordonPoke != nil {
+		cordoner := provider.NewCordoner(client.CoreV1().Nodes(), o.nodeName,
+			eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "cordon")}))
+		log.G(ctx).WithField("node", o.nodeName).WithField("pollMs", cordonPoll.Milliseconds()).
+			Info("cordon while held: on (D-NS-8 ns-cordon)")
+		go cordoner.RunCordon(ctx, cordonPoll, backend.Hold, cordonPoke)
+	}
 	go func() {
 		if err := n.WaitReady(ctx, 0); err == nil {
+			hc.ready() // the guest informer has synced: host commands may act
 			log.G(ctx).WithField("node", o.nodeName).WithField("host", o.hostNode).
 				WithField("providerID", cfg.ProviderID).Info("node registered and controllers running")
+			log.G(ctx).WithField("node", o.nodeName).WithField("labels", nodeSpec.Labels).Info("virtual node labels")
 		}
 	}()
 	return n.Run(ctx) // blocks until ctx is cancelled or a controller fails
@@ -422,7 +583,16 @@ func reRegisterOnNotFound(client kubernetes.Interface, spec *corev1.Node) node.E
 		log.G(ctx).WithField("node", spec.Name).Warn("Node object was deleted by someone else; re-registering")
 		fresh := spec.DeepCopy()
 		fresh.ResourceVersion = ""
-		_, err = client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{})
-		return err
+		if _, err := client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{}); err != nil {
+			return err
+		}
+		log.G(ctx).WithField("node", spec.Name).WithField("finalizer", provider.NodeFinalizer).
+			WithField("action", "re-registered").Info("node finalizer set")
+		return nil
 	}
+}
+
+// probeOnce is one readiness probe attempt with the M2 prober's semantics (the resume check).
+func probeOnce(ctx context.Context, podIP string, c *corev1.Container) error {
+	return probe.NetProber{}.Probe(ctx, probe.Target{PodIP: podIP, Container: c})
 }

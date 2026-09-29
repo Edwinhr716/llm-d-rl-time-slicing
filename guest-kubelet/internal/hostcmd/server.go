@@ -14,8 +14,13 @@
 // the same epoch with the other command, is answered STALE_EPOCH without acting;
 // a higher epoch of the other command aborts the running one; a higher epoch of
 // the same command joins it. Command work is detached from the RPC, so a caller
-// that gives up can retry and join it. After a start the VK assumes nothing: no
-// mirror is created before the first Resume (fail closed).
+// that gives up can retry and join it; a retry of a command that succeeded gets
+// its ack again without a second run. Each command is journalled (Config.Journal)
+// before it acts and when it is done, and each guest's suspend state is kept on
+// its mirror, so after a restart Restore re-derives the fence, the lent or held
+// state and any unfinished command (M5). Without a journal the VK assumes
+// nothing after a start: no mirror is created before the first Resume (fail
+// closed).
 package hostcmd
 
 import (
@@ -46,8 +51,9 @@ type Host interface {
 	VacateMirror(ctx context.Context, guest, m *corev1.Pod) error
 	KillMirror(ctx context.Context, m *corev1.Pod) error
 	WaitMirrorGone(ctx context.Context, m *corev1.Pod) error
-	BumpEpoch(ctx context.Context, m *corev1.Pod) (*corev1.Pod, int64, error)
-	AnnotateMirror(ctx context.Context, m *corev1.Pod, key, value string) error
+	// SetMirrorSuspendState records a suspend state on the mirror ("" clears it) and sets its
+	// guest epoch in the same compare-and-swap (mirror.EpochKeep, mirror.EpochBump or a value).
+	SetMirrorSuspendState(ctx context.Context, m *corev1.Pod, state string, epoch int64) (*corev1.Pod, int64, error)
 }
 
 // Config configures the server. Durations left zero get the defaults.
@@ -69,6 +75,11 @@ type Config struct {
 	// EngineReady reports whether a running mirror really serves. The default is the mirror's
 	// ContainersReady; the VK readiness prober (M2) plugs in here.
 	EngineReady func(guest, m *corev1.Pod) bool
+	// Journal, if set, keeps the last command across restarts (M5).
+	Journal Journal
+	// Ready, if set, is closed once Host lists every guest (the pod informer has synced). No
+	// command acts before: a vacate right after a start must not miss a guest.
+	Ready <-chan struct{}
 
 	VacateMargin  time.Duration // taken off the vacate deadline for the ack's way back (250 ms)
 	ResumeBudget  time.Duration // bound on each guest's Freezer.Resume (30 s)
@@ -142,9 +153,10 @@ type Server struct {
 	// guestMu serializes guest work between commands and the serve loop.
 	guestMu sync.Mutex
 
-	stateMu   sync.Mutex
-	suspended map[types.UID]bool // suspended by this process
-	released  map[types.UID]bool // Ready released by this process
+	journalMu sync.Mutex // orders journal writes
+
+	stateMu  sync.Mutex
+	released map[types.UID]bool // Ready released by this process (or restored as released)
 }
 
 // New returns a server whose detached work lives until ctx ends.
@@ -156,7 +168,7 @@ func New(ctx context.Context, config *Config) (*Server, error) {
 	cfg.defaults()
 	return &Server{
 		cfg: cfg, ctx: ctx, nudge: make(chan struct{}, 1),
-		suspended: map[types.UID]bool{}, released: map[types.UID]bool{},
+		released: map[types.UID]bool{},
 	}, nil
 }
 
@@ -269,6 +281,12 @@ func (s *Server) startOrJoin(cmd hcpb.Command, epoch int64, deadline time.Time) 
 		}
 		s.epoch, s.epochCmd = epoch, cmd
 		running := s.op
+		if running != nil && isDone(running) && running.epoch == epoch && running.command == cmd &&
+			running.outcome == doneOutcome(cmd) {
+			// A retry of a command that succeeded (maybe before a restart): the same ack, no second
+			// run. A failed or aborted one runs again, as before M5.
+			return running, nil
+		}
 		if running == nil || isDone(running) {
 			break
 		}
@@ -340,6 +358,18 @@ func (s *Server) run(ctx context.Context, op *operation, deadline time.Time) {
 		// the node as lent from the Resume on.
 		defer s.startLending(op) //nolint:contextcheck // the serve loop outlives the command; the server context bounds it
 	}
+	// Journalled before close(op.done) (defers run last-in first-out), so an ack never reports a
+	// command the journal does not know as done.
+	defer s.save(ctx, op, deadline, PhaseDone)
+	if s.cfg.Ready != nil {
+		select {
+		case <-s.cfg.Ready:
+		case <-ctx.Done():
+			op.outcome, op.err = hcpb.Outcome_OUTCOME_ABORTED, "aborted by a newer command"
+			return
+		}
+	}
+	s.save(ctx, op, deadline, PhaseRunning)
 	s.guestMu.Lock()
 	defer s.guestMu.Unlock()
 	guests, err := s.cfg.Host.Guests()

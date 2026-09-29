@@ -115,3 +115,9 @@ func (f *FakeFreezer) run(ctx context.Context, op string, delay time.Duration, s
 	}
 	return nil
 }
+
+// Frozen reports what FakeFreezer last recorded on the mirror (Annotate): suspended or not.
+// The host command server asks it after a restart, as it asks freeze.Backend (the host wins).
+func (f *FakeFreezer) Frozen(mirror *corev1.Pod) (bool, error) {
+	return mirror.Annotations[AnnotationFakeFreezer] == FakeSuspended, nil
+}

@@ -8,12 +8,14 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	hcpb "github.com/edwinhr716/guest-kubelet/api/hostcommand/v1alpha1"
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
@@ -36,10 +38,15 @@ type hostCommandWiring struct {
 	allow []netip.Prefix
 	agent *hostcmd.AgentClient
 	srv   *hostcmd.Server
+	// journal keeps the last command on the virtual Node (M5); nil when host commands are off.
+	journal hostcmd.Journal
+	// readyCh is closed by ready() once the guest informer has synced.
+	readyCh   chan struct{}
+	readyOnce sync.Once
 }
 
 func newHostCommandWiring(opts *options) (*hostCommandWiring, error) {
-	wiring := &hostCommandWiring{o: opts}
+	wiring := &hostCommandWiring{o: opts, readyCh: make(chan struct{})}
 	if opts.hostCommandPort == 0 {
 		return wiring, nil
 	}
@@ -91,20 +98,23 @@ func parseAllow(v string) ([]netip.Prefix, error) {
 // build creates the server on top of the mirror backend. It returns nil when host commands
 // are off. ctx bounds the server's detached work.
 func (w *hostCommandWiring) build(
-	ctx context.Context, backend *mirror.Backend, resolver *group.Resolver,
+	ctx context.Context, backend *mirror.Backend, resolver *group.Resolver, nodes corev1client.NodeInterface,
 ) (provider.CreateOwner, error) {
 	if w.o.hostCommandPort == 0 {
 		return nil, nil //nolint:nilnil // nil owner means host commands are off
 	}
+	w.journal = &provider.NodeJournal{Nodes: nodes, Name: w.o.nodeName}
 	cfg := &hostcmd.Config{
 		Node:         w.o.hostNode,
 		Group:        func() (string, bool) { return resolver.Current().Group() },
 		Host:         backend,
-		IsGuest:      provider.IsGuest,
+		IsGuest:      provider.MatchesGuest,
 		EngineReady:  backend.EngineReady,
 		VacateMargin: w.o.vacateMargin,
 		ResumeBudget: w.o.resumeBudget,
 		KillTimeout:  w.o.killTimeout,
+		Journal:      w.journal,
+		Ready:        w.readyCh,
 	}
 	switch w.o.freezer {
 	case freezerAgent:
@@ -183,6 +193,19 @@ func (w *hostCommandWiring) allowed(ctx context.Context) bool {
 	return false
 }
 
+// server is the host command server for Recover, or nil when host commands are off.
+func (w *hostCommandWiring) server() provider.RecoverServer {
+	if w.srv == nil {
+		return nil
+	}
+	return w.srv
+}
+
+// ready lets host commands act: every guest is listed (the pod informer has synced).
+func (w *hostCommandWiring) ready() {
+	w.readyOnce.Do(func() { close(w.readyCh) })
+}
+
 func (w *hostCommandWiring) close(ctx context.Context) {
 	if w.agent == nil {
 		return
@@ -190,4 +213,13 @@ func (w *hostCommandWiring) close(ctx context.Context) {
 	if err := w.agent.Close(); err != nil {
 		log.G(ctx).WithError(err).Warn("closing the snapshot-agent connection failed")
 	}
+}
+
+// killer is the agent Kill that relist repeats for a kill sequence a restart interrupted (M5),
+// or nil when there is no agent (--freezer other than agent, or host commands off).
+func (w *hostCommandWiring) killer() mirror.KillFunc {
+	if w.agent == nil {
+		return nil
+	}
+	return w.agent.Kill
 }

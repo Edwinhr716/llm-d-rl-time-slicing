@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -78,7 +77,7 @@ func (s *Server) agentVacate(ctx context.Context, epoch int64, deadline time.Tim
 			it.finish(fmt.Errorf("read mirror: %w", err))
 			return
 		case !found || mirrorTerminal(mir):
-			s.setState(pod.UID, false, false)
+			s.setReleased(pod.UID, false)
 			it.finish(nil)
 			return
 		case mir.DeletionTimestamp != nil:
@@ -86,17 +85,25 @@ func (s *Server) agentVacate(ctx context.Context, epoch int64, deadline time.Tim
 			return
 		}
 		it.mir = mir
-		if !s.isSuspended(pod.UID) {
-			s.setState(pod.UID, false, false)
+		next := mirror.StateSuspending
+		if suspendState(mir) == mirror.StateSuspended {
+			next = mirror.StateSuspended // suspended before (maybe before a restart); the agent call is idempotent
+			s.setReleased(pod.UID, false)
+			s.cfg.Host.HoldNotReady(pod, mirror.ReasonSuspended)
+		} else {
+			s.setReleased(pod.UID, false)
 			s.cfg.Host.HoldNotReady(pod, mirror.ReasonSuspending)
 		}
 		if err := s.cfg.Host.ConfirmNotReady(dctx, pod); err != nil {
 			it.finish(s.killUnlessAborted(ctx, pod, mir, err, "NotReady not confirmed by the deadline"))
 			return
 		}
-		if err := s.cfg.Host.AnnotateMirror(dctx, mir, mirror.AnnotationGuestEpoch, strconv.FormatInt(epoch, 10)); err != nil {
+		upd, _, err := s.cfg.Host.SetMirrorSuspendState(dctx, mir, next, epoch)
+		if err != nil {
 			it.finish(s.killUnlessAborted(ctx, pod, mir, err, "writing the guest epoch failed"))
+			return
 		}
+		it.mir = upd
 	})
 	if !anyPending(items) {
 		return
@@ -110,7 +117,11 @@ func (s *Server) agentVacate(ctx context.Context, epoch int64, deadline time.Tim
 			it.finish(s.killUnlessAborted(ctx, it.pod, it.mir, err, "agent did not suspend the guest: "+why))
 			return
 		}
-		s.setState(it.pod.UID, true, false)
+		wctx := context.WithoutCancel(ctx)
+		if _, _, err := s.cfg.Host.SetMirrorSuspendState(wctx, it.mir, mirror.StateSuspended, mirror.EpochKeep); err != nil {
+			log.G(ctx).WithError(err).WithField("guest", it.pod.Name).Warn("host command: suspended guest not marked Suspended")
+		}
+		s.setReleased(it.pod.UID, false)
 		s.cfg.Host.HoldNotReady(it.pod, mirror.ReasonSuspended)
 		it.finish(nil)
 	})
@@ -128,23 +139,23 @@ func (s *Server) agentResume(ctx context.Context, epoch int64, deadline time.Tim
 			it.finish(nil)
 			return
 		}
-		if !s.isSuspended(it.pod.UID) {
-			return
-		}
 		mir, found, err := s.cfg.Host.MirrorNow(dctx, it.pod)
 		switch {
 		case err != nil:
 			it.finish(fmt.Errorf("read mirror: %w", err))
 			return
 		case !found || mirrorTerminal(mir) || mir.DeletionTimestamp != nil:
-			s.setState(it.pod.UID, false, false) // startGuest below handles it
+			s.setReleased(it.pod.UID, false) // startGuest below handles it
 			return
+		case suspendState(mir) == "":
+			return // running
 		}
-		if err := s.cfg.Host.AnnotateMirror(dctx, mir, mirror.AnnotationGuestEpoch, strconv.FormatInt(epoch, 10)); err != nil {
+		upd, _, err := s.cfg.Host.SetMirrorSuspendState(dctx, mir, mirror.StateResuming, epoch)
+		if err != nil {
 			it.finish(s.killUnlessAborted(ctx, it.pod, mir, err, "writing the guest epoch failed"))
 			return
 		}
-		it.mir = mir
+		it.mir = upd
 	})
 	for _, it := range items {
 		if !it.finished && it.mir != nil {
@@ -165,7 +176,11 @@ func (s *Server) agentResume(ctx context.Context, epoch int64, deadline time.Tim
 				it.finish(errors.Join(errors.New("resume: "+why), kerr))
 				return
 			}
-			s.setState(it.pod.UID, false, false)
+			if _, _, err := s.cfg.Host.SetMirrorSuspendState(dctx, it.mir, "", mirror.EpochKeep); err != nil {
+				it.finish(fmt.Errorf("resumed, but clearing the suspend state failed: %w", err))
+				return
+			}
+			s.setReleased(it.pod.UID, false)
 			s.cfg.Host.HoldNotReady(it.pod, mirror.ReasonWaitingForGrant)
 		})
 	}

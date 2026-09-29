@@ -49,6 +49,8 @@ type Options struct {
 	// Prober runs the guests' readinessProbes and supplies the ready flags (M2). Nil keeps the
 	// M1 behaviour: the mirror's ready flags, which mean only "running", are copied.
 	Prober Prober
+	// Suspend configures suspend and resume (M3). Its zero value disables them.
+	Suspend SuspendOptions
 }
 
 // Prober is the readiness prober the backend drives (internal/probe implements it).
@@ -77,7 +79,8 @@ type Backend struct {
 	mu          sync.Mutex
 	onStatus    func(*corev1.Pod) // the library's notify callback, wrapped by the provider
 	orphanSince map[types.UID]time.Time
-	gate        gateState // host-command mode only; guarded by mu
+	gate        gateState  // host-command mode only; guarded by mu
+	locks       guestLocks // one suspend or resume per guest at a time
 }
 
 // New builds the backend. guests must list the pods bound to the virtual node.
@@ -195,7 +198,8 @@ func (b *Backend) mirrorDeleted(obj any) {
 	if g == nil {
 		return
 	}
-	if b.takeVacated(g.UID) {
+	// The annotation covers a restart between the delete and this event (M5).
+	if vacated := b.takeVacated(g.UID); vacated || mirrorPod.Annotations[AnnotationVacated] == "true" {
 		b.emit(VacatedStatus(g))
 		return
 	}
@@ -375,7 +379,7 @@ func (b *Backend) adoptOrReplace(ctx context.Context, guest, want *corev1.Pod) (
 // Delete deletes the guest's mirror with the guest's grace period, so the real kubelet sends
 // SIGTERM and waits as it would for the guest. It returns errdefs.NotFound if there is none.
 func (b *Backend) Delete(ctx context.Context, guest *corev1.Pod) error {
-	m, ok := b.mirrorOf(guest)
+	mirrorPod, ok := b.mirrorOf(guest)
 	if !ok {
 		// Nothing runs, so report the guest terminated now; the library then removes it
 		// without waiting out the grace period.
@@ -383,19 +387,20 @@ func (b *Backend) Delete(ctx context.Context, guest *corev1.Pod) error {
 		go b.finishGuestDeletion(context.Background(), guest)
 		return errdefs.NotFoundf("no mirror for guest %s/%s", guest.Namespace, guest.Name)
 	}
-	uid := m.UID
+	b.thawBeforeDelete(ctx, mirrorPod)
+	uid := mirrorPod.UID
 	opts := metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}
 	if guest.DeletionGracePeriodSeconds != nil {
 		opts.GracePeriodSeconds = guest.DeletionGracePeriodSeconds
 	}
-	err := b.client.CoreV1().Pods(m.Namespace).Delete(ctx, m.Name, opts)
+	err := b.client.CoreV1().Pods(mirrorPod.Namespace).Delete(ctx, mirrorPod.Name, opts)
 	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-		return errdefs.NotFoundf("mirror %s/%s already gone", m.Namespace, m.Name)
+		return errdefs.NotFoundf("mirror %s/%s already gone", mirrorPod.Namespace, mirrorPod.Name)
 	}
 	if err != nil {
 		return fmt.Errorf("delete mirror: %w", err)
 	}
-	log.G(ctx).WithField("mirror", m.Namespace+"/"+m.Name).Info("mirror deleted")
+	log.G(ctx).WithField("mirror", mirrorPod.Namespace+"/"+mirrorPod.Name).Info("mirror deleted")
 	return nil
 }
 
@@ -452,4 +457,19 @@ func (b *Backend) collectOrphans(ctx context.Context, now time.Time) {
 		}
 	}
 	b.mu.Unlock()
+}
+
+// thawBeforeDelete thaws a suspended mirror before it is deleted: a frozen process cannot act
+// on SIGTERM, so it would sit out the whole grace period and then be killed. Best effort.
+func (b *Backend) thawBeforeDelete(ctx context.Context, m *corev1.Pod) {
+	fz := b.opts.Suspend.Freezer
+	state, epoch := SuspendState(m)
+	if fz == nil || state == "" {
+		return
+	}
+	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := fz.Resume(tctx, m, epoch); err != nil {
+		log.G(ctx).WithError(err).WithField("mirror", m.Namespace+"/"+m.Name).Warn("could not thaw the mirror before deleting it")
+	}
 }

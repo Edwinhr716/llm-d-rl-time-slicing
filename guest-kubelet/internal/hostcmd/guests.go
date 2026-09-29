@@ -24,31 +24,44 @@ func mirrorTerminal(m *corev1.Pod) bool {
 	return m.Status.Phase == corev1.PodSucceeded || m.Status.Phase == corev1.PodFailed
 }
 
-func (s *Server) isSuspended(uid types.UID) bool {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.suspended[uid]
-}
-
 func (s *Server) isReleased(uid types.UID) bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	return s.released[uid]
 }
 
-func (s *Server) setState(uid types.UID, suspended, released bool) {
+func (s *Server) setReleased(uid types.UID, released bool) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if suspended {
-		s.suspended[uid] = true
-	} else {
-		delete(s.suspended, uid)
-	}
 	if released {
 		s.released[uid] = true
 	} else {
 		delete(s.released, uid)
 	}
+}
+
+// suspendState is the guest's suspend state as recorded on its mirror: "" (running),
+// Suspending, Suspended or Resuming. The mirror is the record, so it survives a restart.
+func suspendState(m *corev1.Pod) string {
+	state, _ := mirror.SuspendState(m)
+	return state
+}
+
+// hostFrozen asks the freezer whether the mirror is stopped now, when the freezer can tell
+// (freeze.Backend and FakeFreezer can). After a restart the host wins over a half-written
+// record: a Suspending mirror that is frozen is Suspended; a Resuming one that runs is resumed.
+func (s *Server) hostFrozen(m *corev1.Pod) (bool, bool) { //nolint:gocritic // see nonamedreturns
+	f, ok := s.cfg.Freezer.(interface {
+		Frozen(pod *corev1.Pod) (bool, error)
+	})
+	if !ok {
+		return false, false
+	}
+	frozen, err := f.Frozen(m)
+	if err != nil {
+		return false, false
+	}
+	return frozen, true
 }
 
 // ---- Vacate ----
@@ -69,18 +82,33 @@ func (s *Server) vacateGuest(ctx context.Context, pod *corev1.Pod, deadline time
 		return fmt.Errorf("read mirror: %w", err)
 	}
 	if !found || mirrorTerminal(mir) {
-		s.setState(pod.UID, false, false)
+		s.setReleased(pod.UID, false)
 		return nil
 	}
 	if mir.DeletionTimestamp != nil {
 		return s.waitGone(ctx, dctx, pod, mir, "mirror already being deleted")
 	}
-	if s.isSuspended(pod.UID) {
-		return nil // suspended by an earlier vacate and not resumed since
+	switch state := suspendState(mir); {
+	case state == mirror.StateSuspended:
+		s.setReleased(pod.UID, false)
+		s.cfg.Host.HoldNotReady(pod, mirror.ReasonSuspended)
+		return nil // suspended by an earlier vacate (maybe before a restart) and not resumed since
+	case state != "":
+		// A freeze or thaw was cut off (a restart, or an aborted resume). The host wins: a frozen
+		// mirror is Suspended; otherwise it runs, and the normal path below suspends it.
+		if frozen, known := s.hostFrozen(mir); known && frozen {
+			s.setReleased(pod.UID, false)
+			s.cfg.Host.HoldNotReady(pod, mirror.ReasonSuspended)
+			if _, _, err := s.cfg.Host.SetMirrorSuspendState(dctx, mir, mirror.StateSuspended, mirror.EpochKeep); err != nil {
+				logger.WithError(err).Warn("host command: frozen mirror not marked Suspended")
+			}
+			logger.WithField("recorded", state).Info("host command: guest found frozen; counted as suspended")
+			return nil
+		}
 	}
 
 	// NotReady first, always: the router must stop sending before the process stops.
-	s.setState(pod.UID, false, false)
+	s.setReleased(pod.UID, false)
 	s.cfg.Host.HoldNotReady(pod, mirror.ReasonSuspending)
 	if err := s.cfg.Host.ConfirmNotReady(dctx, pod); err != nil {
 		if ctx.Err() != nil {
@@ -91,7 +119,9 @@ func (s *Server) vacateGuest(ctx context.Context, pod *corev1.Pod, deadline time
 	if s.cfg.Freezer == nil || mir.Status.Phase != corev1.PodRunning {
 		return s.vacateByDelete(ctx, dctx, pod, mir, "no freezer or mirror not running")
 	}
-	upd, epoch, err := s.cfg.Host.BumpEpoch(dctx, mir)
+	// Suspending and the new epoch in one compare-and-swap, before the freeze: a restart after it
+	// finds the guest mid-freeze and asks the freezer (above).
+	upd, epoch, err := s.cfg.Host.SetMirrorSuspendState(dctx, mir, mirror.StateSuspending, mirror.EpochBump)
 	if err == nil {
 		err = s.cfg.Freezer.Suspend(dctx, upd, epoch)
 	}
@@ -104,7 +134,13 @@ func (s *Server) vacateGuest(ctx context.Context, pod *corev1.Pod, deadline time
 		logger.WithError(err).Warn("host command: suspend failed; killing the guest")
 		return s.kill(ctx, pod, mir, "suspend failed: "+err.Error())
 	}
-	s.setState(pod.UID, true, false)
+	wctx := context.WithoutCancel(ctx)
+	if _, _, err := s.cfg.Host.SetMirrorSuspendState(wctx, upd, mirror.StateSuspended, mirror.EpochKeep); err != nil {
+		// The guest is frozen: that is success. Suspending on the mirror still counts as not
+		// running (Hold, the next vacate asks the freezer).
+		logger.WithError(err).Warn("host command: suspended guest not marked Suspended")
+	}
+	s.setReleased(pod.UID, false)
 	s.cfg.Host.HoldNotReady(pod, mirror.ReasonSuspended)
 	logger.WithField("epoch", epoch).WithField("took", time.Since(start).String()).
 		WithField("left", time.Until(deadline).String()).Info("host command: guest suspended")
@@ -131,7 +167,7 @@ func (s *Server) waitGone(ctx, dctx context.Context, pod, mir *corev1.Pod, why s
 		}
 		return s.kill(ctx, pod, mir, "mirror not gone by the deadline")
 	}
-	s.setState(pod.UID, false, false)
+	s.setReleased(pod.UID, false)
 	log.G(ctx).WithField("guest", pod.Namespace+"/"+pod.Name).WithField("why", why).
 		WithField("took", time.Since(start).String()).Info("host command: mirror gone")
 	return nil
@@ -142,7 +178,7 @@ func (s *Server) waitGone(ctx, dctx context.Context, pod, mir *corev1.Pod, why s
 // mirror is gone: the accelerator is clear.
 func (s *Server) kill(ctx context.Context, pod, mir *corev1.Pod, reason string) error {
 	logger := log.G(ctx).WithField("guest", pod.Namespace+"/"+pod.Name).WithField("reason", reason)
-	s.setState(pod.UID, false, false)
+	s.setReleased(pod.UID, false)
 	kctx, cancel := context.WithTimeout(ctx, s.cfg.KillTimeout)
 	defer cancel()
 	var killErr error
@@ -200,15 +236,15 @@ func (s *Server) startGuest(ctx context.Context, guest mirror.Guest) error {
 		found = false
 	}
 	if !found {
-		s.setState(pod.UID, false, false)
+		s.setReleased(pod.UID, false)
 		if err := s.cfg.Host.Create(ctx, pod); err != nil {
 			return fmt.Errorf("create mirror: %w", err)
 		}
 		logger.Info("host command: mirror created")
 		return nil
 	}
-	if !s.isSuspended(pod.UID) {
-		return nil
+	if suspendState(mir) == "" {
+		return nil // running
 	}
 	if s.cfg.Freezer == nil {
 		return errors.New("guest is suspended and was not resumed")
@@ -217,14 +253,34 @@ func (s *Server) startGuest(ctx context.Context, guest mirror.Guest) error {
 }
 
 // resumeMirror bumps the epoch and resumes the guest within the resume budget. It stays
-// NotReady until the engine serves. A failed resume runs the kill sequence.
+// NotReady until the engine serves. A failed resume runs the kill sequence. The mirror shows
+// Resuming during the thaw, and no suspend state once it runs, so a restart in between knows.
 func (s *Server) resumeMirror(ctx context.Context, pod, mir *corev1.Pod) error {
 	start := time.Now()
+	logger := log.G(ctx).WithField("guest", pod.Namespace+"/"+pod.Name)
 	rctx, cancel := context.WithTimeout(ctx, s.cfg.ResumeBudget)
 	defer cancel()
-	upd, epoch, err := s.cfg.Host.BumpEpoch(rctx, mir)
+	if state := suspendState(mir); state == mirror.StateResuming {
+		// A thaw was cut off (a restart). The host wins: a running mirror is resumed already.
+		if frozen, known := s.hostFrozen(mir); known && !frozen {
+			if _, _, err := s.cfg.Host.SetMirrorSuspendState(rctx, mir, "", mirror.EpochKeep); err != nil {
+				return fmt.Errorf("clear the suspend state of a running mirror: %w", err)
+			}
+			s.setReleased(pod.UID, false)
+			s.cfg.Host.HoldNotReady(pod, mirror.ReasonWaitingForGrant)
+			logger.Info("host command: guest found running; counted as resumed")
+			return nil
+		}
+	}
+	upd, epoch, err := s.cfg.Host.SetMirrorSuspendState(rctx, mir, mirror.StateResuming, mirror.EpochBump)
 	if err == nil {
 		err = s.cfg.Freezer.Resume(rctx, upd, epoch)
+	}
+	if err == nil {
+		_, _, err = s.cfg.Host.SetMirrorSuspendState(rctx, upd, "", mirror.EpochKeep)
+		if err != nil {
+			err = fmt.Errorf("clear the suspend state: %w", err)
+		}
 	}
 	if err != nil {
 		if ctx.Err() != nil {
@@ -233,9 +289,9 @@ func (s *Server) resumeMirror(ctx context.Context, pod, mir *corev1.Pod) error {
 		kerr := s.kill(context.WithoutCancel(ctx), pod, mir, "resume failed: "+err.Error())
 		return errors.Join(fmt.Errorf("resume: %w", err), kerr)
 	}
-	s.setState(pod.UID, false, false)
+	s.setReleased(pod.UID, false)
 	s.cfg.Host.HoldNotReady(pod, mirror.ReasonWaitingForGrant)
-	log.G(ctx).WithField("guest", pod.Namespace+"/"+pod.Name).WithField("epoch", epoch).
+	logger.WithField("epoch", epoch).
 		WithField("took", time.Since(start).String()).Info("host command: guest resumed")
 	return nil
 }
@@ -262,9 +318,6 @@ func (s *Server) releaseIfReady(pod *corev1.Pod) (bool, error) {
 	if s.isReleased(pod.UID) {
 		return true, nil
 	}
-	if s.isSuspended(pod.UID) {
-		return false, nil // a suspended guest is released only after its resume
-	}
 	guests, err := s.cfg.Host.Guests()
 	if err != nil {
 		return false, err
@@ -276,11 +329,12 @@ func (s *Server) releaseIfReady(pod *corev1.Pod) (bool, error) {
 		if !guestLive(g.Pod) || (g.Mirror != nil && mirrorTerminal(g.Mirror)) {
 			return true, nil // nothing to release
 		}
-		if g.Mirror == nil || !s.cfg.EngineReady(g.Pod, g.Mirror) {
+		// A suspended (or mid-freeze or mid-thaw) guest is released only after its resume.
+		if g.Mirror == nil || suspendState(g.Mirror) != "" || !s.cfg.EngineReady(g.Pod, g.Mirror) {
 			return false, nil
 		}
 		s.cfg.Host.ReleaseReady(g.Pod)
-		s.setState(pod.UID, false, true)
+		s.setReleased(pod.UID, true)
 		log.G(s.ctx).WithField("guest", pod.Namespace+"/"+pod.Name).Info("host command: guest Ready")
 		return true, nil
 	}
@@ -304,6 +358,9 @@ func (s *Server) serveLoop(ctx context.Context) {
 }
 
 func (s *Server) servePass(ctx context.Context) {
+	if !s.ready() {
+		return // the guest list is not complete yet
+	}
 	s.guestMu.Lock()
 	defer s.guestMu.Unlock()
 	if ctx.Err() != nil {
@@ -321,7 +378,10 @@ func (s *Server) servePass(ctx context.Context) {
 		if !s.cfg.IsGuest(g.Pod) || !guestLive(g.Pod) {
 			continue
 		}
-		if g.Mirror == nil {
+		// No mirror: create one. A mirror still marked suspended while lent (a Resume cut off
+		// by a restart and then aborted, or a lost state write) is resumed: it must not stay
+		// frozen on a lent node.
+		if g.Mirror == nil || (s.cfg.Agent == nil && suspendState(g.Mirror) != "" && !mirrorTerminal(g.Mirror)) {
 			if err := s.startGuest(ctx, g); err != nil {
 				log.G(ctx).WithError(err).WithField("guest", g.Pod.Name).Warn("host command: starting a guest failed")
 			}
@@ -330,5 +390,18 @@ func (s *Server) servePass(ctx context.Context) {
 		if _, err := s.releaseIfReady(g.Pod); err != nil {
 			log.G(ctx).WithError(err).Warn("host command: release check failed")
 		}
+	}
+}
+
+// ready reports whether Config.Ready is closed (or not set).
+func (s *Server) ready() bool {
+	if s.cfg.Ready == nil {
+		return true
+	}
+	select {
+	case <-s.cfg.Ready:
+		return true
+	default:
+		return false
 	}
 }
