@@ -42,9 +42,6 @@ type Job struct {
 	// (last_outcome OUTCOME_KILLED) or on which the orchestrator saw its own
 	// Kill of the job confirmed.
 	killed map[string]bool
-	// unconfirmedKill holds the nodes on which a Kill of the job was not
-	// confirmed and the node was handed back anyway (D-NS-6).
-	unconfirmedKill map[string]bool
 }
 
 // NewJob creates a new Job with default values.
@@ -147,23 +144,4 @@ func (j *Job) SetKilled(nodeName string, killed bool) {
 		j.killed = make(map[string]bool)
 	}
 	j.killed[nodeName] = killed
-}
-
-// UnconfirmedKill reports whether nodeName was handed back after a Kill of the
-// job that was never confirmed.
-func (j *Job) UnconfirmedKill(nodeName string) bool {
-	j.mu.RLock()
-	defer j.mu.RUnlock()
-	return j.unconfirmedKill[nodeName]
-}
-
-// SetUnconfirmedKill records that nodeName was handed back after a Kill of the
-// job that was never confirmed.
-func (j *Job) SetUnconfirmedKill(nodeName string) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if j.unconfirmedKill == nil {
-		j.unconfirmedKill = make(map[string]bool)
-	}
-	j.unconfirmedKill[nodeName] = true
 }

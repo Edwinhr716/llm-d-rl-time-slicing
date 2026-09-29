@@ -273,8 +273,8 @@ func TestORCHA4_GuestOK(t *testing.T) {
 			t.Errorf("Kill sent to %s: %+v", node, k)
 		}
 	}
-	if !sink.has(t, "Foreground granted", map[string]any{"group": e2eGroup, "vram_unconfirmed": false}) {
-		t.Error("no Foreground granted line with vram_unconfirmed=false")
+	if !sink.has(t, "Foreground granted", map[string]any{"group": e2eGroup}) {
+		t.Error("no Foreground granted line")
 	}
 }
 
@@ -350,7 +350,7 @@ func TestORCHA4_GuestHung(t *testing.T) {
 		{"Kill sent", map[string]any{"group": e2eGroup, "node": e2eNodes[1], "reason": "deadline"}},
 		{"Kill confirmed", map[string]any{"group": e2eGroup, "node": e2eNodes[1]}},
 		{"Host clear", map[string]any{"group": e2eGroup, "node": e2eNodes[1], "how": "kill"}},
-		{"Foreground granted", map[string]any{"group": e2eGroup, "vram_unconfirmed": false}},
+		{"Foreground granted", map[string]any{"group": e2eGroup}},
 	} {
 		if !sink.has(t, check.msg, check.attrs) {
 			t.Errorf("no %q log line with %v", check.msg, check.attrs)
@@ -418,46 +418,6 @@ func TestORCHA4_AgentUnreachable_HungHostHeld(t *testing.T) {
 	}
 	if sink.has(t, "Foreground granted", nil) {
 		t.Error("granted over a hung host whose guest could not be killed")
-	}
-}
-
-// TestORCHA4_UnconfirmedKill_GrantedAtN: the agent cannot confirm the Kill.
-// D-NS-6 today: the trainer is granted at N with vram_unconfirmed (returned on
-// the next 1s Acquire poll), and timeslice_kill_unconfirmed_total counts it.
-func TestORCHA4_UnconfirmedKill_GrantedAtN(t *testing.T) {
-	sink := captureLogs(t)
-	clu := newA4Cluster(t, map[string]string{e2eNodes[0]: killConfirm, e2eNodes[1]: killUnconfirmed})
-	hung := clu.execs[e2eNodes[1]]
-	hung.hang.Store(true)
-	t.Cleanup(func() { close(hung.release) })
-	clu.startHostsOn(t, e2eNodes...)
-	orch := clu.startOrch(t)
-	api := client(t, orch)
-	waitGuestsKnown(t, sink)
-
-	resp, took := mustGrantBy(t, api, a4Notice+a4AcquirePoll+300*time.Millisecond)
-	if took < a4Notice-200*time.Millisecond {
-		t.Errorf("granted after %v, before N with an unconfirmed kill", took)
-	}
-	if !resp.GetVramUnconfirmed() {
-		t.Error("AcquireResponse.vram_unconfirmed = false after an unconfirmed kill")
-	}
-	for _, check := range []struct {
-		msg   string
-		attrs map[string]any
-	}{
-		{"Kill sent", map[string]any{"node": e2eNodes[1], "reason": "deadline"}},
-		{"Kill attempt not confirmed", map[string]any{"node": e2eNodes[1], "signal": "agent-kill-unconfirmed"}},
-		{"Kill unconfirmed", map[string]any{"group": e2eGroup, "node": e2eNodes[1], "action": "grant"}},
-		{"Host clear", map[string]any{"node": e2eNodes[1], "how": "unconfirmed-kill"}},
-		{"Foreground granted", map[string]any{"group": e2eGroup, "vram_unconfirmed": true}},
-	} {
-		if !sink.has(t, check.msg, check.attrs) {
-			t.Errorf("no %q log line with %v", check.msg, check.attrs)
-		}
-	}
-	if v := scrapeCounter(t, orch.MetricsAddr, "timeslice_kill_unconfirmed_total"); v < 1 {
-		t.Errorf("timeslice_kill_unconfirmed_total = %v, want >= 1", v)
 	}
 }
 

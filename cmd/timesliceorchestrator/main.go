@@ -107,6 +107,10 @@ func run() error {
 	backgroundLiveness := flag.Duration("background-liveness", controller.DefaultBackgroundLiveness,
 		"Background liveness L: with host commands on, a host whose commands have failed this long during a "+
 			"vacate counts as unseen and its guests are killed through their snapshot agent.")
+	unconfirmedEscalateAfter := flag.String("unconfirmed-escalate-after", controller.DefaultUnconfirmedEscalateAfter,
+		"<E1>,<E2> after the unconfirmed-kill decision (T + K). A guest whose Kill is not confirmed blocks the "+
+			"foreground grant until it is; at E1 the guest's mirror pod is deleted gracefully, at E2 the node is "+
+			"marked not lendable.")
 	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
 	// are proposals awaiting the lead's sign-off.
 	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
@@ -148,6 +152,11 @@ func run() error {
 	if *noticeWindow <= 0 || *killBudget <= 0 || *killBudget >= *noticeWindow {
 		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
 			*killBudget, *noticeWindow)
+	}
+
+	escalateAfter, err := controller.ParseUnconfirmedEscalateAfter(*unconfirmedEscalateAfter)
+	if err != nil {
+		return fmt.Errorf("--unconfirmed-escalate-after: %w", err)
 	}
 
 	if *hostCommandPort < 0 || *hostCommandPort > 65535 {
@@ -235,6 +244,8 @@ func run() error {
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 	ctrl.KillPollInterval = *killPollInterval
 	ctrl.BackgroundLiveness = *backgroundLiveness
+	ctrl.UnconfirmedEscalateAfter = escalateAfter
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, infraOrch)
 
 	// Start informers
 	informerFactories.Nodes.Start(ctx.Done())
@@ -289,6 +300,7 @@ func run() error {
 		"killBudget", *killBudget,
 		"hostCommandPort", *hostCommandPort,
 		"backgroundLiveness", *backgroundLiveness,
+		"unconfirmedEscalateAfter", *unconfirmedEscalateAfter,
 		"controllerWorkers", *controllerWorkers,
 		"agentRPCTimeout", *agentRPCTimeout,
 		"retryBaseDelay", *retryBaseDelay,

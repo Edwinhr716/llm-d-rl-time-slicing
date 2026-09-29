@@ -37,14 +37,15 @@ type HostCommander interface {
 }
 
 // forgetHostsIfGroupDeleted drops the host registry and the kill path state
-// (kill records and hold log marks, kill.go) of a group that the observe step
-// deleted from the store, so host state, commands and kill state do not
-// outlive the group.
+// (kill records and hold log marks, kill.go; blocked grants,
+// unconfirmed_kill_block.go) of a group that the observe step deleted from the
+// store, so host state, commands and kill state do not outlive the group.
 func (c *Controller) forgetHostsIfGroupDeleted(ctx context.Context, groupID string) {
 	if _, err := c.groupStore.Get(ctx, groupID); errors.Is(err, store.ErrNotFound) {
 		slog.InfoContext(ctx, "Group deleted: forgetting its hosts")
 		c.Hosts.Forget(groupID)
 		c.forgetKills(groupID)
+		c.releaseBlocks(ctx, groupID, func(*blockState) bool { return false })
 	}
 }
 
@@ -103,11 +104,12 @@ func (c *Controller) resumeIfLent(ctx context.Context, group *store.Group) error
 	if !lendWanted(spec) || spec.ActiveJob() != "" || c.Hosts.Lent(group.ID()) {
 		return nil
 	}
-	if guest := c.unconfirmedGuestOn(ctx, group); guest.job != "" {
-		// A guest handed back after an unconfirmed Kill may still be on the
-		// node: do not lend it again until the agent says it is gone.
-		slog.WarnContext(ctx, "Not lending: an unconfirmed kill is not vacated yet", "job", guest.job, "node", guest.node)
-		return nil
+	for _, node := range group.Status().Nodes() {
+		// Marked by the last escalation step of an unconfirmed Kill.
+		if reason := c.nodeNotLendable(node); reason != "" {
+			slog.WarnContext(ctx, "Node not lendable", "node", node, "reason", reason)
+			return nil
+		}
 	}
 	busy, err := c.foregroundResident(ctx, group)
 	if err != nil {

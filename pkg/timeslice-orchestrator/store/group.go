@@ -47,10 +47,6 @@ type GroupSpec struct {
 	// noticeAt is when the current notice to the background started. Zero
 	// when no notice runs.
 	noticeAt time.Time
-	// vramUnconfirmed records that a node was handed back to the foreground
-	// after a guest Kill that was never confirmed. The next foreground grant
-	// reports it (AcquireResponse.vram_unconfirmed) and clears it.
-	vramUnconfirmed bool
 }
 
 // participant is the in-memory record of a node's background participant.
@@ -533,23 +529,6 @@ func (s *GroupSpec) ClearNotice() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.noticeAt = time.Time{}
-}
-
-// SetVramUnconfirmed records that a node was handed back after an
-// unconfirmed guest Kill.
-func (s *GroupSpec) SetVramUnconfirmed() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.vramUnconfirmed = true
-}
-
-// TakeVramUnconfirmed reports and clears the flag SetVramUnconfirmed set.
-func (s *GroupSpec) TakeVramUnconfirmed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vramUnconfirmed
-	s.vramUnconfirmed = false
-	return v
 }
 
 // NoticeAt returns when the current notice started, or zero.

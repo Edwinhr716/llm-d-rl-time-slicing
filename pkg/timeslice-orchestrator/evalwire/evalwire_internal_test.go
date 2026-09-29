@@ -92,6 +92,9 @@ func TestEvalwire_RejectsBadArgs(t *testing.T) {
 		{"--kill-budget=40s", "--notice-window=30s"},
 		{"stray"},
 		{"--host-command-port=-1"},
+		{"--unconfirmed-escalate-after=40s,10s"},
+		{"--unconfirmed-escalate-after=10s"},
+		{"--unconfirmed-escalate-after=0s,10s"},
 	} {
 		if orch, err := Start(context.Background(), Config{Clientset: cs, Args: args}); err == nil {
 			orch.Stop()

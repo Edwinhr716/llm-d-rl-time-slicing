@@ -95,6 +95,14 @@ dispatchBudget:
   openDelay: "0s"
   externalRisingEdge: false
 
+# A guest whose Kill is not confirmed by T + K keeps the foreground grant
+# blocked until it is (the Kill is retried, and the operator alerted).
+#   escalateAfter: "<E1>,<E2>" after T + K: at E1 the guest's mirror pod is
+#     deleted gracefully (never grace period 0), at E2 the node is marked not
+#     lendable (Warning event on the Node, timeslice_node_failed).
+unconfirmedKill:
+  escalateAfter: "10s,40s"
+
 resources: {}
   # limits:
   #   cpu: 100m

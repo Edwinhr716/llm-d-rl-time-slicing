@@ -360,9 +360,9 @@ func (c *Commander) Barrier(group string) (Barrier, bool) {
 }
 
 // ClearByOrchestrator marks a host clear without its ack, because the
-// orchestrator vacated it itself (how is "kill", "unconfirmed-kill" or
-// "no-live-guest"). The running command is stopped and fenced: a late ack of
-// it is ignored. The next Resume commands the host again as usual.
+// orchestrator vacated it itself (how is "kill" or "no-live-guest"). The
+// running command is stopped and fenced: a late ack of it is ignored. The
+// next Resume commands the host again as usual.
 func (c *Commander) ClearByOrchestrator(group, node, how string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

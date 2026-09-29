@@ -12,8 +12,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
 )
 
-// This file is the kill path on the host-push path (ORCH-A4 on D-NS-4
-// ns-push-vk). The hosts are commanded to vacate by hostcmd.Commander; the
+// This file is the kill path on the host-push path. The hosts are commanded to vacate by hostcmd.Commander; the
 // reconcile loop acts on a host that has not acked:
 //
 //   - at T = notice + N - K, and
@@ -29,8 +28,9 @@ import (
 // Each Kill has the deadline now + K and is polled every KillPollInterval,
 // bounded by K. A Kill the agent cannot be reached for is retried every
 // killRetryInterval and the host stays not clear (fail closed). A Kill that
-// reached the agent but was not confirmed is decided by onKillUnconfirmed
-// (unconfirmed_kill.go, D-NS-6 H2).
+// reached the agent but was not confirmed keeps the host not clear, so the
+// foreground grant is blocked, alerted and escalated until the guest is gone
+// (unconfirmed_kill.go).
 
 // Kill reasons, sent to the agent and logged.
 const (
@@ -41,9 +41,8 @@ const (
 
 // How a host was cleared by the orchestrator, for ClearByOrchestrator.
 const (
-	clearHowKill            = "kill"
-	clearHowUnconfirmedKill = "unconfirmed-kill"
-	clearHowNoLiveGuest     = "no-live-guest"
+	clearHowKill        = "kill"
+	clearHowNoLiveGuest = "no-live-guest"
 )
 
 // DefaultBackgroundLiveness is L, the time a host may go unseen during a
@@ -72,8 +71,6 @@ type killRecord struct {
 	// confirmed; signal says how (see unconfirmed_kill.go).
 	unconfirmed bool
 	signal      string
-	// handedBack is set once handBackUnconfirmed ran for the guest.
-	handedBack bool
 }
 
 func killKey(groupID, node, jobID string) string {
@@ -152,6 +149,8 @@ func (c *Controller) killOverdueHosts(ctx context.Context, group *store.Group) b
 	groupID := group.ID()
 	bar, ok := c.Hosts.Barrier(groupID)
 	if !ok {
+		// No barrier: nothing holds a grant back any more.
+		c.releaseBlocks(ctx, groupID, func(*blockState) bool { return false })
 		return c.Hosts.AllClear(groupID)
 	}
 	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
@@ -161,6 +160,7 @@ func (c *Controller) killOverdueHosts(ctx context.Context, group *store.Group) b
 		return false
 	}
 	c.pruneKills(groupID, jobs)
+	c.releaseSettledBlocks(ctx, groupID, jobs, &bar)
 
 	now := time.Now()
 	liveness := c.backgroundLiveness()
@@ -201,7 +201,6 @@ func (c *Controller) vacateHost(
 ) hostVacate {
 	groupID := group.ID()
 	var guests []*store.Job
-	handedBack := false
 	for _, job := range jobs {
 		if !job.Background() {
 			continue
@@ -210,17 +209,10 @@ func (c *Controller) vacateHost(
 		if !guestOnNode(job, states, node) || guestVacated(job, states, node) {
 			continue
 		}
-		if job.UnconfirmedKill(node) {
-			handedBack = true
-			continue
-		}
 		guests = append(guests, job)
 	}
 
 	if len(guests) == 0 {
-		if handedBack {
-			return hostVacate{how: clearHowUnconfirmedKill, done: true}
-		}
 		// No guest is known on the host. Only trust that when the agent
 		// answered recently; otherwise a guest may be there that no
 		// mirror pod shows (fail closed).
@@ -242,6 +234,7 @@ func (c *Controller) vacateHost(
 			c.killGuest(ctx, groupID, job, node, rec, bar.KillBudget)
 		}
 		if job.Killed(node) {
+			c.releaseBlock(ctx, groupID, node, job.JobID())
 			continue
 		}
 		if !rec.unconfirmed {
@@ -250,21 +243,13 @@ func (c *Controller) vacateHost(
 			allDone = false
 			continue
 		}
-		// H2 seam (D-NS-6): a Kill that reached the agent but was not
-		// confirmed.
-		decision := c.onKillUnconfirmed(ctx, groupID, node, job.JobID(), rec.firstSent)
-		if !decision.grant {
-			allDone = false
-			continue
-		}
-		c.handBackUnconfirmed(ctx, group, job, node, rec, decision.vramUnconfirmed)
-		handedBack = true
+		// Reached the agent but not confirmed: the host stays not clear
+		// and the grant is blocked.
+		c.onKillUnconfirmed(ctx, groupID, node, job.JobID(), rec.firstSent)
+		allDone = false
 	}
 	if !allDone {
 		return hostVacate{retry: pendingKillRequeue}
-	}
-	if handedBack {
-		return hostVacate{how: clearHowUnconfirmedKill, done: true}
 	}
 	return hostVacate{how: clearHowKill, done: true}
 }
@@ -400,32 +385,26 @@ func (c *Controller) forgetKills(groupID string) {
 	}
 }
 
-// guestRef names a guest and the node it is on.
-type guestRef struct {
-	job, node string
-}
-
-// unconfirmedGuestOn returns a guest that was handed back after an
-// unconfirmed Kill and that the agent does not yet report vacated, with its
-// node, or an empty job when there is none.
-func (c *Controller) unconfirmedGuestOn(ctx context.Context, group *store.Group) guestRef {
-	jobs, err := c.jobStore.ListByGroup(ctx, group.ID())
-	if err != nil {
-		// Fail closed: not knowing counts as a guest that may be there.
-		return guestRef{job: "unknown"}
+// releaseSettledBlocks drops the blocked grants of the group that no longer
+// hold: the host is clear or no longer in the barrier, or the guest left the
+// store, is no longer on the node or is vacated.
+func (c *Controller) releaseSettledBlocks(ctx context.Context, groupID string, jobs []*store.Job, bar *hostcmd.Barrier) {
+	notClear := make(map[string]bool, len(bar.NotClear))
+	for _, h := range bar.NotClear {
+		notClear[h.Node] = true
 	}
+	byID := make(map[string]*store.Job, len(jobs))
 	for _, job := range jobs {
-		if !job.Background() {
-			continue
+		byID[job.JobID()] = job
+	}
+	c.releaseBlocks(ctx, groupID, func(st *blockState) bool {
+		job, ok := byID[st.job]
+		if !ok || !notClear[st.node] {
+			return false
 		}
 		states := job.ContextState()
-		for _, node := range group.Status().Nodes() {
-			if job.UnconfirmedKill(node) && guestOnNode(job, states, node) && !guestVacated(job, states, node) {
-				return guestRef{job: job.JobID(), node: node}
-			}
-		}
-	}
-	return guestRef{}
+		return guestOnNode(job, states, st.node) && !guestVacated(job, states, st.node)
+	})
 }
 
 // firstHoldLog reports whether this is the first time, for this barrier, that

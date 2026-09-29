@@ -70,10 +70,11 @@ func (h *barrierHosts) ClearByOrchestrator(_, node, how string) {
 	}
 }
 
-func (h *barrierHosts) clearedHow(node string) string {
+// clearedHow returns how the kill path cleared killNode, "" if it did not.
+func (h *barrierHosts) clearedHow() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.cleared[node]
+	return h.cleared[killNode]
 }
 
 // killCall is one Kill the controller sent.
@@ -140,6 +141,12 @@ func newKillFixture(t *testing.T, noticeAt time.Time, window, budget time.Durati
 	fx.ctrl = NewController(groupStore, jobStore, queue, nil, fx.agent)
 	fx.ctrl.Hosts = fx.hosts
 	fx.ctrl.KillPollInterval = 10 * time.Millisecond
+	// Escalation steps far out, so that no step of one test fires during
+	// another; tests of the ladder set their own.
+	fx.ctrl.UnconfirmedEscalateAfter = [2]time.Duration{time.Hour, 2 * time.Hour}
+	t.Cleanup(func() {
+		fx.ctrl.releaseBlocks(context.Background(), killGroup, func(*blockState) bool { return false })
+	})
 	return fx
 }
 
@@ -201,14 +208,11 @@ func TestORCHA4_Kill_HungHostAtT(t *testing.T) {
 	if cleared.After(noticeAt.Add(window + 200*time.Millisecond)) {
 		t.Errorf("host cleared at notice + %v, want by N (%v)", cleared.Sub(noticeAt), window)
 	}
-	if got := fx.hosts.clearedHow(killNode); got != clearHowKill {
+	if got := fx.hosts.clearedHow(); got != clearHowKill {
 		t.Errorf("cleared how = %q, want %q", got, clearHowKill)
 	}
 	if !fx.guest.Killed(killNode) {
 		t.Error("guest not marked killed")
-	}
-	if fx.group.Spec().TakeVramUnconfirmed() {
-		t.Error("a confirmed kill flagged vram_unconfirmed")
 	}
 }
 
@@ -274,7 +278,7 @@ func TestORCHA4_Kill_NoGuest(t *testing.T) {
 	if !fx.ctrl.killOverdueHosts(context.Background(), fx.group) {
 		t.Fatal("host not cleared with no guest and a live agent")
 	}
-	if got := fx.hosts.clearedHow(killNode); got != clearHowNoLiveGuest {
+	if got := fx.hosts.clearedHow(); got != clearHowNoLiveGuest {
 		t.Errorf("cleared how = %q, want %q", got, clearHowNoLiveGuest)
 	}
 	if len(fx.killCalls()) != 0 {
@@ -319,37 +323,38 @@ const (
 	unconfirmedK = 100 * time.Millisecond
 )
 
-// unconfirmedCase runs one unconfirmed Kill signal and checks today's H2
-// default: the host is handed back at noticeAt + N, not before, with
-// vram_unconfirmed and the metric.
+// unconfirmedCase runs one unconfirmed Kill signal and checks the block: the
+// host is never handed back, the grant is blocked at noticeAt + N and not
+// before, the signal is recorded and the metric counted once.
 func unconfirmedCase(t *testing.T, fx *killFixture, noticeAt time.Time, wantSignal string) {
 	t.Helper()
 	window := unconfirmedN
 	before := testutil.ToFloat64(metrics.KillUnconfirmedTotal)
-	cleared := fx.passUntilClear(t, 3*time.Second)
-	if cleared.IsZero() {
-		t.Fatal("host never handed back")
+	blockedAt := time.Time{}
+	end := noticeAt.Add(window + 300*time.Millisecond)
+	for time.Now().Before(end) {
+		if fx.ctrl.killOverdueHosts(context.Background(), fx.group) {
+			t.Fatal("host handed back over an unconfirmed kill")
+		}
+		if blockedAt.IsZero() && fx.blocked() {
+			blockedAt = time.Now()
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if cleared.Before(noticeAt.Add(window)) {
-		t.Errorf("handed back at notice + %v, before N (%v)", cleared.Sub(noticeAt), window)
+	if blockedAt.IsZero() {
+		t.Fatal("grant never blocked")
 	}
-	if cleared.After(noticeAt.Add(window + 300*time.Millisecond)) {
-		t.Errorf("handed back at notice + %v, want right after N (%v)", cleared.Sub(noticeAt), window)
+	if blockedAt.Before(noticeAt.Add(window)) {
+		t.Errorf("blocked at notice + %v, before N (%v)", blockedAt.Sub(noticeAt), window)
 	}
-	if got := fx.hosts.clearedHow(killNode); got != clearHowUnconfirmedKill {
-		t.Errorf("cleared how = %q, want %q", got, clearHowUnconfirmedKill)
-	}
-	if !fx.group.Spec().TakeVramUnconfirmed() {
-		t.Error("the next grant is not flagged vram_unconfirmed")
-	}
-	if fx.group.Spec().TakeVramUnconfirmed() {
-		t.Error("vram_unconfirmed not cleared once taken")
+	if got := fx.hosts.clearedHow(); got != "" {
+		t.Errorf("host cleared (%s) over an unconfirmed kill", got)
 	}
 	if got := testutil.ToFloat64(metrics.KillUnconfirmedTotal) - before; got != 1 {
 		t.Errorf("timeslice_kill_unconfirmed_total grew by %v, want 1", got)
 	}
-	if !fx.guest.UnconfirmedKill(killNode) || fx.guest.Killed(killNode) {
-		t.Error("guest not marked unconfirmed, or marked killed")
+	if fx.guest.Killed(killNode) {
+		t.Error("guest marked killed")
 	}
 	rec := fx.ctrl.killRecordFor(killKey(killGroup, killNode, killGuest), killReasonDeadline, noticeAt)
 	if rec.signal != wantSignal {
@@ -357,7 +362,7 @@ func unconfirmedCase(t *testing.T, fx *killFixture, noticeAt time.Time, wantSign
 	}
 }
 
-func TestUnconfirmedKill_Grant_AgentKillUnconfirmed(t *testing.T) {
+func TestUnconfirmedKill_AgentKillUnconfirmed(t *testing.T) {
 	noticeAt := time.Now()
 	fx := newKillFixture(t, noticeAt, unconfirmedN, unconfirmedK)
 	fx.agent.OperationFunc = func(context.Context, string, string) (*agentpb.GetOperationResponse, error) {
@@ -370,7 +375,7 @@ func TestUnconfirmedKill_Grant_AgentKillUnconfirmed(t *testing.T) {
 	unconfirmedCase(t, fx, noticeAt, unconfirmedKillAgent)
 }
 
-func TestUnconfirmedKill_Grant_NotCompleteByK(t *testing.T) {
+func TestUnconfirmedKill_NotCompleteByK(t *testing.T) {
 	noticeAt := time.Now()
 	fx := newKillFixture(t, noticeAt, unconfirmedN, unconfirmedK)
 	fx.agent.OperationFunc = func(context.Context, string, string) (*agentpb.GetOperationResponse, error) {
@@ -379,7 +384,7 @@ func TestUnconfirmedKill_Grant_NotCompleteByK(t *testing.T) {
 	unconfirmedCase(t, fx, noticeAt, unconfirmedKillTimeout)
 }
 
-func TestUnconfirmedKill_Grant_DeviceBytesAfterComplete(t *testing.T) {
+func TestUnconfirmedKill_DeviceBytesAfterComplete(t *testing.T) {
 	noticeAt := time.Now()
 	fx := newKillFixture(t, noticeAt, unconfirmedN, unconfirmedK)
 	fx.agent.GetStatusFunc = func(context.Context, string) (*agentpb.StatusResponse, error) {
@@ -390,32 +395,19 @@ func TestUnconfirmedKill_Grant_DeviceBytesAfterComplete(t *testing.T) {
 	unconfirmedCase(t, fx, noticeAt, unconfirmedDeviceBytes)
 }
 
-// TestUnconfirmedKill_Grant_NotBeforeKillBudget: the hand-back never comes
-// before the Kill had its full budget K, even when N already ran out.
-func TestUnconfirmedKill_Grant_NotBeforeKillBudget(t *testing.T) {
+// TestUnconfirmedKill_NotBeforeKillBudget: the grant is never recorded as
+// blocked before the Kill had its full budget K, even when N already ran out.
+func TestUnconfirmedKill_NotBeforeKillBudget(t *testing.T) {
 	fx := newKillFixture(t, time.Now().Add(-10*time.Second), 400*time.Millisecond, 100*time.Millisecond)
 	start := time.Now()
-	if fx.ctrl.onKillUnconfirmed(context.Background(), killGroup, killNode, killGuest, start).grant {
-		t.Fatal("granted before since + K")
+	fx.ctrl.onKillUnconfirmed(context.Background(), killGroup, killNode, killGuest, start)
+	if fx.blocked() {
+		t.Fatal("blocked before since + K")
 	}
 	time.Sleep(120 * time.Millisecond)
-	decision := fx.ctrl.onKillUnconfirmed(context.Background(), killGroup, killNode, killGuest, start)
-	if !decision.grant || !decision.vramUnconfirmed {
-		t.Fatalf("onKillUnconfirmed = %+v after K and N, want grant with vram_unconfirmed", decision)
-	}
-}
-
-// TestUnconfirmedKill_NotLentAgain: a guest handed back after an unconfirmed
-// Kill blocks the next lend until the agent reports it vacated.
-func TestUnconfirmedKill_NotLentAgain(t *testing.T) {
-	fx := newKillFixture(t, time.Now(), 30*time.Second, 3*time.Second)
-	fx.guest.SetUnconfirmedKill(killNode)
-	if got := fx.ctrl.unconfirmedGuestOn(context.Background(), fx.group); got.job != killGuest || got.node != killNode {
-		t.Fatalf("unconfirmedGuestOn = %+v, want %s on %s", got, killGuest, killNode)
-	}
-	fx.guest.UpdateContextState(killNode, pb.SnapshotAgentJobState_STATE_SUSPENDED)
-	if got := fx.ctrl.unconfirmedGuestOn(context.Background(), fx.group); got.job != "" {
-		t.Fatalf("unconfirmedGuestOn = %+v after the agent reports it suspended, want none", got)
+	fx.ctrl.onKillUnconfirmed(context.Background(), killGroup, killNode, killGuest, start)
+	if !fx.blocked() {
+		t.Fatal("not blocked after K and N")
 	}
 }
 
