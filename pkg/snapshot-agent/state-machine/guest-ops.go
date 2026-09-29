@@ -97,7 +97,13 @@ func ErrorReasonOf(err error) pb.ErrorReason {
 // StartGuestOp starts a Suspend or Resume of a background (guest) job and
 // returns the operation ID to poll. deadline is absolute and required.
 //
-// Epoch fencing comes first:
+// epoch must be at least 1. Epoch 0 is the proto default of a caller that
+// never set the field, so it (and a negative epoch) is refused with
+// InvalidArgument before the job lookup: the refusal creates no operation
+// (no RELEASED for an unknown job) and leaves the job's last epoch
+// unchanged. Kill carries no epoch.
+//
+// Epoch fencing comes next:
 //   - an epoch lower than the job's last epoch is refused with STALE_EPOCH;
 //   - the same epoch and the same call returns that call's operation ID,
 //     running or finished, until the operation expires (a re-issue after a
@@ -129,6 +135,11 @@ func (sm *StateManager) StartGuestOp(
 	if deadline.IsZero() {
 		return "", refuse(codes.InvalidArgument, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
 			"%s of job %s: a deadline is required", intent, jobID)
+	}
+	if epoch < 1 {
+		slog.Warn("Refusing guest operation with epoch below 1", "jobID", jobID, "intent", intent, "epoch", epoch)
+		return "", refuse(codes.InvalidArgument, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
+			"%s of job %s: epoch must be at least 1", intent, jobID)
 	}
 
 	sm.mu.Lock()
