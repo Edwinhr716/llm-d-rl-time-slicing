@@ -347,46 +347,6 @@ func TestGuestOp_SameEpochDifferentCallIsStale(t *testing.T) {
 	checkJobState(t, sm, guestJob, pb.JobState_JOB_STATE_SUSPENDED)
 }
 
-func TestGuestOp_HigherEpochAbortsRunningOperation(t *testing.T) {
-	sm := newGuestSM(t, pb.JobState_JOB_STATE_RUNNING)
-	suspendStub := newGuestStub(suspendedResult)
-	resumeStub := newGuestStub(statemachine.GuestResult{HostBytesPinned: 1 << 20})
-
-	suspendID := startGuest(t, sm, statemachine.OpTypeSuspend, 3, suspendStub.run)
-	suspendCtx := waitStarted(t, suspendStub)
-
-	resumeID := startGuest(t, sm, statemachine.OpTypeResume, 4, resumeStub.run)
-	if resumeID == suspendID {
-		t.Fatal("a higher epoch must start a new operation")
-	}
-	waitStarted(t, resumeStub)
-
-	aborted := getOp(t, sm, suspendID)
-	checkFailed(t, aborted, pb.ErrorReason_STALE_EPOCH)
-	if !strings.Contains(aborted.Error, "aborted by Resume with epoch 4") {
-		t.Errorf("unexpected abort message %q", aborted.Error)
-	}
-	if !errors.Is(suspendCtx.Err(), context.Canceled) {
-		t.Errorf("aborted operation's context: expected Canceled, got %v", suspendCtx.Err())
-	}
-
-	// The aborted worker returning success afterwards writes nothing.
-	close(suspendStub.release)
-	waitReturned(t, suspendStub)
-	checkJobState(t, sm, guestJob, pb.JobState_JOB_STATE_TRANSITIONING)
-	checkFailed(t, getOp(t, sm, suspendID), pb.ErrorReason_STALE_EPOCH)
-
-	close(resumeStub.release)
-	checkComplete(t, waitForOperation(t, sm, resumeID), pb.Outcome_OUTCOME_RESUMED)
-	st := jobStatus(t, sm)
-	if st.GetState() != pb.JobState_JOB_STATE_RUNNING || st.GetLastOutcome() != pb.Outcome_OUTCOME_RESUMED {
-		t.Errorf("expected RUNNING/RESUMED, got %s/%s", st.GetState(), st.GetLastOutcome())
-	}
-	if st.GetEpoch() != 4 {
-		t.Errorf("expected epoch 4, got %d", st.GetEpoch())
-	}
-}
-
 func TestSeedEpoch(t *testing.T) {
 	sm := newGuestSM(t, pb.JobState_JOB_STATE_SUSPENDED)
 

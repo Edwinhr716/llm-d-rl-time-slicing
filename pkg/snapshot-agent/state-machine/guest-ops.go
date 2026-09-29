@@ -28,8 +28,8 @@ type GuestResult struct {
 }
 
 // GuestWorker runs a Suspend or Resume pipeline. Its context carries the
-// call's absolute deadline and is cancelled when the operation is aborted
-// or superseded.
+// call's absolute deadline and is cancelled when a Kill supersedes the
+// operation.
 type GuestWorker func(ctx context.Context) (GuestResult, error)
 
 // KillWorker kills a job's processes and confirms they are gone. Its
@@ -103,9 +103,9 @@ func ErrorReasonOf(err error) pb.ErrorReason {
 //     running or finished, until the operation expires (a re-issue after a
 //     lost reply);
 //   - the same epoch and a different call is refused with STALE_EPOCH;
-//   - a higher epoch while a Suspend or Resume runs aborts the running
-//     operation (FAILED with STALE_EPOCH, context cancelled) and starts
-//     this call's worker, which observes the node and continues from there.
+//   - a higher epoch while a Suspend or Resume runs is refused with Aborted
+//     and the running operation continues; the epoch is recorded, and the
+//     caller retries once the running operation has finished.
 //
 // A call that passes fencing is then answered by job state:
 //   - Suspend runs the worker from RUNNING, SAVED, SUSPENDED and IDLE (the
@@ -166,33 +166,34 @@ func (sm *StateManager) StartGuestOp(
 	job.LastEpoch = epoch
 
 	if job.current != nil {
-		return sm.preemptLocked(job, intent, epoch, deadline, worker)
+		return "", sm.refuseWhileRunningLocked(job, intent, epoch, deadline)
 	}
 	return sm.answerByStateLocked(job, intent, epoch, deadline, worker)
 }
 
-// preemptLocked answers a guest call that passed fencing while the job has
-// a running operation. The running operation has a lower epoch: fencing
-// already answered an equal or higher one.
-func (sm *StateManager) preemptLocked(
-	job *Job, intent OpType, epoch int64, deadline time.Time, worker GuestWorker,
-) (string, error) {
+// refuseWhileRunningLocked answers a guest call that passed fencing while
+// the job has a running operation. The running operation has a lower epoch:
+// fencing already answered an equal or higher one. The call is refused and
+// the running operation is left alone.
+func (sm *StateManager) refuseWhileRunningLocked(
+	job *Job, intent OpType, epoch int64, deadline time.Time,
+) error {
 	running := job.current.op
 	if running.Type != OpTypeSuspend && running.Type != OpTypeResume {
 		// A Kill is never aborted by a guest call, and a foreground
 		// Snapshot or Restore belongs to the RL job.
-		return "", refuse(codes.Aborted, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
+		return refuse(codes.Aborted, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
 			"%s of job %s: a %s operation is running", intent, job.ID, running.Type)
 	}
 	if err := sm.checkDeadline(job.ID, intent, deadline); err != nil {
-		return "", err
+		return err
 	}
-	slog.Warn("Aborting running guest operation for a higher epoch",
-		"jobID", job.ID, "aborted", running.Type, "abortedEpoch", running.Epoch,
+	slog.Info("Refusing higher-epoch call: an operation is running",
+		"jobID", job.ID, "running", running.Type, "runningEpoch", running.Epoch,
 		"intent", intent, "epoch", epoch)
-	sm.supersedeLocked(job, pb.ErrorReason_STALE_EPOCH,
-		fmt.Sprintf("aborted by %s with epoch %d", intent, epoch))
-	return sm.startGuestLocked(job, intent, epoch, deadline, worker), nil
+	return refuse(codes.Aborted, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
+		"%s of job %s with epoch %d: a %s operation with epoch %d is running",
+		intent, job.ID, epoch, running.Type, running.Epoch)
 }
 
 // answerByStateLocked answers a guest call that passed fencing when the job
