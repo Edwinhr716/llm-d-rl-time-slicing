@@ -1,0 +1,14 @@
+# Webhook flags for the TODAY stack (D-NS-15 ns-webhook), one per line. Lines starting with # are
+# comments. Each flag replaces the __EXTRA_ARGS__ line of manifests/deployment.yaml as one
+# "- <flag>" item. Placeholders, replaced at install time:
+#   __ORCH_ADDR__  the orchestrator gRPC address, <service>.<namespace>.svc:<port>
+#   __VK_SA__      the guest-kubelet service account, <namespace>:<name>
+# TODAY guests are marked by the timeslice.io/guest toleration, and the VK Node carries
+# timeslice.io/virtual-node=true, so guests get a required nodeSelector on that label. Donors get
+# the TIMESLICE_* env wiring (the TODAY clients read env).
+--guest-steering=required
+--virtual-node-label=timeslice.io/virtual-node
+--donor-client-wiring=env
+--orchestrator-addr=__ORCH_ADDR__
+--group-format=ns.job.group
+--vk-service-account=__VK_SA__
