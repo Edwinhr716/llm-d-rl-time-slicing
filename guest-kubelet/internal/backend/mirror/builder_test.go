@@ -187,3 +187,54 @@ func TestSpecHashIgnoresTokenMount(t *testing.T) {
 		t.Error("SpecHash modified the guest")
 	}
 }
+
+func TestBuildAgentJob(t *testing.T) {
+	cfg := testConfig()
+	m, err := Build(testGuest(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Labels[LabelJobID]; ok || m.Spec.RestartPolicy == corev1.RestartPolicyNever {
+		t.Errorf("without AgentJob the mirror is not an agent job: %v %s", m.Labels, m.Spec.RestartPolicy)
+	}
+	cfg.AgentJob, cfg.Attempt = true, 3
+	if m, err = Build(testGuest(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Labels[LabelJobID]; got != "guest-uid-3" {
+		t.Errorf("job id = %q, want guest-uid-3", got)
+	}
+	if m.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Errorf("an agent job must never be restarted by the kubelet: %s", m.Spec.RestartPolicy)
+	}
+}
+
+func TestBuildDeviceMemoryReserve(t *testing.T) {
+	cfg := testConfig()
+	cfg.DeviceMemoryReserve = resource.MustParse("24Gi")
+	mirror, err := Build(testGuest(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q := mirror.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]; q.Cmp(resource.MustParse("54Gi")) != 0 {
+		t.Errorf("GPU guest memory limit = %s, want 30Gi + 24Gi", q.String())
+	}
+	// A CPU guest, or a container without a memory limit, gets nothing added.
+	g := testGuest()
+	delete(g.Spec.Containers[0].Resources.Requests, GPUResource)
+	delete(g.Spec.Containers[0].Resources.Limits, GPUResource)
+	if mirror, err = Build(g, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if q := mirror.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]; q.Cmp(resource.MustParse("30Gi")) != 0 {
+		t.Errorf("CPU guest memory limit = %s, want 30Gi", q.String())
+	}
+	g = testGuest()
+	delete(g.Spec.Containers[0].Resources.Limits, corev1.ResourceMemory)
+	if mirror, err = Build(g, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mirror.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]; ok {
+		t.Error("no memory limit must stay no memory limit")
+	}
+}

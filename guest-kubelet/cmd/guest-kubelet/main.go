@@ -37,7 +37,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
-	"github.com/edwinhr716/guest-kubelet/internal/freeze"
+	"github.com/edwinhr716/guest-kubelet/internal/handshake"
 	"github.com/edwinhr716/guest-kubelet/internal/probe"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
@@ -66,11 +66,15 @@ type options struct {
 	// M2: readiness
 	readinessProbes bool
 
-	// M3: suspend and resume by cgroup freeze
-	cgroupRoot         string
-	notReadyTimeout    time.Duration
-	freezeTimeout      time.Duration
-	resumeReadyTimeout time.Duration
+	// M3/M4: suspend and resume through the snapshot agent
+	agentAddr           string
+	notReadyTimeout     time.Duration
+	agentSuspendTimeout time.Duration
+	agentResumeTimeout  time.Duration
+	agentKillTimeout    time.Duration
+	agentRPC            handshake.Options
+	resumeReadyTimeout  time.Duration
+	deviceMemReserve    string
 
 	// M2 and M3 test hooks
 	debugAddr string
@@ -111,13 +115,28 @@ func main() {
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
 	flag.BoolVar(&o.readinessProbes, "readiness-probes", true,
 		"run the guests' readinessProbes (httpGet, tcpSocket) and report Ready from them; false copies the mirror's ready flags (M1)")
-	flag.StringVar(&o.cgroupRoot, "cgroup-root", "/host/cgroup",
-		"host cgroup v2 hierarchy as mounted in this container; empty disables suspend/resume")
+	flag.StringVar(&o.agentAddr, "agent-addr", "",
+		"host:port of the node's snapshot agent (gRPC); it suspends, resumes and kills mirrors. Empty disables suspend/resume")
 	flag.DurationVar(&o.notReadyTimeout, "suspend-notready-timeout", 5*time.Second,
-		"how long a suspend waits for the guest's Ready=False to reach the API before freezing")
-	flag.DurationVar(&o.freezeTimeout, "freeze-timeout", 10*time.Second, "deadline for each cgroup freeze or thaw")
+		"how long a suspend waits for the guest's Ready=False to reach the API before calling the agent")
+	flag.DurationVar(&o.agentSuspendTimeout, "agent-suspend-timeout", 30*time.Second,
+		"deadline of the agent's Suspend (cuda-checkpoint takes about 13 s for an L4); an earlier caller deadline wins")
+	flag.DurationVar(&o.agentResumeTimeout, "agent-resume-timeout", 30*time.Second, "deadline of the agent's Resume")
+	flag.DurationVar(&o.agentKillTimeout, "agent-kill-timeout", 10*time.Second,
+		"deadline of the agent's Kill in the kill sequence; the mirror is deleted after it either way")
+	flag.DurationVar(&o.agentRPC.Poll, "agent-poll", 100*time.Millisecond,
+		"GetOperation interval while an agent operation is pending")
+	flag.DurationVar(&o.agentRPC.RetryInitial, "agent-retry-initial", time.Second,
+		"first delay before retrying an agent call that did not complete")
+	flag.DurationVar(&o.agentRPC.RetryMax, "agent-retry-max", 30*time.Second, "cap of the agent retry backoff")
+	flag.DurationVar(&o.agentRPC.RPCTimeout, "agent-rpc-timeout", 5*time.Second, "timeout of every single agent RPC")
+	flag.DurationVar(&o.agentRPC.Grace, "agent-deadline-grace", time.Second,
+		"how much earlier than its own deadline the agent is told to finish, so that its verdict is still read")
 	flag.DurationVar(&o.resumeReadyTimeout, "resume-ready-timeout", 60*time.Second,
-		"how long a resume waits for the guest's readiness probe to pass after the thaw")
+		"how long a resume waits for the guest's readiness probe to pass after the agent's Resume")
+	flag.StringVar(&o.deviceMemReserve, "mirror-device-memory-reserve", "24Gi",
+		"added to the memory limit of each GPU mirror container that has one: "+
+			"room for the agent's checkpoint of device memory (0 = none)")
 	// Off by default. The endpoint can force a guest Ready or freeze it, so only loopback addresses
 	// are accepted.
 	flag.StringVar(&o.debugAddr, "debug-addr", "",
@@ -243,6 +262,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		Config: mirror.Config{
 			HostNode: o.hostNode, VirtualNode: o.nodeName, GPUClaim: o.gpuClaim,
 			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey, OwnerRef: o.mirrorOwnerRef,
+			AgentJob: o.agentAddr != "",
 		},
 		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
 	}
@@ -251,6 +271,9 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	}
 	if mopts.MemoryHeadroom, err = resource.ParseQuantity(o.memHeadroom); err != nil {
 		return fmt.Errorf("--mirror-memory-headroom: %w", err)
+	}
+	if mopts.DeviceMemoryReserve, err = resource.ParseQuantity(o.deviceMemReserve); err != nil {
+		return fmt.Errorf("--mirror-device-memory-reserve: %w", err)
 	}
 
 	nodeSpec := provider.NewNodeSpec(cfg)
@@ -266,13 +289,24 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	recorder := provider.GuestOnlyRecorder{
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
-	if o.cgroupRoot != "" {
-		// M3: the guest kubelet freezes the mirror's cgroup itself. M4 swaps this backend for
-		// the snapshot agent.
+	if o.agentAddr != "" {
+		// M4 (Q6): the snapshot agent suspends, resumes and kills; the guest kubelet never
+		// touches cgroups or the GPU. The agent reads the job from the mirror's job-id label
+		// and the guest from the mirror's owner reference.
+		if !o.mirrorOwnerRef {
+			return fmt.Errorf("--agent-addr needs --mirror-owner-ref: the agent finds the guest through the mirror's owner reference")
+		}
+		agent, conn, err := handshake.Dial(o.agentAddr, o.agentRPC)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = conn.Close() }()
 		mopts.Suspend = mirror.SuspendOptions{
-			Freezer:         &freeze.Cgroup{Root: o.cgroupRoot},
+			Freezer:         agent,
 			NotReadyTimeout: o.notReadyTimeout,
-			FreezeTimeout:   o.freezeTimeout,
+			SuspendTimeout:  o.agentSuspendTimeout,
+			ResumeTimeout:   o.agentResumeTimeout,
+			KillTimeout:     o.agentKillTimeout,
 			ReadyCheck:      mirror.ProbeUntilReady(100*time.Millisecond, probeOnce),
 			ReadyTimeout:    o.resumeReadyTimeout,
 			Recorder:        recorder,

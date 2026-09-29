@@ -139,7 +139,7 @@ func suspendedMirror(state string) *corev1.Pod {
 func TestTranslateStatus_SuspendStates(t *testing.T) {
 	guest := testGuest()
 	guest.Spec.ReadinessGates = nil
-	for _, state := range []string{StateSuspending, StateSuspended, StateResuming} {
+	for _, state := range []string{StateSuspending, StateSuspended, StateResuming, StateKilling} {
 		st := TranslateStatus(guest, suspendedMirror(state)).Status
 		if IsReady(&corev1.Pod{Status: st}) || st.Phase != corev1.PodRunning {
 			t.Errorf("%s: want Running and NotReady, got %+v", state, st)

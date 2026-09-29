@@ -27,6 +27,11 @@ const (
 	// same name may adopt an orphaned mirror only if the hash matches.
 	AnnotationGuestSpecHash = "timeslice.io/guest-spec-hash"
 
+	// LabelJobID is the contract label the snapshot agent finds a mirror's job by. It is
+	// unique per mirror incarnation: the guest UID plus an attempt counter. Set only when
+	// Config.AgentJob is on.
+	LabelJobID = "timeslice.io/job-id"
+
 	// Suffix is appended to the guest's name to get the mirror's name. The name is
 	// deterministic, so a create is idempotent (AlreadyExists), like LWS's StatefulSet names.
 	Suffix = "-m"
@@ -58,10 +63,23 @@ type Config struct {
 	// mirror. With false, the mirror outlives a guest that is force-deleted (for example after
 	// the virtual Node is deleted) and a guest re-created with the same name re-adopts it.
 	OwnerRef bool
+	// AgentJob makes the mirror a snapshot-agent job (M4): it gets LabelJobID and
+	// restartPolicy Never.
+	AgentJob bool
+	// Attempt counts the mirrors created for one guest; it makes the job id unique per
+	// incarnation. Used only with AgentJob.
+	Attempt int
+	// DeviceMemoryReserve is added to the memory limit of every container of a GPU guest
+	// that has one. The snapshot agent checkpoints device memory into the pod's memory
+	// cgroup and refuses to suspend a pod without room for it. Zero adds nothing.
+	DeviceMemoryReserve resource.Quantity
 }
 
 // Name returns the mirror's name for a guest.
 func Name(guestName string) string { return guestName + Suffix }
+
+// JobID is the mirror's job id for one incarnation of a guest.
+func JobID(guest *corev1.Pod, attempt int) string { return fmt.Sprintf("%s-%d", guest.UID, attempt) }
 
 // SpecHash hashes the fields of the guest that decide what runs: its containers, minus the
 // service-account token mount. Admission adds that mount as "kube-api-access-<random>", so it
@@ -145,7 +163,7 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 		})
 	}
 
-	m := &corev1.Pod{
+	mirror := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      Name(guest.Name),
 			Namespace: guest.Namespace,
@@ -162,10 +180,16 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 		},
 		Spec: spec,
 	}
-	if cfg.OwnerRef {
-		m.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
+	if cfg.AgentJob {
+		// The snapshot agent finds the job by this label. A kubelet restart of a suspended or
+		// killed process would run it behind the agent's back, so never restart.
+		mirror.Labels[LabelJobID] = JobID(guest, cfg.Attempt)
+		mirror.Spec.RestartPolicy = corev1.RestartPolicyNever
 	}
-	return m, nil
+	if cfg.OwnerRef {
+		mirror.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
+	}
+	return mirror, nil
 }
 
 // OwnerRef is the reference from a mirror to its guest. blockOwnerDeletion is left unset: it
@@ -226,6 +250,10 @@ func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev
 	capAt(out.Requests, corev1.ResourceCPU, cfg.CPUHeadroom)
 	capAt(out.Requests, corev1.ResourceMemory, cfg.MemoryHeadroom)
 	if gpu {
+		if lim, ok := out.Limits[corev1.ResourceMemory]; ok && !cfg.DeviceMemoryReserve.IsZero() {
+			lim.Add(cfg.DeviceMemoryReserve)
+			out.Limits[corev1.ResourceMemory] = lim
+		}
 		out.Claims = append(out.Claims, corev1.ResourceClaim{Name: ClaimRefName})
 	}
 	if len(out.Requests) == 0 {

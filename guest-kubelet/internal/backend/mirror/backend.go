@@ -143,8 +143,17 @@ func (b *Backend) mirrorChanged(obj any) {
 	b.emit(b.translate(g, m))
 }
 
-// translate is TranslateStatusWith the configured prober, if any.
+// translate is TranslateStatusWith the configured prober, if any. A mirror the kill sequence
+// has finished with (Killed) translates to a Failed guest, and so does a Killing mirror that
+// has already stopped or is being deleted: the library never updates a Failed guest again, so
+// the first Failed status it gets must carry the kill reason.
 func (b *Backend) translate(guest, m *corev1.Pod) *corev1.Pod {
+	state, _ := SuspendState(m)
+	stopped := m.DeletionTimestamp != nil || m.Status.Phase == corev1.PodFailed ||
+		m.Status.Phase == corev1.PodSucceeded
+	if state == StateKilled || (state == StateKilling && stopped) {
+		return TerminalStatus(guest, m, ReasonKilled)
+	}
 	if b.opts.Prober == nil {
 		return TranslateStatus(guest, m)
 	}
@@ -164,26 +173,30 @@ func (b *Backend) Refresh(namespace, name string) {
 }
 
 func (b *Backend) mirrorDeleted(obj any) {
-	m, ok := obj.(*corev1.Pod)
+	mirrorPod, ok := obj.(*corev1.Pod)
 	if !ok {
 		tomb, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			return
 		}
-		if m, ok = tomb.Obj.(*corev1.Pod); !ok {
+		if mirrorPod, ok = tomb.Obj.(*corev1.Pod); !ok {
 			return
 		}
 	}
-	b.forgetProbes(m)
-	g := b.guestFor(m)
+	b.forgetProbes(mirrorPod)
+	g := b.guestFor(mirrorPod)
 	if g == nil {
 		return
 	}
 	if g.DeletionTimestamp == nil {
-		b.emit(TerminalStatus(g, m, ReasonMirrorDeleted))
+		reason := ReasonMirrorDeleted
+		if state, _ := SuspendState(mirrorPod); state == StateKilling || state == StateKilled {
+			reason = ReasonKilled
+		}
+		b.emit(TerminalStatus(g, mirrorPod, reason))
 		return
 	}
-	b.emit(TerminalStatus(g, m, ReasonGuestDeleted))
+	b.emit(TerminalStatus(g, mirrorPod, ReasonGuestDeleted))
 	go b.finishGuestDeletion(context.Background(), g)
 }
 
@@ -347,7 +360,7 @@ func (b *Backend) Delete(ctx context.Context, guest *corev1.Pod) error {
 		go b.finishGuestDeletion(context.Background(), guest)
 		return errdefs.NotFoundf("no mirror for guest %s/%s", guest.Namespace, guest.Name)
 	}
-	b.thawBeforeDelete(ctx, mirrorPod)
+	b.killBeforeDelete(ctx, mirrorPod)
 	uid := mirrorPod.UID
 	opts := metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}
 	if guest.DeletionGracePeriodSeconds != nil {
@@ -419,17 +432,18 @@ func (b *Backend) collectOrphans(ctx context.Context, now time.Time) {
 	b.mu.Unlock()
 }
 
-// thawBeforeDelete thaws a suspended mirror before it is deleted: a frozen process cannot act
-// on SIGTERM, so it would sit out the whole grace period and then be killed. Best effort.
-func (b *Backend) thawBeforeDelete(ctx context.Context, m *corev1.Pod) {
-	fz := b.opts.Suspend.Freezer
-	state, epoch := SuspendState(m)
-	if fz == nil || state == "" {
+// killBeforeDelete has the snapshot agent kill a mirror that is suspended or in transition
+// before it is deleted: a frozen process cannot act on SIGTERM, so it would sit out the whole
+// grace period. A running mirror is left to the normal SIGTERM. Best effort.
+func (b *Backend) killBeforeDelete(ctx context.Context, m *corev1.Pod) {
+	so := b.opts.Suspend
+	state, _ := SuspendState(m)
+	if so.Freezer == nil || state == "" {
 		return
 	}
-	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	kctx, cancel := context.WithTimeout(ctx, so.KillTimeout)
 	defer cancel()
-	if err := fz.Resume(tctx, m, epoch); err != nil {
-		log.G(ctx).WithError(err).WithField("mirror", m.Namespace+"/"+m.Name).Warn("could not thaw the mirror before deleting it")
+	if err := so.Freezer.Kill(kctx, m, "guest deleted while "+state); err != nil {
+		log.G(ctx).WithError(err).WithField("mirror", m.Namespace+"/"+m.Name).Warn("agent could not kill the mirror before its delete")
 	}
 }

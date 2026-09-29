@@ -57,10 +57,12 @@ internal/backend/mirror/claim.go     optional reservedFor write (kube-controller
 internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
 internal/probe/debug.go              debug endpoint: override, Ready edges
 cmd/q5-measure/main.go               Q5 timings; runs in a pod
-internal/backend/mirror/suspend.go   M3 suspend/resume, suspend state on the mirror, guest status overlay
+internal/backend/mirror/suspend.go   suspend/resume/kill, state on the mirror
 internal/backend/mirror/readiness.go MarkNotReady, the one NotReady signal; wait for NotReady in the API
 internal/backend/mirror/readycheck.go after a resume, run the guest readinessProbe until it passes
-internal/freeze/                     freeze.Backend; Cgroup: cgroup v2 freezer on the pod cgroup
+internal/freeze/                     freeze.Backend: Suspend, Resume, Kill
+internal/handshake/                  freeze.Backend over the agent's gRPC API
+api/snapshot_agent/v1alpha1/         agent proto copy; Go code from Cloud Build
 cmd/guest-kubelet/debug.go           the --debug-addr mux: M2 hooks plus POST /debug/suspend, /debug/resume
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
@@ -69,41 +71,77 @@ deploy/m2/                           probed guests, pool, router, Q5 pods
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
 
-## M3: suspend and resume by cgroup freeze
+## M3/M4: suspend and resume through the snapshot agent
 
-Interim step: the VK freezes the mirror's pod cgroup itself. It sits behind `freeze.Backend`
-(`internal/freeze`), so M4 swaps it for the snapshot agent's Suspend/Resume and the VK stops
-touching cgroups.
+M3 froze the mirror's pod cgroup from the VK. Since M4 the node's snapshot
+agent does it (checkpoint, freeze, verify), behind `freeze.Backend`
+(`internal/freeze`), implemented by `internal/handshake`: the VK never
+touches cgroups or the GPU. `--agent-addr` (host:port of the agent on the
+node; empty disables suspend) turns it on.
 
-- Suspend (`Backend.Suspend`), in this order: raise `timeslice.io/guest-epoch` and set
-  `timeslice.io/suspend-state=Suspending` on the mirror (compare-and-swap on its
-  resourceVersion); the guest turns NotReady (`MarkNotReady`, the same function the prober
-  uses for a failed probe, with reason `Suspending`); wait until the API shows the guest
-  NotReady (`--suspend-notready-timeout`); write `1` to `cgroup.freeze` on the pod-level
-  cgroup and wait for `frozen 1` in `cgroup.events` (`--freeze-timeout`); record `Suspended`.
-  No drain. If the wait or the freeze fails, the pod is thawed and put back to Running.
-- While frozen the guest shows phase Running, Ready=False, condition
-  `timeslice.io/suspended=True`, and its containers Waiting with reason `Suspended`, so
-  `kubectl get pods` prints `0/1 Suspended`. Restart counts do not change.
-- Resume (`Backend.Resume`): raise the epoch, record `Resuming` (still NotReady), thaw, run the
-  guest's httpGet/tcpSocket readinessProbe against the mirror (one attempt at a time with the
-  prober's HTTP and TCP semantics) until it passes (`--resume-ready-timeout`), then clear the
-  state; from then on the prober's verdict decides Ready, as for any guest. Any failure leaves it
-  `Resuming`, so it is never Ready on a process that did not come back.
-- The suspend state is applied after the prober's verdict, so a probe that still passes (or a
-  debug override) never shows a suspended guest Ready.
-- One suspend or resume per guest at a time. The state lives on the mirror, so a restarted VK
-  or a new leader derives the same guest status. Deleting a suspended guest thaws the mirror
-  first, so it can act on SIGTERM.
-- Deployment: the VK container is privileged, runs as root and mounts the host's
-  `/sys/fs/cgroup` read-write at `/host/cgroup` (`--cgroup-root`; empty disables suspend).
-  The cgroup is found under both kubelet cgroup drivers (systemd `kubepods.slice/...` and
-  cgroupfs `kubepods/...`). Mirror pods stay unprivileged.
-- Until the orchestrator loop (VK-A6) drives it, suspend and resume are triggered by hand
-  through `--debug-addr` (loopback only, for example `127.0.0.1:10261`, reached with
-  `kubectl port-forward` to the leader pod; it works with `--readiness-probes=false` too):
-  `POST /debug/suspend?namespace=<ns>&name=<guest>` and `POST /debug/resume?...`. The reply is the step timings as JSON.
-  It has no authentication: enable it only in test deployments.
+- Mirrors are agent jobs: label `timeslice.io/job-id` =
+  `<guest UID>-<attempt>` (an adopted mirror keeps its id),
+  `restartPolicy: Never` (a kubelet restart of a suspended or killed process
+  would run behind the agent's back), and the guest as owner
+  (`--mirror-owner-ref`, required: the agent reads the guest's Ready through
+  it). The memory limit of each GPU container that has one grows by
+  `--mirror-device-memory-reserve` (default 24Gi): the agent checkpoints
+  device memory into the pod's memory cgroup and refuses a pod without room.
+- Suspend (`Backend.Suspend`), in this order: raise
+  `timeslice.io/guest-epoch` and set `timeslice.io/suspend-state=Suspending`
+  on the mirror (compare-and-swap on its resourceVersion); the guest turns
+  NotReady (`MarkNotReady`, with reason `Suspending`); wait until the API
+  shows the guest NotReady (`--suspend-notready-timeout`); require the job
+  in the agent's `Status`; agent `Suspend(job_id, epoch, deadline)` with
+  deadline `--agent-suspend-timeout` (or the caller's earlier one), polled
+  through `GetOperation`; record `Suspended`. No drain. If the NotReady wait
+  fails, the agent was never called and the guest goes back to Running.
+- While suspended the guest shows phase Running, Ready=False, condition
+  `timeslice.io/suspended=True`, and its containers Waiting with reason
+  `Suspended`, so `kubectl get pods` prints `0/1 Suspended`. Restart counts
+  do not change.
+- Resume (`Backend.Resume`): raise the epoch, record `Resuming` (still
+  NotReady), agent `Resume` (`--agent-resume-timeout`; outcome RESUMED or
+  none), run the guest's httpGet/tcpSocket readinessProbe against the mirror
+  until it passes (`--resume-ready-timeout`), then clear the state; from then
+  on the prober's verdict decides Ready.
+- Kill sequence (Q6): any failure of the agent's Suspend or Resume (a
+  refusal, a FAILED operation, a missed deadline, `Unimplemented`, a job the
+  agent does not list or reports FAULTED, an outcome such as RELEASED) and a
+  failed ready check after a Resume: record `Killing` (NotReady), agent
+  `Kill` (`--agent-kill-timeout`), delete the mirror with its normal grace
+  period (never a force delete), record `Killed` on the terminating mirror
+  and report the guest Failed with reason `SnapshotAgentKilled`. Each step
+  runs even if the one before failed, so a hung or crashed agent still ends
+  with the mirror gone and the guest Failed. A later suspend or resume of a
+  guest left `Killing` finishes the sequence.
+- Agent calls follow the Q13 defaults: every RPC times out after
+  `--agent-rpc-timeout` (5s), pending operations are polled every
+  `--agent-poll` (100ms), and a call that does not reach the agent
+  (Unavailable, a timed-out RPC: a hung agent) or whose operation the agent
+  lost (GetOperation NotFound after a restart) is re-issued with the same
+  epoch, backing off from `--agent-retry-initial` (1s) to
+  `--agent-retry-max` (30s), never past the deadline. The agent is told a
+  deadline `--agent-deadline-grace` (1s) earlier than the VK's own, so its
+  verdict is still read. The agent's refusal reason (the `ErrorReason` name
+  that prefixes its message) is logged and recorded in the event.
+- The suspend state is applied after the prober's verdict, so a probe that
+  still passes (or a debug override) never shows a suspended guest Ready.
+- One suspend or resume per guest at a time. The state lives on the mirror,
+  so a restarted VK or a new leader derives the same guest status. Deleting
+  a guest that is not Running has the agent kill the mirror first, so it
+  does not sit out the grace period frozen.
+- Deployment: the VK is unprivileged (no cgroup mount) and reaches the agent
+  over the host network (`--agent-addr=127.0.0.1:9001` in
+  `deploy/deployment.yaml`).
+- Until the orchestrator loop (VK-A6) drives it, suspend and resume are
+  triggered by hand through `--debug-addr` (loopback only, for example
+  `127.0.0.1:10261`, reached with `kubectl port-forward` to the leader pod;
+  it works with `--readiness-probes=false` too):
+  `POST /debug/suspend?namespace=<ns>&name=<guest>` and
+  `POST /debug/resume?...`. The reply is the step timings as JSON; a call
+  that ended in the kill sequence answers 410 with the error. It has no
+  authentication: enable it only in test deployments.
 
 ## Build and deploy
 

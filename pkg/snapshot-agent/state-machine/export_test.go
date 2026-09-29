@@ -2,6 +2,7 @@ package statemachine
 
 import (
 	"sync"
+	"time"
 )
 
 // Exported for testing purposes only.
@@ -38,4 +39,12 @@ func (sm *StateManager) InternalJobSlot(jobID string) string {
 	job.mu.Lock()
 	defer job.mu.Unlock()
 	return job.Slot
+}
+
+// InternalSetClock replaces the StateManager's clock. now must be safe for
+// concurrent use.
+func (sm *StateManager) InternalSetClock(now func() time.Time) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.now = now
 }

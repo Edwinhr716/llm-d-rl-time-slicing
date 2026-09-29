@@ -276,33 +276,51 @@ func TestGuestRemovedWhenMirrorStops(t *testing.T) {
 	}
 }
 
-// fakeFreezer records calls and, at each Suspend, whether the guest was already NotReady in
-// the guest lister.
+// fakeFreezer stands in for the snapshot agent. It records calls and, at each Suspend, whether
+// the guest was already NotReady in the guest lister.
 type fakeFreezer struct {
 	mu          sync.Mutex
 	calls       []string
 	suspendErr  error
 	resumeErr   error
+	killErr     error
 	readyAtCall []bool
 	guestReady  func() bool
+	deadlines   []time.Duration // time left until each call's deadline
 }
 
-func (f *fakeFreezer) Suspend(_ context.Context, _ *corev1.Pod, epoch int64) error {
+func (f *fakeFreezer) noteDeadline(ctx context.Context) {
+	if d, ok := ctx.Deadline(); ok {
+		f.deadlines = append(f.deadlines, time.Until(d))
+	} else {
+		f.deadlines = append(f.deadlines, -1)
+	}
+}
+
+func (f *fakeFreezer) Suspend(ctx context.Context, _ *corev1.Pod, epoch int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, "freeze:"+strconv.FormatInt(epoch, 10))
+	f.calls = append(f.calls, "suspend:"+strconv.FormatInt(epoch, 10))
 	f.readyAtCall = append(f.readyAtCall, f.guestReady())
+	f.noteDeadline(ctx)
 	return f.suspendErr
 }
 
-func (f *fakeFreezer) Resume(_ context.Context, _ *corev1.Pod, epoch int64) error {
+func (f *fakeFreezer) Resume(ctx context.Context, _ *corev1.Pod, epoch int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, "thaw:"+strconv.FormatInt(epoch, 10))
+	f.calls = append(f.calls, "resume:"+strconv.FormatInt(epoch, 10))
+	f.noteDeadline(ctx)
 	return f.resumeErr
 }
 
-func (f *fakeFreezer) Frozen(*corev1.Pod) (bool, error) { return false, nil }
+func (f *fakeFreezer) Kill(ctx context.Context, _ *corev1.Pod, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "kill")
+	f.noteDeadline(ctx)
+	return f.killErr
+}
 
 func (f *fakeFreezer) record(s string) {
 	f.mu.Lock()
@@ -316,13 +334,14 @@ func (f *fakeFreezer) callList() []string {
 	return append([]string(nil), f.calls...)
 }
 
-// suspendHarness runs a Ready CPU guest with a running mirror and a fake freezer.
+// suspendHarness runs a Ready CPU guest with a running mirror and a fake agent.
 func suspendHarness(t *testing.T) (*harness, *fakeFreezer) {
 	t.Helper()
 	ff := &fakeFreezer{}
 	opts := testOptions()
 	opts.Suspend = SuspendOptions{
-		Freezer: ff, NotReadyTimeout: 2 * time.Second, FreezeTimeout: time.Second, ReadyTimeout: time.Second,
+		Freezer: ff, NotReadyTimeout: 2 * time.Second, SuspendTimeout: 20 * time.Second,
+		ResumeTimeout: 15 * time.Second, KillTimeout: 5 * time.Second, ReadyTimeout: time.Second,
 		ReadyCheck: func(context.Context, *corev1.Pod, *corev1.Pod) error { ff.record("readycheck"); return nil },
 	}
 	hrn := newHarness(t, opts)
@@ -382,7 +401,7 @@ func (h *harness) settled(what string, ok func(*corev1.Pod) bool) *corev1.Pod {
 
 func notReady(p *corev1.Pod) bool { return !IsReady(p) }
 
-func TestSuspendResume_NotReadyBeforeFreeze(t *testing.T) {
+func TestSuspendResume_NotReadyBeforeAgentSuspend(t *testing.T) {
 	hrn, ff := suspendHarness(t)
 	res, err := hrn.b.Suspend(context.Background(), "ns", "vllm")
 	if err != nil {
@@ -392,7 +411,7 @@ func TestSuspendResume_NotReadyBeforeFreeze(t *testing.T) {
 		t.Fatalf("suspend result: %+v", res)
 	}
 	if len(ff.readyAtCall) != 1 || ff.readyAtCall[0] {
-		t.Fatalf("the freeze must come after NotReady is visible: ready at freeze = %v", ff.readyAtCall)
+		t.Fatalf("the agent suspend must come after NotReady is visible: ready at call = %v", ff.readyAtCall)
 	}
 	mirrorPod := hrn.mirror("vllm-m")
 	if mirrorPod.Annotations[AnnotationSuspendState] != StateSuspended || mirrorPod.Annotations[AnnotationGuestEpoch] != "1" ||
@@ -426,7 +445,7 @@ func TestSuspendResume_NotReadyBeforeFreeze(t *testing.T) {
 	if res.Epoch != 2 || res.State != "Running" {
 		t.Fatalf("resume result: %+v", res)
 	}
-	if got, want := strings.Join(ff.callList(), ","), "freeze:1,thaw:2,readycheck"; got != want {
+	if got, want := strings.Join(ff.callList(), ","), "suspend:1,resume:2,readycheck"; got != want {
 		t.Fatalf("calls = %s, want %s", got, want)
 	}
 	mirrorPod = hrn.mirror("vllm-m")
@@ -440,71 +459,248 @@ func TestSuspendResume_NotReadyBeforeFreeze(t *testing.T) {
 	}
 }
 
-func TestSuspend_FreezeFailureRevertsToRunning(t *testing.T) {
+// suspended suspends the guest and waits until the informer holds the Suspended mirror, which
+// the next call reads.
+func (h *harness) suspended() {
+	h.t.Helper()
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err != nil {
+		h.t.Fatal(err)
+	}
+	g, err := h.b.guests.Pods("ns").Get("vllm")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if err := h.b.waitInformerState(context.Background(), g, StateSuspended, 5*time.Second); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// readyAfter reports the first emitted guest from index i on that is Ready, if any.
+func (h *harness) readyAfter(i int) *corev1.Pod {
+	for _, p := range h.emittedPods()[i:] {
+		if IsReady(p) {
+			return p
+		}
+	}
+	return nil
+}
+
+func killedGuest(p *corev1.Pod) bool {
+	return p.Status.Phase == corev1.PodFailed && p.Status.Reason == ReasonKilled && !IsReady(p)
+}
+
+// waitMirrorGone waits until the mirror informer no longer has the guest's mirror.
+func (h *harness) waitMirrorGone(name string) {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := h.b.mirrors.Pods("ns").Get(name); err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("mirror %s never went away", name)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSuspend_AgentDeadlines(t *testing.T) {
 	h, ff := suspendHarness(t)
-	ff.suspendErr = errors.New("stuck task")
-	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err == nil {
-		t.Fatal("want an error")
+	h.suspended()
+	// A caller's earlier deadline wins over --agent-suspend-timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := h.b.Resume(ctx, "ns", "vllm"); err != nil {
+		t.Fatal(err)
 	}
-	if got := strings.Join(ff.callList(), ","); got != "freeze:1,thaw:1" {
-		t.Fatalf("a failed freeze must be undone with a thaw: calls = %s", got)
+	if len(ff.deadlines) != 2 || ff.deadlines[0] < 19*time.Second || ff.deadlines[0] > 20*time.Second ||
+		ff.deadlines[1] <= 0 || ff.deadlines[1] > 3*time.Second {
+		t.Fatalf("deadlines left at each call = %v, want about 20s then at most 3s", ff.deadlines)
 	}
-	m := h.mirror("vllm-m")
-	if _, ok := m.Annotations[AnnotationSuspendState]; ok {
-		t.Fatalf("state must be cleared: %v", m.Annotations)
+}
+
+func TestSuspend_AgentFailureRunsKillSequence(t *testing.T) {
+	h, ff := suspendHarness(t)
+	from := len(h.emittedPods())
+	ff.suspendErr = errors.New("agent Suspend of job x: DeadlineMissed")
+	res, err := h.b.Suspend(context.Background(), "ns", "vllm")
+	if !errors.Is(err, ErrKilled) || !res.Killed || res.State != StateKilled {
+		t.Fatalf("want the kill sequence: %+v %v", res, err)
+	}
+	if got := strings.Join(ff.callList(), ","); got != "suspend:1,kill" {
+		t.Fatalf("calls = %s, want the agent kill after the failed suspend", got)
+	}
+	if h.mirror("vllm-m") != nil {
+		t.Fatal("the kill sequence must delete the mirror")
+	}
+	h.waitMirrorGone("vllm-m")
+	h.settled("Failed (killed)", killedGuest)
+	if p := h.readyAfter(from); p != nil {
+		t.Fatalf("the guest was reported Ready after the suspend began: %+v", p.Status)
+	}
+}
+
+func TestSuspend_KillFailureStillDeletesMirror(t *testing.T) {
+	h, ff := suspendHarness(t)
+	ff.suspendErr, ff.killErr = errors.New("agent hangs"), errors.New("agent hangs")
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); !errors.Is(err, ErrKilled) {
+		t.Fatalf("want the kill sequence, got %v", err)
+	}
+	if h.mirror("vllm-m") != nil {
+		t.Fatal("the mirror must be deleted even when the agent kill fails")
+	}
+	h.settled("Failed (killed)", killedGuest)
+}
+
+func TestSuspend_KillSequenceUsesNormalGrace(t *testing.T) {
+	h, ff := suspendHarness(t)
+	ff.suspendErr = errors.New("refused")
+	var grace []*int64
+	h.client.PrependReactor("delete", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if d, ok := a.(k8stesting.DeleteActionImpl); ok {
+			grace = append(grace, d.DeleteOptions.GracePeriodSeconds)
+		}
+		return false, nil, nil
+	})
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); !errors.Is(err, ErrKilled) {
+		t.Fatalf("want the kill sequence, got %v", err)
+	}
+	if len(grace) != 1 || grace[0] != nil {
+		t.Fatalf("the mirror must be deleted once with its normal grace period, never forced: %v", grace)
+	}
+}
+
+func TestSuspend_NotReadyNotConfirmedRevertsWithoutAgentCall(t *testing.T) {
+	h, ff := suspendHarness(t)
+	h.b.opts.Suspend.NotReadyTimeout = 200 * time.Millisecond
+	h.mu.Lock()
+	h.writeBack = false // the API never shows the guest NotReady
+	h.mu.Unlock()
+	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err == nil || errors.Is(err, ErrKilled) {
+		t.Fatalf("want a plain error, got %v", err)
+	}
+	if got := ff.callList(); len(got) != 0 {
+		t.Fatalf("the agent must not be called before NotReady is confirmed: %v", got)
+	}
+	if m := h.mirror("vllm-m"); m == nil || m.Annotations[AnnotationSuspendState] != "" {
+		t.Fatalf("the guest must be back to Running: %v", m)
 	}
 	h.settled("ready again", IsReady)
 }
 
-func TestSuspend_ThawFailureAfterFreezeFailureStaysNotReady(t *testing.T) {
+func TestResume_AgentFailureRunsKillSequence(t *testing.T) {
 	h, ff := suspendHarness(t)
-	ff.suspendErr, ff.resumeErr = errors.New("stuck task"), errors.New("no thaw")
-	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err == nil {
-		t.Fatal("want an error")
+	h.suspended()
+	from := len(h.emittedPods())
+	ff.resumeErr = errors.New("agent Resume of job x: Refused (FAILED_PRECONDITION): cannot resume job x in state JOB_STATE_FAULTED")
+	if _, err := h.b.Resume(context.Background(), "ns", "vllm"); !errors.Is(err, ErrKilled) {
+		t.Fatalf("want the kill sequence, got %v", err)
 	}
-	if s := h.mirror("vllm-m").Annotations[AnnotationSuspendState]; s != StateSuspending {
-		t.Fatalf("state = %q, want %s", s, StateSuspending)
+	if got := strings.Join(ff.callList(), ","); got != "suspend:1,resume:2,kill" {
+		t.Fatalf("calls = %s", got)
 	}
-	h.settled("NotReady", notReady)
+	h.settled("Failed (killed)", killedGuest)
+	if p := h.readyAfter(from); p != nil {
+		t.Fatalf("a guest whose resume failed was reported Ready: %+v", p.Status)
+	}
 }
 
-func TestResume_ReadyCheckFailureStaysNotReady(t *testing.T) {
-	h, _ := suspendHarness(t)
-	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err != nil {
+func TestResume_ReadyCheckFailureRunsKillSequence(t *testing.T) {
+	h, ff := suspendHarness(t)
+	h.suspended()
+	from := len(h.emittedPods())
+	h.b.opts.Suspend.ReadyCheck = func(context.Context, *corev1.Pod, *corev1.Pod) error { return errors.New("503") }
+	if _, err := h.b.Resume(context.Background(), "ns", "vllm"); !errors.Is(err, ErrKilled) {
+		t.Fatalf("want the kill sequence, got %v", err)
+	}
+	if got := strings.Join(ff.callList(), ","); got != "suspend:1,resume:2,kill" {
+		t.Fatalf("calls = %s", got)
+	}
+	h.settled("Failed (killed)", killedGuest)
+	if p := h.readyAfter(from); p != nil {
+		t.Fatalf("a guest that failed its ready check was reported Ready: %+v", p.Status)
+	}
+}
+
+func TestSuspend_HalfDoneKillIsFinished(t *testing.T) {
+	h, ff := suspendHarness(t)
+	g, err := h.b.guests.Pods("ns").Get("vllm")
+	if err != nil {
 		t.Fatal(err)
 	}
-	h.b.opts.Suspend.ReadyCheck = func(context.Context, *corev1.Pod, *corev1.Pod) error { return errors.New("503") }
-	if _, err := h.b.Resume(context.Background(), "ns", "vllm"); err == nil {
-		t.Fatal("want an error")
+	// A guest kubelet that stopped mid kill sequence left the mirror Killing.
+	if _, err := h.b.setSuspendState(context.Background(), g, StateKilling, false); err != nil {
+		t.Fatal(err)
 	}
-	if s := h.mirror("vllm-m").Annotations[AnnotationSuspendState]; s != StateResuming {
-		t.Fatalf("state = %q, want %s", s, StateResuming)
+	if err := h.b.waitInformerState(context.Background(), g, StateKilling, 5*time.Second); err != nil {
+		t.Fatal(err)
 	}
-	h.settled("NotReady", notReady)
+	if _, err := h.b.Resume(context.Background(), "ns", "vllm"); !errors.Is(err, ErrKilled) {
+		t.Fatalf("want the kill sequence finished, got %v", err)
+	}
+	if got := strings.Join(ff.callList(), ","); got != "kill" {
+		t.Fatalf("calls = %s", got)
+	}
+	if h.mirror("vllm-m") != nil {
+		t.Fatal("mirror must be deleted")
+	}
+}
+
+func TestTranslate_KilledMirrorIsFailed(t *testing.T) {
+	h, _ := suspendHarness(t)
+	g, err := h.b.guests.Pods("ns").Get("vllm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := h.b.setSuspendState(context.Background(), g, StateKilled, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := h.b.translate(g, m); !killedGuest(p) {
+		t.Fatalf("a Killed mirror must translate to a Failed guest: %+v", p.Status)
+	}
+	h.settled("Failed (killed)", killedGuest)
+}
+
+// The agent's Kill can stop the mirror before the kill sequence records Killed. The library
+// never updates a Failed guest again, so a stopped Killing mirror must already translate to
+// the kill reason, not to the mirror's own Failed status.
+func TestTranslate_StoppedKillingMirrorIsKilled(t *testing.T) {
+	h, _ := suspendHarness(t)
+	g, err := h.b.guests.Pods("ns").Get("vllm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirrorPod, err := h.b.setSuspendState(context.Background(), g, StateKilling, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := h.b.translate(g, mirrorPod); p.Status.Phase == corev1.PodFailed || IsReady(p) {
+		t.Fatalf("a running Killing mirror must translate to a live NotReady guest: %+v", p.Status)
+	}
+	stopped := mirrorPod.DeepCopy()
+	stopped.Status.Phase = corev1.PodFailed
+	if p := h.b.translate(g, stopped); !killedGuest(p) {
+		t.Fatalf("a stopped Killing mirror must translate to a killed guest: %+v", p.Status)
+	}
+	deleting := mirrorPod.DeepCopy()
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+	if p := h.b.translate(g, deleting); !killedGuest(p) {
+		t.Fatalf("a deleted Killing mirror must translate to a killed guest: %+v", p.Status)
+	}
 }
 
 func TestSuspend_NoFreezerConfigured(t *testing.T) {
 	h := newHarness(t, testOptions())
 	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err == nil {
-		t.Fatal("want an error without a freeze backend")
+		t.Fatal("want an error without a snapshot agent")
 	}
 }
 
-func TestDelete_ThawsSuspendedMirrorFirst(t *testing.T) {
+func TestDelete_KillsSuspendedMirrorFirst(t *testing.T) {
 	h, ff := suspendHarness(t)
-	if _, err := h.b.Suspend(context.Background(), "ns", "vllm"); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if m, err := h.b.mirrors.Pods("ns").Get("vllm-m"); err == nil && m.Annotations[AnnotationSuspendState] == StateSuspended {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("informer never saw Suspended")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	h.suspended()
 	g, err := h.b.guests.Pods("ns").Get("vllm")
 	if err != nil {
 		t.Fatal(err)
@@ -512,7 +708,21 @@ func TestDelete_ThawsSuspendedMirrorFirst(t *testing.T) {
 	if err := h.b.Delete(context.Background(), g.DeepCopy()); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(ff.callList(), ","); got != "freeze:1,thaw:1" {
-		t.Fatalf("calls = %s, want the delete to thaw first", got)
+	if got := strings.Join(ff.callList(), ","); got != "suspend:1,kill" {
+		t.Fatalf("calls = %s, want the delete to have the agent kill first", got)
+	}
+}
+
+func TestDelete_RunningMirrorIsNotKilled(t *testing.T) {
+	h, ff := suspendHarness(t)
+	g, err := h.b.guests.Pods("ns").Get("vllm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.b.Delete(context.Background(), g.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if got := ff.callList(); len(got) != 0 {
+		t.Fatalf("a running mirror gets the normal SIGTERM, no agent kill: %v", got)
 	}
 }

@@ -1,5 +1,6 @@
 # M1: two replicas on the host node with leader election; only the Lease holder is the kubelet.
-# M3: privileged, root, host cgroup v2 tree at /host/cgroup (suspend = cgroup freeze).
+# M4: suspend, resume and kill go to the node's snapshot agent (gRPC on the host network), so
+# the guest kubelet is unprivileged and never touches cgroups.
 # `make deploy` replaces __IMAGE__ with the Artifact Registry image and __HOST__ with the host node.
 apiVersion: apps/v1
 kind: Deployment
@@ -39,10 +40,10 @@ spec:
             - --mirror-cpu-headroom=1
             - --mirror-memory-headroom=4Gi
             - --mirror-owner-ref=true
-            # M3: suspend/resume freezes the mirror's pod cgroup through this mount.
-            - --cgroup-root=/host/cgroup
-            # Test hooks (M2: force a guest's readiness, read its Ready edges; M3: suspend and
-            # resume by hand); loopback only.
+            # M4: the snapshot agent on this node (host network, its --port).
+            - --agent-addr=127.0.0.1:9001
+            # Test hooks (M2: force a guest's readiness, read its Ready edges; M3/M4: suspend
+            # and resume by hand); loopback only.
             - --debug-addr=127.0.0.1:10261
           env:
             - name: HOST_IP
@@ -57,15 +58,8 @@ spec:
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: 100m, memory: 256Mi}
-          # M3 (interim until M4 hands suspend to the snapshot agent): writing cgroup.freeze
-          # on the host's pod cgroups needs root and a privileged container. Mirror pods stay
-          # unprivileged.
           securityContext:
-            privileged: true
-            runAsUser: 0
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
             readOnlyRootFilesystem: true
-          volumeMounts:
-            - {name: host-cgroup, mountPath: /host/cgroup}
-      volumes:
-        - name: host-cgroup
-          hostPath: {path: /sys/fs/cgroup, type: Directory}
