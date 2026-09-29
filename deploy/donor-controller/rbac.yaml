@@ -1,0 +1,42 @@
+# Base RBAC for the donor controller. Placeholder: __NS__ (the controller's namespace).
+# It reads donor pods, labels and unlabels real nodes, and records Node events. It never writes
+# pods. H11 (--release-dead-hosts) also needs nodes/delete: apply release-dead-hosts/rbac.yaml.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: donor-controller
+  namespace: __NS__
+  labels:
+    app.kubernetes.io/name: donor-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: __NS__-donor-controller
+  labels:
+    app.kubernetes.io/name: donor-controller
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, watch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: __NS__-donor-controller
+  labels:
+    app.kubernetes.io/name: donor-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: __NS__-donor-controller
+subjects:
+  - kind: ServiceAccount
+    name: donor-controller
+    namespace: __NS__
