@@ -166,7 +166,7 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.BoolVar(&fv.budgetExternalRisingEdge, "dispatch-budget-external-rising-edge",
 		envBool("TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE", false), "Publish only \"0\"")
 	fs.StringVar(&fv.foregroundWait, "foreground-wait", controller.ForegroundWaitBlocking,
-		"How reconcile waits on a foreground snapshot or restore")
+		"How reconcile waits on a foreground snapshot or restore: blocking or async-requeue (alias async)")
 	fs.DurationVar(&fv.foregroundOpTimeout, "foreground-op-timeout", 10*time.Minute,
 		"Upper bound on each blocking wait for a foreground operation; 0 means unbounded")
 	fs.StringVar(&fv.foregroundOpTimeoutAct, "foreground-op-timeout-action", controller.ForegroundOpTimeoutActionRetry,
@@ -356,6 +356,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.ResyncPeriod = fv.resyncPeriod
 	ctrl.HolderWaitRequeue = fv.holderWaitRequeue
 	ctrl.SettleTimeout = fv.settleTimeout
+	ctrl.ForegroundWait = fv.foregroundWait
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
 	ctrl.ForegroundOpTimeoutAction = fv.foregroundOpTimeoutAct
 	ctrl.ForegroundOpTimeoutRetries = fv.foregroundOpTimeoutRetry

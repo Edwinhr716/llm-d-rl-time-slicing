@@ -101,7 +101,6 @@ func TestEvalwire_FlagsMatchMain(t *testing.T) {
 func TestEvalwire_RejectsBadArgs(t *testing.T) {
 	cs := fake.NewClientset()
 	for _, args := range [][]string{
-		{"--foreground-wait=async"},
 		{"--foreground-wait=other"},
 		{"--foreground-op-timeout-action=other"},
 		{"--foreground-op-timeout-retries=-1"},
@@ -188,11 +187,14 @@ func checkMetrics(t *testing.T, addr string) {
 
 func TestEvalwire_StartStopRestart(t *testing.T) {
 	for _, action := range []string{"retry", "faulted", "bounded"} {
-		t.Run(action, func(t *testing.T) { startStopRestart(t, action) })
+		t.Run(action, func(t *testing.T) { startStopRestart(t, action, controller.ForegroundWaitBlocking) })
+	}
+	for _, wait := range []string{controller.ForegroundWaitAsyncRequeue, controller.ForegroundWaitAsync} {
+		t.Run(wait, func(t *testing.T) { startStopRestart(t, controller.ForegroundOpTimeoutActionRetry, wait) })
 	}
 }
 
-func startStopRestart(t *testing.T, action string) {
+func startStopRestart(t *testing.T, action, wait string) {
 	t.Helper()
 	const groupID = "g-eval"
 	cs := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{
@@ -202,7 +204,7 @@ func startStopRestart(t *testing.T, action string) {
 	args := []string{
 		"--foreground-op-timeout-action=" + action,
 		"--foreground-op-timeout-retries=2",
-		"--foreground-wait=blocking",
+		"--foreground-wait=" + wait,
 		"--controller-workers=4",
 		"--foreground-op-timeout=60s",
 		"--resync-period=30s",
