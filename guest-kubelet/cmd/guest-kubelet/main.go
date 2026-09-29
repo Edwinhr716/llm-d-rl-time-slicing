@@ -68,6 +68,18 @@ type options struct {
 	// M2: readiness
 	readinessProbes bool
 	debugAddr       string
+
+	// VK-A6: host command server (D-NS-4 ns-push-vk)
+	hostCommandPort  int
+	hostCommandAllow string
+	freezer          string
+	agentAddr        string
+	agentPort        int
+	vacateMargin     time.Duration
+	resumeBudget     time.Duration
+	killTimeout      time.Duration
+	fakeSuspendDelay time.Duration
+	fakeResumeDelay  time.Duration
 }
 
 // edgeLogSize is how many Ready edges per guest the debug endpoint keeps.
@@ -111,19 +123,35 @@ func main() {
 	// Off by default. The endpoint can force a guest Ready, so only loopback addresses are accepted.
 	flag.StringVar(&o.debugAddr, "debug-addr", "",
 		"loopback host:port for the M2 test hooks (/debug/readiness, /debug/ready-edges); empty disables them")
+	flag.IntVar(&o.hostCommandPort, "host-command-port", 0, "port on --host-ip where the VK serves the orchestrator's "+
+		"Vacate and Resume commands; 0 turns host commands off and mirrors start at once (M1)")
+	flag.StringVar(&o.hostCommandAllow, "host-command-allow", "",
+		"comma-separated IPs or CIDRs allowed to send host commands; empty allows every caller")
+	flag.StringVar(&o.freezer, "freezer", freezerDelete,
+		"how guests vacate the accelerator: agent = snapshot-agent SuspendAll/ResumeAll (D-NS-5 ns-host); "+
+			"delete = delete the mirror (re-created on the next Resume); fake = test freezer")
+	flag.StringVar(&o.agentAddr, "snapshot-agent-addr", "",
+		"--freezer=agent: snapshot-agent host:port; empty means --host-ip:--snapshot-agent-port")
+	flag.IntVar(&o.agentPort, "snapshot-agent-port", 9001, "--freezer=agent: snapshot-agent port on the real node")
+	flag.DurationVar(&o.vacateMargin, "vacate-margin", 250*time.Millisecond, "taken off each Vacate deadline for the ack's way back")
+	flag.DurationVar(&o.resumeBudget, "resume-budget", 30*time.Second, "bound on each guest Resume (--freezer=fake)")
+	flag.DurationVar(&o.killTimeout, "kill-timeout", 30*time.Second, "bound on the kill sequence of one guest")
+	flag.DurationVar(&o.fakeSuspendDelay, "fake-freezer-suspend-delay", 12500*time.Millisecond,
+		"--freezer=fake: time a Suspend takes")
+	flag.DurationVar(&o.fakeResumeDelay, "fake-freezer-resume-delay", 6*time.Second, "--freezer=fake: time a Resume takes")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx, o); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(ctx, &o); err != nil && !errors.Is(err, context.Canceled) {
 		log.G(ctx).WithError(err).Error("guest-kubelet exited")
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, o options) error {
+func run(ctx context.Context, o *options) error {
 	if o.hostIP == "" || o.hostNode == "" {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
 	}
@@ -164,7 +192,7 @@ func (o *options) checkDebug() error {
 // the thing being protected is the kubelet role for one Node. Only the Lease holder builds the
 // virtual-kubelet Node; a standby takes over within about LeaseDuration of a crash, or at once
 // when the leader shuts down cleanly (ReleaseOnCancel).
-func runWithLeaderElection(ctx context.Context, client kubernetes.Interface, o options) error {
+func runWithLeaderElection(ctx context.Context, client kubernetes.Interface, o *options) error {
 	if o.leaseNamespace == "" || o.podName == "" {
 		return fmt.Errorf("--leader-elect needs POD_NAMESPACE and POD_NAME")
 	}
@@ -212,7 +240,7 @@ func runWithLeaderElection(ctx context.Context, client kubernetes.Interface, o o
 }
 
 // runKubelet is the M0 wiring plus the mirror backend.
-func runKubelet(ctx context.Context, client kubernetes.Interface, o options) error {
+func runKubelet(ctx context.Context, client kubernetes.Interface, o *options) error {
 	host, err := client.CoreV1().Nodes().Get(ctx, o.hostNode, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get host node %s: %w", o.hostNode, err)
@@ -238,6 +266,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey, OwnerRef: o.mirrorOwnerRef,
 		},
 		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
+		Gated: o.hostCommandPort > 0,
 	}
 	if mopts.CPUHeadroom, err = resource.ParseQuantity(o.cpuHeadroom); err != nil {
 		return fmt.Errorf("--mirror-cpu-headroom: %w", err)
@@ -278,6 +307,11 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		recorder.Eventf(vkNodeRef, corev1.EventTypeWarning, group.EventGroupUnresolved,
 			"no mirror for guest %s/%s: host node %s resolves to no group (%s)", guest.Namespace, guest.Name, o.hostNode, reason)
 	}
+	hc, err := newHostCommandWiring(o)
+	if err != nil {
+		return err
+	}
+	defer hc.close(ctx)
 
 	// The prober reports verdict changes to the backend, which re-translates the guest's status.
 	var backend *mirror.Backend
@@ -300,8 +334,15 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	n, err := nodeutil.NewNode(o.nodeName,
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
-			backend = mirror.New(client, pc.Pods, mopts)
+			backend = mirror.New(client, pc.Pods, &mopts)
+			owner, err := hc.build(ctx, backend, resolver)
+			if err != nil {
+				return nil, nil, err
+			}
 			prov := provider.New(backend)
+			if owner != nil {
+				prov = provider.NewWithCreateOwner(backend, owner)
+			}
 			if edges != nil {
 				prov.SetNotifyHook(func(pod *corev1.Pod) { edges.Observe(pod) })
 			}
@@ -331,6 +372,9 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	}
 	if edges != nil {
 		go probe.Serve(ctx, o.debugAddr, probe.DebugHandler(prober, edges))
+	}
+	if err := hc.start(ctx); err != nil {
+		return err
 	}
 	go func() {
 		if err := n.WaitReady(ctx, 0); err == nil {

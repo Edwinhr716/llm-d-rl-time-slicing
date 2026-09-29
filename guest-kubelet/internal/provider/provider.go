@@ -26,14 +26,28 @@ type Backend interface {
 	SetStatusCallback(func(*corev1.Pod))
 }
 
+// CreateOwner takes over mirror creation. In host-command mode mirrors may be created only
+// while the orchestrator has lent the node (after a Resume, before the next Vacate), so the host
+// command server creates them and CreatePod only tells it that a guest is waiting.
+type CreateOwner interface {
+	// GuestWaiting is called instead of creating the mirror.
+	GuestWaiting(guest *corev1.Pod)
+}
+
 // Provider implements nodeutil.Provider and node.PodNotifier on top of a Backend.
 type Provider struct {
 	backend Backend
 	hook    func(*corev1.Pod)
+	creator CreateOwner // nil: CreatePod creates the mirror itself (M1)
 }
 
 // New returns a provider backed by b.
 func New(b Backend) *Provider { return &Provider{backend: b} }
+
+// NewWithCreateOwner returns a provider whose mirrors are created by owner, not by CreatePod.
+func NewWithCreateOwner(b Backend, owner CreateOwner) *Provider {
+	return &Provider{backend: b, creator: owner}
+}
 
 // IsGuest reports whether a pod is meant for this node: it must tolerate the guest taint
 // by key. System DaemonSets that tolerate everything ({operator: Exists}, no key) do not count,
@@ -71,6 +85,11 @@ func (p *Provider) NotifyPods(_ context.Context, cb func(*corev1.Pod)) {
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if !IsGuest(pod) {
 		log.G(ctx).WithField("pod", key(pod)).Debug("ignoring non-guest pod")
+		return nil
+	}
+	if p.creator != nil {
+		log.G(ctx).WithField("pod", key(pod)).Debug("guest waits for the host command server to create its mirror")
+		p.creator.GuestWaiting(pod)
 		return nil
 	}
 	return p.backend.Create(ctx, pod)

@@ -43,6 +43,24 @@ kubelet for the guest pods scheduled onto it.
   `POST /debug/readiness?pod=ns/name&ready=true|false|clear` (an override
   that wins over the probes) and `GET /debug/ready-edges?pod=ns/name`
   (when the VK sent each Ready change). Only the Q5 measurement uses it.
+- Host commands (`--host-command-port`, off by default): the VK serves the
+  orchestrator's `HostCommandService` (`api/hostcommand/v1alpha1`) on
+  `--host-ip:<port>` and never reads the orchestrator's lock. No mirror is
+  created before the first Resume. Resume creates the missing mirrors, resumes
+  suspended ones and releases each guest's Ready once its engine serves;
+  guests that arrive while the node is lent get a mirror at once. Vacate holds
+  each guest NotReady, confirms it, then suspends it by the command's deadline
+  and acks VACATED only when every guest is suspended or its mirror is gone; a
+  guest that cannot be suspended is killed (agent Kill, then a normal delete).
+  Epochs fence the commands. A command still running just before the caller's
+  RPC deadline is answered `OUTCOME_UNSPECIFIED` (not finished); calling again
+  joins it. Mirrors then carry `timeslice.io/job-id`,
+  `timeslice.io/role=background`, `restartPolicy: Never` and
+  `timeslice.io/guest-epoch`. `--freezer`: `agent` (snapshot-agent
+  SuspendAll/ResumeAll with the command's epoch, one call per command),
+  `delete` (default: delete the mirror, re-create it on the next Resume) or
+  `fake` (test freezer that only annotates the mirror). `--host-command-allow`
+  limits the callers.
 - Not yet: liveness and startup probes, logs/exec
   (use `kubectl logs <guest>-m`), stats.
 
@@ -58,6 +76,9 @@ internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
 internal/backend/mirror/claim.go     optional reservedFor write (kube-controller-manager also does it)
+internal/hostcmd/                    Vacate/Resume server, epochs, freezers
+internal/backend/mirror/orchestrated.go  Ready hold, epoch CAS, vacate deletes
+api/                                 copied protos, generated code
 internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
 internal/probe/debug.go              debug endpoint: override, Ready edges
 cmd/q5-measure/main.go               Q5 timings; runs in a pod

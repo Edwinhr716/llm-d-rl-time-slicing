@@ -31,6 +31,18 @@ const (
 	// same name may adopt an orphaned mirror only if the hash matches.
 	AnnotationGuestSpecHash = "timeslice.io/guest-spec-hash"
 
+	// LabelJobID and LabelRole, with LabelGroup, are the contract labels the orchestrator and
+	// the snapshot-agent read. They are set only in host-command mode (Config.Background).
+	// LabelJobID is unique per mirror incarnation: the guest UID plus an attempt counter.
+	LabelJobID = "timeslice.io/job-id"
+	// LabelRole marks the mirror as a background guest.
+	LabelRole = "timeslice.io/role"
+	// RoleBackground is the value of LabelRole on every mirror.
+	RoleBackground = "background"
+	// AnnotationGuestEpoch is the fencing epoch, written by compare-and-swap before each
+	// Suspend or Resume.
+	AnnotationGuestEpoch = "timeslice.io/guest-epoch"
+
 	// Suffix is appended to the guest's name to get the mirror's name. The name is
 	// deterministic, so a create is idempotent (AlreadyExists), like LWS's StatefulSet names.
 	Suffix = "-m"
@@ -65,10 +77,19 @@ type Config struct {
 	// Group is the group the real node yields to (internal/group). When set, the mirror
 	// carries it as LabelGroup. The backend sets it per create from the host node's labels.
 	Group string
+	// Background turns on host-command mode (D-NS-4 ns-push-vk): the mirror also gets
+	// LabelJobID and LabelRole and restartPolicy Never.
+	Background bool
+	// Attempt counts the mirrors created for one guest; it makes the job id unique per
+	// incarnation. Used only with Background.
+	Attempt int
 }
 
 // Name returns the mirror's name for a guest.
 func Name(guestName string) string { return guestName + Suffix }
+
+// JobID is the mirror's job id for one incarnation of a guest.
+func JobID(guest *corev1.Pod, attempt int) string { return fmt.Sprintf("%s-%d", guest.UID, attempt) }
 
 // SpecHash hashes the fields of the guest that decide what runs: its containers, minus the
 // service-account token mount. Admission adds that mount as "kube-api-access-<random>", so it
@@ -106,7 +127,7 @@ func RequestsGPU(pod *corev1.Pod) bool {
 }
 
 // Build returns the mirror pod for a guest. The guest is not modified.
-func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
+func Build(guest *corev1.Pod, cfg *Config) (*corev1.Pod, error) {
 	if cfg.HostNode == "" {
 		return nil, fmt.Errorf("mirror: HostNode is required")
 	}
@@ -152,7 +173,7 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 		})
 	}
 
-	m := &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      Name(guest.Name),
 			Namespace: guest.Namespace,
@@ -169,18 +190,20 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 		},
 		Spec: spec,
 	}
+	if cfg.Group != "" {
+		pod.Labels[LabelGroup] = cfg.Group
+	}
+	if cfg.Background {
+		// The orchestrator finds background guests by these labels. A kubelet restart of a
+		// suspended or killed process would run it behind the agent's back, so never restart.
+		pod.Labels[LabelJobID] = JobID(guest, cfg.Attempt)
+		pod.Labels[LabelRole] = RoleBackground
+		pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+	}
 	if cfg.OwnerRef {
-		m.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
+		pod.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
 	}
-	return withGroup(m, cfg.Group), nil
-}
-
-// withGroup labels the mirror with the real node's group, if there is one.
-func withGroup(mirror *corev1.Pod, grp string) *corev1.Pod {
-	if grp != "" {
-		mirror.Labels[LabelGroup] = grp
-	}
-	return mirror
+	return pod, nil
 }
 
 // OwnerRef is the reference from a mirror to its guest. blockOwnerDeletion is left unset: it
@@ -192,7 +215,7 @@ func OwnerRef(guest *corev1.Pod) metav1.OwnerReference {
 	}
 }
 
-func mirrorTolerations(guestTols []corev1.Toleration, cfg Config) []corev1.Toleration {
+func mirrorTolerations(guestTols []corev1.Toleration, cfg *Config) []corev1.Toleration {
 	var out []corev1.Toleration
 	for _, t := range guestTols {
 		if cfg.GuestTaintKey != "" && t.Key == cfg.GuestTaintKey {
@@ -221,7 +244,7 @@ func tolerated(tols []corev1.Toleration, want corev1.Toleration) bool {
 // mirrorResources caps requests at the headroom and swaps the GPU for the claim. Limits are
 // kept (a memory limit is what protects the trainer from the guest), except that a capped
 // request never exceeds its limit.
-func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev1.ResourceRequirements {
+func mirrorResources(in corev1.ResourceRequirements, cfg *Config, gpu bool) corev1.ResourceRequirements {
 	out := *in.DeepCopy()
 	delete(out.Requests, GPUResource)
 	delete(out.Limits, GPUResource)

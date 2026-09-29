@@ -41,6 +41,11 @@ type Options struct {
 	Group func() group.Result
 	// OnUnresolved is told about each create refused for lack of a group.
 	OnUnresolved func(guest *corev1.Pod, reason string)
+	// Gated turns on host-command mode (D-NS-4 ns-push-vk): mirrors are created only by the
+	// host command server (internal/hostcmd), carry the background contract labels, and a guest
+	// is held NotReady until the server releases it (after a Resume and the engine check) and
+	// again before each Suspend. Off, the guest's Ready follows its mirror as in M1.
+	Gated bool
 	// Prober runs the guests' readinessProbes and supplies the ready flags (M2). Nil keeps the
 	// M1 behaviour: the mirror's ready flags, which mean only "running", are copied.
 	Prober Prober
@@ -72,10 +77,12 @@ type Backend struct {
 	mu          sync.Mutex
 	onStatus    func(*corev1.Pod) // the library's notify callback, wrapped by the provider
 	orphanSince map[types.UID]time.Time
+	gate        gateState // host-command mode only; guarded by mu
 }
 
 // New builds the backend. guests must list the pods bound to the virtual node.
-func New(client kubernetes.Interface, guests corev1listers.PodLister, opts Options) *Backend {
+func New(client kubernetes.Interface, guests corev1listers.PodLister, options *Options) *Backend {
+	opts := *options
 	if opts.Resync == 0 {
 		opts.Resync = 30 * time.Second
 	}
@@ -90,6 +97,7 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, opts Optio
 		client: client, opts: opts, guests: guests, factory: f,
 		mirrors: inf.Lister(), synced: inf.Informer().HasSynced,
 		orphanSince: map[types.UID]time.Time{},
+		gate:        newGateState(),
 	}
 	_, _ = inf.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { b.mirrorChanged(obj) },
@@ -151,8 +159,8 @@ func (b *Backend) mirrorChanged(obj any) {
 	b.emit(b.translate(g, m))
 }
 
-// translate is TranslateStatusWith the configured prober, if any.
-func (b *Backend) translate(guest, m *corev1.Pod) *corev1.Pod {
+// translateProbed is TranslateStatusWith the configured prober, if any.
+func (b *Backend) translateProbed(guest, m *corev1.Pod) *corev1.Pod {
 	if b.opts.Prober == nil {
 		return TranslateStatus(guest, m)
 	}
@@ -172,26 +180,30 @@ func (b *Backend) Refresh(namespace, name string) {
 }
 
 func (b *Backend) mirrorDeleted(obj any) {
-	m, ok := obj.(*corev1.Pod)
+	mirrorPod, ok := obj.(*corev1.Pod)
 	if !ok {
 		tomb, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			return
 		}
-		if m, ok = tomb.Obj.(*corev1.Pod); !ok {
+		if mirrorPod, ok = tomb.Obj.(*corev1.Pod); !ok {
 			return
 		}
 	}
-	b.forgetProbes(m)
-	g := b.guestFor(m)
+	b.forgetProbes(mirrorPod)
+	g := b.guestFor(mirrorPod)
 	if g == nil {
 		return
 	}
-	if g.DeletionTimestamp == nil {
-		b.emit(TerminalStatus(g, m, ReasonMirrorDeleted))
+	if b.takeVacated(g.UID) {
+		b.emit(VacatedStatus(g))
 		return
 	}
-	b.emit(TerminalStatus(g, m, ReasonGuestDeleted))
+	if g.DeletionTimestamp == nil {
+		b.emit(TerminalStatus(g, mirrorPod, ReasonMirrorDeleted))
+		return
+	}
+	b.emit(TerminalStatus(g, mirrorPod, ReasonGuestDeleted))
 	go b.finishGuestDeletion(context.Background(), g)
 }
 
@@ -276,7 +288,7 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 // Create builds and creates the mirror. It is idempotent: an existing mirror for this guest is
 // fine; an orphaned mirror with the same name and the same containers is adopted.
 func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
-	cfg := b.opts.Config
+	cfg := b.buildConfig(guest)
 	if b.opts.Group != nil {
 		res := b.opts.Group()
 		g, ok := res.Group()
@@ -289,7 +301,7 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 		}
 		cfg.Group = g
 	}
-	want, err := Build(guest, cfg)
+	want, err := Build(guest, &cfg)
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}

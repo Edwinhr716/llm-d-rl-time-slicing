@@ -179,10 +179,10 @@ func (m *Manager) Sync(guest, mirror *corev1.Pod) {
 		// New container (first start or a restart) or a new IP: start over from not ready.
 		m.stopLocked(key)
 		ctx, cancel := context.WithCancel(m.base)
-		wrk := &worker{cancel: cancel, containerID: status.ContainerID, podIP: mirror.Status.PodIP}
-		m.workers[key] = wrk
+		probeWorker := &worker{cancel: cancel, containerID: status.ContainerID, podIP: mirror.Status.PodIP}
+		m.workers[key] = probeWorker
 		target := Target{PodIP: mirror.Status.PodIP, Container: spec.DeepCopy()}
-		go m.run(ctx, wrk, key, guest.DeepCopy(), target, status.State.Running.StartedAt.Time)
+		go m.run(ctx, probeWorker, key, guest.DeepCopy(), target, status.State.Running.StartedAt.Time)
 	}
 }
 
@@ -212,19 +212,19 @@ func (m *Manager) Forget(uid types.UID, namespace, name string) {
 }
 
 func (m *Manager) stopLocked(key workerKey) {
-	if wrk := m.workers[key]; wrk != nil {
-		wrk.cancel()
+	if probeWorker := m.workers[key]; probeWorker != nil {
+		probeWorker.cancel()
 		delete(m.workers, key)
 	}
 	delete(m.results, key)
 }
 
-// setResult stores a verdict if wrk is still the current worker for key, and reports whether
+// setResult stores a verdict if probeWorker is still the current worker for key, and reports whether
 // it did.
-func (m *Manager) setResult(wrk *worker, key workerKey, ready bool) bool {
+func (m *Manager) setResult(probeWorker *worker, key workerKey, ready bool) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.workers[key] != wrk {
+	if m.workers[key] != probeWorker {
 		return false
 	}
 	m.results[key] = ready
@@ -241,7 +241,7 @@ func (m *Manager) eventf(guest *corev1.Pod, eventType, reason, format string, ar
 // periodSeconds with timeoutSeconds, and flip the verdict after successThreshold consecutive
 // successes or failureThreshold consecutive failures. The verdict starts not ready.
 func (m *Manager) run(
-	ctx context.Context, wrk *worker, key workerKey, guest *corev1.Pod, target Target, startedAt time.Time,
+	ctx context.Context, probeWorker *worker, key workerKey, guest *corev1.Pod, target Target, startedAt time.Time,
 ) {
 	spec := target.Container.ReadinessProbe
 	logger := log.G(ctx).WithField("guest", podKey(guest.Namespace, guest.Name)).WithField("container", key.container)
@@ -267,7 +267,7 @@ func (m *Manager) run(
 		if err != nil {
 			m.eventf(guest, corev1.EventTypeWarning, ReasonUnhealthy, "Readiness probe failed: %v", err)
 		}
-		if ready, changed := th.Observe(err == nil); changed && m.setResult(wrk, key, ready) {
+		if ready, changed := th.Observe(err == nil); changed && m.setResult(probeWorker, key, ready) {
 			logger.WithField("ready", ready).Info("readiness probe verdict changed")
 			m.opts.OnChange(guest.Namespace, guest.Name)
 		}

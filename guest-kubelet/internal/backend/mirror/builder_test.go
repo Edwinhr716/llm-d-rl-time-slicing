@@ -9,6 +9,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// ref returns a pointer to a copy of v.
+func ref[T any](v T) *T { return &v }
+
 func testConfig() Config {
 	return Config{
 		HostNode: "real-node", VirtualNode: "vk-x",
@@ -58,7 +61,7 @@ func testGuest() *corev1.Pod {
 
 func TestBuildMirror(t *testing.T) {
 	g := testGuest()
-	m, err := Build(g, testConfig())
+	m, err := Build(g, ref(testConfig()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +137,7 @@ func TestBuildNoOwnerRefAndNoGPU(t *testing.T) {
 	cfg := testConfig()
 	cfg.OwnerRef = false
 	cfg.GPUClaim = ""
-	m, err := Build(g, cfg)
+	m, err := Build(g, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +149,7 @@ func TestBuildNoOwnerRefAndNoGPU(t *testing.T) {
 func TestBuildRefusesGPUWithoutClaim(t *testing.T) {
 	cfg := testConfig()
 	cfg.GPUClaim = ""
-	if _, err := Build(testGuest(), cfg); err == nil {
+	if _, err := Build(testGuest(), &cfg); err == nil {
 		t.Error("want an error for a GPU guest without a claim")
 	}
 }
@@ -156,7 +159,7 @@ func TestLimitOnlyIsCapped(t *testing.T) {
 	g.Spec.Containers[0].Resources = corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("7")},
 	}
-	m, _ := Build(g, testConfig())
+	m, _ := Build(g, ref(testConfig()))
 	r := m.Spec.Containers[0].Resources
 	if q := r.Requests[corev1.ResourceCPU]; q.Cmp(resource.MustParse("1")) != 0 {
 		t.Errorf("limit-only cpu should get an explicit capped request, got %v", r.Requests)
@@ -166,7 +169,7 @@ func TestLimitOnlyIsCapped(t *testing.T) {
 func TestNoCapWhenHeadroomZero(t *testing.T) {
 	cfg := testConfig()
 	cfg.CPUHeadroom = resource.Quantity{}
-	m, _ := Build(testGuest(), cfg)
+	m, _ := Build(testGuest(), &cfg)
 	if q := m.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU]; q.Cmp(resource.MustParse("6")) != 0 {
 		t.Errorf("cpu must not be capped: %s", q.String())
 	}

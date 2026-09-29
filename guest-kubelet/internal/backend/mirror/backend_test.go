@@ -38,7 +38,7 @@ func (h *harness) emittedPods() []*corev1.Pod {
 	return append([]*corev1.Pod(nil), h.emitted...)
 }
 
-func newHarness(t *testing.T, opts Options, objs ...runtime.Object) *harness {
+func newHarness(t *testing.T, opts *Options, objs ...runtime.Object) *harness {
 	t.Helper()
 	client := fake.NewClientset(objs...)
 	// The API server sets UIDs; the fake does not.
@@ -108,7 +108,7 @@ func (h *harness) waitInformer(guestUID string) {
 }
 
 func TestCreateThenGet(t *testing.T) {
-	h := newHarness(t, testOptions())
+	h := newHarness(t, ref(testOptions()))
 	g := cpuGuest("g1")
 	h.addGuest(g)
 	if err := h.b.Create(context.Background(), g); err != nil {
@@ -136,11 +136,11 @@ func TestCreateThenGet(t *testing.T) {
 
 func TestReadoptOrphanWithSameSpec(t *testing.T) {
 	old := cpuGuest("old-uid")
-	orphan, _ := Build(old, testOptions().Config)
+	orphan, _ := Build(old, ref(testOptions().Config))
 	orphan.UID = "mirror-uid"
 	orphan.Status.PodIP = "10.9.9.9"
 	orphan.Status.Phase = corev1.PodRunning
-	h := newHarness(t, testOptions(), orphan)
+	h := newHarness(t, ref(testOptions()), orphan)
 
 	g := cpuGuest("new-uid") // same name and containers, new UID (StatefulSet re-creation)
 	h.addGuest(g)
@@ -156,9 +156,9 @@ func TestReadoptOrphanWithSameSpec(t *testing.T) {
 func TestReplaceOrphanWithDifferentSpec(t *testing.T) {
 	old := cpuGuest("old-uid")
 	old.Spec.Containers[0].Image = "other:1"
-	orphan, _ := Build(old, testOptions().Config)
+	orphan, _ := Build(old, ref(testOptions().Config))
 	orphan.UID = "mirror-uid"
-	h := newHarness(t, testOptions(), orphan)
+	h := newHarness(t, ref(testOptions()), orphan)
 
 	g := cpuGuest("new-uid")
 	h.addGuest(g)
@@ -175,7 +175,7 @@ func TestGPUMirrorIsReservedOnClaim(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "shared-gpu"},
 		Status:     resourcev1.ResourceClaimStatus{Allocation: &resourcev1.AllocationResult{}},
 	}
-	h := newHarness(t, testOptions(), claim)
+	h := newHarness(t, ref(testOptions()), claim)
 	g := testGuest() // requests nvidia.com/gpu
 	h.addGuest(g)
 	if err := h.b.Create(context.Background(), g); err != nil {
@@ -189,7 +189,7 @@ func TestGPUMirrorIsReservedOnClaim(t *testing.T) {
 
 func TestUnallocatedClaimFails(t *testing.T) {
 	claim := &resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "shared-gpu"}}
-	h := newHarness(t, testOptions(), claim)
+	h := newHarness(t, ref(testOptions()), claim)
 	g := testGuest()
 	h.addGuest(g)
 	if err := h.b.Create(context.Background(), g); err == nil {
@@ -198,7 +198,7 @@ func TestUnallocatedClaimFails(t *testing.T) {
 }
 
 func TestDeleteUsesGuestGrace(t *testing.T) {
-	h := newHarness(t, testOptions())
+	h := newHarness(t, ref(testOptions()))
 	g := cpuGuest("g1")
 	h.addGuest(g)
 	if err := h.b.Create(context.Background(), g); err != nil {
@@ -225,7 +225,7 @@ func TestDeleteUsesGuestGrace(t *testing.T) {
 }
 
 func TestDeleteWithoutMirrorReportsTerminated(t *testing.T) {
-	h := newHarness(t, testOptions())
+	h := newHarness(t, ref(testOptions()))
 	g := cpuGuest("g1")
 	h.addGuest(g)
 	if err := h.b.Delete(context.Background(), g); err == nil {
@@ -237,9 +237,9 @@ func TestDeleteWithoutMirrorReportsTerminated(t *testing.T) {
 }
 
 func TestOrphanCollectedAfterGrace(t *testing.T) {
-	orphan, _ := Build(cpuGuest("gone"), testOptions().Config)
+	orphan, _ := Build(cpuGuest("gone"), ref(testOptions().Config))
 	orphan.UID = "mirror-uid"
-	h := newHarness(t, testOptions(), orphan)
+	h := newHarness(t, ref(testOptions()), orphan)
 	h.waitInformer("gone")
 	now := time.Now()
 	h.b.collectOrphans(context.Background(), now)
@@ -253,7 +253,7 @@ func TestOrphanCollectedAfterGrace(t *testing.T) {
 }
 
 func TestGuestRemovedWhenMirrorStops(t *testing.T) {
-	h := newHarness(t, testOptions())
+	h := newHarness(t, ref(testOptions()))
 	g := cpuGuest("g1")
 	now := metav1.Now()
 	g.DeletionTimestamp = &now
@@ -273,7 +273,7 @@ func TestGuestRemovedWhenMirrorStops(t *testing.T) {
 func TestBuildSetsGroupLabel(t *testing.T) {
 	cfg := testConfig()
 	cfg.Group = "team-a.rc-1.trainers"
-	m, err := Build(testGuest(), cfg)
+	m, err := Build(testGuest(), &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +281,7 @@ func TestBuildSetsGroupLabel(t *testing.T) {
 		t.Errorf("labels: %v", m.Labels)
 	}
 	cfg.Group = ""
-	m, err = Build(testGuest(), cfg)
+	m, err = Build(testGuest(), &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestCreateRefusedWhileGroupUnresolved(t *testing.T) {
 	opts := testOptions()
 	opts.Group = func() group.Result { return res }
 	opts.OnUnresolved = func(g *corev1.Pod, reason string) { refused = append(refused, g.Name+":"+reason) }
-	h := newHarness(t, opts)
+	h := newHarness(t, &opts)
 	g := cpuGuest("g1")
 	h.addGuest(g)
 
@@ -324,7 +324,7 @@ func TestCreateRefusedWhileGroupUnresolved(t *testing.T) {
 func TestReadoptionRefreshesGroupLabel(t *testing.T) {
 	cfg := testOptions().Config
 	cfg.Group = "old.rc-0.trainers"
-	orphan, err := Build(cpuGuest("old-uid"), cfg)
+	orphan, err := Build(cpuGuest("old-uid"), &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestReadoptionRefreshesGroupLabel(t *testing.T) {
 	opts := testOptions()
 	newGroup := group.Result{Groups: []string{"new.rc-1.trainers"}, Reason: group.ReasonOK}
 	opts.Group = func() group.Result { return newGroup }
-	h := newHarness(t, opts, orphan)
+	h := newHarness(t, &opts, orphan)
 	g := cpuGuest("new-uid")
 	h.addGuest(g)
 	if err := h.b.Create(context.Background(), g); err != nil {
