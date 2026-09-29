@@ -50,6 +50,13 @@ To deploy the agent independently using the local Helm chart:
 
 *   `nvidia.driver.hostPath`: `/home/kubernetes/bin/nvidia` (Standard path for GPU drivers on GKE COS).
 *   `nvidia.devices.hostPath`: `/dev` (Standard path for device access).
+*   `cgroup.hostPath`: `/sys/fs/cgroup`, mounted read-write (cgroup v2
+    required; Suspend and Resume freeze and thaw guest pod cgroups).
+*   `vramZeroingQualified`: GPUs and driver branches on which Suspend is
+    allowed. Empty keeps the agent default, `NVIDIA L4:580`.
+*   `scrubPolicy`: VRAM handling at a handoff: `keep`, `ns-scrub` (scrub the
+    freed VRAM after every Suspend) or `flag`. Empty keeps the agent default,
+    `keep`.
 *   `tolerations`: Includes `nvidia.com/gpu` to allow the agent to run on GPU-tainted nodes.
 
 ### 3. Installation on GKE
