@@ -25,7 +25,20 @@ type fakeHostCommander struct {
 	synced   []string
 	noticeAt []time.Time
 	resumes  int
+	forgot   []string
 	events   *eventLog
+}
+
+func (f *fakeHostCommander) Forget(group string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forgot = append(f.forgot, group)
+}
+
+func (f *fakeHostCommander) forgotten() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.forgot...)
 }
 
 func (f *fakeHostCommander) SyncHosts(_ string, nodes []string) {
@@ -109,6 +122,8 @@ type pushFixture struct {
 	hosts  *fakeHostCommander
 	events *eventLog
 	queue  *trackQueue
+	infra  *mockInfrastructureOrchestrator
+	groups *store.GroupStore
 }
 
 // newPushFixture builds group-1 on node-1 with the trainer job in the given
@@ -159,6 +174,7 @@ func newPushFixture(
 	ctrl.Hosts = hosts
 	return &pushFixture{
 		ctrl: ctrl, group: group, hosts: hosts, events: events, queue: queue,
+		infra: infra, groups: groupStore,
 	}
 }
 
@@ -285,5 +301,41 @@ func TestNS4_Push_ControllerDisabledByDefault(t *testing.T) {
 	}
 	if vacates, resumes := fix.hosts.vacateCount(), fix.hosts.resumeCount(); vacates != 0 || resumes != 0 {
 		t.Errorf("host commands sent while disabled: %d vacates, %d resumes", vacates, resumes)
+	}
+}
+
+// When the observe step deletes the group (no nodes and no pods left), the
+// controller forgets its hosts, so host state and commands do not leak.
+func TestNS4_Push_ControllerForgetsHostsOfDeletedGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fix := newPushFixture(t, ctx, pb.SnapshotAgentJobState_STATE_SAVED)
+	fix.infra.observeFunc = func(ctx context.Context, groupID string) error {
+		return fix.groups.Delete(ctx, groupID)
+	}
+	fix.run(t, ctx)
+	fix.queue.Add(pushGroup)
+
+	if err := waitWithTimeout(func() bool { return len(fix.hosts.forgotten()) >= 1 }, 3*time.Second); err != nil {
+		t.Fatalf("hosts of a deleted group were never forgotten: %v", err)
+	}
+	if got := fix.hosts.forgotten(); got[0] != pushGroup {
+		t.Errorf("forgot %v, want [%s]", got, pushGroup)
+	}
+}
+
+// A group that still exists is never forgotten.
+func TestNS4_Push_ControllerKeepsHostsOfLiveGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fix := newPushFixture(t, ctx, pb.SnapshotAgentJobState_STATE_SAVED)
+	fix.hosts.setClear(true)
+	fix.run(t, ctx)
+	fix.queue.Add(pushGroup)
+	if err := waitWithTimeout(func() bool { return fix.queue.getDoneCount() >= 1 }, 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := fix.hosts.forgotten(); len(got) != 0 {
+		t.Errorf("forgot %v for a live group, want none", got)
 	}
 }

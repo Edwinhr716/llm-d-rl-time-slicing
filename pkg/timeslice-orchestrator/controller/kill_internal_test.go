@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +40,8 @@ func (h *barrierHosts) Lent(string) bool { return false }
 func (h *barrierHosts) StartVacate(string, time.Time) {}
 
 func (h *barrierHosts) Resume(string) {}
+
+func (h *barrierHosts) Forget(string) {}
 
 func (h *barrierHosts) AllClear(string) bool {
 	h.mu.Lock()
@@ -413,5 +416,115 @@ func TestUnconfirmedKill_NotLentAgain(t *testing.T) {
 	fx.guest.UpdateContextState(killNode, pb.SnapshotAgentJobState_STATE_SUSPENDED)
 	if got := fx.ctrl.unconfirmedGuestOn(context.Background(), fx.group); got.job != "" {
 		t.Fatalf("unconfirmedGuestOn = %+v after the agent reports it suspended, want none", got)
+	}
+}
+
+// realCommander returns a hostcmd.Commander whose hosts cannot be reached,
+// with a counter of the groups it enqueued.
+func realCommander(t *testing.T, window, budget time.Duration) (*hostcmd.Commander, *atomic.Int32) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	var enqueued atomic.Int32
+	cmd := hostcmd.New(ctx, hostcmd.Config{
+		Resolve:           func(string) (string, error) { return "", errors.New("unreachable") },
+		NoticeWindow:      window,
+		KillBudget:        budget,
+		Enqueue:           func(string) { enqueued.Add(1) },
+		RetryInterval:     10 * time.Millisecond,
+		LateRetryInterval: 20 * time.Millisecond,
+		AttemptTimeout:    100 * time.Millisecond,
+	})
+	t.Cleanup(func() {
+		cancel()
+		cmd.Close()
+	})
+	return cmd, &enqueued
+}
+
+// TestORCHA4_Kill_EmptyGroupThenLateJoin: with the real Commander, a barrier
+// of a group with no hosts holds past T and the kill path sends nothing (fail
+// closed). A host that joins after T is sent the barrier's Vacate, the
+// reconcile loop is asked to look again, and the kill path kills its guest and
+// clears it, which finishes the barrier.
+func TestORCHA4_Kill_EmptyGroupThenLateJoin(t *testing.T) {
+	window, budget := 400*time.Millisecond, 100*time.Millisecond
+	fx := newKillFixture(t, time.Now(), window, budget)
+	cmd, enqueued := realCommander(t, window, budget)
+	fx.ctrl.Hosts = cmd
+	ctx := context.Background()
+
+	cmd.SyncHosts(killGroup, nil)
+	cmd.StartVacate(killGroup, time.Now().Add(-time.Second))
+	if _, ok := cmd.Barrier(killGroup); !ok {
+		t.Fatal("no barrier for a group without hosts")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for enqueued.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if fx.ctrl.killOverdueHosts(ctx, fx.group) {
+		t.Fatal("a group without hosts is clear past T")
+	}
+	if len(fx.killCalls()) != 0 {
+		t.Fatal("Kill sent for a group without hosts")
+	}
+
+	before := enqueued.Load()
+	cmd.SyncHosts(killGroup, []string{killNode})
+	deadline = time.Now().Add(2 * time.Second)
+	for enqueued.Load() <= before && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if enqueued.Load() <= before {
+		t.Fatal("a host that joined after T did not enqueue the group")
+	}
+	bar, ok := cmd.Barrier(killGroup)
+	if !ok || len(bar.NotClear) != 1 || bar.NotClear[0].Node != killNode {
+		t.Fatalf("barrier = %+v, %v; want node-1 not clear", bar, ok)
+	}
+	if cleared := fx.passUntilClear(t, 2*time.Second); cleared.IsZero() {
+		t.Fatal("the late host was never cleared by the kill path")
+	}
+	calls := fx.killCalls()
+	if len(calls) != 1 || calls[0].node != killNode || calls[0].reason != killReasonDeadline {
+		t.Fatalf("Kill calls = %+v, want one on %s with reason %s", calls, killNode, killReasonDeadline)
+	}
+	if _, ok := cmd.Barrier(killGroup); ok {
+		t.Error("the barrier still runs after the kill path cleared every host")
+	}
+	if got := cmd.HostStates(killGroup)[killNode]; got != hostcmd.StateClear {
+		t.Errorf("node-1 state = %v, want clear", got)
+	}
+}
+
+// TestORCHA4_Kill_ForgetDropsKillState: when the group is deleted, the
+// controller forgets its hosts and drops its kill records and hold log marks,
+// and keeps those of other groups.
+func TestORCHA4_Kill_ForgetDropsKillState(t *testing.T) {
+	fx := newKillFixture(t, time.Now(), 30*time.Second, 3*time.Second)
+	ctx := context.Background()
+	fx.ctrl.killRecordFor(killKey(killGroup, killNode, killGuest), killReasonDeadline, time.Time{})
+	fx.ctrl.killRecordFor(killKey("other", killNode, killGuest), killReasonDeadline, time.Time{})
+	fx.ctrl.firstHoldLog(killGroup, killNode, time.Time{})
+	fx.ctrl.firstHoldLog("other", killNode, time.Time{})
+
+	fx.ctrl.forgetHostsIfGroupDeleted(ctx, killGroup)
+	if len(fx.ctrl.kills) != 2 || len(fx.ctrl.holdLogged) != 2 {
+		t.Fatal("kill state dropped for a live group")
+	}
+
+	if err := fx.ctrl.groupStore.Delete(ctx, killGroup); err != nil {
+		t.Fatal(err)
+	}
+	fx.ctrl.forgetHostsIfGroupDeleted(ctx, killGroup)
+	if _, ok := fx.ctrl.kills[killKey(killGroup, killNode, killGuest)]; ok {
+		t.Error("kill record of the deleted group kept")
+	}
+	if _, ok := fx.ctrl.holdLogged[killGroup+"\x00"+killNode]; ok {
+		t.Error("hold log mark of the deleted group kept")
+	}
+	if len(fx.ctrl.kills) != 1 || len(fx.ctrl.holdLogged) != 1 {
+		t.Errorf("kill state of other groups = %d records, %d marks; want 1 and 1",
+			len(fx.ctrl.kills), len(fx.ctrl.holdLogged))
 	}
 }

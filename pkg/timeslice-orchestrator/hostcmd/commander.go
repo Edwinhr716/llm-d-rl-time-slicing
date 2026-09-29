@@ -182,18 +182,36 @@ func (c *Commander) Close() {
 }
 
 // SyncHosts sets the hosts of a group from the node watch. A new host starts
-// unknown (not clear). A removed host is forgotten and its command stopped.
+// unknown (not clear). While a vacate barrier runs, a new host is sent the
+// barrier's Vacate at once, so the barrier can complete. A host that joins
+// after the barrier's deadline T also asks the reconcile loop to look at the
+// group, so the kill path (ORCH-A4), which ran before this sync, acts on it
+// now. A removed host is forgotten and its command stopped.
 func (c *Commander) SyncHosts(group string, nodes []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	gh := c.groupLocked(group)
 	want := make(map[string]bool, len(nodes))
 	changed := false
+	joinedLate := false
 	for _, node := range nodes {
 		want[node] = true
-		if _, ok := gh.hosts[node]; !ok {
-			gh.hosts[node] = &host{node: node, state: StateUnknown}
-			changed = true
+		if _, ok := gh.hosts[node]; ok {
+			continue
+		}
+		hst := &host{node: node, state: StateUnknown}
+		gh.hosts[node] = hst
+		changed = true
+		if bar := gh.barrier; bar != nil {
+			c.log.Info("Host joined a running vacate", "group", group, "node", node,
+				"deadline", bar.deadline, "epoch", bar.epoch)
+			c.sendLocked(group, hst, commandVacate, bar.epoch, bar.deadline)
+			if !time.Now().Before(bar.deadline) {
+				hst.notClearLogged = true
+				joinedLate = true
+				c.log.Warn("Host not clear at deadline", "group", group, "node", node, "epoch", bar.epoch,
+					"deadline", bar.deadline, "reachable", true)
+			}
 		}
 	}
 	for node, hst := range gh.hosts {
@@ -213,10 +231,14 @@ func (c *Commander) SyncHosts(group string, nodes []string) {
 		sort.Strings(hosts)
 		c.log.Info("Host registry updated", "group", group, "hosts", hosts)
 	}
+	if joinedLate && c.cfg.Enqueue != nil {
+		go c.cfg.Enqueue(group)
+	}
 	c.finishBarrierIfClearLocked(group, gh)
 }
 
-// Forget drops a group from the registry.
+// Forget drops a group from the registry and stops its commands. The
+// controller calls it when the group is deleted from the store.
 func (c *Commander) Forget(group string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -236,7 +258,7 @@ func (c *Commander) Forget(group string) {
 }
 
 // AllClear reports whether every host of the group acked a vacate and none
-// was lent since. A group with no hosts is clear. A group never synced is not
+// was lent since. A group with no hosts, and a group never synced, is not
 // clear (fail closed).
 func (c *Commander) AllClear(group string) bool {
 	c.mu.Lock()
@@ -422,7 +444,12 @@ func (c *Commander) groupLocked(group string) *groupHosts {
 	return gh
 }
 
+// allClearLocked reports whether the group has hosts and every one is clear.
+// No hosts means nothing acked, so the group is not clear (fail closed).
 func allClearLocked(gh *groupHosts) bool {
+	if len(gh.hosts) == 0 {
+		return false
+	}
 	for _, hst := range gh.hosts {
 		if hst.state != StateClear {
 			return false
@@ -622,6 +649,9 @@ func (c *Commander) deadlinePassed(group string, bar *barrier) {
 	gh, ok := c.groups[group]
 	if !ok || gh.barrier != bar {
 		return
+	}
+	if len(gh.hosts) == 0 {
+		c.log.Warn("No hosts at deadline", "group", group, "epoch", bar.epoch, "deadline", bar.deadline)
 	}
 	for _, hst := range gh.hosts {
 		if hst.state == StateClear || hst.notClearLogged {

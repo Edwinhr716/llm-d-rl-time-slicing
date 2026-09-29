@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -31,6 +32,20 @@ type HostCommander interface {
 	// ClearByOrchestrator marks a host clear without its ack, because the
 	// kill path vacated it (how names the way).
 	ClearByOrchestrator(group, node, how string)
+	// Forget drops the group and stops its commands.
+	Forget(group string)
+}
+
+// forgetHostsIfGroupDeleted drops the host registry and the kill path state
+// (kill records and hold log marks, kill.go) of a group that the observe step
+// deleted from the store, so host state, commands and kill state do not
+// outlive the group.
+func (c *Controller) forgetHostsIfGroupDeleted(ctx context.Context, groupID string) {
+	if _, err := c.groupStore.Get(ctx, groupID); errors.Is(err, store.ErrNotFound) {
+		slog.InfoContext(ctx, "Group deleted: forgetting its hosts")
+		c.Hosts.Forget(groupID)
+		c.forgetKills(groupID)
+	}
 }
 
 // holdForHosts syncs the hosts of the group and reports whether the reconcile

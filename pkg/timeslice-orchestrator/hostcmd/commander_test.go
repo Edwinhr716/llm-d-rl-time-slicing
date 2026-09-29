@@ -202,9 +202,112 @@ func TestNS4_Push_UnknownHostsFailClosed(t *testing.T) {
 	if got := hns.cmd.HostStates(testGroup)["node-a"]; got != hostcmd.StateUnknown {
 		t.Errorf("state = %v, want unknown", got)
 	}
-	hns.cmd.SyncHosts("empty", nil)
-	if !hns.cmd.AllClear("empty") {
-		t.Error("a group without hosts is not clear, want clear")
+}
+
+// An empty group has no host that acked, so it must not count as clear. Its
+// barrier waits until hosts appear and ack.
+func TestNS4_Push_EmptyGroupFailsClosed(t *testing.T) {
+	addrs := map[string]string{"node-a": serve(t, &fakeHost{})}
+	hns := newHarness(t, addrs, 30*time.Second, 3*time.Second)
+	hns.cmd.SyncHosts(testGroup, nil)
+	if hns.cmd.AllClear(testGroup) {
+		t.Fatal("a group without hosts is clear, want not clear")
+	}
+
+	hns.cmd.StartVacate(testGroup, time.Now())
+	time.Sleep(50 * time.Millisecond)
+	if hns.cmd.AllClear(testGroup) || hns.enqueued.Load() != 0 {
+		t.Fatal("the barrier of a group without hosts completed")
+	}
+	if len(hns.sink.records(t, "Vacate started")) != 1 {
+		t.Fatal("want one Vacate started line for the empty group")
+	}
+
+	// Removing the last host of a clear group makes it not clear again.
+	hns.cmd.SyncHosts(testGroup, []string{"node-a"})
+	eventually(t, "all clear", func() bool { return hns.cmd.AllClear(testGroup) })
+	eventually(t, "enqueue", func() bool { return hns.enqueued.Load() == 1 })
+	hns.cmd.SyncHosts(testGroup, nil)
+	if hns.cmd.AllClear(testGroup) {
+		t.Error("a group whose hosts were all removed is clear, want not clear")
+	}
+}
+
+// A host that joins while a barrier runs is sent the barrier's Vacate, so the
+// barrier completes instead of waiting forever.
+func TestNS4_Push_HostAddedDuringBarrierIsCommanded(t *testing.T) {
+	release := make(chan struct{})
+	var barrierEpoch atomic.Int64
+	slow := &fakeHost{vacate: func(ctx context.Context, req *hcpb.VacateRequest) (*hcpb.HostAck, error) {
+		barrierEpoch.Store(req.GetEpoch())
+		select {
+		case <-release:
+			return vacated(req), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}}
+	var joinedEpoch atomic.Int64
+	joined := &fakeHost{vacate: func(_ context.Context, req *hcpb.VacateRequest) (*hcpb.HostAck, error) {
+		joinedEpoch.Store(req.GetEpoch())
+		return vacated(req), nil
+	}}
+	addrs := map[string]string{
+		"node-a": serve(t, &fakeHost{}), "node-b": serve(t, slow), "node-c": serve(t, joined),
+	}
+	hns := newHarness(t, addrs, 30*time.Second, 3*time.Second)
+	hns.cmd.SyncHosts(testGroup, []string{"node-a", "node-b"})
+	hns.cmd.StartVacate(testGroup, time.Now())
+	eventually(t, "node-b commanded", func() bool { return slow.calls.Load() >= 1 })
+
+	hns.cmd.SyncHosts(testGroup, []string{"node-a", "node-b", "node-c"})
+	eventually(t, "node-c clear", func() bool {
+		return hns.cmd.HostStates(testGroup)["node-c"] == hostcmd.StateClear
+	})
+	if hns.cmd.AllClear(testGroup) || hns.enqueued.Load() != 0 {
+		t.Fatal("barrier completed while node-b has not acked")
+	}
+	if !hns.sink.hasRecord(t, "Host joined a running vacate", map[string]any{"group": testGroup, "node": "node-c"}) {
+		t.Error("no Host joined a running vacate line for node-c")
+	}
+	if len(hns.sink.records(t, "Vacate started")) != 1 {
+		t.Error("want one Vacate started line: the join must not start a new barrier")
+	}
+	if got, want := joinedEpoch.Load(), barrierEpoch.Load(); got != want {
+		t.Errorf("node-c epoch = %d, want the barrier epoch %d", got, want)
+	}
+
+	close(release)
+	eventually(t, "all clear", func() bool { return hns.cmd.AllClear(testGroup) })
+	eventually(t, "enqueue", func() bool { return hns.enqueued.Load() == 1 })
+}
+
+// Forget drops the group's hosts and stops their running commands.
+func TestNS4_Push_ForgetStopsCommands(t *testing.T) {
+	failing := &fakeHost{vacate: func(_ context.Context, req *hcpb.VacateRequest) (*hcpb.HostAck, error) {
+		return &hcpb.HostAck{
+			NodeName: req.GetNodeName(), Epoch: req.GetEpoch(),
+			Command: hcpb.Command_COMMAND_VACATE, Outcome: hcpb.Outcome_OUTCOME_FAILED,
+		}, nil
+	}}
+	addrs := map[string]string{"node-a": serve(t, failing)}
+	hns := newHarness(t, addrs, 30*time.Second, 3*time.Second)
+	hns.cmd.SyncHosts(testGroup, nodes(addrs))
+	hns.cmd.StartVacate(testGroup, time.Now())
+	eventually(t, "retries", func() bool { return failing.calls.Load() >= 2 })
+
+	hns.cmd.Forget(testGroup)
+	if got := hns.cmd.HostStates(testGroup); len(got) != 0 {
+		t.Errorf("host states after Forget = %v, want none", got)
+	}
+	if hns.cmd.AllClear(testGroup) {
+		t.Error("a forgotten group is clear, want not clear")
+	}
+	time.Sleep(50 * time.Millisecond) // let an in-flight attempt finish
+	calls := failing.calls.Load()
+	time.Sleep(100 * time.Millisecond)
+	if got := failing.calls.Load(); got != calls {
+		t.Errorf("host still commanded after Forget: %d calls, then %d", calls, got)
 	}
 }
 

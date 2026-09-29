@@ -321,6 +321,10 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		return fmt.Errorf("failed to observe group state: %w", err)
 	}
 
+	if c.Hosts != nil {
+		c.forgetHostsIfGroupDeleted(ctx, groupID)
+	}
+
 	if err := c.ObserveJobContext(ctx, groupID); err != nil {
 		return fmt.Errorf("failed to observe job context: %w", err)
 	}

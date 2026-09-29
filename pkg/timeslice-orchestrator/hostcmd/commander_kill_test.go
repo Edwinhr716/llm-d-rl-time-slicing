@@ -125,3 +125,41 @@ func TestORCHA4_HostRegistryUpdatedLog(t *testing.T) {
 		t.Errorf("hosts = %v, want [node-a node-b] then [node-a]", got)
 	}
 }
+
+// TestORCHA4_HostJoinedAfterDeadlineEnqueues: a host that joins a barrier
+// after T is sent the barrier's Vacate and asks the reconcile loop to look at
+// the group, so the kill path acts on it at once.
+func TestORCHA4_HostJoinedAfterDeadlineEnqueues(t *testing.T) {
+	failing := func() *fakeHost {
+		return &fakeHost{vacate: func(_ context.Context, req *hcpb.VacateRequest) (*hcpb.HostAck, error) {
+			return &hcpb.HostAck{
+				NodeName: req.GetNodeName(), Epoch: req.GetEpoch(),
+				Command: hcpb.Command_COMMAND_VACATE, Outcome: hcpb.Outcome_OUTCOME_FAILED,
+			}, nil
+		}}
+	}
+	late := failing()
+	addrs := map[string]string{"node-a": serve(t, failing()), "node-b": serve(t, late)}
+	hns := newHarness(t, addrs, 30*time.Second, 3*time.Second)
+	hns.cmd.SyncHosts(testGroup, []string{"node-a"})
+	hns.cmd.StartVacate(testGroup, time.Now().Add(-time.Minute))
+	eventually(t, "enqueue at T", func() bool { return hns.enqueued.Load() == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if got := hns.enqueued.Load(); got != 1 {
+		t.Fatalf("enqueued = %d before the join, want 1", got)
+	}
+
+	hns.cmd.SyncHosts(testGroup, []string{"node-a", "node-b"})
+	eventually(t, "enqueue on the late join", func() bool { return hns.enqueued.Load() == 2 })
+	eventually(t, "node-b commanded", func() bool { return late.calls.Load() >= 1 })
+	bar, ok := hns.cmd.Barrier(testGroup)
+	if !ok || len(bar.NotClear) != 2 || bar.NotClear[1].Node != "node-b" || bar.NotClear[1].State != hostcmd.StateVacating {
+		t.Fatalf("barrier = %+v, %v; want node-a and node-b vacating", bar, ok)
+	}
+	if !hns.sink.hasRecord(t, "Host not clear at deadline", map[string]any{"group": testGroup, "node": "node-b"}) {
+		t.Error("no Host not clear at deadline line for the late host")
+	}
+	if len(hns.sink.records(t, "Vacate started")) != 1 {
+		t.Error("want one Vacate started line: the join must not start a new barrier")
+	}
+}

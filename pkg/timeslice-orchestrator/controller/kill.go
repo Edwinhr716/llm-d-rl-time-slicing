@@ -382,6 +382,24 @@ func (c *Controller) pruneKills(groupID string, jobs []*store.Job) {
 	}
 }
 
+// forgetKills drops every kill record and hold log mark of the group, when
+// the group is deleted.
+func (c *Controller) forgetKills(groupID string) {
+	prefix := groupID + "\x00"
+	c.killMu.Lock()
+	defer c.killMu.Unlock()
+	for key := range c.kills {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.kills, key)
+		}
+	}
+	for key := range c.holdLogged {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.holdLogged, key)
+		}
+	}
+}
+
 // guestRef names a guest and the node it is on.
 type guestRef struct {
 	job, node string
