@@ -461,8 +461,8 @@ func TestGuestOp_StateTable(t *testing.T) {
 			completedAtOnce, pb.Outcome_OUTCOME_RELEASED, pb.JobState_JOB_STATE_IDLE,
 		},
 		{
-			"suspend unknown job", unknown, 0, statemachine.OpTypeSuspend, completedAtOnce,
-			pb.Outcome_OUTCOME_RELEASED, unknown,
+			"suspend unknown job", unknown, 0, statemachine.OpTypeSuspend, refused,
+			0, unknown,
 		},
 		{
 			"suspend FAULTED", pb.JobState_JOB_STATE_FAULTED, 0, statemachine.OpTypeSuspend, refused,

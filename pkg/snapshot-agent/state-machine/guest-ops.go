@@ -110,8 +110,13 @@ func ErrorReasonOf(err error) pb.ErrorReason {
 // A call that passes fencing is then answered by job state:
 //   - Suspend runs the worker from RUNNING, SAVED, SUSPENDED and IDLE (the
 //     worker reports RELEASED when no process is left). It completes at
-//     once with RELEASED for an unknown job or an IDLE job whose last
-//     outcome is KILLED.
+//     once with RELEASED for an IDLE job whose last outcome is KILLED.
+//   - Suspend and Resume of a job the agent does not know (for example
+//     right after an agent restart, before the watcher has listed the
+//     mirror pods again) are refused with FAILED_PRECONDITION. No
+//     operation, job record or epoch is created; once the watcher
+//     registers the job, SeedEpoch restores its fence and the same call
+//     can be retried.
 //   - Resume runs the worker from SAVED and SUSPENDED and completes at once
 //     from RUNNING.
 //   - Anything else is refused with FAILED_PRECONDITION, and a running
@@ -137,13 +142,8 @@ func (sm *StateManager) StartGuestOp(
 
 	job, ok := sm.jobs[jobID]
 	if !ok {
-		if intent == OpTypeResume {
-			return "", refuse(codes.FailedPrecondition, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
-				"cannot resume job %s: the job is unknown to this agent", jobID)
-		}
-		op := sm.newCompletedOpLocked(jobID, intent, pb.Outcome_OUTCOME_RELEASED)
-		op.Epoch = epoch
-		return op.ID, nil
+		return "", refuse(codes.FailedPrecondition, pb.ErrorReason_ERROR_REASON_UNSPECIFIED,
+			"%s of job %s: the job is unknown to this agent", intent, jobID)
 	}
 
 	job.mu.Lock()
