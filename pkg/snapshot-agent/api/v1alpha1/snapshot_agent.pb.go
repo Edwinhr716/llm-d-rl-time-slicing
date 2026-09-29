@@ -1783,7 +1783,8 @@ func (x *RestoreResponse) GetOperationId() string {
 // exactly one call. A lower epoch than the last one seen is refused with
 // STALE_EPOCH. The same epoch and the same call returns the same operation_id.
 // The same epoch with a different call is refused with STALE_EPOCH. A higher
-// epoch while an operation runs aborts the running operation.
+// epoch while an operation runs is refused with gRPC Aborted, and the running
+// operation continues; the caller retries once it has finished.
 type SuspendRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// job_id is the unique identifier for the job, unique per agent.
