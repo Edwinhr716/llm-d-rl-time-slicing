@@ -3,9 +3,10 @@
 // The mirror pod carries no probes: a frozen process would fail them, and the real kubelet would
 // then restart or unready a pod that is only suspended. So the guest kubelet runs each guest
 // container's readinessProbe itself, against the mirror's pod IP, with the probe's own period,
-// timeout and thresholds, and computes the guest's Ready condition from the results. A debug
-// override forces a guest's readiness without touching the process, so the endpoint path can be
-// exercised many times quickly.
+// timeout and thresholds, holds a container not ready until its startupProbe has passed, and
+// computes the guest's Ready condition from the results. A debug override forces a guest's
+// readiness without touching the process, so the endpoint path can be exercised many times
+// quickly.
 package probe
 
 import (
@@ -33,7 +34,7 @@ import (
 const (
 	// ReasonUnhealthy is the real kubelet's reason for a failed probe.
 	ReasonUnhealthy = "Unhealthy"
-	// ReasonProbeUnsupported marks a readinessProbe the guest kubelet cannot run (exec, gRPC).
+	// ReasonProbeUnsupported marks a probe the guest kubelet cannot run (one with no handler).
 	ReasonProbeUnsupported = "ReadinessProbeUnsupported"
 )
 
@@ -47,14 +48,28 @@ const (
 	userAgent               = "kube-probe/guest-kubelet"
 )
 
-// ErrUnsupported is returned for probe handlers the guest kubelet cannot run from outside the
-// container (exec and gRPC).
+// ErrUnsupported is returned for a probe the guest kubelet cannot run: no handler, or an exec
+// probe without an executor.
 var ErrUnsupported = errors.New("probe handler not supported by the guest kubelet")
 
-// Target is one probe to run: the container's readinessProbe against the mirror's pod IP.
+// Target is one probe to run: by default the container's readinessProbe against the mirror's
+// pod IP.
 type Target struct {
 	PodIP     string
 	Container *corev1.Container
+	// Probe is the probe to run. Nil means Container.ReadinessProbe. The startup gate sets it to
+	// the startupProbe.
+	Probe *corev1.Probe
+	// MirrorNamespace and MirrorName name the mirror pod, for exec probes.
+	MirrorNamespace, MirrorName string
+}
+
+// Spec is the probe to run.
+func (t *Target) Spec() *corev1.Probe {
+	if t.Probe != nil {
+		return t.Probe
+	}
+	return t.Container.ReadinessProbe
 }
 
 // Prober runs one probe attempt. A nil error means success.
@@ -69,7 +84,7 @@ type Options struct {
 	OnChange func(namespace, name string)
 	// Recorder receives Unhealthy and ReadinessProbeUnsupported events on the guest. May be nil.
 	Recorder record.EventRecorder
-	// Prober runs the probes. Nil means NetProber.
+	// Prober runs the probes. Nil means AllProber without an executor (exec probes fail).
 	Prober Prober
 }
 
@@ -84,9 +99,10 @@ type worker struct {
 	podIP       string
 }
 
-// Manager runs one probe worker per guest container that has a readinessProbe, while that
-// container runs in the mirror. It keeps results in memory only: after a restart every probed
-// container starts not ready again, which is what the real kubelet does too.
+// Manager runs one probe worker per guest container that has a readinessProbe or a
+// startupProbe, while that container runs in the mirror. It keeps results in memory only: after
+// a restart every probed container starts not ready again, which is what the real kubelet does
+// too.
 type Manager struct {
 	base context.Context // workers outlive the Sync call that starts them
 	opts Options
@@ -95,13 +111,14 @@ type Manager struct {
 	workers     map[workerKey]*worker
 	results     map[workerKey]bool
 	unsupported map[workerKey]bool
-	overrides   map[string]bool // namespace/name -> forced readiness
+	started     map[workerKey]bool // the startupProbe has passed
+	overrides   map[string]bool    // namespace/name -> forced readiness
 }
 
 // NewManager returns a Manager whose workers stop when ctx ends.
 func NewManager(ctx context.Context, opts Options) *Manager {
 	if opts.Prober == nil {
-		opts.Prober = NetProber{}
+		opts.Prober = AllProber{}
 	}
 	if opts.OnChange == nil {
 		opts.OnChange = func(string, string) {}
@@ -111,6 +128,7 @@ func NewManager(ctx context.Context, opts Options) *Manager {
 		workers:     map[workerKey]*worker{},
 		results:     map[workerKey]bool{},
 		unsupported: map[workerKey]bool{},
+		started:     map[workerKey]bool{},
 		overrides:   map[string]bool{},
 	}
 }
@@ -118,8 +136,8 @@ func NewManager(ctx context.Context, opts Options) *Manager {
 func podKey(namespace, name string) string { return namespace + "/" + name }
 
 // ContainerReady returns the guest kubelet's readiness verdict for one guest container, and
-// whether it has one. It has none when the container has no readinessProbe and no override is
-// set; the container is then ready once it runs, as with the real kubelet.
+// whether it has one. It has none when the container has no readinessProbe, no startupProbe and
+// no override is set; the container is then ready once it runs, as with the real kubelet.
 func (m *Manager) ContainerReady(guest *corev1.Pod, container string) (bool, bool) { //nolint:gocritic // see nonamedreturns
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -127,10 +145,22 @@ func (m *Manager) ContainerReady(guest *corev1.Pod, container string) (bool, boo
 		return forced, true
 	}
 	spec := findContainer(guest, container)
-	if spec == nil || spec.ReadinessProbe == nil {
+	if spec == nil || !probed(spec) {
 		return false, false
 	}
-	return m.results[workerKey{guest.UID, container}], true
+	key := workerKey{guest.UID, container}
+	if spec.StartupProbe != nil && !m.started[key] {
+		return false, true
+	}
+	if spec.ReadinessProbe == nil {
+		return true, true // started, and no readinessProbe: ready, as with the kubelet
+	}
+	return m.results[key], true
+}
+
+// probed reports whether the guest kubelet runs a probe for a container.
+func probed(spec *corev1.Container) bool {
+	return spec.ReadinessProbe != nil || spec.StartupProbe != nil
 }
 
 // SetOverride forces a guest's readiness (true or false) or, with nil, returns it to the probes.
@@ -155,7 +185,7 @@ func (m *Manager) Sync(guest, mirror *corev1.Pod) {
 	defer m.mu.Unlock()
 	for i := range guest.Spec.Containers {
 		spec := &guest.Spec.Containers[i]
-		if spec.ReadinessProbe == nil {
+		if !probed(spec) {
 			continue
 		}
 		key := workerKey{guest.UID, spec.Name}
@@ -164,12 +194,12 @@ func (m *Manager) Sync(guest, mirror *corev1.Pod) {
 			m.stopLocked(key)
 			continue
 		}
-		if err := Supported(spec.ReadinessProbe); err != nil {
+		if field, err := unsupportedProbe(spec); err != nil {
 			m.stopLocked(key)
 			if !m.unsupported[key] {
 				m.unsupported[key] = true
 				m.eventf(guest, corev1.EventTypeWarning, ReasonProbeUnsupported,
-					"readinessProbe of container %q: %v; the container is reported not ready", spec.Name, err)
+					"%s of container %q: %v; the container is reported not ready", field, spec.Name, err)
 			}
 			continue
 		}
@@ -181,9 +211,28 @@ func (m *Manager) Sync(guest, mirror *corev1.Pod) {
 		ctx, cancel := context.WithCancel(m.base)
 		wrk := &worker{cancel: cancel, containerID: status.ContainerID, podIP: mirror.Status.PodIP}
 		m.workers[key] = wrk
-		target := Target{PodIP: mirror.Status.PodIP, Container: spec.DeepCopy()}
+		target := Target{
+			PodIP: mirror.Status.PodIP, Container: spec.DeepCopy(),
+			MirrorNamespace: mirror.Namespace, MirrorName: mirror.Name,
+		}
 		go m.run(ctx, wrk, key, guest.DeepCopy(), target, status.State.Running.StartedAt.Time)
 	}
+}
+
+// unsupportedProbe returns the first probe of a container that the guest kubelet cannot run, by
+// field name.
+func unsupportedProbe(spec *corev1.Container) (string, error) {
+	if spec.StartupProbe != nil {
+		if err := Supported(spec.StartupProbe); err != nil {
+			return "startupProbe", err
+		}
+	}
+	if spec.ReadinessProbe != nil {
+		if err := Supported(spec.ReadinessProbe); err != nil {
+			return "readinessProbe", err
+		}
+	}
+	return "", nil
 }
 
 // Forget stops every worker of a guest and drops its results and override. The backend calls it
@@ -206,6 +255,11 @@ func (m *Manager) Forget(uid types.UID, namespace, name string) {
 			delete(m.unsupported, key)
 		}
 	}
+	for key := range m.started {
+		if key.uid == uid {
+			delete(m.started, key)
+		}
+	}
 	if namespace != "" && name != "" {
 		delete(m.overrides, podKey(namespace, name))
 	}
@@ -217,6 +271,7 @@ func (m *Manager) stopLocked(key workerKey) {
 		delete(m.workers, key)
 	}
 	delete(m.results, key)
+	delete(m.started, key)
 }
 
 // setResult stores a verdict if wrk is still the current worker for key, and reports whether
@@ -239,20 +294,25 @@ func (m *Manager) eventf(guest *corev1.Pod, eventType, reason, format string, ar
 
 // run is one worker: wait out initialDelaySeconds from the container start, then probe every
 // periodSeconds with timeoutSeconds, and flip the verdict after successThreshold consecutive
-// successes or failureThreshold consecutive failures. The verdict starts not ready.
+// successes or failureThreshold consecutive failures. The verdict starts not ready. A
+// container with a startupProbe runs it first (runStartup); the readinessProbe runs only after
+// it has passed.
 func (m *Manager) run(
 	ctx context.Context, wrk *worker, key workerKey, guest *corev1.Pod, target Target, startedAt time.Time,
 ) {
-	spec := target.Container.ReadinessProbe
 	logger := log.G(ctx).WithField("guest", podKey(guest.Namespace, guest.Name)).WithField("container", key.container)
-	if wait := time.Until(startedAt.Add(seconds(spec.InitialDelaySeconds, 0))); wait > 0 {
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+	if target.Container.StartupProbe != nil {
+		if !m.runStartup(ctx, wrk, key, guest, target, startedAt) {
 			return
-		case <-timer.C:
 		}
+		logger.Info("startup probe passed")
+		if target.Container.ReadinessProbe == nil {
+			return
+		}
+	}
+	spec := target.Container.ReadinessProbe
+	if !waitUntil(ctx, startedAt.Add(seconds(spec.InitialDelaySeconds, 0))) {
+		return
 	}
 	ticker := time.NewTicker(seconds(spec.PeriodSeconds, defaultPeriod))
 	defer ticker.Stop()
@@ -317,16 +377,12 @@ func (t *Thresholds) Observe(success bool) (bool, bool) { //nolint:gocritic // s
 	return t.ready, false
 }
 
-// Supported returns nil for the handlers the guest kubelet runs (httpGet, tcpSocket) and
-// ErrUnsupported otherwise.
+// Supported returns nil for the handlers the guest kubelet runs (httpGet, tcpSocket, exec,
+// grpc) and ErrUnsupported for a probe with no handler.
 func Supported(p *corev1.Probe) error {
 	switch {
-	case p.HTTPGet != nil, p.TCPSocket != nil:
+	case p.HTTPGet != nil, p.TCPSocket != nil, p.Exec != nil, p.GRPC != nil:
 		return nil
-	case p.Exec != nil:
-		return fmt.Errorf("%w: exec", ErrUnsupported)
-	case p.GRPC != nil:
-		return fmt.Errorf("%w: grpc", ErrUnsupported)
 	}
 	return fmt.Errorf("%w: no handler", ErrUnsupported)
 }
@@ -338,7 +394,7 @@ type NetProber struct{}
 
 // Probe runs one attempt. The deadline comes from ctx.
 func (NetProber) Probe(ctx context.Context, target Target) error {
-	spec := target.Container.ReadinessProbe
+	spec := target.Spec()
 	switch {
 	case spec.HTTPGet != nil:
 		return probeHTTP(ctx, target.PodIP, target.Container, spec.HTTPGet)
@@ -473,4 +529,20 @@ func findStatus(statuses []corev1.ContainerStatus, name string) *corev1.Containe
 		}
 	}
 	return nil
+}
+
+// waitUntil sleeps until t and reports whether ctx is still live.
+func waitUntil(ctx context.Context, t time.Time) bool {
+	wait := time.Until(t)
+	if wait <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }

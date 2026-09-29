@@ -17,6 +17,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods/status"]
     verbs: ["update", "patch"]
+  # Exec readiness and startup probes run inside the mirror's container through the API
+  # server.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
   # The pod controller starts informers on these to resolve env vars in pod specs.
   - apiGroups: [""]
     resources: ["configmaps", "secrets", "services"]

@@ -149,40 +149,46 @@ func execProbe() *corev1.Probe {
 	return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}}}
 }
 
-func TestAdmitProbesOptionA(t *testing.T) {
+// Probes and readinessGates never refuse a guest; the GPU rules still apply.
+func TestAdmitProbes(t *testing.T) {
 	cases := []struct {
 		name string
 		mut  func(*corev1.Pod)
-		rule string // "" = admitted
 	}{
-		{"plain", func(*corev1.Pod) {}, ""},
-		{"httpGet readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = httpProbe() }, ""},
+		{"plain", func(*corev1.Pod) {}},
+		{"httpGet readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = httpProbe() }},
 		{"tcpSocket readiness", func(p *corev1.Pod) {
 			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{}}}
-		}, ""},
-		{"exec readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = execProbe() }, "readiness-probe-exec"},
+		}},
+		{"exec readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = execProbe() }},
 		{"grpc readiness", func(p *corev1.Pod) {
 			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 9000}}}
-		}, "readiness-probe-grpc"},
-		{"httpGet liveness", func(p *corev1.Pod) { p.Spec.Containers[0].LivenessProbe = httpProbe() }, "liveness-probe"},
-		{"startup", func(p *corev1.Pod) { p.Spec.Containers[0].StartupProbe = httpProbe() }, "startup-probe"},
-		{"sidecar liveness", func(p *corev1.Pod) {
-			p.Spec.InitContainers = []corev1.Container{{Name: "side", LivenessProbe: httpProbe()}}
-		}, "liveness-probe"},
+		}},
+		{"httpGet liveness", func(p *corev1.Pod) { p.Spec.Containers[0].LivenessProbe = httpProbe() }},
+		{"startup", func(p *corev1.Pod) { p.Spec.Containers[0].StartupProbe = httpProbe() }},
+		{"stock chart: startup, liveness and readiness", func(p *corev1.Pod) {
+			p.Spec.Containers[0].StartupProbe = httpProbe()
+			p.Spec.Containers[0].LivenessProbe = httpProbe()
+			p.Spec.Containers[0].ReadinessProbe = httpProbe()
+		}},
+		{"sidecar liveness and readiness", func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "side", LivenessProbe: httpProbe(), ReadinessProbe: execProbe()}}
+		}},
 		{"readiness gate", func(p *corev1.Pod) {
 			p.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: "x/ready"}}
-		}, "readiness-gates"},
+		}},
 	}
 	for _, c := range cases {
 		p := guestPod("g")
 		c.mut(p)
-		r := Admit(p, l4Policy())
-		switch {
-		case c.rule == "" && r != nil:
+		if r := Admit(p, l4Policy()); r != nil {
 			t.Errorf("%s: rejected (%v), want admitted", c.name, r)
-		case c.rule != "" && (r == nil || r.Rule != c.rule):
-			t.Errorf("%s: got %v, want rule %s", c.name, r, c.rule)
 		}
+	}
+	p := withGPU(guestPod("g"), "nvidia.com/mig-1g.10gb")
+	p.Spec.Containers[0].LivenessProbe = httpProbe()
+	if r := Admit(p, l4Policy()); r == nil || r.Rule != "gpu-resource" {
+		t.Errorf("a guest with probes still gets the GPU checks: %v", r)
 	}
 }
 
@@ -248,9 +254,8 @@ func TestCreatePodRejects(t *testing.T) {
 	got := make(chan *corev1.Pod, 4)
 	prov.NotifyPods(context.Background(), func(pod *corev1.Pod) { got <- pod })
 
-	bad := guestPod("bad")
+	bad := withGPU(guestPod("bad"), "nvidia.com/mig-1g.10gb")
 	bad.UID = types.UID("bad-uid")
-	bad.Spec.Containers[0].LivenessProbe = httpProbe()
 	ctx := context.Background()
 	for i := 0; i < 2; i++ { // a second offer must not repeat the event
 		if err := prov.CreatePod(ctx, bad); err != nil {
@@ -266,7 +271,7 @@ func TestCreatePodRejects(t *testing.T) {
 		case st := <-got:
 			status := st.Status
 			failed := status.Phase == corev1.PodFailed && status.Reason == ReasonGuestRejected
-			if !failed || !strings.Contains(status.Message, "liveness-probe") {
+			if !failed || !strings.Contains(status.Message, "gpu-resource") {
 				t.Errorf("status: %+v", st.Status)
 			}
 		case <-time.After(5 * time.Second):
@@ -276,12 +281,13 @@ func TestCreatePodRejects(t *testing.T) {
 	if n := len(fake.Events); n != 1 {
 		t.Fatalf("want exactly 1 event, got %d", n)
 	}
-	if e := <-fake.Events; !strings.HasPrefix(e, "Warning GuestRejected liveness-probe:") {
+	if e := <-fake.Events; !strings.HasPrefix(e, "Warning GuestRejected gpu-resource:") {
 		t.Errorf("event %q", e)
 	}
 
 	good := guestPod("good")
 	good.UID = types.UID("good-uid")
+	good.Spec.Containers[0].LivenessProbe = httpProbe()
 	good.Spec.Containers[0].ReadinessProbe = httpProbe()
 	if err := prov.CreatePod(ctx, good); err != nil || len(backend.created) != 1 {
 		t.Fatalf("good guest: err=%v created=%v", err, backend.created)

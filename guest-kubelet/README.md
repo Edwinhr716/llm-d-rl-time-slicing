@@ -31,19 +31,26 @@ kubelet for the guest pods scheduled onto it.
   thresholds with the kubelet's defaults; a verdict that starts not ready
   and starts over when the container restarts; HTTP 200-399 without
   keep-alive or redirects; named ports. The guest's ContainersReady and
-  Ready follow the verdicts (reason `ContainersNotReady`). httpGet and
-  tcpSocket only: a container with an exec or gRPC readiness probe stays
-  not ready, with one `ReadinessProbeUnsupported` Warning event.
+  Ready follow the verdicts (reason `ContainersNotReady`). Any handler:
+  httpGet and tcpSocket over the network, gRPC with the standard health
+  check, exec inside the mirror's container through `pods/exec`. A
+  container with a startupProbe stays not ready until it has passed (and
+  again after a restart). A probe with no handler keeps the container not
+  ready, with one `ReadinessProbeUnsupported` Warning event. Readiness
+  gates are honoured: Ready is false until every gate is true, a gate
+  change re-emits the guest's status at once, and the VK's status writes
+  keep the API's current gate conditions (`internal/backend/mirror/gates.go`).
   `--readiness-probes=false` restores M1 (Ready follows the mirror).
 - `--debug-addr` (off by default, loopback only) serves
   `POST /debug/readiness?pod=ns/name&ready=true|false|clear` (an override
   that wins over the probes) and `GET /debug/ready-edges?pod=ns/name`
   (when the VK sent each Ready change). Only the Q5 measurement uses it.
-- Admission (VK-A7) refuses a guest before it gets a mirror: a liveness
-  or startup probe, an exec or grpc readiness probe, readiness gates (an
-  httpGet or tcpSocket readinessProbe is allowed), a GPU resource other
-  than `nvidia.com/gpu`, or a GPU guest on a host whose model label is
-  not in `--gpu-allowlist` (default `nvidia-l4`; no label fails closed).
+- Admission (VK-A7) refuses a guest before it gets a mirror: a GPU
+  resource other than `nvidia.com/gpu`, or a GPU guest on a host whose
+  model label is not in `--gpu-allowlist` (default `nvidia-l4`; no label
+  fails closed). Probes and readiness gates never refuse a guest: the
+  mirror carries no probes, so a liveness probe is dropped, and the VK
+  runs the readiness and startup probes (above).
   The guest gets a Warning event `GuestRejected` naming the rule and goes
   `Failed` with reason `GuestRejected`.
 - A GPU mirror container's memory limit is its limit (or request) plus
@@ -57,9 +64,8 @@ kubelet for the guest pods scheduled onto it.
   The Node stays Ready through a guest-kubelet outage, so it is not
   deleted and its guests and mirrors keep running. Past the grace it
   stops and the Node goes NotReady as before.
-- Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Liveness and
-  startup probes are refused by admission (above), so an exec or gRPC
-  readinessProbe never reaches the prober.
+- Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Liveness
+  probes are not run (a frozen guest must not be restarted).
 
 ## Layout
 
@@ -67,14 +73,17 @@ kubelet for the guest pods scheduled onto it.
 cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wiring; own event recorder
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
-internal/provider/admission.go       admission: probes, gates, GPU allowlist
+internal/provider/admission.go       admission: GPU allowlist
 internal/provider/events.go          drops events about non-guest pods
 internal/keeper/keeper.go            outage guard (keeps the Node Lease fresh)
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
 internal/backend/mirror/claim.go     optional reservedFor write (kube-controller-manager also does it)
+internal/backend/mirror/gates.go     readiness gates kept on status writes
 internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
+internal/probe/handlers.go           exec and gRPC probes
+internal/probe/startup.go            startup gate
 internal/probe/debug.go              debug endpoint: override, Ready edges
 cmd/q5-measure/main.go               Q5 timings; runs in a pod
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service

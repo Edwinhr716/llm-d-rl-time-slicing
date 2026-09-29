@@ -88,21 +88,16 @@ func TestSupported(t *testing.T) {
 	ok := []*corev1.Probe{
 		{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{}}},
 		{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{}}},
+		{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}}},
+		{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 9000}}},
 	}
 	for _, p := range ok {
 		if err := probe.Supported(p); err != nil {
 			t.Errorf("Supported(%+v) = %v", p.ProbeHandler, err)
 		}
 	}
-	bad := []*corev1.Probe{
-		{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{}}},
-		{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{}}},
-		{},
-	}
-	for _, p := range bad {
-		if err := probe.Supported(p); !errors.Is(err, probe.ErrUnsupported) {
-			t.Errorf("Supported(%+v) = %v, want ErrUnsupported", p.ProbeHandler, err)
-		}
+	if err := probe.Supported(&corev1.Probe{}); !errors.Is(err, probe.ErrUnsupported) {
+		t.Errorf("no handler: got %v, want ErrUnsupported", err)
 	}
 }
 
@@ -304,11 +299,11 @@ func TestManagerUnsupported(t *testing.T) {
 	t.Parallel()
 	rec := record.NewFakeRecorder(10)
 	mgr := probe.NewManager(t.Context(), probe.Options{Recorder: rec, Prober: &fakeProber{}})
-	guest := probedGuest(corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}})
+	guest := probedGuest(corev1.ProbeHandler{})
 	mgr.Sync(guest, runningMirror("c1"))
 	mgr.Sync(guest, runningMirror("c1"))
 	if verdict, has := mgr.ContainerReady(guest, "server"); verdict || !has {
-		t.Errorf("exec probe: got (%t, %t), want not ready", verdict, has)
+		t.Errorf("probe with no handler: got (%t, %t), want not ready", verdict, has)
 	}
 	if len(rec.Events) != 1 {
 		t.Fatalf("want exactly one event, got %d", len(rec.Events))

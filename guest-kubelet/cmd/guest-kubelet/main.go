@@ -3,8 +3,8 @@
 // M1: every guest bound to the virtual Node runs as a mirror pod on the real host (the node
 // this process runs on), and the mirror's real status is copied back to the guest.
 //
-// M2: the guest kubelet runs each guest container's readinessProbe itself (the mirror has none)
-// and reports the guest's Ready from the results.
+// M2: the guest kubelet runs each guest container's readinessProbe and startupProbe itself (the
+// mirror has none) and reports the guest's Ready from the results and the readinessGates.
 package main
 
 import (
@@ -32,6 +32,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
@@ -131,7 +133,8 @@ func main() {
 	flag.DurationVar(&o.keeperInterval, "keeper-interval", 5*time.Second, "node keeper: time between checks")
 
 	flag.BoolVar(&o.readinessProbes, "readiness-probes", true,
-		"run the guests' readinessProbes (httpGet, tcpSocket) and report Ready from them; false copies the mirror's ready flags (M1)")
+		"run the guests' readiness and startup probes (httpGet, tcpSocket, exec, grpc) and report Ready from them; "+
+			"false copies the mirror's ready flags (M1)")
 	// Off by default. The endpoint can force a guest Ready, so only loopback addresses are accepted.
 	flag.StringVar(&o.debugAddr, "debug-addr", "",
 		"loopback host:port for the M2 test hooks (/debug/readiness, /debug/ready-edges); empty disables them")
@@ -304,6 +307,11 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	var backend *mirror.Backend
 	var prober *probe.Manager
 	if o.readinessProbes {
+		// Exec probes run inside the mirror's container through the API server (pods/exec).
+		restCfg, err := restConfig(o.kubeconfig)
+		if err != nil {
+			return fmt.Errorf("rest config for exec probes: %w", err)
+		}
 		prober = probe.NewManager(ctx, probe.Options{
 			OnChange: func(namespace, name string) {
 				if backend != nil {
@@ -311,6 +319,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 				}
 			},
 			Recorder: recorder,
+			Prober:   probe.AllProber{Exec: probe.PodExecer{Config: restCfg, Client: client}},
 		})
 		mopts.Prober = prober
 	}
@@ -328,7 +337,9 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			}
 			return prov, provider.NodeProvider{}, nil
 		},
-		nodeutil.WithClient(client),
+		// The library writes the guests' status; this client keeps the readiness-gate conditions
+		// their owner wrote.
+		nodeutil.WithClient(mirror.GateKeepingClient(client)),
 		func(c *nodeutil.NodeConfig) error {
 			c.NodeSpec = nodeSpec
 			c.NumWorkers = o.workers
@@ -348,6 +359,9 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	// Sync the mirror informer before the pod controller starts: after a restart, the first
 	// GetPod for each guest must already find its mirror (re-adoption, no duplicate create).
 	if err := backend.Start(ctx); err != nil {
+		return err
+	}
+	if err := backend.WatchReadinessGates(ctx); err != nil {
 		return err
 	}
 	if edges != nil {
@@ -429,4 +443,16 @@ func runNodeKeeper(ctx context.Context, client kubernetes.Interface, cfg keeper.
 		}
 		entry.Info(msg)
 	})
+}
+
+// restConfig loads the client config the same way nodeutil.ClientsetFromEnv does.
+func restConfig(kubeconfig string) (*rest.Config, error) {
+	if kubeconfig != "" {
+		if _, err := os.Stat(kubeconfig); err == nil {
+			return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+				&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}, &clientcmd.ConfigOverrides{},
+			).ClientConfig()
+		}
+	}
+	return rest.InClusterConfig()
 }
