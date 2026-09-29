@@ -183,11 +183,14 @@ type Controller struct {
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
 
-	// killMu guards kills, agentSeen and holdLogged (kill path, kill.go).
+	// killMu guards kills, agentSeen, agentFailed and holdLogged (kill path,
+	// kill.go; lend gate, hosts_push.go).
 	killMu     sync.Mutex
 	kills      map[string]*killRecord
 	agentSeen  map[string]time.Time
 	holdLogged map[string]time.Time
+	// agentFailed is when a status call to the agent of a node last failed.
+	agentFailed map[string]time.Time
 }
 
 // settleEntry remembers when a group's active job was first seen holding an
@@ -773,6 +776,7 @@ func (c *Controller) observeNodeJobContext(ctx context.Context, groupID, nodeNam
 	resp, err := c.agentStore.GetStatus(ctx, nodeName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get status from snapshot agent", "error", err, "node", nodeName)
+		c.markAgentFailed(nodeName)
 		return nil
 	}
 	c.markAgentSeen(nodeName)

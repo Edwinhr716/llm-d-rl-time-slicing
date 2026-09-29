@@ -173,21 +173,27 @@ func newA4Cluster(t *testing.T, agents map[string]string) *a4Cluster {
 		}
 		agent := newFakeAgent(mode, guestOf(node))
 		clu.agents[node] = agent
-		lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp",
-			net.JoinHostPort(node, strconv.Itoa(clu.agentPort)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		srv := grpc.NewServer()
-		agentpb.RegisterSnapshotAgentServiceServer(srv, agent)
-		go func() {
-			if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-				t.Errorf("fake agent %s: %v", node, err)
-			}
-		}()
-		t.Cleanup(srv.Stop)
+		serveAgent(t, node, clu.agentPort, agent)
 	}
 	return clu
+}
+
+// serveAgent serves agent as the snapshot agent of node on port until the
+// test ends.
+func serveAgent(t *testing.T, node string, port int, agent *fakeAgent) {
+	t.Helper()
+	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", net.JoinHostPort(node, strconv.Itoa(port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	agentpb.RegisterSnapshotAgentServiceServer(srv, agent)
+	go func() {
+		if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("fake agent %s: %v", node, err)
+		}
+	}()
+	t.Cleanup(srv.Stop)
 }
 
 // startHostsOn starts the reference host on the given nodes only; the other

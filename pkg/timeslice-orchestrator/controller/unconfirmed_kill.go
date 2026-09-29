@@ -38,6 +38,10 @@ type unconfirmedDecision struct {
 	// vramUnconfirmed: flag the next foreground grant with
 	// AcquireResponse.vram_unconfirmed.
 	vramUnconfirmed bool
+	// decideAt, when it does not grant, is the earliest time it may grant.
+	// A retry Kill ends by then, so it never holds a due hand-back. Zero
+	// means unknown: the retry gets the full K.
+	decideAt time.Time
 }
 
 // onKillUnconfirmed is the D-NS-6 H2 seam. It is called from vacateHost
@@ -70,7 +74,7 @@ func (c *Controller) onKillUnconfirmed(
 		grantAt = floor
 	}
 	if time.Now().Before(grantAt) {
-		return unconfirmedDecision{}
+		return unconfirmedDecision{decideAt: grantAt}
 	}
 	slog.DebugContext(ctx, "Unconfirmed kill decided", "group", group, "node", node, "job", job,
 		"grant", true, "vramUnconfirmed", true)

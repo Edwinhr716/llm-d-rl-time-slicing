@@ -16,6 +16,9 @@
 //     ports and reports them in Orch.Addr and Orch.MetricsAddr.
 //   - Config.AgentPort, when non-zero, overrides --snapshot-agent-port.
 //   - Config.HostPort, when non-zero, overrides --host-command-port.
+//   - The snapshot agent of a node is dialed at <node InternalIP>:port, as the
+//     host endpoint is, instead of <node name>:port. A harness pod cannot
+//     resolve node names, so without this the agent is never reached.
 //   - The default slog logger is left to the caller. To get the group, job,
 //     node and operation IDs from the context on each record, as main.go
 //     does, wrap the handler with logging.NewContextHandler.
@@ -34,6 +37,7 @@ import (
 	"sync"
 	"time"
 
+	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/budget"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/hostcmd"
@@ -41,7 +45,9 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -229,7 +235,12 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	lockStore := store.NewConfigMapLockStore(clientset, store.WithConfigMap(fv.lockNamespace, fv.lockConfigMap))
 	groupStore := store.NewGroupStore(lockStore)
 	jobStore := store.NewJobStore()
-	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, fv.snapshotAgentPort).WithRPCTimeout(fv.agentRPCTimeout)
+	grpcAgentStore := store.NewGRPCSnapshotAgentStore(0, fv.snapshotAgentPort).WithRPCTimeout(fv.agentRPCTimeout)
+	snapshotAgentStore := &addressedAgentStore{
+		inner: grpcAgentStore,
+		nodes: informerFactories.Nodes.Core().V1().Nodes().Lister(),
+		port:  fv.snapshotAgentPort,
+	}
 	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
 		controller.NewRateLimiter(fv.retryBaseDelay, fv.retryMaxDelay),
 		workqueue.TypedRateLimitingQueueConfig[string]{
@@ -371,6 +382,65 @@ func hostResolver(infraOrch *infrastructure.KubernetesOrchestrator, port int) fu
 		}
 		return net.JoinHostPort(addr, strconv.Itoa(port)), nil
 	}
+}
+
+// addressedAgentStore dials a node's snapshot agent at <node InternalIP>:port.
+// Nodes without an InternalIP, and names that already carry a port, go to the
+// wrapped store unchanged.
+type addressedAgentStore struct {
+	inner store.SnapshotAgentStore
+	nodes corev1listers.NodeLister
+	port  int
+}
+
+var _ store.SnapshotAgentStore = (*addressedAgentStore)(nil)
+
+func (a *addressedAgentStore) address(nodeName string) string {
+	if _, _, err := net.SplitHostPort(nodeName); err == nil {
+		return nodeName
+	}
+	node, err := a.nodes.Get(nodeName)
+	if err != nil {
+		return nodeName
+	}
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+			return net.JoinHostPort(addr.Address, strconv.Itoa(a.port))
+		}
+	}
+	return nodeName
+}
+
+func (a *addressedAgentStore) GetStatus(ctx context.Context, nodeName string) (*agentpb.StatusResponse, error) {
+	return a.inner.GetStatus(ctx, a.address(nodeName))
+}
+
+func (a *addressedAgentStore) CloseClient(nodeName string) error {
+	return a.inner.CloseClient(a.address(nodeName))
+}
+
+func (a *addressedAgentStore) Snapshot(
+	ctx context.Context, nodeName, jobID, groupID string,
+) (*agentpb.SnapshotResponse, error) {
+	return a.inner.Snapshot(ctx, a.address(nodeName), jobID, groupID)
+}
+
+func (a *addressedAgentStore) GetOperation(
+	ctx context.Context, nodeName, operationID string,
+) (*agentpb.GetOperationResponse, error) {
+	return a.inner.GetOperation(ctx, a.address(nodeName), operationID)
+}
+
+func (a *addressedAgentStore) Restore(
+	ctx context.Context, nodeName, jobID, groupID string,
+) (*agentpb.RestoreResponse, error) {
+	return a.inner.Restore(ctx, a.address(nodeName), jobID, groupID)
+}
+
+func (a *addressedAgentStore) Kill(
+	ctx context.Context, nodeName, jobID, reason string, deadline time.Time,
+) (*agentpb.KillResponse, error) {
+	return a.inner.Kill(ctx, a.address(nodeName), jobID, reason, deadline)
 }
 
 // freePort returns a loopback TCP port that was free a moment ago.

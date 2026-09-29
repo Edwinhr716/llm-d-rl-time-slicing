@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
@@ -56,6 +58,13 @@ const killRetryInterval = 1 * time.Second
 // pendingKillRequeue is how soon the group is looked at again while a host
 // waits on a Kill or on the unconfirmed-kill decision.
 const pendingKillRequeue = 100 * time.Millisecond
+
+// noticeRequeue bounds how long the group waits for its next look while a
+// vacate barrier runs and a host is not clear yet: the reconcile loop requeues
+// with min(noticeRequeue, due - now). A guest that turns FAULTED while its
+// host neither acks nor fails (a hung suspend) is killed within this bound
+// rather than at T.
+const noticeRequeue = 1 * time.Second
 
 // killRecord is the kill state of one guest on one node. Only the reconcile of
 // the guest's group touches it; the workqueue never runs two reconciles of the
@@ -164,24 +173,38 @@ func (c *Controller) killOverdueHosts(ctx context.Context, group *store.Group) b
 
 	now := time.Now()
 	liveness := c.backgroundLiveness()
+	type overdueHost struct{ node, reason string }
+	var overdue []overdueHost
 	for _, h := range bar.NotClear {
 		reason := overdueReason(h, bar.Deadline, now, liveness)
 		if reason == "" {
-			// Not due yet: look again when it is. The Commander also
-			// enqueues the group at T.
+			// Not due yet: look again when it is, and at least every
+			// noticeRequeue so a guest that turns FAULTED meanwhile is
+			// killed without waiting for T. The Commander also enqueues
+			// the group at T.
 			due := bar.Deadline
 			if !h.FailingSince.IsZero() && h.FailingSince.Add(liveness).Before(due) {
 				due = h.FailingSince.Add(liveness)
 			}
-			c.queue.AddAfter(groupID, max(time.Until(due), pendingKillRequeue))
+			c.queue.AddAfter(groupID, max(min(time.Until(due), noticeRequeue), pendingKillRequeue))
 			continue
 		}
-		res := c.vacateHost(ctx, group, jobs, h.Node, reason, &bar)
-		if !res.done {
+		overdue = append(overdue, overdueHost{node: h.Node, reason: reason})
+	}
+	// The overdue hosts are vacated at the same time (D-NS-6 B2): each may wait
+	// up to K on its Kills, and one host must not delay the next by K.
+	results := make([]hostVacate, len(overdue))
+	var wg sync.WaitGroup
+	for i, h := range overdue {
+		wg.Go(func() { results[i] = c.vacateHost(ctx, group, jobs, h.node, h.reason, &bar) })
+	}
+	wg.Wait()
+	for i, h := range overdue {
+		if res := results[i]; !res.done {
 			c.queue.AddAfter(groupID, res.retry)
-			continue
+		} else {
+			c.Hosts.ClearByOrchestrator(groupID, h.node, res.how)
 		}
-		c.Hosts.ClearByOrchestrator(groupID, h.Node, res.how)
 	}
 	return c.Hosts.AllClear(groupID)
 }
@@ -238,8 +261,31 @@ func (c *Controller) vacateHost(
 	for _, job := range guests {
 		key := killKey(groupID, node, job.JobID())
 		rec := c.killRecordFor(key, reason, bar.NoticeAt)
-		if rec.lastAttempt.IsZero() || time.Since(rec.lastAttempt) >= killRetryInterval {
-			c.killGuest(ctx, groupID, job, node, rec, bar.KillBudget)
+		// A guest whose last Kill reached the agent unconfirmed is decided
+		// before any retry (D-NS-6 B1): a retry Kill must not hold a hand-back
+		// that is due, and it ends by the time the decision is due.
+		var decision unconfirmedDecision
+		decided := false
+		budget := bar.KillBudget
+		if rec.unconfirmed {
+			decision = c.onKillUnconfirmed(ctx, groupID, node, job.JobID(), rec.firstSent)
+			decided = true
+			if !decision.decideAt.IsZero() {
+				budget = min(budget, time.Until(decision.decideAt))
+			}
+		}
+		retryDue := rec.lastAttempt.IsZero() || time.Since(rec.lastAttempt) >= killRetryInterval
+		if !decision.grant && retryDue && budget >= c.killPollInterval() {
+			kctx, stop := c.cancelWhenHostClears(ctx, groupID, node)
+			c.killGuest(kctx, groupID, job, node, rec, budget)
+			cleared := errors.Is(context.Cause(kctx), errHostCleared)
+			stop()
+			if cleared {
+				// The host acked the vacate while the Kill ran: its guests are
+				// vacated, and the holds after the kill path see it clear.
+				return hostVacate{retry: pendingKillRequeue}
+			}
+			decided = false // the Kill took time: decide again
 		}
 		if job.Killed(node) {
 			continue
@@ -252,7 +298,9 @@ func (c *Controller) vacateHost(
 		}
 		// H2 seam (D-NS-6): a Kill that reached the agent but was not
 		// confirmed.
-		decision := c.onKillUnconfirmed(ctx, groupID, node, job.JobID(), rec.firstSent)
+		if !decided {
+			decision = c.onKillUnconfirmed(ctx, groupID, node, job.JobID(), rec.firstSent)
+		}
 		if !decision.grant {
 			allDone = false
 			continue
@@ -327,12 +375,18 @@ func (c *Controller) killGuest(
 	log := slog.With("group", groupID, "node", node, "job", job.JobID(), "reason", rec.reason, "attempt", rec.attempts)
 	log.InfoContext(ctx, "Kill sent", "deadline", deadline)
 	resp, err := c.agentStore.Kill(kctx, node, job.JobID(), rec.reason, deadline)
+	if hostClearedDuring(ctx, log, start) {
+		return
+	}
 	if err != nil {
 		log.WarnContext(ctx, "Kill not delivered: agent unreachable, will retry", "retryIn", killRetryInterval,
 			"error", err)
 		return
 	}
 	if signal, err := c.waitKillConfirmed(kctx, groupID, job.JobID(), node, resp.GetOperationId()); signal != "" {
+		if hostClearedDuring(ctx, log, start) {
+			return
+		}
 		rec.unconfirmed = true
 		rec.signal = signal
 		log.WarnContext(ctx, "Kill attempt not confirmed", "signal", signal,
@@ -442,4 +496,72 @@ func (c *Controller) firstHoldLog(groupID, node string, noticeAt time.Time) bool
 	}
 	c.holdLogged[key] = noticeAt
 	return true
+}
+
+// errHostCleared is the cancel cause of a Kill that stopped because its host
+// acked the vacate meanwhile.
+var errHostCleared = errors.New("host acked the vacate")
+
+// cancelWhenHostClears returns a context that is cancelled with errHostCleared
+// once node is clear in the group's host registry, checked every
+// KillPollInterval, and a func that stops the watch. vacateHost kills only on
+// hosts that are not clear, and marks a host clear itself only after the Kill
+// returns, so the host clears meanwhile only by its own vacate ack. Stopping
+// the Kill then lets the reconcile go on to the grant (resume-first) instead
+// of holding the group until the Kill's budget K runs out.
+func (c *Controller) cancelWhenHostClears(
+	ctx context.Context, groupID, node string,
+) (context.Context, context.CancelFunc) {
+	interval := c.KillPollInterval
+	if interval <= 0 {
+		interval = DefaultKillPollInterval
+	}
+	wctx, cancel := context.WithCancelCause(ctx)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if c.hostClear(groupID, node) {
+				cancel(errHostCleared)
+				return
+			}
+		}
+	}()
+	return wctx, func() { cancel(context.Canceled) }
+}
+
+// hostClear reports whether node is clear in the group's host registry.
+func (c *Controller) hostClear(groupID, node string) bool {
+	if c.Hosts.AllClear(groupID) {
+		return true
+	}
+	bar, ok := c.Hosts.Barrier(groupID)
+	if !ok {
+		return false
+	}
+	return !slices.ContainsFunc(bar.NotClear, func(h hostcmd.HostStatus) bool { return h.Node == node })
+}
+
+// hostClearedDuring reports whether the Kill in ctx was stopped because its
+// host acked the vacate, and logs it.
+func hostClearedDuring(ctx context.Context, log *slog.Logger, start time.Time) bool {
+	if !errors.Is(context.Cause(ctx), errHostCleared) {
+		return false
+	}
+	log.InfoContext(ctx, "Kill stopped: the host acked the vacate", "elapsed_ms", time.Since(start).Milliseconds())
+	return true
+}
+
+// killPollInterval is KillPollInterval, or its default when unset. A retry
+// Kill with less budget than one poll is not sent.
+func (c *Controller) killPollInterval() time.Duration {
+	if c.KillPollInterval > 0 {
+		return c.KillPollInterval
+	}
+	return DefaultKillPollInterval
 }

@@ -120,9 +120,44 @@ func (c *Controller) resumeIfLent(ctx context.Context, group *store.Group) error
 	return nil
 }
 
+// lendRetryInterval is how soon a lend held because an agent did not answer
+// is looked at again.
+const lendRetryInterval = 1 * time.Second
+
+// markAgentFailed records that a status call to the agent of node failed.
+func (c *Controller) markAgentFailed(node string) {
+	c.killMu.Lock()
+	defer c.killMu.Unlock()
+	if c.agentFailed == nil {
+		c.agentFailed = make(map[string]time.Time)
+	}
+	c.agentFailed[node] = time.Now()
+}
+
+// agentAnsweredLast reports whether the agent of node answered a status call
+// and the last status call to it did not fail. Only then do the context
+// states of node describe what is on the accelerator now.
+func (c *Controller) agentAnsweredLast(node string) bool {
+	c.killMu.Lock()
+	defer c.killMu.Unlock()
+	seen, ok := c.agentSeen[node]
+	return ok && !c.agentFailed[node].After(seen)
+}
+
 // foregroundResident reports whether any foreground job is RUNNING or
-// TRANSITIONING on a node of the group. Guests do not count.
+// TRANSITIONING on a node of the group, or may be: a node whose agent did not
+// answer its last status call counts as resident (fail closed), because its
+// context states are unknown or stale and the foreground job's snapshot is
+// not confirmed. Guests do not count.
 func (c *Controller) foregroundResident(ctx context.Context, group *store.Group) (bool, error) {
+	for _, node := range group.Status().Nodes() {
+		if !c.agentAnsweredLast(node) {
+			slog.WarnContext(ctx, "Not lending: the snapshot agent did not answer, so the foreground job is not known to be saved",
+				"node", node)
+			c.queue.AddAfter(group.ID(), lendRetryInterval)
+			return true, nil
+		}
+	}
 	jobs, err := c.jobStore.ListByGroup(ctx, group.ID())
 	if err != nil {
 		return false, fmt.Errorf("failed to list jobs for group %s: %w", group.ID(), err)

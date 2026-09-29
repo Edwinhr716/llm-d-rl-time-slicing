@@ -2,7 +2,9 @@ package controller_test
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,10 +83,10 @@ func (f *fakeHostCommander) Barrier(string) (hostcmd.Barrier, bool) {
 
 func (f *fakeHostCommander) ClearByOrchestrator(_, _, _ string) {}
 
-func (f *fakeHostCommander) setClear(allClear bool) {
+func (f *fakeHostCommander) setAllClear() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.allClear = allClear
+	f.allClear = true
 }
 
 func (f *fakeHostCommander) vacateCount() int {
@@ -124,6 +126,7 @@ type pushFixture struct {
 	queue  *trackQueue
 	infra  *mockInfrastructureOrchestrator
 	groups *store.GroupStore
+	agent  *controller.MockSnapshotAgentStore
 }
 
 // newPushFixture builds group-1 on node-1 with the trainer job in the given
@@ -174,7 +177,7 @@ func newPushFixture(
 	ctrl.Hosts = hosts
 	return &pushFixture{
 		ctrl: ctrl, group: group, hosts: hosts, events: events, queue: queue,
-		infra: infra, groups: groupStore,
+		infra: infra, groups: groupStore, agent: agent,
 	}
 }
 
@@ -213,7 +216,7 @@ func TestNS4_Push_ControllerHoldsPromotionUntilHostsClear(t *testing.T) {
 		}
 	}
 
-	fix.hosts.setClear(true)
+	fix.hosts.setAllClear()
 	fix.queue.Add(pushGroup) // the barrier enqueues the group when it completes
 	if err := waitWithTimeout(func() bool { return fix.group.Spec().LockingJob() == "trainer" }, 3*time.Second); err != nil {
 		t.Fatalf("trainer not promoted once hosts are clear: %v", err)
@@ -227,7 +230,7 @@ func TestNS4_Push_ControllerLendSavesThenResumes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fix := newPushFixture(t, ctx, pb.SnapshotAgentJobState_STATE_RUNNING)
-	fix.hosts.setClear(true)
+	fix.hosts.setAllClear()
 	spec := fix.group.Spec()
 	spec.RequestLock("trainer")
 	if _, err := spec.TryPromote(ctx); err != nil {
@@ -329,7 +332,7 @@ func TestNS4_Push_ControllerKeepsHostsOfLiveGroup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fix := newPushFixture(t, ctx, pb.SnapshotAgentJobState_STATE_SAVED)
-	fix.hosts.setClear(true)
+	fix.hosts.setAllClear()
 	fix.run(t, ctx)
 	fix.queue.Add(pushGroup)
 	if err := waitWithTimeout(func() bool { return fix.queue.getDoneCount() >= 1 }, 3*time.Second); err != nil {
@@ -337,5 +340,51 @@ func TestNS4_Push_ControllerKeepsHostsOfLiveGroup(t *testing.T) {
 	}
 	if got := fix.hosts.forgotten(); len(got) != 0 {
 		t.Errorf("forgot %v for a live group, want none", got)
+	}
+}
+
+// TestNS4_Push_ControllerNoLendWhileAgentUnanswered: while the node's snapshot
+// agent does not answer, the foreground job is not known to be saved, so the
+// hosts are not resumed (fail closed). Once the agent answers, the lend goes
+// ahead, the trainer saved first.
+func TestNS4_Push_ControllerNoLendWhileAgentUnanswered(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fix := newPushFixture(t, ctx, pb.SnapshotAgentJobState_STATE_RUNNING)
+	var answering atomic.Bool
+	fix.agent.GetStatusFunc = func(context.Context, string) (*agentpb.StatusResponse, error) {
+		if !answering.Load() {
+			return nil, errors.New("connection refused")
+		}
+		return &agentpb.StatusResponse{}, nil
+	}
+	fix.hosts.setAllClear()
+	spec := fix.group.Spec()
+	spec.RequestLock("trainer")
+	if _, err := spec.TryPromote(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := spec.Yield(ctx, "trainer"); err != nil {
+		t.Fatal(err)
+	}
+	spec.SetLend(true)
+	fix.run(t, ctx)
+	fix.queue.Add(pushGroup)
+
+	// The lend is retried every second: give it a few tries.
+	if err := waitWithTimeout(func() bool { return fix.queue.getDoneCount() >= 3 }, 5*time.Second); err != nil {
+		t.Fatalf("lend not retried while the agent is unanswered: %v", err)
+	}
+	if n := fix.hosts.resumeCount(); n != 0 {
+		t.Fatalf("resumes = %d while the agent does not answer, want 0", n)
+	}
+
+	answering.Store(true)
+	if err := waitWithTimeout(func() bool { return fix.hosts.resumeCount() == 1 }, 5*time.Second); err != nil {
+		t.Fatalf("hosts not resumed once the agent answers: %v", err)
+	}
+	got := fix.events.list()
+	if len(got) < 2 || got[0] != "snapshot trainer" || got[len(got)-1] != "resume" {
+		t.Fatalf("events = %v, want the trainer saved before the hosts resume", got)
 	}
 }

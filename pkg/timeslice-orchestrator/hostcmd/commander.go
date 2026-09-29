@@ -65,8 +65,8 @@ const (
 	DefaultRetryInterval = 200 * time.Millisecond
 	// DefaultLateRetryInterval is the pause between attempts after T.
 	DefaultLateRetryInterval = 1 * time.Second
-	// DefaultAttemptTimeout bounds one command call after T, and every
-	// resume call.
+	// DefaultAttemptTimeout bounds one command call once the command's
+	// deadline (T for a vacate, the resume budget for a resume) has passed.
 	DefaultAttemptTimeout = 5 * time.Second
 )
 
@@ -101,9 +101,15 @@ type host struct {
 	// failingSince is when the current run of failed commands started. Zero
 	// while the host is reachable.
 	failingSince time.Time
+	// failingCommand is the command whose failure started the current run
+	// of failed commands.
+	failingCommand string
 	// notClearLogged is set once the host was logged as not clear at the
 	// current barrier's deadline.
 	notClearLogged bool
+	// failedAckEpoch is the epoch whose vacate the host last answered FAILED
+	// or ABORTED for; the reconcile loop is asked to look once per epoch.
+	failedAckEpoch int64
 	// cancel stops the command goroutine of this host, if one runs.
 	cancel context.CancelFunc
 }
@@ -255,6 +261,9 @@ func (c *Commander) Forget(group string) {
 		gh.barrier.timer.Stop()
 	}
 	delete(c.groups, group)
+	// The registry is now empty for the group: say so, so the last registry
+	// line of a deleted group does not still list its old hosts.
+	c.log.Info("Host registry updated", "group", group, "hosts", []string{}, "reason", "group deleted")
 }
 
 // AllClear reports whether every host of the group acked a vacate and none
@@ -468,6 +477,17 @@ func (c *Commander) sendLocked(group string, hst *host, command string, epoch in
 	hst.cancel = cancel
 	hst.epoch = epoch
 	hst.notClearLogged = false
+	if command == commandVacate && hst.failures > 0 && hst.failingCommand == commandResume {
+		// Failed resumes (for example one cut short while the guests were
+		// still resuming) say nothing about whether the host will vacate.
+		// The vacate times the background liveness L from its own
+		// failures, so a slow resume never makes the host vk-unseen.
+		c.log.Info("Vacate starts a new failure count: earlier failures were resumes", "group", group,
+			"node", hst.node, "failures", hst.failures, "failingSince", hst.failingSince)
+		hst.failures = 0
+		hst.failingSince = time.Time{}
+		hst.failingCommand = ""
+	}
 	if command == commandVacate {
 		hst.state = StateVacating
 	} else {
@@ -509,8 +529,11 @@ func (c *Commander) run(ctx context.Context, group, node, command string, epoch 
 	}
 }
 
-// call sends one attempt. Before T a vacate attempt is bounded by T, so a
-// hung host is known at T; after T, and for resume, by AttemptTimeout.
+// call sends one attempt. An attempt is bounded by the command's deadline
+// while it has not passed: T for a vacate, so a hung host is known at T, and
+// the resume budget for a resume, because the host acks a resume only once
+// its guests run again, which may take longer than AttemptTimeout. After the
+// deadline, an attempt is bounded by AttemptTimeout.
 func (c *Commander) call(
 	ctx context.Context, group, node, command string, epoch int64, deadline time.Time,
 ) (*hcpb.HostAck, error) {
@@ -519,7 +542,7 @@ func (c *Commander) call(
 		return nil, err
 	}
 	callDeadline := time.Now().Add(c.cfg.AttemptTimeout)
-	if command == commandVacate && time.Now().Before(deadline) {
+	if time.Now().Before(deadline) {
 		callDeadline = deadline
 	}
 	callCtx, cancel := context.WithDeadline(ctx, callDeadline)
@@ -593,6 +616,10 @@ func (c *Commander) handle(
 		c.epochs.Observe(ack.GetCurrentEpoch())
 		hst.epoch = c.epochs.Next()
 		return hst.epoch, false
+	case hcpb.Outcome_OUTCOME_FAILED, hcpb.Outcome_OUTCOME_ABORTED:
+		if command == commandVacate {
+			c.vacateFailedLocked(group, gh, hst, epoch)
+		}
 	default:
 	}
 	// OUTCOME_FAILED, OUTCOME_ABORTED or an outcome that does not fit the
@@ -605,6 +632,7 @@ func (c *Commander) failedLocked(group string, hst *host, command string, err er
 	hst.failures++
 	if hst.failures == 1 {
 		hst.failingSince = time.Now()
+		hst.failingCommand = command
 		c.log.Warn("Host command failed", "group", group, "node", hst.node, "command", command,
 			"epoch", hst.epoch, "error", err)
 		// The reconcile loop times the background liveness L from here
@@ -615,6 +643,25 @@ func (c *Commander) failedLocked(group string, hst *host, command string, err er
 	}
 }
 
+// vacateFailedLocked handles a host that answered a vacate with FAILED or
+// ABORTED before T. The host is reachable, so failedLocked never runs for it,
+// and nothing else enqueues the group before T. A failed suspend often leaves
+// the guest FAULTED on the agent, and the kill path kills a FAULTED guest at
+// any time, so the reconcile loop is asked to look now, once per epoch; the
+// retries that follow do not enqueue again. After T, deadlinePassed has
+// already enqueued the group. c.mu is held.
+func (c *Commander) vacateFailedLocked(group string, gh *groupHosts, hst *host, epoch int64) {
+	if hst.failedAckEpoch == epoch || gh.barrier == nil || !time.Now().Before(gh.barrier.deadline) {
+		return
+	}
+	hst.failedAckEpoch = epoch
+	c.log.Info("Host vacate failed before the deadline", "group", group, "node", hst.node,
+		"epoch", epoch, "deadline", gh.barrier.deadline)
+	if c.cfg.Enqueue != nil {
+		go c.cfg.Enqueue(group)
+	}
+}
+
 func (c *Commander) reachableLocked(group string, hst *host) {
 	if hst.failures > 0 {
 		c.log.Info("Host command succeeded after failures", "group", group, "node", hst.node,
@@ -622,6 +669,7 @@ func (c *Commander) reachableLocked(group string, hst *host) {
 	}
 	hst.failures = 0
 	hst.failingSince = time.Time{}
+	hst.failingCommand = ""
 }
 
 // finishBarrierIfClearLocked ends the barrier once every host is clear and

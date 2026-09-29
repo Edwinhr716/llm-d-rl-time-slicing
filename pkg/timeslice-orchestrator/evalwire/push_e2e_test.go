@@ -186,6 +186,14 @@ type cluster struct {
 	hostPort int
 	rec      *recorder
 	execs    map[string]*hostExec
+
+	// pushAgentPort is where startHosts serves an agent per node that
+	// answers Status with no jobs: the lend waits for the agent (fail
+	// closed), so the push tests need one.
+	pushAgentPort int
+
+	// noAgents leaves the agents out: nothing answers on pushAgentPort.
+	noAgents bool
 }
 
 func newCluster(t *testing.T) *cluster {
@@ -208,7 +216,10 @@ func newCluster(t *testing.T) *cluster {
 			t.Fatal(err)
 		}
 	}
-	clu := &cluster{cs: cs, hostPort: freePort(t, e2eNodes[0]), rec: &recorder{}, execs: map[string]*hostExec{}}
+	clu := &cluster{
+		cs: cs, hostPort: freePort(t, e2eNodes[0]), pushAgentPort: freePort(t, e2eNodes[0]),
+		rec: &recorder{}, execs: map[string]*hostExec{},
+	}
 	for _, node := range e2eNodes {
 		clu.execs[node] = &hostExec{
 			guest: guestOf(node), rec: clu.rec, release: make(chan struct{}), blocked: make(chan struct{}),
@@ -220,6 +231,9 @@ func newCluster(t *testing.T) *cluster {
 func (c *cluster) startHosts(t *testing.T) {
 	t.Helper()
 	for _, node := range e2eNodes {
+		if !c.noAgents {
+			serveAgent(t, node, c.pushAgentPort, newFakeAgent(killConfirm))
+		}
 		hst, err := host.Start(context.Background(), host.Config{
 			Node:       node,
 			ListenAddr: net.JoinHostPort(node, strconv.Itoa(c.hostPort)),
@@ -236,7 +250,7 @@ func (c *cluster) startOrch(t *testing.T) *evalwire.Orch {
 	t.Helper()
 	orch, err := evalwire.Start(context.Background(), evalwire.Config{
 		Clientset: c.cs,
-		AgentPort: freePort(t, "127.0.0.1"), // no agent: status errors are ignored
+		AgentPort: c.pushAgentPort,
 		HostPort:  c.hostPort,
 		Args:      pushArgs(),
 	})
@@ -438,10 +452,12 @@ func TestNS4_Push_RestartMidNotice(t *testing.T) {
 }
 
 // TestNS4_Push_HungHostNeverGranted: a host that never acks keeps the grant
-// held past T (this option has no kill) and is logged not clear at T.
+// held past T and is logged not clear at T. No agent answers,
+// so the kill path cannot vacate the hung host (fail closed).
 func TestNS4_Push_HungHostNeverGranted(t *testing.T) {
 	sink := captureLogs(t)
 	clu := newCluster(t)
+	clu.noAgents = true
 	hung := clu.execs[e2eNodes[1]]
 	hung.hang.Store(true)
 	clu.startHosts(t)
