@@ -30,6 +30,7 @@ import (
 	statemachine "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/tpu"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/vramzero"
 )
 
 func main() {
@@ -49,6 +50,9 @@ func main() {
 	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
 	reportResumed := flag.Bool("report-resumed-outcome", true,
 		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
+	vramZeroingQualified := flag.String("vram-zeroing-qualified", vramzero.DefaultQualified,
+		"Comma-separated <GPU name>:<driver branch> entries whose driver zeroes freed VRAM; "+
+			"a Suspend on any other GPU is refused")
 	flag.Parse()
 
 	depMode := *deploymentMode
@@ -89,6 +93,17 @@ func main() {
 	featureGates, err := features.Parse(gatesSpec)
 	if err != nil {
 		slog.Error("Invalid feature gates", "value", gatesSpec, "error", err)
+		os.Exit(1)
+	}
+
+	// VRAM_ZEROING_QUALIFIED overrides the flag, mirroring DEPLOYMENT_MODE: the
+	// Helm chart configures the agent through env vars.
+	if envQualified, ok := os.LookupEnv("VRAM_ZEROING_QUALIFIED"); ok {
+		*vramZeroingQualified = envQualified
+	}
+	qualifiedList, err := vramzero.ParseAllowlist(*vramZeroingQualified)
+	if err != nil {
+		slog.Error("Invalid VRAM zeroing allowlist", "value", *vramZeroingQualified, "error", err)
 		os.Exit(1)
 	}
 
@@ -137,6 +152,8 @@ func main() {
 		utils.GetPodPIDs = tpu.GetPodPIDs
 		utils.HasGPUProcesses = tpu.HasProcesses
 		slog.InfoContext(ctx, "Using TPU process discovery", "acceleratorType", accelType)
+	} else {
+		logVRAMZeroing(ctx, qualifiedList)
 	}
 
 	// GPU-CR housekeeping runs only when the shared checkpoint dir is
