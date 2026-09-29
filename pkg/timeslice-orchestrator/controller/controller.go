@@ -330,8 +330,10 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		}
 	}
 
-	// 4. Update Status
-	if err := c.updateGroupStatus(ctx, group); err != nil {
+	// 4. Update Status. While any node has a foreground operation in flight
+	// (an outgoing snapshot or the incoming restore), no job counts as
+	// loaded, so Acquire cannot grant: fail closed (contract section 3).
+	if err := c.updateGroupStatus(ctx, group, pending); err != nil {
 		return fmt.Errorf("failed to update group status: %w", err)
 	}
 
@@ -582,7 +584,8 @@ func (c *Controller) tryDeduceActiveJob(ctx context.Context, group *store.Group)
 
 // isJobLoaded checks if a specific job is currently loaded on the nodes of the group.
 // A job J is considered loaded if, for every node N in the group, the job's state on N
-// is either STATE_RUNNING, or STATE_UNSPECIFIED/STATE_IDLE and no other job is running on N.
+// is either STATE_RUNNING, or STATE_UNSPECIFIED/STATE_IDLE and no other job is running or
+// TRANSITIONING on N.
 // STATE_IDLE means the job's pods exist but have not created an accelerator context yet
 // (pre-provisioned workloads, e.g. a Ray cluster deployed before the driver acquires the
 // lock); like STATE_UNSPECIFIED, there is nothing to restore, so the job is grantable.
@@ -604,8 +607,14 @@ func (c *Controller) isJobLoaded(ctx context.Context, group *store.Group, jobID 
 	// Map of node -> jobID of the job running on it.
 	// If multiple jobs are running on the same node, we error out.
 	nodeRunningJob := make(map[string]string)
+	// Map of node -> a job whose snapshot or restore is in progress on it. Its
+	// context may still be on the device, so the node is not free (fail closed).
+	nodeTransitioningJob := make(map[string]string)
 	for _, job := range jobs {
 		for node, state := range job.ContextState() {
+			if state == pb.SnapshotAgentJobState_STATE_TRANSITIONING && job.JobID() != jobID {
+				nodeTransitioningJob[node] = job.JobID()
+			}
 			if state == pb.SnapshotAgentJobState_STATE_RUNNING {
 				if current, ok := nodeRunningJob[node]; ok && current != job.JobID() {
 					return false, fmt.Errorf("impossible state: multiple jobs running on node %s: %s and %s", node, current, job.JobID())
@@ -646,6 +655,10 @@ func (c *Controller) isJobLoaded(ctx context.Context, group *store.Group, jobID 
 				// Another job is running on this node
 				return false, nil
 			}
+			if nodeTransitioningJob[node] != "" {
+				// Another job's snapshot or restore is still in progress here
+				return false, nil
+			}
 		default:
 			// STATE_SAVED, STATE_FAULTED, etc.
 			return false, nil
@@ -675,10 +688,15 @@ func determineGroupState(lockingJobID, activeJobID, loadedJobID string) pb.Group
 }
 
 // updateGroupStatus deduces the group status based on the current state and updates it in the store.
-func (c *Controller) updateGroupStatus(ctx context.Context, group *store.Group) error {
+// opInFlight is true while a node of the group has a foreground operation in
+// flight; the active job is then never reported loaded, whatever its own state.
+func (c *Controller) updateGroupStatus(ctx context.Context, group *store.Group, opInFlight bool) error {
 	activeJobID := group.Spec().ActiveJob()
 	activeJobLoaded := false
-	if activeJobID != "" {
+	if opInFlight && activeJobID != "" {
+		slog.DebugContext(ctx, "Foreground operation in flight, active job not reported loaded", "activeJobID", activeJobID)
+	}
+	if activeJobID != "" && !opInFlight {
 		var err error
 		activeJobLoaded, err = c.isJobLoaded(ctx, group, activeJobID)
 		if err != nil {

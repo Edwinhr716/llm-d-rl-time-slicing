@@ -11,6 +11,7 @@ import (
 	"time"
 
 	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -592,4 +593,91 @@ func (s *splitAgent) GetOperation(ctx context.Context, node, id string) (*agentp
 	s.ok.states[op.node][op.job] = op.target
 	s.ok.mu.Unlock()
 	return &agentpb.GetOperationResponse{Status: agentpb.OperationStatus_OPERATION_STATUS_COMPLETE}, nil
+}
+
+// TestForegroundWait_Async_NoGrantWhileSnapshotInFlight reproduces the
+// evaluator's M7 case: the first grant to a job with no context yet (IDLE, or
+// no pods at all) while the outgoing job's snapshot is still in progress. The
+// server grants when the job holds the lock and is the loaded job, so the
+// incoming job must not be reported loaded until the snapshot has finished.
+func TestForegroundWait_Async_NoGrantWhileSnapshotInFlight(t *testing.T) {
+	cases := map[string]map[string]agentpb.JobState{
+		"incoming IDLE": {
+			"t1": agentpb.JobState_JOB_STATE_RUNNING,
+			"r1": agentpb.JobState_JOB_STATE_IDLE,
+		},
+		"incoming has no pods": {
+			"t1": agentpb.JobState_JOB_STATE_RUNNING,
+		},
+	}
+	for name, states := range cases {
+		t.Run(name, func(t *testing.T) {
+			fx := newAsyncFixture(t, []string{"n1"}, states)
+			fx.group(t).Spec().RequestLock("r1")
+			ctx := context.Background()
+			granted := func() bool {
+				g := fx.group(t)
+				return g.Spec().LockingJob() == "r1" && g.Status().LoadedJob() == "r1"
+			}
+
+			// Pass 1 starts the snapshot of t1; pass 2 sees t1 TRANSITIONING in
+			// the store while the operation is still pending.
+			for i := 1; i <= 3; i++ {
+				if err := fx.ctrl.reconcileGroup(ctx, "g1"); !errors.Is(err, errForegroundPending) {
+					t.Fatalf("pass %d = %v, want pending snapshot", i, err)
+				}
+				if op := fx.ctrl.getForegroundOp("g1", "n1"); op == nil || op.opType != "snapshot" || op.jobID != "t1" {
+					t.Fatalf("pass %d: record = %+v, want snapshot of t1", i, op)
+				}
+				if granted() {
+					t.Fatalf("pass %d: r1 grantable (LoadedJob=r1) while the snapshot of t1 is in progress", i)
+				}
+				if got, _ := fx.group(t).Status().State(); got != pb.GroupStatus_STATE_SWITCHING {
+					t.Errorf("pass %d: state = %v, want SWITCHING", i, got)
+				}
+			}
+
+			fx.agent.finishAll(agentpb.OperationStatus_OPERATION_STATUS_COMPLETE)
+			if err := fx.ctrl.reconcileGroup(ctx, "g1"); err != nil {
+				t.Fatalf("reconcile after the snapshot finished = %v, want nil", err)
+			}
+			if !granted() {
+				t.Errorf("r1 not granted after the snapshot finished: LoadedJob = %q", fx.group(t).Status().LoadedJob())
+			}
+			if n := fx.agent.counts(); n.snapshots != 1 || n.restores != 0 {
+				t.Errorf("snapshots=%d restores=%d, want 1 and 0", n.snapshots, n.restores)
+			}
+		})
+	}
+}
+
+// TestForegroundWait_Async_IsJobLoadedWaitsForTransitioning: a job with no
+// context is not loaded on a node where another job is TRANSITIONING, so no
+// code path (status update, restart deduction) can report it loaded there.
+func TestForegroundWait_Async_IsJobLoadedWaitsForTransitioning(t *testing.T) {
+	fx := newAsyncFixture(t, []string{"n1"}, map[string]agentpb.JobState{
+		"t1": agentpb.JobState_JOB_STATE_TRANSITIONING,
+		"r1": agentpb.JobState_JOB_STATE_IDLE,
+	})
+	ctx := context.Background()
+	if err := fx.ctrl.ObserveJobContext(ctx, "g1"); err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	for _, job := range []string{"r1", "never-seen"} {
+		loaded, err := fx.ctrl.isJobLoaded(ctx, fx.group(t), job)
+		if err != nil {
+			t.Fatalf("isJobLoaded(%s): %v", job, err)
+		}
+		if loaded {
+			t.Errorf("isJobLoaded(%s) = true while t1 is TRANSITIONING on n1", job)
+		}
+	}
+
+	fx.agent.setState("n1", "t1", agentpb.JobState_JOB_STATE_SAVED)
+	if err := fx.ctrl.ObserveJobContext(ctx, "g1"); err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	if loaded, err := fx.ctrl.isJobLoaded(ctx, fx.group(t), "r1"); err != nil || !loaded {
+		t.Errorf("isJobLoaded(r1) = %v, %v after t1 was saved, want true", loaded, err)
+	}
 }
