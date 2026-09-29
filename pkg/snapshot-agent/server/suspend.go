@@ -282,6 +282,9 @@ func (g *guestPipeline) suspend(ctx context.Context, jobID string, deadline time
 		slog.InfoContext(ctx, "Suspend: guest is gone; released", "jobID", jobID, "reason", err)
 		return released, nil
 	}
+	if errors.Is(err, cgroup.ErrNotV2) {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_PRECONDITION_NODE, err)
+	}
 	if err != nil {
 		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
 	}

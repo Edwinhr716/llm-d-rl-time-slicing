@@ -42,6 +42,7 @@ func TestPodCgroupPath(t *testing.T) {
 	for name, rel := range cases {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
+			write(t, filepath.Join(root, "cgroup.controllers"), "cpu memory\n")
 			mkdir(t, filepath.Join(root, "kubepods.slice", "kubepods-burstable.slice", "kubepods-burstable-podother.slice"))
 			mkdir(t, filepath.Join(root, rel))
 			got, err := New(root).PodCgroupPath(uid)
@@ -56,6 +57,7 @@ func TestPodCgroupPath(t *testing.T) {
 
 	t.Run("missing", func(t *testing.T) {
 		root := t.TempDir()
+		write(t, filepath.Join(root, "cgroup.controllers"), "cpu memory\n")
 		mkdir(t, filepath.Join(root, "kubepods.slice"))
 		if _, err := New(root).PodCgroupPath(uid); !errors.Is(err, ErrNotFound) {
 			t.Errorf("want ErrNotFound, got %v", err)
@@ -63,6 +65,7 @@ func TestPodCgroupPath(t *testing.T) {
 	})
 	t.Run("no prefix match", func(t *testing.T) {
 		root := t.TempDir()
+		write(t, filepath.Join(root, "cgroup.controllers"), "cpu memory\n")
 		// A UID that only shares a prefix must not match.
 		mkdir(t, filepath.Join(root, "kubepods.slice", "kubepods-pod"+uid+"0.slice"))
 		if _, err := New(root).PodCgroupPath(uid); !errors.Is(err, ErrNotFound) {
@@ -167,9 +170,10 @@ func TestFreezeThaw(t *testing.T) {
 
 func TestKill(t *testing.T) {
 	t.Run("cgroup.kill", func(t *testing.T) {
-		dir := t.TempDir()
+		root := t.TempDir()
+		dir := filepath.Join(root, "kubepods", "pod1")
 		write(t, filepath.Join(dir, "cgroup.kill"), "")
-		m := New(t.TempDir())
+		m := New(root)
 		m.kill = func(int, syscall.Signal) error { t.Fatal("must not signal"); return nil }
 		if err := m.Kill(dir); err != nil {
 			t.Fatal(err)
@@ -179,10 +183,11 @@ func TestKill(t *testing.T) {
 		}
 	})
 	t.Run("fallback SIGKILL", func(t *testing.T) {
-		dir := t.TempDir()
+		root := t.TempDir()
+		dir := filepath.Join(root, "kubepods", "pod1")
 		write(t, filepath.Join(dir, "cgroup.procs"), "7\n8\n")
 		write(t, filepath.Join(dir, "c", "cgroup.procs"), "9\n")
-		m := New(t.TempDir())
+		m := New(root)
 		var got []int
 		m.kill = func(pid int, sig syscall.Signal) error {
 			if sig != syscall.SIGKILL {
@@ -201,9 +206,11 @@ func TestKill(t *testing.T) {
 			t.Errorf("signalled %v, want %v", got, want)
 		}
 	})
+	// A removed cgroup has nothing to kill (Kill confirms with Procs).
 	t.Run("missing cgroup", func(t *testing.T) {
-		if err := New(t.TempDir()).Kill(filepath.Join(t.TempDir(), "gone")); err == nil {
-			t.Error("want an error")
+		root := t.TempDir()
+		if err := New(root).Kill(filepath.Join(root, "gone")); err != nil {
+			t.Errorf("want nil, got %v", err)
 		}
 	})
 }

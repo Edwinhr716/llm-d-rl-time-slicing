@@ -14,7 +14,8 @@
 
 // Package cgroup reads and drives the cgroup v2 hierarchy of a pod on this
 // node: it finds the pod and container cgroups, lists their processes,
-// freezes, thaws and kills them, and reads their memory files.
+// freezes, thaws and kills them, and reads their memory files. The Suspend
+// and Resume pipelines, Kill and restart recovery share this one package.
 //
 // Every path is resolved against one root, the host's cgroup v2 mount as the
 // agent sees it (DefaultRoot). The agent runs privileged with the host
@@ -48,6 +49,9 @@ const maxSearchDepth = 3
 // ErrNotFound is returned when a pod or container cgroup does not exist.
 var ErrNotFound = errors.New("cgroup not found")
 
+// ErrNotV2 is returned when Root is not a cgroup v2 (unified) mount.
+var ErrNotV2 = errors.New("not a cgroup v2 mount")
+
 // Manager resolves and drives pod cgroups below Root.
 type Manager struct {
 	// Root is the cgroup v2 mount point.
@@ -78,10 +82,15 @@ func (m *Manager) IsV2() bool {
 // (kubepods.slice/kubepods-<qos>.slice/kubepods-<qos>-pod<uid_>.slice, with
 // Guaranteed pods directly under kubepods.slice) and the cgroupfs layout
 // (kubepods/<qos>/pod<uid>). The UID may appear with dashes or with
-// underscores, as on /proc/<pid>/cgroup.
+// underscores, as on /proc/<pid>/cgroup. It returns ErrNotFound when the pod
+// has no cgroup, and a different error when Root is not a cgroup v2 mount,
+// so a caller never mistakes a missing mount for a pod that is gone.
 func (m *Manager) PodCgroupPath(podUID string) (string, error) {
 	if podUID == "" {
-		return "", fmt.Errorf("empty pod UID: %w", ErrNotFound)
+		return "", errors.New("pod UID is empty")
+	}
+	if !m.IsV2() {
+		return "", fmt.Errorf("%s: %w", m.Root, ErrNotV2)
 	}
 	names := []string{"pod" + podUID, "pod" + strings.ReplaceAll(podUID, "-", "_")}
 	for _, top := range []string{"kubepods.slice", "kubepods"} {
@@ -212,6 +221,36 @@ func (m *Manager) Procs(dirs ...string) ([]int, error) {
 	return out, nil
 }
 
+// ContainerProcs returns the PIDs of the given containers of the pod whose
+// cgroup is podDir (containerIDs as in the pod's container statuses, for
+// example "containerd://<id>"). The pod sandbox (pause) is left out, and a
+// container whose cgroup is gone, or a pod cgroup that is gone, counts as
+// empty. With no container ID at all it reads the whole pod, sandbox
+// included, so a pod whose containers have not reported yet never looks
+// empty.
+func (m *Manager) ContainerProcs(podDir string, containerIDs []string) ([]int, error) {
+	known := 0
+	var dirs []string
+	for _, id := range containerIDs {
+		if StripRuntimePrefix(id) == "" {
+			continue
+		}
+		known++
+		dir, err := m.ContainerCgroupPath(podDir, id)
+		if errors.Is(err, ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			continue // the container exited and its cgroup is gone
+		}
+		if err != nil {
+			return nil, err
+		}
+		dirs = append(dirs, dir)
+	}
+	if known == 0 {
+		return m.Procs(podDir)
+	}
+	return m.Procs(dirs...)
+}
+
 func readPIDs(path string) ([]int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -295,19 +334,39 @@ func (m *Manager) setFrozen(ctx context.Context, dir string, frozen bool) error 
 	}
 }
 
-// Kill kills every process in dir and below by writing 1 to cgroup.kill.
-// When the kernel has no cgroup.kill it sends SIGKILL to every PID listed
-// in dir's cgroup.procs files instead. It does not wait for the processes
-// to exit; callers confirm with Procs.
+// Kill kills every process in the cgroup dir and below, frozen or not, by
+// writing 1 to its cgroup.kill (Linux 5.14 or later). When the kernel has no
+// cgroup.kill it sends SIGKILL to every PID listed in the subtree's
+// cgroup.procs files instead. A cgroup that no longer exists has nothing to
+// kill. dir must be inside Root: Kill never writes outside the cgroup mount,
+// even through a symlink. It does not wait for the processes to exit;
+// callers confirm with Procs.
 func (m *Manager) Kill(dir string) error {
-	err := writeControl(filepath.Join(dir, "cgroup.kill"), "1")
+	rel, err := filepath.Rel(m.Root, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("kill %s: not inside %s", dir, m.Root)
+	}
+	root, err := os.OpenRoot(m.Root)
+	if err != nil {
+		return fmt.Errorf("kill %s: open %s: %w", dir, m.Root, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	file, err := root.OpenFile(filepath.Join(rel, "cgroup.kill"), os.O_WRONLY|os.O_TRUNC, 0)
 	if err == nil {
+		_, writeErr := file.WriteString("1")
+		if err := errors.Join(writeErr, file.Close()); err != nil {
+			return fmt.Errorf("kill %s: write cgroup.kill: %w", dir, err)
+		}
 		return nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("kill %s: %w", dir, err)
+		return fmt.Errorf("kill %s: open cgroup.kill: %w", dir, err)
 	}
-	if _, statErr := os.Stat(dir); statErr != nil {
+	if _, statErr := root.Stat(rel); statErr != nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return nil
+		}
 		return fmt.Errorf("kill %s: %w", dir, statErr)
 	}
 	pids, err := m.Procs(dir)

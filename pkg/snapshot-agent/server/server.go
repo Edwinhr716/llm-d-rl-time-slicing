@@ -11,6 +11,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/cgroup"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	sm "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
@@ -33,6 +34,8 @@ type Server struct {
 	// guest runs the Suspend and Resume pipelines; nil until StartServer
 	// wires it.
 	guest *guestPipeline
+	// killer runs Kill; it never takes the node lock.
+	killer *killer
 }
 
 // NewServer creates a new Server instance. channelRegistry is shared with
@@ -56,6 +59,7 @@ func NewServer(
 		deploymentMode:  deploymentMode,
 		channelRegistry: channelRegistry,
 		featureGates:    featureGates,
+		killer:          newKiller(),
 	}
 }
 
@@ -575,6 +579,10 @@ func StartServer(
 	if err != nil {
 		return fmt.Errorf("failed to create watcher: %w", err)
 	}
+	// Kill finds the job's pods in the watcher's cache.
+	srv.killer.pods = watcher
+	// Kill, Suspend, Resume and restart recovery read one cgroup root.
+	srv.killer.cgroups = cgroup.New(guestCfg.CgroupRoot)
 	watcher.Start(ctx)
 
 	// 4. Wire the Suspend and Resume pipelines to the cuda-checkpoint
@@ -583,6 +591,14 @@ func StartServer(
 		srv.guest = newGuestPipeline(guestCfg, watcher, k8sClient, cuda)
 	} else {
 		slog.WarnContext(ctx, "cuda-checkpoint backend not registered; Suspend and Resume are unavailable")
+	}
+
+	// 5. Restart recovery: observe every local job's state on the node
+	// before serving any RPC.
+	if watcher.Synced() {
+		srv.recoverJobs(ctx, watcher.LocalJobs())
+	} else {
+		slog.ErrorContext(ctx, "Restart recovery skipped: the pod cache did not sync")
 	}
 
 	s := grpc.NewServer()

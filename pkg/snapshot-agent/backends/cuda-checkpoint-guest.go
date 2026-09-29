@@ -18,12 +18,12 @@ const (
 	CudaStateFailed       = "failed"
 )
 
-// ErrNotCudaProcess is returned by GetState for a process that has no CUDA
-// context (cuda-checkpoint refuses it).
 // unlockTimeout bounds the best-effort unlock on a failure path, which may run
 // after the caller's deadline has passed.
 const unlockTimeout = 5 * time.Second
 
+// ErrNotCudaProcess is returned by GetState for a process that has no CUDA
+// context (cuda-checkpoint refuses it).
 var ErrNotCudaProcess = errors.New("not a CUDA process")
 
 // GetState returns the cuda-checkpoint state of one process: "running",
@@ -48,10 +48,12 @@ func (c *CudaCheckpoint) GetState(ctx context.Context, pid int) (string, error) 
 }
 
 // GuestCheckpoint locks and then checkpoints every process in pids, one
-// process at a time, under the node lock. beforeRun, if not nil, runs after
-// the lock is taken and before any process is touched; an error from it
-// aborts the checkpoint without touching the processes (the suspend pipeline
-// re-checks its deadline budget there).
+// process at a time, under the node lock. It waits for the lock only as long
+// as ctx allows, so a hung checkpoint elsewhere cannot hold it past its
+// deadline. beforeRun, if not nil, runs after the lock is taken and before
+// any process is touched; an error from it aborts the checkpoint without
+// touching the processes (the suspend pipeline re-checks its deadline budget
+// there).
 //
 // A process that is already locked is only checkpointed. If a later step
 // fails, processes that were locked but not checkpointed are unlocked again
@@ -62,8 +64,10 @@ func (c *CudaCheckpoint) GuestCheckpoint(
 	if len(pids) == 0 {
 		return errors.New("at least one PID is required for CUDA checkpoint")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.lock.Acquire(ctx); err != nil {
+		return err
+	}
+	defer c.lock.Release()
 
 	if beforeRun != nil {
 		if err := beforeRun(); err != nil {
@@ -95,12 +99,14 @@ func (c *CudaCheckpoint) GuestCheckpoint(
 }
 
 // GuestRestore brings every process in pids back to running under the node
-// lock: a checkpointed process is restored and then unlocked, a locked one
-// is only unlocked, a running one is left alone. states gives the state of
-// each process as read by GetState.
+// lock (waiting only as long as ctx allows): a checkpointed process is
+// restored and then unlocked, a locked one is only unlocked, a running one is
+// left alone. states gives the state of each process as read by GetState.
 func (c *CudaCheckpoint) GuestRestore(ctx context.Context, pids []int, states map[int]string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.lock.Acquire(ctx); err != nil {
+		return err
+	}
+	defer c.lock.Release()
 
 	bin := c.getCudaCheckpointPath()
 	t0 := time.Now()

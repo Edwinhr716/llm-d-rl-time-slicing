@@ -314,3 +314,48 @@ func waitForEpoch(t *testing.T, state *sm.StateManager, want int64) {
 	}
 	t.Fatalf("expected epoch %d, got %d", want, got)
 }
+
+// TestWatcherLocalJobs checks that restart recovery sees every cached job,
+// registered with its mirror's epoch, as soon as the cache has synced.
+func TestWatcherLocalJobs(t *testing.T) {
+	t.Setenv("NODE_NAME", "test-node")
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() { podutils.GetPodPIDs = origGetPodPIDs }()
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) { return nil, nil }
+	pod := func(name, jobID, epoch string) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{}},
+			Spec:       corev1.PodSpec{NodeName: "test-node"},
+		}
+		if jobID != "" {
+			p.Labels[podutils.JobIDLabel] = jobID
+		}
+		if epoch != "" {
+			p.Annotations = map[string]string{podutils.GuestEpochAnnotation: epoch}
+		}
+		return p
+	}
+	fakeClient := fakek8s.NewSimpleClientset(
+		pod("b", "job-b", ""), pod("a", "guest-1", "12"), pod("a2", "guest-1", ""), pod("plain", "", ""))
+	state := sm.NewStateManager()
+	watcher, err := server.NewWatcher(fakeClient, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+	if !watcher.Synced() {
+		t.Fatal("cache not synced after Start")
+	}
+	if got, want := watcher.LocalJobs(), []string{"guest-1", "job-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("LocalJobs %v, want %v", got, want)
+	}
+	epochs := map[string]int64{}
+	for _, st := range state.GetJobStatus() {
+		epochs[st.GetJobId()] = st.GetEpoch()
+	}
+	if want := map[string]int64{"guest-1": 12, "job-b": 0}; !reflect.DeepEqual(epochs, want) {
+		t.Errorf("registered jobs %v, want %v", epochs, want)
+	}
+}
