@@ -53,6 +53,7 @@ type KubernetesOrchestrator struct {
 	nodeSynced         cache.InformerSynced
 	podSynced          []cache.InformerSynced
 	nodeScopedPods     bool
+	skipUnbound        skipUnboundPods
 	groupStore         *store.GroupStore
 	jobStore           *store.JobStore
 	snapshotAgentStore store.SnapshotAgentStore
@@ -76,7 +77,7 @@ func WithPodInformers(podInformers ...corev1informers.PodInformer) Option {
 // WithNodeScopedPods ignores pods bound to a node that the node informer does
 // not see. Set it when the node informer is limited by --node-selector, so a
 // pod on a node outside the selector joins no group. Pods not yet bound to a
-// node are kept.
+// node are kept, unless WithSkipUnboundPods is also set.
 func WithNodeScopedPods() Option {
 	return func(k *KubernetesOrchestrator) {
 		k.nodeScopedPods = true
@@ -116,7 +117,13 @@ func (k *KubernetesOrchestrator) addPodInformer(pi corev1informers.PodInformer) 
 // podOnWatchedNode reports whether the pod may join a group: always, unless
 // WithNodeScopedPods is set and the pod is bound to a node outside the node
 // informer's scope.
+//
+// With WithSkipUnboundPods (D-ORCH-6 "skip") a pod not yet bound to a node
+// also returns false while node scoping is on; see skip_unbound_pods.go.
 func (k *KubernetesOrchestrator) podOnWatchedNode(pod *corev1.Pod) bool {
+	if k.skipsUnboundPod(pod) {
+		return false
+	}
 	if !k.nodeScopedPods || pod.Spec.NodeName == "" {
 		return true
 	}
@@ -372,6 +379,7 @@ func (k *KubernetesOrchestrator) setupPodInformer(ctx context.Context, queue con
 			},
 			DeleteFunc: func(obj interface{}) {
 				k.enqueuePod(ctx, obj, queue)
+				k.forgetSkippedUnboundPod(obj)
 			},
 		})
 		if err != nil {
@@ -395,6 +403,12 @@ func (k *KubernetesOrchestrator) enqueuePod(ctx context.Context, obj interface{}
 			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
 			return
 		}
+	}
+
+	// An unbound pod skipped under --skip-unbound-pods (skipsUnboundPod logs
+	// it once). Its bind Update enqueues the group from the new object.
+	if k.skipsUnboundPod(pod) {
+		return
 	}
 
 	// Before the node cache has synced every node looks unknown; the node's

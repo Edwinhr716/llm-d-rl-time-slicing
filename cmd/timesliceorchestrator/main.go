@@ -87,6 +87,10 @@ func run() error {
 		"Label selector (kubectl syntax, e.g. pool=demo) limiting the nodes this orchestrator sees. "+
 			"Nodes outside it contribute to no group, and pods bound to them are ignored. Group membership "+
 			"still comes from the group.timeslice.io/<group> node label. Empty (the default) watches all nodes.")
+	skipUnboundPods := flag.Bool("skip-unbound-pods", false,
+		"With --node-selector set, do not count a pod toward its group until it is bound to a node "+
+			"(spec.nodeName set); it joins when it binds to a selected node. False (the default) counts "+
+			"unbound pods at once, as before. No effect without --node-selector.")
 	flag.Parse()
 
 	scope, err := infrastructure.ParseScope(*watchNamespaces, *nodeSelector)
@@ -142,6 +146,11 @@ func run() error {
 	}
 	if !scope.AllNodes() {
 		infraOpts = append(infraOpts, infrastructure.WithNodeScopedPods())
+		if *skipUnboundPods {
+			infraOpts = append(infraOpts, infrastructure.WithSkipUnboundPods())
+		}
+	} else if *skipUnboundPods {
+		slog.Warn("--skip-unbound-pods has no effect without --node-selector")
 	}
 	infraOrch := infrastructure.NewKubernetesOrchestrator(
 		informerFactories.Nodes.Core().V1().Nodes(),
@@ -193,6 +202,7 @@ func run() error {
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,
+		"skipUnboundPods", *skipUnboundPods,
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
 }

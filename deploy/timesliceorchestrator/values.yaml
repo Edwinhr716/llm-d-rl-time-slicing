@@ -27,9 +27,14 @@ lock:
 #     pods bound to them are ignored. Group membership still comes from the
 #     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
 #     with the pod-scheduling nodeSelector further down.
+#   skipUnboundPods: with nodeSelector set, a pod counts toward its group only
+#     once it is bound to a node (it joins when it binds to a selected node).
+#     false = unbound pods count at once, as before. No effect without
+#     nodeSelector.
 scope:
   watchNamespaces: []
   nodeSelector: ""
+  skipUnboundPods: false
 
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator

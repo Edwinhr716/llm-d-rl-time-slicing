@@ -119,6 +119,11 @@ chart values (and the flags they set) narrow that down:
   label selector limiting the nodes the orchestrator sees. Nodes outside it
   contribute to no group, and pods bound to them are ignored. Group
   membership still comes from the `group.timeslice.io/<group>` node label.
+* `scope.skipUnboundPods`, flag `--skip-unbound-pods` (default `false`):
+  with `scope.nodeSelector` set, a pod that is not yet bound to a node does
+  not count toward its group until it binds; it joins when it binds to a
+  selected node. With `false`, unbound pods count at once. No effect without
+  `scope.nodeSelector`.
 * `strategy` (default `type: Recreate`): the old pod stops before the new one
   starts, so two replicas never act on the lock ConfigMap at once.
 
