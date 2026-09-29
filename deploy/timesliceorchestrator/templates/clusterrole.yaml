@@ -7,6 +7,10 @@ metadata:
     {{- include "timesliceorchestrator.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
+{{- if eq (include "timesliceorchestrator.podsInRoles" .) "true" }}
+    resources: ["nodes"]
+{{- else }}
     resources: ["pods", "nodes"]
+{{- end }}
     verbs: ["get", "list", "watch"]
 {{- end }}

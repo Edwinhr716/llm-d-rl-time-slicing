@@ -120,3 +120,14 @@ serviceAccount:
 rbac:
   # Specifies whether RBAC resources should be created
   create: true
+  # How pod read access is granted (decision D-ORCH-7).
+  #   cluster (default): one ClusterRole grants get/list/watch on pods and
+  #     nodes in every namespace, as before.
+  #   namespaced: the ClusterRole keeps nodes only (nodes are cluster-scoped,
+  #     a Role cannot grant them) and one Role + RoleBinding per namespace in
+  #     scope.watchNamespaces grants get/list/watch on pods there. Every
+  #     watched namespace must exist before install. With watchNamespaces []
+  #     the orchestrator watches all namespaces, so this falls back to the
+  #     cluster ClusterRole.
+  # The lock ConfigMap Role is the same in both.
+  scope: cluster

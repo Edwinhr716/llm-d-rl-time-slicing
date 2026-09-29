@@ -139,5 +139,38 @@ helm upgrade --install demo-orchestrator ./timesliceorchestrator \
   --set scope.nodeSelector=timeslice.io/pool=demo
 ```
 
-The chart still grants read access to pods and nodes cluster-wide through a
-`ClusterRole`.
+By default the chart still grants read access to pods and nodes cluster-wide
+through a `ClusterRole`. See [RBAC scope](#rbac-scope) to narrow pod access
+to the watched namespaces.
+
+## RBAC scope
+
+`rbac.scope` chooses how the orchestrator's ServiceAccount gets read access
+to pods:
+
+* `cluster` (default): one `ClusterRole` and `ClusterRoleBinding` grant
+  `get`, `list`, `watch` on `pods` and `nodes` in every namespace.
+* `namespaced`: the `ClusterRole` keeps `nodes` only (nodes are
+  cluster-scoped, so a `Role` cannot grant them). For each namespace in
+  `scope.watchNamespaces` the chart creates a `Role` and a `RoleBinding`
+  named `<release fullname>-pods` that grant `get`, `list`, `watch` on
+  `pods` in that namespace. With an empty `scope.watchNamespaces` the
+  orchestrator watches every namespace, so the chart falls back to the
+  `cluster` `ClusterRole` (the install notes say so).
+
+The lock ConfigMap `Role` is the same in both. Nothing else changes.
+
+> [!IMPORTANT]
+> With `rbac.scope=namespaced`, every namespace in `scope.watchNamespaces`
+> must exist before `helm install` or `helm upgrade`: a `Role` cannot be
+> created in a missing namespace, and the install fails. A namespace added
+> to the list later needs a `helm upgrade` after it is created.
+
+```bash
+helm upgrade --install demo-orchestrator ./timesliceorchestrator \
+  --namespace rl-demo-system --create-namespace \
+  --set namespace=rl-demo-system \
+  --set lock.configMap=demo-orchestrator-locks \
+  --set 'scope.watchNamespaces={rl-demo}' \
+  --set rbac.scope=namespaced
+```

@@ -1,0 +1,11 @@
+{{- if and .Values.rbac.create (eq (include "timesliceorchestrator.rbacScope" .) "namespaced") }}
+{{- if eq (include "timesliceorchestrator.podsInRoles" .) "true" }}
+rbac.scope=namespaced: pods are readable only in {{ join ", " (uniq .Values.scope.watchNamespaces) }}
+(one Role and RoleBinding each). Nodes stay cluster-wide in the ClusterRole
+{{ include "timesliceorchestrator.fullname" . }}. Every watched namespace must exist before install.
+{{- else }}
+rbac.scope=namespaced fell back to cluster-wide pod access: scope.watchNamespaces
+is empty, so the orchestrator watches every namespace and the ClusterRole
+{{ include "timesliceorchestrator.fullname" . }} grants pods and nodes.
+{{- end }}
+{{- end }}
