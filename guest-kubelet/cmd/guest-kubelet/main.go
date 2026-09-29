@@ -24,6 +24,7 @@ import (
 	vkslog "github.com/virtual-kubelet/virtual-kubelet/log/slog"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
+	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -37,7 +38,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
-	"github.com/edwinhr716/guest-kubelet/internal/freeze"
+	"github.com/edwinhr716/guest-kubelet/internal/hostcmd"
 	"github.com/edwinhr716/guest-kubelet/internal/probe"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
@@ -78,10 +79,19 @@ type options struct {
 	gpuMemory          string
 	mirrorMemoryFactor float64
 
-	// M3: suspend and resume by cgroup freeze
-	cgroupRoot         string
+	// M3/M4: suspend and resume through the snapshot agent (Q6)
+	agentAddr          string
+	agentPoll          time.Duration
+	agentRPCTimeout    time.Duration
+	agentRetryInitial  time.Duration
+	agentRetryMax      time.Duration
+	agentStatusPoll    time.Duration
+	agentFaults        bool
+	killBudget         time.Duration
+	noticeWindow       time.Duration
+	checkpointEstimate time.Duration
+	restoreEstimate    time.Duration
 	notReadyTimeout    time.Duration
-	freezeTimeout      time.Duration
 	resumeReadyTimeout time.Duration
 
 	// Pending lead decision D-NS-8: true = ns-cordon (NS stack default), false = skip (today).
@@ -137,13 +147,29 @@ func main() {
 			"remove our finalizer and register it again; guests stay bound by name. false leaves it Terminating")
 	flag.BoolVar(&o.readinessProbes, "readiness-probes", true,
 		"run the guests' readinessProbes (httpGet, tcpSocket) and report Ready from them; false copies the mirror's ready flags (M1)")
-	flag.StringVar(&o.cgroupRoot, "cgroup-root", "/host/cgroup",
-		"host cgroup v2 hierarchy as mounted in this container; empty disables suspend/resume")
+	flag.StringVar(&o.agentAddr, "agent-addr", "",
+		"host:port of the node's snapshot agent (the deployment passes $(HOST_IP):9101); empty disables suspend/resume. "+
+			"The guest kubelet never touches cgroups: every suspend, resume and kill is an agent call")
+	flag.DurationVar(&o.agentPoll, "agent-poll", 100*time.Millisecond, "GetOperation poll interval (Q13 default)")
+	flag.DurationVar(&o.agentRPCTimeout, "agent-rpc-timeout", 5*time.Second, "timeout of each agent RPC (Q13 default)")
+	flag.DurationVar(&o.agentRetryInitial, "agent-retry-initial", time.Second,
+		"first delay before sending a lost agent call again (Q13 default)")
+	flag.DurationVar(&o.agentRetryMax, "agent-retry-max", 30*time.Second, "cap of the doubling retry delay (Q13 default)")
+	flag.DurationVar(&o.agentStatusPoll, "agent-status-poll", 2*time.Second,
+		"how often the agent's Status is read for the hold (D-NS-8) and to repair a mirror the agent reports SUSPENDED; 0 disables")
+	flag.BoolVar(&o.agentFaults, "agent-fault-injection", false,
+		"test hook: arm agent RPC faults (hang, crash, drop-ack, pending, unimplemented, refuse) through /debug/fault on --debug-addr")
+	flag.DurationVar(&o.killBudget, "kill-budget", 3*time.Second,
+		"K: the agent's deadline for a Kill; a suspend without a deadline gets now + N - K")
+	flag.DurationVar(&o.noticeWindow, "notice-window", 30*time.Second, "N: the notice window")
+	flag.DurationVar(&o.checkpointEstimate, "checkpoint-estimate", 13*time.Second,
+		"one guest's suspend time, for admission (one restore + the sum of checkpoints must fit N - K); 0 disables admission")
+	flag.DurationVar(&o.restoreEstimate, "restore-estimate", 6500*time.Millisecond,
+		"one guest's resume time, for admission; 0 disables admission")
 	flag.DurationVar(&o.notReadyTimeout, "suspend-notready-timeout", 5*time.Second,
-		"how long a suspend waits for the guest's Ready=False to reach the API before freezing")
-	flag.DurationVar(&o.freezeTimeout, "freeze-timeout", 10*time.Second, "deadline for each cgroup freeze or thaw")
+		"how long a suspend waits for the guest's Ready=False to reach the API before the agent is called")
 	flag.DurationVar(&o.resumeReadyTimeout, "resume-ready-timeout", 60*time.Second,
-		"how long a resume waits for the guest's readiness probe to pass after the thaw")
+		"how long a resume waits for the guest's readiness probe to pass after the agent's Resume")
 	flag.BoolVar(&o.cordonWhileHeld, "cordon-while-held", true,
 		"set spec.unschedulable on the virtual Node while the donor holds the GPU (M3: while a guest is suspending "+
 			"or suspended), so no new guest lands on it; false never touches spec.unschedulable")
@@ -151,7 +177,8 @@ func main() {
 	// are accepted.
 	flag.StringVar(&o.debugAddr, "debug-addr", "",
 		"loopback host:port for the test hooks (M2: /debug/readiness, /debug/ready-edges; "+
-			"M3: /debug/suspend, /debug/resume); empty disables them")
+			"M3/M4: /debug/suspend, /debug/resume, /debug/suspend-all, /debug/resume-all, /debug/agent, /debug/fault); "+
+			"empty disables them")
 	flag.BoolVar(&o.guestNodeLabel, "guest-node-label", false,
 		"also label the virtual Node timeslice.io/guest=true, for guests with a preferred node affinity (virtual-node=true stays)")
 
@@ -368,21 +395,42 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		Rejected:      rejected,
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
-	if o.cgroupRoot != "" {
-		// M3: the guest kubelet freezes the mirror's cgroup itself. M4 swaps this backend for
-		// the snapshot agent.
-		mopts.Suspend = mirror.SuspendOptions{
-			Freezer:         &freeze.Cgroup{Root: o.cgroupRoot},
-			NotReadyTimeout: o.notReadyTimeout,
-			FreezeTimeout:   o.freezeTimeout,
-			ReadyCheck:      mirror.ProbeUntilReady(100*time.Millisecond, probeOnce),
-			ReadyTimeout:    o.resumeReadyTimeout,
-			Recorder:        recorder,
+	var faults *hostcmd.FaultInjector
+	if o.agentAddr != "" {
+		// M4: every suspend, resume and kill is a snapshot-agent call with a deadline (Q6); the
+		// guest kubelet never touches cgroups.
+		var dialOpts []grpc.DialOption
+		if o.agentFaults {
+			faults = hostcmd.NewFaultInjector()
+			dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(faults.Interceptor()))
+			log.G(ctx).Warn("agent fault injection is on (test hook)")
 		}
+		ac, err := hostcmd.DialAgent(o.agentAddr, dialOpts...)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = ac.Close() }()
+		ac.Poll, ac.RPCTimeout = o.agentPoll, o.agentRPCTimeout
+		ac.RetryInitial, ac.RetryMax = o.agentRetryInitial, o.agentRetryMax
+		mopts.Suspend = mirror.SuspendOptions{
+			Agent:              &hostcmd.AgentBackend{Client: ac},
+			NotReadyTimeout:    o.notReadyTimeout,
+			NoticeWindow:       o.noticeWindow,
+			KillBudget:         o.killBudget,
+			CheckpointEstimate: o.checkpointEstimate,
+			RestoreEstimate:    o.restoreEstimate,
+			AgentStatusPoll:    o.agentStatusPoll,
+			ReadyCheck:         mirror.ProbeUntilReady(100*time.Millisecond, probeOnce),
+			ReadyTimeout:       o.resumeReadyTimeout,
+			Recorder:           recorder,
+		}
+		log.G(ctx).WithField("agent", o.agentAddr).WithField("killBudget", o.killBudget.String()).
+			WithField("noticeWindow", o.noticeWindow.String()).Info("suspend and resume through the snapshot agent")
 	}
-	// D-NS-8 ns-cordon: poked by every suspend-state change, polled every cordonPoll.
+	// D-NS-8 ns-cordon: poked by every suspend-state change and agent Status change, polled every
+	// cordonPoll.
 	var cordonPoke chan struct{}
-	if o.cordonWhileHeld && o.cgroupRoot != "" {
+	if o.cordonWhileHeld && o.agentAddr != "" {
 		cordonPoke = make(chan struct{}, 1)
 		mopts.Suspend.OnHoldChange = func() {
 			select {
@@ -443,7 +491,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		return err
 	}
 	if o.debugAddr != "" {
-		go probe.Serve(ctx, o.debugAddr, debugHandler(backend, prober, edges))
+		go probe.Serve(ctx, o.debugAddr, debugHandler(backend, prober, edges, faults))
 	}
 	if cordonPoke != nil {
 		cordoner := provider.NewCordoner(client.CoreV1().Nodes(), o.nodeName,

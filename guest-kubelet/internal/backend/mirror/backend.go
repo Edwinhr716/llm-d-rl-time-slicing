@@ -63,7 +63,16 @@ type Backend struct {
 	onStatus    func(*corev1.Pod) // the library's notify callback, wrapped by the provider
 	orphanSince map[types.UID]time.Time
 
-	locks guestLocks // one suspend or resume per guest at a time
+	locks guestLocks // one agent call per guest at a time
+	// resumeMu resumes one guest at a time (Q6); hostMu runs one host-level call at a time.
+	resumeMu, hostMu sync.Mutex
+	// Guarded by mu: kill messages of guests whose mirror the kill sequence is removing, the
+	// mirrors created per guest (the job id attempt), the last host epoch and the agent Status.
+	killed    map[types.UID]string
+	killing   map[types.UID]string // causes of kill sequences that have not recorded the kill yet
+	attempts  map[types.UID]int
+	hostEpoch int64
+	agent     agentView
 }
 
 // New builds the backend. guests must list the pods bound to the virtual node.
@@ -82,6 +91,9 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, opts Optio
 		client: client, opts: opts, guests: guests, factory: f,
 		mirrors: inf.Lister(), synced: inf.Informer().HasSynced,
 		orphanSince: map[types.UID]time.Time{},
+		killed:      map[types.UID]string{},
+		killing:     map[types.UID]string{},
+		attempts:    map[types.UID]int{},
 	}
 	_, _ = inf.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { b.mirrorChanged(obj) },
@@ -100,6 +112,9 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("mirror informer did not sync")
 	}
 	go b.orphanLoop(ctx)
+	if b.opts.Suspend.Agent != nil && b.opts.Suspend.AgentStatusPoll > 0 {
+		go b.agentStatusLoop(ctx)
+	}
 	return nil
 }
 
@@ -145,6 +160,9 @@ func (b *Backend) mirrorChanged(obj any) {
 
 // translate is TranslateStatusWith the configured prober, if any.
 func (b *Backend) translate(guest, m *corev1.Pod) *corev1.Pod {
+	if st := b.killedStatus(guest, m); st != nil {
+		return st // Failed from the kill on, while the mirror still terminates
+	}
 	if b.opts.Prober == nil {
 		return TranslateStatus(guest, m)
 	}
@@ -164,26 +182,32 @@ func (b *Backend) Refresh(namespace, name string) {
 }
 
 func (b *Backend) mirrorDeleted(obj any) {
-	m, ok := obj.(*corev1.Pod)
+	mirrorPod, ok := obj.(*corev1.Pod)
 	if !ok {
 		tomb, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			return
 		}
-		if m, ok = tomb.Obj.(*corev1.Pod); !ok {
+		if mirrorPod, ok = tomb.Obj.(*corev1.Pod); !ok {
 			return
 		}
 	}
-	b.forgetProbes(m)
-	g := b.guestFor(m)
+	b.forgetProbes(mirrorPod)
+	g := b.guestFor(mirrorPod)
 	if g == nil {
+		b.forgetKilled(types.UID(mirrorPod.Labels[LabelMirrorOf]))
 		return
+	}
+	if st := b.killedStatus(g, mirrorPod); st != nil && g.DeletionTimestamp == nil {
+		b.emit(st)
+		return // the kill record stays: the guest must keep showing Failed
 	}
 	if g.DeletionTimestamp == nil {
-		b.emit(TerminalStatus(g, m, ReasonMirrorDeleted))
+		b.emit(TerminalStatus(g, mirrorPod, ReasonMirrorDeleted))
 		return
 	}
-	b.emit(TerminalStatus(g, m, ReasonGuestDeleted))
+	b.forgetKilled(g.UID)
+	b.emit(TerminalStatus(g, mirrorPod, ReasonGuestDeleted))
 	go b.finishGuestDeletion(context.Background(), g)
 }
 
@@ -268,18 +292,35 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 // Create builds and creates the mirror. It is idempotent: an existing mirror for this guest is
 // fine; an orphaned mirror with the same name and the same containers is adopted.
 func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
-	want, err := Build(guest, b.opts.Config)
+	cfg := b.opts.Config
+	if b.opts.Suspend.Agent != nil {
+		if _, exists := b.mirrorOf(guest); !exists {
+			if err := b.admit(guest); err != nil {
+				return err
+			}
+		}
+		cfg.Background = true
+		b.mu.Lock()
+		cfg.Attempt = b.attempts[guest.UID]
+		b.mu.Unlock()
+	}
+	want, err := Build(guest, cfg)
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}
 	logger := log.G(ctx).WithField("guest", guest.Namespace+"/"+guest.Name).WithField("mirror", want.Name)
 
-	m, err := b.client.CoreV1().Pods(guest.Namespace).Create(ctx, want, metav1.CreateOptions{})
+	mirrorPod, err := b.client.CoreV1().Pods(guest.Namespace).Create(ctx, want, metav1.CreateOptions{})
 	switch {
 	case err == nil:
-		logger.WithField("mirrorUID", m.UID).Info("mirror created")
+		if cfg.Background {
+			b.mu.Lock()
+			b.attempts[guest.UID]++ // a mirror created again for this guest gets a new job id
+			b.mu.Unlock()
+		}
+		logger.WithField("mirrorUID", mirrorPod.UID).WithField("job", mirrorPod.Labels[LabelJobID]).Info("mirror created")
 	case apierrors.IsAlreadyExists(err):
-		if m, err = b.adoptOrReplace(ctx, guest, want); err != nil {
+		if mirrorPod, err = b.adoptOrReplace(ctx, guest, want); err != nil {
 			return err
 		}
 	default:
@@ -287,11 +328,11 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	}
 
 	if RequestsGPU(guest) && b.opts.ReserveClaim {
-		if err := b.reserveClaim(ctx, guest.Namespace, b.opts.GPUClaim, m); err != nil {
+		if err := b.reserveClaim(ctx, guest.Namespace, b.opts.GPUClaim, mirrorPod); err != nil {
 			return err
 		}
 	}
-	b.emit(b.translate(guest, m))
+	b.emit(b.translate(guest, mirrorPod))
 	return nil
 }
 
@@ -347,7 +388,7 @@ func (b *Backend) Delete(ctx context.Context, guest *corev1.Pod) error {
 		go b.finishGuestDeletion(context.Background(), guest)
 		return errdefs.NotFoundf("no mirror for guest %s/%s", guest.Namespace, guest.Name)
 	}
-	b.thawBeforeDelete(ctx, mirrorPod)
+	b.killBeforeDelete(ctx, mirrorPod)
 	uid := mirrorPod.UID
 	opts := metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}
 	if guest.DeletionGracePeriodSeconds != nil {
@@ -417,19 +458,4 @@ func (b *Backend) collectOrphans(ctx context.Context, now time.Time) {
 		}
 	}
 	b.mu.Unlock()
-}
-
-// thawBeforeDelete thaws a suspended mirror before it is deleted: a frozen process cannot act
-// on SIGTERM, so it would sit out the whole grace period and then be killed. Best effort.
-func (b *Backend) thawBeforeDelete(ctx context.Context, m *corev1.Pod) {
-	fz := b.opts.Suspend.Freezer
-	state, epoch := SuspendState(m)
-	if fz == nil || state == "" {
-		return
-	}
-	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := fz.Resume(tctx, m, epoch); err != nil {
-		log.G(ctx).WithError(err).WithField("mirror", m.Namespace+"/"+m.Name).Warn("could not thaw the mirror before deleting it")
-	}
 }
