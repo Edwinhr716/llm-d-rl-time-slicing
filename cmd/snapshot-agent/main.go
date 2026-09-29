@@ -33,6 +33,11 @@ import (
 )
 
 func main() {
+	// "snapshot-agent scrub ..." runs one handoff scrub decision and exits.
+	if len(os.Args) > 1 && os.Args[1] == "scrub" {
+		os.Exit(runScrubCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	// Initialize slog with ContextHandler
 	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
 	ctxHandler := logging.NewContextHandler(jsonHandler)
@@ -49,6 +54,7 @@ func main() {
 	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
 	reportResumed := flag.Bool("report-resumed-outcome", true,
 		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
+	scrubFlags := addScrubFlags(flag.CommandLine)
 	flag.Parse()
 
 	depMode := *deploymentMode
@@ -89,6 +95,21 @@ func main() {
 	featureGates, err := features.Parse(gatesSpec)
 	if err != nil {
 		slog.Error("Invalid feature gates", "value", gatesSpec, "error", err)
+		os.Exit(1)
+	}
+
+	// SCRUB and VRAM_ZEROING_QUALIFIED override the flags, mirroring
+	// DEPLOYMENT_MODE: the Helm chart configures the agent through env vars.
+	for env, value := range map[string]*string{
+		"SCRUB": scrubFlags.mode, "VRAM_ZEROING_QUALIFIED": scrubFlags.qualified,
+	} {
+		if envValue, ok := os.LookupEnv(env); ok {
+			*value = envValue
+		}
+	}
+	scrubCfg, err := scrubFlags.parse()
+	if err != nil {
+		slog.Error("Invalid VRAM scrub configuration", "error", err)
 		os.Exit(1)
 	}
 
@@ -137,6 +158,8 @@ func main() {
 		utils.GetPodPIDs = tpu.GetPodPIDs
 		utils.HasGPUProcesses = tpu.HasProcesses
 		slog.InfoContext(ctx, "Using TPU process discovery", "acceleratorType", accelType)
+	} else {
+		logScrubQualification(ctx, scrubCfg)
 	}
 
 	// GPU-CR housekeeping runs only when the shared checkpoint dir is
