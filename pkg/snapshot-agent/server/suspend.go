@@ -20,9 +20,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,22 +73,51 @@ type GuestConfig struct {
 	CgroupRoot string
 }
 
-// ScrubConfig is the VRAM handling at the Suspend handoff. PENDING LEAD
-// DECISION D-NS-7: the policy is decided in scrub.Decide. Under keep (the
-// default) a GPU off the allowlist refuses Suspend with PRECONDITION_NODE and
+// ScrubConfig is the VRAM handling at a GPU handoff, both at the Suspend
+// boundary and after a confirmed Kill. PENDING LEAD DECISION D-NS-7: the
+// policy is decided in scrub.Decide. Under keep (the default and the zero
+// value) a GPU off the allowlist refuses Suspend with PRECONDITION_NODE and
 // nothing is scrubbed; under ns-scrub every GPU the guest held VRAM on is
 // scrubbed after the guest is checkpointed, frozen and verified, before the
-// operation reports SUSPENDED.
+// operation reports SUSPENDED, and after a Kill is confirmed. Both
+// boundaries run the scrub through runScrubProcess, one at a time per node
+// (scrubGate).
 type ScrubConfig struct {
 	Policy    scrub.Policy
 	Mode      scrub.Mode
 	Allowlist scrub.Allowlist
-	// MarginMiB is the VRAM left unscrubbed so the scrub's allocation fits.
+	// MarginMiB is the VRAM left unscrubbed so the scrub's allocation fits;
+	// 0 means scrub.DefaultMarginMiB.
 	MarginMiB uint64
 	// Command is the binary run as "<Command> scrub ..."; empty means the
 	// agent's own binary.
 	Command string
 }
+
+// scrubs reports whether the policy can ever scrub. Under keep the Kill
+// path does no scrub work at all, not even the NVML query that finds the
+// job's GPUs.
+func (c *ScrubConfig) scrubs() bool {
+	return c.Policy == scrub.PolicyNsScrub || c.Policy == scrub.PolicyFlag
+}
+
+// scrubGate lets one VRAM scrub run on the node at a time, whichever
+// boundary (Suspend or Kill) runs it. Waiting honours the caller's context,
+// so a Kill never waits past its deadline behind a Suspend's scrub.
+type scrubGate chan struct{}
+
+func newScrubGate() scrubGate { return make(scrubGate, 1) }
+
+func (g scrubGate) acquire(ctx context.Context) error {
+	select {
+	case g <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for the node's scrub slot: %w", ctx.Err())
+	}
+}
+
+func (g scrubGate) release() { <-g }
 
 // scrubFunc scrubs the GPU with the given NVML UUID at the Suspend boundary.
 type scrubFunc func(ctx context.Context, gpuUUID string) (scrub.Result, error)
@@ -104,6 +135,9 @@ type gpuDevice struct {
 	Name          string
 	DriverVersion string
 	UUID          string
+	// Minor is the device minor number (/dev/nvidia<Minor>), or -1 when
+	// NVML does not report it.
+	Minor int
 }
 
 // gpuProcess is one process NVML lists on a GPU. UsedBytes is
@@ -136,11 +170,16 @@ type guestPipeline struct {
 	backend  guestBackend
 	gpu      gpuInspector
 	scrubCfg ScrubConfig
-	// scrub runs one VRAM scrub; scrubMu serializes scrubs, so that two
-	// guests suspended together never scrub the same GPU at once.
-	scrub   scrubFunc
-	scrubMu sync.Mutex
-	now     func() time.Time
+	// scrub runs one VRAM scrub; scrubGate serializes scrubs node-wide
+	// (shared with Kill), so that two guests suspended together, or a
+	// Suspend and a Kill, never scrub a GPU at once.
+	scrub     scrubFunc
+	scrubGate scrubGate
+	// procRoot is where /proc is mounted, to find a checkpointed guest's
+	// GPUs from the device nodes in its mount namespace; empty turns that
+	// off.
+	procRoot string
+	now      func() time.Time
 
 	mu      sync.Mutex
 	records map[string]*guestRecord
@@ -349,6 +388,14 @@ func (g *guestPipeline) suspend(ctx context.Context, jobID string, deadline time
 	if err != nil {
 		return sm.GuestResult{}, err
 	}
+	// A guest that is already checkpointed (a re-issued Suspend, or one
+	// after a restart) holds no VRAM, so NVML lists none of its GPUs: they
+	// come from its device nodes instead, those no process is on.
+	if len(scrubGPUs) > 0 && len(guestGPUs) == 0 {
+		if guestGPUs, err = g.idleGuestGPUs(procs); err != nil {
+			return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+		}
+	}
 	// Only the GPUs the guest held VRAM on are scrubbed: another GPU may
 	// belong to a tenant that is still running.
 	scrubGPUs = intersect(scrubGPUs, guestGPUs)
@@ -506,6 +553,13 @@ func (g *guestPipeline) checkNode() (map[string]bool, error) {
 	if err := g.backend.Available(); err != nil {
 		return nil, err
 	}
+	return g.policyScrubGPUs()
+}
+
+// policyScrubGPUs asks the scrub policy (scrub.Decide at the Suspend
+// boundary) about every GPU and returns the UUIDs of those it scrubs; a
+// refusal is an error.
+func (g *guestPipeline) policyScrubGPUs() (map[string]bool, error) {
 	devices, err := g.gpu.Devices()
 	if err != nil {
 		return nil, fmt.Errorf("query GPUs: %w", err)
@@ -541,8 +595,10 @@ func (g *guestPipeline) scrubFreed(ctx context.Context, jobID string, gpus map[s
 		uuids = append(uuids, u)
 	}
 	sort.Strings(uuids)
-	g.scrubMu.Lock()
-	defer g.scrubMu.Unlock()
+	if err := g.scrubGate.acquire(ctx); err != nil {
+		return backendError(ctx, err)
+	}
+	defer g.scrubGate.release()
 	for _, u := range uuids {
 		res, err := g.scrub(ctx, u)
 		if err != nil {
@@ -561,11 +617,21 @@ func (g *guestPipeline) scrubFreed(ctx context.Context, jobID string, gpus map[s
 // scrubJSONPrefix starts the one result line of "snapshot-agent scrub".
 const scrubJSONPrefix = "SCRUBJSON "
 
-// runScrub is the default scrubFunc. It runs "snapshot-agent scrub" at the
-// Suspend boundary as a child process, so that the scrub's CUDA context
-// lives and dies with that process and never stays in the agent, and reads
-// its SCRUBJSON line.
+// runScrub is the default scrubFunc of the Suspend pipeline: one scrub at
+// the Suspend boundary through runScrubProcess.
 func (c *ScrubConfig) runScrub(ctx context.Context, gpuUUID string) (scrub.Result, error) {
+	return c.runScrubProcess(ctx, &scrub.Options{
+		Policy: c.Policy, Mode: c.Mode, Boundary: scrub.BoundarySuspend,
+		Allowlist: c.Allowlist, GPUUUID: gpuUUID, MarginMiB: c.MarginMiB,
+	})
+}
+
+// runScrubProcess is the agent's only scrub path, used at the Suspend and
+// the Kill boundary. It runs "snapshot-agent scrub" as a child process, so
+// that the scrub's CUDA context lives and dies with that process and never
+// stays in the agent, and reads its SCRUBJSON line. opts gives the policy,
+// boundary, GPU and margin; c gives the binary.
+func (c *ScrubConfig) runScrubProcess(ctx context.Context, opts *scrub.Options) (scrub.Result, error) {
 	bin := c.Command
 	if bin == "" {
 		exe, err := os.Executable()
@@ -574,11 +640,15 @@ func (c *ScrubConfig) runScrub(ctx context.Context, gpuUUID string) (scrub.Resul
 		}
 		bin = exe
 	}
+	margin := opts.MarginMiB
+	if margin == 0 {
+		margin = scrub.DefaultMarginMiB
+	}
 	args := []string{
-		"scrub", "--boundary=" + string(scrub.BoundarySuspend),
-		"--scrub-policy=" + string(c.Policy), "--scrub=" + string(c.Mode),
-		"--vram-zeroing-qualified=" + c.Allowlist.String(),
-		"--gpu-uuid=" + gpuUUID, "--margin-mib=" + strconv.FormatUint(c.MarginMiB, 10),
+		"scrub", "--boundary=" + string(opts.Boundary),
+		"--scrub-policy=" + string(opts.Policy), "--scrub=" + string(opts.Mode),
+		"--vram-zeroing-qualified=" + opts.Allowlist.String(),
+		"--gpu-uuid=" + opts.GPUUUID, "--margin-mib=" + strconv.FormatUint(margin, 10),
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	var stderr bytes.Buffer
@@ -841,4 +911,70 @@ func toSet(pids []int) map[int]bool {
 		set[p] = true
 	}
 	return set
+}
+
+// deviceGPUs returns the NVML UUIDs of the GPUs whose device nodes
+// (/dev/nvidia<minor>) are in the mount namespace of any of pids, read
+// through <procRoot>/<pid>/root/dev. It finds the GPUs of a checkpointed
+// guest, which NVML no longer lists; a frozen process can be read this way.
+// A process that is gone is skipped.
+func (g *guestPipeline) deviceGPUs(pids []int, devices []gpuDevice) (map[string]bool, error) {
+	out := map[string]bool{}
+	if g.procRoot == "" || len(pids) == 0 {
+		return out, nil
+	}
+	byMinor := make(map[int]string, len(devices))
+	for _, d := range devices {
+		if d.Minor >= 0 {
+			byMinor[d.Minor] = d.UUID
+		}
+	}
+	for _, pid := range pids {
+		entries, err := os.ReadDir(filepath.Join(g.procRoot, strconv.Itoa(pid), "root", "dev"))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("list the device nodes of pid %d: %w", pid, err)
+		}
+		for _, e := range entries {
+			minor, ok := strings.CutPrefix(e.Name(), "nvidia")
+			if !ok {
+				continue
+			}
+			n, err := strconv.Atoi(minor)
+			if err != nil || n < 0 {
+				continue // nvidiactl, nvidia-uvm, nvidia-caps, ...
+			}
+			if uuid, ok := byMinor[n]; ok {
+				out[uuid] = true
+			}
+		}
+	}
+	return out, nil
+}
+
+// idleGuestGPUs returns the GPUs among the guest's device nodes on which
+// NVML lists no process: once the guest is checkpointed, the GPUs its
+// freed VRAM is on, and no other tenant's.
+func (g *guestPipeline) idleGuestGPUs(pids []int) (map[string]bool, error) {
+	if g.procRoot == "" || len(pids) == 0 {
+		return map[string]bool{}, nil
+	}
+	devices, err := g.gpu.Devices()
+	if err != nil {
+		return nil, fmt.Errorf("query GPUs: %w", err)
+	}
+	gpus, err := g.deviceGPUs(pids, devices)
+	if err != nil || len(gpus) == 0 {
+		return gpus, err
+	}
+	procs, err := g.gpu.Processes()
+	if err != nil {
+		return nil, fmt.Errorf("query GPU processes: %w", err)
+	}
+	for _, p := range procs {
+		delete(gpus, p.GPUUUID)
+	}
+	return gpus, nil
 }

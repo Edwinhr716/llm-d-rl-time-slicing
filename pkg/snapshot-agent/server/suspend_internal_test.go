@@ -261,9 +261,10 @@ func newGuestFixture(t *testing.T) *guestFixture {
 		scrubCfg: ScrubConfig{
 			Policy: scrub.DefaultPolicy, Mode: scrub.DefaultMode, Allowlist: allowlist, MarginMiB: scrub.DefaultMarginMiB,
 		},
-		scrub:   fx.fakeScrub,
-		now:     time.Now,
-		records: map[string]*guestRecord{},
+		scrub:     fx.fakeScrub,
+		scrubGate: newScrubGate(),
+		now:       time.Now,
+		records:   map[string]*guestRecord{},
 	}
 	return fx
 }

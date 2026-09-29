@@ -396,3 +396,102 @@ func TestHostOp_WatcherLabelledJobs(t *testing.T) {
 		t.Errorf("LabelledJobs(none): expected nothing, got %v", got)
 	}
 }
+
+func recoveryPod(name, jobID, role, epoch string) *corev1.Pod {
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{}},
+		Spec:       corev1.PodSpec{NodeName: "test-node"},
+	}
+	if jobID != "" {
+		p.Labels[podutils.JobIDLabel] = jobID
+	}
+	if role != "" {
+		p.Labels[podutils.RoleLabel] = role
+	}
+	if epoch != "" {
+		p.Annotations = map[string]string{podutils.GuestEpochAnnotation: epoch}
+	}
+	return p
+}
+
+// TestWatcherLocalJobs checks that restart recovery sees every cached job,
+// registered with its mirror's epoch, as soon as the cache has synced, and
+// the highest epoch of each role for the SuspendAll and ResumeAll fences.
+func TestWatcherLocalJobs(t *testing.T) {
+	t.Setenv("NODE_NAME", "test-node")
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() { podutils.GetPodPIDs = origGetPodPIDs }()
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) { return nil, nil }
+
+	other := recoveryPod("elsewhere", "job-x", "background", "40")
+	other.Spec.NodeName = "other-node"
+	done := recoveryPod("done", "job-d", "background", "50")
+	done.Status.Phase = corev1.PodSucceeded
+	fakeClient := fakek8s.NewSimpleClientset(
+		recoveryPod("b", "job-b", "background", "7"), recoveryPod("a", "guest-1", "background", "12"),
+		recoveryPod("a2", "guest-1", "", ""), recoveryPod("plain", "", "background", "99"),
+		recoveryPod("t", "trainer", "foreground", "3"), recoveryPod("bad", "job-e", "background", "x"),
+		other, done)
+	state := sm.NewStateManager()
+	watcher, err := server.NewWatcher(fakeClient, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+	if !watcher.Synced() {
+		t.Fatal("cache not synced after Start")
+	}
+	if got, want := watcher.LocalJobs(), []string{"guest-1", "job-b", "job-d", "job-e", "trainer"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("LocalJobs %v, want %v", got, want)
+	}
+	// The fake client ignores the informer's spec.nodeName field selector,
+	// so the event handlers also see job-x; only the local jobs count here.
+	epochs := map[string]int64{}
+	for _, st := range state.GetJobStatus() {
+		if st.GetJobId() != "job-x" {
+			epochs[st.GetJobId()] = st.GetEpoch()
+		}
+	}
+	if want := map[string]int64{"guest-1": 12, "job-b": 7, "job-d": 50, "job-e": 0, "trainer": 3}; !reflect.DeepEqual(epochs, want) {
+		t.Errorf("registered jobs %v, want %v", epochs, want)
+	}
+	if got, want := watcher.RoleEpochs(), map[string]int64{"background": 12, "foreground": 3}; !reflect.DeepEqual(got, want) {
+		t.Errorf("RoleEpochs %v, want %v", got, want)
+	}
+}
+
+// TestWatcherHoldDetection checks that a held detection loop promotes no
+// IDLE job until it is released, so restart recovery sets states first.
+func TestWatcherHoldDetection(t *testing.T) {
+	t.Setenv("NODE_NAME", "test-node")
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() { podutils.GetPodPIDs = origGetPodPIDs }()
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) { return []int{42}, nil }
+
+	state := sm.NewStateManager()
+	watcher, err := server.NewWatcher(fakek8s.NewSimpleClientset(recoveryPod("a", "job-a", "", "")), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.HoldDetection()
+	watcher.Start(ctx)
+	watcher.LocalJobs()
+	time.Sleep(1500 * time.Millisecond) // past the first detection tick
+	if st := state.GetJobStatus(); len(st) != 1 || st[0].GetState() != pb.JobState_JOB_STATE_IDLE {
+		t.Fatalf("held detection changed the job: %v", st)
+	}
+	watcher.ReleaseDetection()
+	watcher.ReleaseDetection() // idempotent
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := state.GetJobStatus(); len(st) == 1 && st[0].GetState() == pb.JobState_JOB_STATE_RUNNING {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("job not promoted after ReleaseDetection: %v", state.GetJobStatus())
+}

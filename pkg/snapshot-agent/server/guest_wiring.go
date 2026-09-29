@@ -52,13 +52,15 @@ func newGuestPipeline(cfg *GuestConfig, w *Watcher, client kubernetes.Interface,
 		getPod: func(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
 			return client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		},
-		cgroups:  cgroup.New(cfg.CgroupRoot),
-		backend:  backend,
-		gpu:      nvmlInspector{},
-		scrubCfg: scrubCfg,
-		scrub:    scrubCfg.runScrub,
-		now:      time.Now,
-		records:  map[string]*guestRecord{},
+		cgroups:   cgroup.New(cfg.CgroupRoot),
+		backend:   backend,
+		gpu:       nvmlInspector{},
+		scrubCfg:  scrubCfg,
+		scrub:     scrubCfg.runScrub,
+		scrubGate: newScrubGate(),
+		procRoot:  "/proc",
+		now:       time.Now,
+		records:   map[string]*guestRecord{},
 	}
 }
 
@@ -113,7 +115,11 @@ func (nvmlInspector) Devices() ([]gpuDevice, error) {
 			if ret != nvml.SUCCESS {
 				return nil, fmt.Errorf("device %d UUID: %v", i, nvml.ErrorString(ret))
 			}
-			out = append(out, gpuDevice{Name: name, DriverVersion: driver, UUID: uuid})
+			minor, ret := dev.GetMinorNumber()
+			if ret != nvml.SUCCESS {
+				minor = -1
+			}
+			out = append(out, gpuDevice{Name: name, DriverVersion: driver, UUID: uuid, Minor: minor})
 		}
 		return out, nil
 	})

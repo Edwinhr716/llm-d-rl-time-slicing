@@ -461,6 +461,34 @@ func (sm *StateManager) SeedEpoch(jobID string, epoch int64) {
 	}
 }
 
+// RemoveJob forgets a job whose last local pod is gone. It first fails and
+// cancels the job's running operation, whose worker then writes nothing: a
+// running Kill fails with KILL_UNCONFIRMED (the agent never confirmed it),
+// any other operation with ERROR_REASON_UNSPECIFIED. The job's operations
+// stay readable until OperationTTL, and a later pod with the same job ID
+// starts clean. An unknown job is ignored.
+func (sm *StateManager) RemoveJob(jobID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	job, ok := sm.jobs[jobID]
+	if !ok {
+		return
+	}
+	job.mu.Lock()
+	if job.current != nil {
+		reason := pb.ErrorReason_ERROR_REASON_UNSPECIFIED
+		if job.current.op.Type == OpTypeKill {
+			reason = pb.ErrorReason_KILL_UNCONFIRMED
+		}
+		slog.Warn("Job removed while an operation runs; aborting it",
+			"jobID", jobID, "type", job.current.op.Type, "reason", reason)
+		sm.supersedeLocked(job, reason, "aborted: the job's pod is gone")
+	}
+	job.mu.Unlock()
+	delete(sm.jobs, jobID)
+	slog.Info("Job removed", "jobID", jobID)
+}
+
 // supersedeLocked fails the job's running operation with reason and msg,
 // cancels its context and clears it. The operation's worker, when it
 // returns, writes nothing.

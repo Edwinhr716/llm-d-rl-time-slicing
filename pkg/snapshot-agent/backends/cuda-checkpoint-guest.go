@@ -62,8 +62,10 @@ func (c *CudaCheckpoint) GuestCheckpoint(
 	if len(pids) == 0 {
 		return errors.New("at least one PID is required for CUDA checkpoint")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.lock.Acquire(ctx); err != nil {
+		return err
+	}
+	defer c.lock.Release()
 
 	if beforeRun != nil {
 		if err := beforeRun(); err != nil {
@@ -99,8 +101,10 @@ func (c *CudaCheckpoint) GuestCheckpoint(
 // is only unlocked, a running one is left alone. states gives the state of
 // each process as read by GetState.
 func (c *CudaCheckpoint) GuestRestore(ctx context.Context, pids []int, states map[int]string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.lock.Acquire(ctx); err != nil {
+		return err
+	}
+	defer c.lock.Release()
 
 	bin := c.getCudaCheckpointPath()
 	t0 := time.Now()
