@@ -117,6 +117,9 @@ func ErrorReasonOf(err error) pb.ErrorReason {
 //   - Anything else is refused with FAILED_PRECONDITION, and a running
 //     Kill, Snapshot or Restore with Aborted.
 //
+// Only an accepted call (one that returns an operation ID) stores its
+// epoch as the job's last epoch; a refused call leaves it unchanged.
+//
 // A worker failure, or a worker that returns after the deadline, fails the
 // operation and leaves the job FAULTED; the kill path follows.
 func (sm *StateManager) StartGuestOp(
@@ -160,15 +163,25 @@ func (sm *StateManager) StartGuestOp(
 		return "", refuse(codes.FailedPrecondition, pb.ErrorReason_STALE_EPOCH,
 			"%s of job %s: epoch %d was already used for %s", intent, jobID, epoch, rec.Type)
 	}
-	// The epoch is used from here on even if the call is refused below: the
-	// caller wrote it on the mirror before calling, and any lower call is
-	// late.
-	job.LastEpoch = epoch
 
+	var (
+		opID string
+		err  error
+	)
 	if job.current != nil {
-		return sm.preemptLocked(job, intent, epoch, deadline, worker)
+		opID, err = sm.preemptLocked(job, intent, epoch, deadline, worker)
+	} else {
+		opID, err = sm.answerByStateLocked(job, intent, epoch, deadline, worker)
 	}
-	return sm.answerByStateLocked(job, intent, epoch, deadline, worker)
+	// Only an accepted call stores its epoch: a call refused after fencing
+	// leaves the last epoch as it was. Nothing between fencing and here
+	// reads LastEpoch, so storing it now is the same as storing it right
+	// after fencing.
+	if err != nil {
+		return "", err
+	}
+	job.LastEpoch = epoch
+	return opID, nil
 }
 
 // preemptLocked answers a guest call that passed fencing while the job has
