@@ -14,11 +14,9 @@ SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE
 build: ## vet, test, build and push the image remotely
 	gcloud builds submit --project=$(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
 
-deploy: ## namespace, RBAC, Deployment and the outage guard (image tag = TAG)
+deploy: ## namespace, RBAC, Deployment (image tag = TAG); option c: finalizer, no keeper
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
 	$(SUBST) deploy/deployment.yaml | $(KUBECTL) apply -f -
-	$(SUBST) deploy/guard/node-keeper.yaml | $(KUBECTL) apply -f -
-| $(KUBECTL) apply -f -
 
 test-guest: ## step one: CPU-only guest and a Service selecting it
 	$(SUBST) deploy/test-guest.yaml | $(KUBECTL) apply -f -
@@ -44,7 +42,9 @@ status:
 
 undeploy: ## namespace first (guests, then mirrors via ownerRef), then cluster-scoped objects
 	-$(KUBECTL) delete ns guest-kubelet-proto --wait=true
-	-$(KUBECTL) delete node $(VNODE)
+# The VK Node carries the timeslice.io/virtual-node-protection finalizer (D-VK-2 option c): it stays
+# Terminating until the VK deregisters (guest-kubelet --deregister) or the donor controller releases it.
+	-$(KUBECTL) delete node $(VNODE) --wait=false
 	-$(KUBECTL) -n kube-node-lease delete lease $(VNODE)
 	-$(KUBECTL) delete clusterrole,clusterrolebinding guest-kubelet-proto
 	-$(KUBECTL) -n kube-node-lease delete role,rolebinding guest-kubelet-proto

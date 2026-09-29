@@ -1,0 +1,84 @@
+# D-VK-2 option c: a stand-in for the donor controller's host-death duty. When the real Node
+# __HOST__ is gone, it releases the virtual Node __VK_NODE__ (deletes it and removes the VK
+# finalizer timeslice.io/virtual-node-protection). The VK cannot do this on host death: it
+# runs on that host. It runs on a CPU node, never on __HOST__, and may touch only these two
+# Nodes. Stand-in only: the real donor controller does not exist yet.
+# Placeholders: __IMAGE__ (the guest-kubelet image, which also holds /donor-standin),
+# __HOST__, __VK_NODE__; guest-kubelet-proto is the VK's namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: donor-standin
+  namespace: guest-kubelet-proto
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: guest-kubelet-proto-donor-standin
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    resourceNames: ["__HOST__", "__VK_NODE__"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    resourceNames: ["__VK_NODE__"]
+    verbs: ["update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: guest-kubelet-proto-donor-standin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: guest-kubelet-proto-donor-standin
+subjects:
+  - kind: ServiceAccount
+    name: donor-standin
+    namespace: guest-kubelet-proto
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: donor-standin
+  namespace: guest-kubelet-proto
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: donor-standin}
+  template:
+    metadata:
+      labels:
+        app: donor-standin
+        timeslice.io/eval-role: donor-standin
+    spec:
+      serviceAccountName: donor-standin
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        cloud.google.com/gke-nodepool: default-pool
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: kubernetes.io/hostname, operator: NotIn, values: ["__HOST__"]}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: donor-standin
+          image: __IMAGE__
+          command: ["/donor-standin"]
+          args:
+            - --vk-node=__VK_NODE__
+            - --host-node=__HOST__
+            - --interval=5s
+          resources:
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}

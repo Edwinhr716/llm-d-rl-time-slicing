@@ -121,10 +121,17 @@ type options struct {
 	// D-NS-8: cordon the virtual Node while the donor holds the group lock
 	cordonWhileHeld bool
 	holdGroup       string
+	// D-VK-2 option c: one-shot deregistration (end of an era).
+	deregister bool
+	// VK-A7 (NS form): replace a Terminating virtual Node on start.
+	reclaimNode bool
 }
 
 // edgeLogSize is how many Ready edges per guest the debug endpoint keeps.
 const edgeLogSize = 256
+
+// reclaimTimeout bounds the wait for a Terminating Node to go once its finalizer is removed.
+const reclaimTimeout = 30 * time.Second
 
 func main() {
 	var o options
@@ -238,6 +245,11 @@ func main() {
 	flag.BoolVar(&o.cordonWhileHeld, "cordon-while-held", false,
 		"set spec.unschedulable on the virtual Node while the donor holds the group lock")
 	flag.StringVar(&o.holdGroup, "hold-group", "", "group whose lock the hold watcher polls (needed with --cordon-while-held)")
+	flag.BoolVar(&o.deregister, "deregister", false,
+		"one-shot: delete the virtual Node, remove its finalizer and exit (end of an era; stop the serving VK first)")
+	flag.BoolVar(&o.reclaimNode, "reclaim-terminating-node", true,
+		"on start, replace the virtual Node if a delete (for example GKE during a VK outage) holds it Terminating: "+
+			"remove our finalizer and register it again; guests stay bound by name. false leaves it Terminating")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -251,6 +263,9 @@ func main() {
 }
 
 func run(ctx context.Context, o options) error {
+	if o.deregister {
+		return deregister(ctx, o.nodeName, o.hostNode, o.kubeconfig)
+	}
 	if o.hostNode == "" || (o.hostIP == "" && !o.nodeKeeper) {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
 	}
@@ -261,7 +276,7 @@ func run(ctx context.Context, o options) error {
 		return fmt.Errorf("--cordon-while-held needs --hold-group and --orchestrator-addr")
 	}
 	if o.nodeName == "" {
-		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
+		o.nodeName = defaultNodeName(o.hostNode)
 	}
 	client, err := nodeutil.ClientsetFromEnv(o.kubeconfig)
 	if err != nil {
@@ -285,6 +300,32 @@ func (o *options) checkDebug() error {
 	if err := probe.CheckLoopback(o.debugAddr); err != nil {
 		return err
 	}
+	return nil
+}
+
+func defaultNodeName(hostNode string) string {
+	return "vk-" + hostNode[strings.LastIndex(hostNode, "-")+1:]
+}
+
+// deregister is the VK's own removal of its virtual Node at the end of an era: it deletes the
+// Node and removes the finalizer (reason deregister), then exits. Run it after the serving VK
+// has stopped, or its re-registration recreates the Node.
+func deregister(ctx context.Context, name, hostNode, kubeconfig string) error {
+	if name == "" && hostNode != "" {
+		name = defaultNodeName(hostNode)
+	}
+	if name == "" {
+		return fmt.Errorf("--deregister needs --node-name or --host-node")
+	}
+	client, err := nodeutil.ClientsetFromEnv(kubeconfig)
+	if err != nil {
+		return err
+	}
+	released, err := provider.ReleaseNode(ctx, client, name, provider.ReasonDeregister)
+	if err != nil {
+		return err
+	}
+	log.G(ctx).WithField("node", name).WithField("released", released).Info("deregistered")
 	return nil
 }
 
@@ -348,6 +389,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	cfg := provider.NodeConfig{
 		Name: o.nodeName, InternalIP: o.hostIP, KubeletPort: int32(o.kubeletPort),
 		KubeletVersion: o.kubeletVersion, GPUs: o.gpus, GuestNodeLabel: o.guestNodeLabel,
+		HostName: host.Name, HostUID: host.UID,
 	}
 	if o.providerIDFromHost {
 		cfg.ProviderID = host.Spec.ProviderID
@@ -416,6 +458,22 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	nodeSpec := *nodeProvider.Node()
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
 		return err
+	}
+	// D-VK-2 option c: register the Node ourselves with the finalizer and the ownerReference to
+	// the host (or add them to an existing Node), so the library finds it and only patches status.
+	action, err := provider.EnsureNodeGuard(ctx, client, &nodeSpec)
+	if err != nil {
+		return err
+	}
+	// VK-A7: a Terminating Node cannot be un-deleted. On a live host (we run on it), swap it for
+	// a fresh one before the library starts, so the outage leaves no trace on the Node.
+	if action == provider.GuardTerminating && o.reclaimNode {
+		if _, err := provider.ReclaimNode(ctx, client, &nodeSpec, reclaimTimeout); err != nil {
+			return err
+		}
+		if _, err := provider.EnsureNodeGuard(ctx, client, &nodeSpec); err != nil {
+			return err
+		}
 	}
 
 	// Our own event broadcaster, so the recorder can be wrapped: the library would otherwise

@@ -81,6 +81,10 @@ internal/provider/marker.go          --guest-marker: what makes a pod a guest
 internal/provider/probepolicy.go     --guest-probe-policy (D-VK-5 a/b/c)
 internal/provider/events.go          drops events about non-guest pods
 internal/keeper/keeper.go            outage guard (keeps the Node Lease fresh)
+internal/provider/finalizer.go       Node finalizer, ownerRef to host, release
+internal/provider/reclaim.go         replace a Terminating Node on start (--reclaim-terminating-node)
+internal/donorstandin/               donor stand-in: releases Node on host death
+cmd/donor-standin/main.go            its command (same image as the VK)
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
@@ -116,6 +120,7 @@ deploy/admission/                    W9 policies, one per guest marker
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
 deploy/m2/                           probed guests, pool, router, Q5 pods
+deploy/opt-c/                        donor stand-in Deployment + RBAC
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
 
@@ -240,6 +245,32 @@ make q5-toggle    # Q5 run, a real probe flipped by the guest
 make status
 make undeploy
 ```
+
+## Outage guard: Node finalizer (option c of an open decision)
+
+The VK Node carries the finalizer `timeslice.io/virtual-node-protection`
+and an ownerReference to the real Node. When anyone else deletes the VK
+Node during a VK outage (for example the cloud node lifecycle
+controller), the finalizer holds it (Terminating), so its guests are not
+garbage-collected. Only two actors remove the finalizer:
+
+- the donor controller, when the real Node is gone (`deploy/opt-c/`, a
+  stand-in until the real controller exists; the VK cannot act on its
+  own host's death), and
+- the VK itself when it deregisters at the end of an era: stop the
+  serving VK, then run `guest-kubelet --deregister --node-name=<node>`.
+
+A Terminating Node cannot be un-deleted. With
+`--reclaim-terminating-node` (default true), a VK that starts on a live
+host and finds its own Node Terminating removes the finalizer and
+registers the Node again (new UID, same name), so bound guests keep
+running. Only a Node with the virtual-node label, only this finalizer
+and an ownerReference to the live host (same UID) is reclaimed. With the
+flag false the Node keeps serving but stays Terminating until one of the
+two releases it. A plain `kubectl delete node` also stays Terminating.
+
+The node keeper (`--node-keeper`, `deploy/guard/`) is still in the tree,
+off by default; this variant does not deploy it.
 
 The plan and the notes explaining this code are kept outside this repository
 (prototype plan, milestones M0 to M2).
