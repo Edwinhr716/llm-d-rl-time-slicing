@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -48,6 +49,8 @@ type options struct {
 	// M1: mirror backend
 	cpuHeadroom, memHeadroom string
 	gpuClaim                 string
+	gpuClaimMode             string // D-NS-18 M3: static (today) or donor
+	donorSelector            string
 	reserveClaim             bool
 	mirrorOwnerRef           bool
 	orphanGrace              time.Duration
@@ -76,6 +79,11 @@ func main() {
 	flag.StringVar(&o.cpuHeadroom, "mirror-cpu-headroom", "1", "cap on each mirror container's cpu request (0 = no cap)")
 	flag.StringVar(&o.memHeadroom, "mirror-memory-headroom", "4Gi", "cap on each mirror container's memory request (0 = no cap)")
 	flag.StringVar(&o.gpuClaim, "gpu-claim", "", "ResourceClaim (in the guest's namespace) that replaces nvidia.com/gpu on the mirror")
+	flag.StringVar(&o.gpuClaimMode, "gpu-claim-mode", string(mirror.ClaimModeStatic),
+		"where a GPU mirror's claim comes from: static (--gpu-claim) or donor "+
+			"(the claim of the donor pod on --host-node, in the guest's namespace)")
+	flag.StringVar(&o.donorSelector, "donor-selector", mirror.DefaultDonorSelector,
+		"label selector of the donor pods for --gpu-claim-mode=donor")
 	// Off by default: measured in M1, kube-controller-manager's resourceclaim controller adds a
 	// pod that already has spec.nodeName to the claim's reservedFor about 1 s after creation.
 	flag.BoolVar(&o.reserveClaim, "reserve-claim", false, "add GPU mirrors to the claim's status.reservedFor (kube-controller-manager also does it)")
@@ -196,6 +204,12 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey, OwnerRef: o.mirrorOwnerRef,
 		},
 		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
+	}
+	if mopts.ClaimMode, err = mirror.ParseClaimMode(o.gpuClaimMode); err != nil {
+		return fmt.Errorf("--gpu-claim-mode: %w", err)
+	}
+	if mopts.DonorSelector, err = labels.Parse(o.donorSelector); err != nil {
+		return fmt.Errorf("--donor-selector: %w", err)
 	}
 	if mopts.CPUHeadroom, err = resource.ParseQuantity(o.cpuHeadroom); err != nil {
 		return fmt.Errorf("--mirror-cpu-headroom: %w", err)

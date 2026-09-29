@@ -32,6 +32,11 @@ type Options struct {
 	OrphanGrace time.Duration
 	// Resync is the mirror informer's resync period.
 	Resync time.Duration
+	// ClaimMode is where a GPU mirror's claim comes from (D-NS-18 M3, donorclaim.go). The
+	// zero value is ClaimModeStatic: Config.GPUClaim, today's behaviour.
+	ClaimMode ClaimMode
+	// DonorSelector selects the donor pods in ClaimModeDonor. Nil means DefaultDonorSelector.
+	DonorSelector labels.Selector
 }
 
 // Backend creates, watches and deletes mirror pods. It keeps no state of its own that matters
@@ -217,7 +222,11 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 // Create builds and creates the mirror. It is idempotent: an existing mirror for this guest is
 // fine; an orphaned mirror with the same name and the same containers is adopted.
 func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
-	want, err := Build(guest, b.opts.Config)
+	cfg, err := b.claimConfig(ctx, guest)
+	if err != nil {
+		return err
+	}
+	want, err := Build(guest, cfg)
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}
@@ -236,7 +245,7 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	}
 
 	if RequestsGPU(guest) && b.opts.ReserveClaim {
-		if err := b.reserveClaim(ctx, guest.Namespace, b.opts.GPUClaim, m); err != nil {
+		if err := b.reserveClaim(ctx, guest.Namespace, cfg.GPUClaim, m); err != nil {
 			return err
 		}
 	}
