@@ -68,7 +68,7 @@ func HostGPUModel(n *corev1.Node) string {
 // Admit returns why a guest must be refused, or nil. It is a pure function of the pod and
 // the policy.
 func Admit(pod *corev1.Pod, pol AdmissionPolicy) *Rejection {
-	if r := checkProbesOptionA(pod); r != nil {
+	if r := checkProbes(pod); r != nil {
 		return r
 	}
 	return checkGPU(pod, pol)
@@ -78,36 +78,27 @@ func allContainers(pod *corev1.Pod) []corev1.Container {
 	return append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
 }
 
-// onlyReadiness is the tail of every probe rejection: what a guest may have instead.
-const onlyReadiness = "only an httpGet or tcpSocket readinessProbe"
-
-// checkProbesOptionA is lead decision D-VK-5 option a, kept in one place so another option can
-// replace it. The mirror never gets probes (the real kubelet must not restart or un-ready a
-// guest the orchestrator froze on purpose), so a probe that only makes sense on the real
-// kubelet is refused rather than silently dropped:
-//   - livenessProbe and startupProbe: refused (they restart the container).
-//   - readinessProbe: httpGet and tcpSocket are allowed (the guest kubelet can run them from
-//     outside the container); exec and grpc are refused.
-//   - readinessGates: refused.
-func checkProbesOptionA(pod *corev1.Pod) *Rejection {
+// checkProbes is the probe rule: a guest carries no probes at all. The mirror never gets
+// probes (the real kubelet must not restart or un-ready a guest the orchestrator froze on
+// purpose), so rather than silently dropping them, any livenessProbe, readinessProbe or
+// startupProbe, on any container (init containers included), is refused, and so are
+// readinessGates. The guest's Ready rests on the guest kubelet's own checks.
+func checkProbes(pod *corev1.Pod) *Rejection {
 	containers := allContainers(pod)
 	for i := range containers {
 		ctr := &containers[i]
-		if ctr.LivenessProbe != nil {
-			return &Rejection{"liveness-probe", fmt.Sprintf(
-				"container %q has a livenessProbe; guests may not have liveness probes (%s)", ctr.Name, onlyReadiness)}
-		}
-		if ctr.StartupProbe != nil {
-			return &Rejection{"startup-probe", fmt.Sprintf(
-				"container %q has a startupProbe; guests may not have startup probes (%s)", ctr.Name, onlyReadiness)}
-		}
-		if p := ctr.ReadinessProbe; p != nil && p.HTTPGet == nil && p.TCPSocket == nil {
-			kind := "exec"
-			if p.GRPC != nil {
-				kind = "grpc"
+		for _, pr := range []struct {
+			field, rule string
+			probe       *corev1.Probe
+		}{
+			{"livenessProbe", "liveness-probe", ctr.LivenessProbe},
+			{"readinessProbe", "readiness-probe", ctr.ReadinessProbe},
+			{"startupProbe", "startup-probe", ctr.StartupProbe},
+		} {
+			if pr.probe != nil {
+				return &Rejection{pr.rule, fmt.Sprintf(
+					"container %q has a %s; guests may not have probes", ctr.Name, pr.field)}
 			}
-			return &Rejection{"readiness-probe-" + kind, fmt.Sprintf(
-				"container %q has a %s readinessProbe; guests may use %s", ctr.Name, kind, onlyReadiness)}
 		}
 	}
 	if n := len(pod.Spec.ReadinessGates); n > 0 {

@@ -39,11 +39,11 @@ kubelet for the guest pods scheduled onto it.
   `POST /debug/readiness?pod=ns/name&ready=true|false|clear` (an override
   that wins over the probes) and `GET /debug/ready-edges?pod=ns/name`
   (when the VK sent each Ready change). Only the Q5 measurement uses it.
-- Admission (VK-A7) refuses a guest before it gets a mirror: a liveness
-  or startup probe, an exec or grpc readiness probe, readiness gates (an
-  httpGet or tcpSocket readinessProbe is allowed), a GPU resource other
-  than `nvidia.com/gpu`, or a GPU guest on a host whose model label is
-  not in `--gpu-allowlist` (default `nvidia-l4`; no label fails closed).
+- Admission (VK-A7) refuses a guest before it gets a mirror: any probe
+  (liveness, readiness or startup, of any kind, on any container),
+  readiness gates, a GPU resource other than `nvidia.com/gpu`, or a GPU
+  guest on a host whose model label is not in `--gpu-allowlist` (default
+  `nvidia-l4`; no label fails closed).
   The guest gets a Warning event `GuestRejected` naming the rule and goes
   `Failed` with reason `GuestRejected`.
 - A GPU mirror container's memory limit is its limit (or request) plus
@@ -57,9 +57,10 @@ kubelet for the guest pods scheduled onto it.
   The Node stays Ready through a guest-kubelet outage, so it is not
   deleted and its guests and mirrors keep running. Past the grace it
   stops and the Node goes NotReady as before.
-- Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Liveness and
-  startup probes are refused by admission (above), so an exec or gRPC
-  readinessProbe never reaches the prober.
+- Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Admission
+  refuses every probe (above), so an admitted guest never has a
+  readinessProbe for the prober to run; its Ready follows the mirror (or
+  the debug override).
 
 ## Layout
 

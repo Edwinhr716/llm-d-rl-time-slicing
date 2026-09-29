@@ -149,26 +149,34 @@ func execProbe() *corev1.Probe {
 	return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}}}
 }
 
-func TestAdmitProbesOptionA(t *testing.T) {
+func TestAdmitProbes(t *testing.T) {
 	cases := []struct {
 		name string
 		mut  func(*corev1.Pod)
 		rule string // "" = admitted
 	}{
 		{"plain", func(*corev1.Pod) {}, ""},
-		{"httpGet readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = httpProbe() }, ""},
+		{"httpGet readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = httpProbe() }, "readiness-probe"},
 		{"tcpSocket readiness", func(p *corev1.Pod) {
 			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{}}}
-		}, ""},
-		{"exec readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = execProbe() }, "readiness-probe-exec"},
+		}, "readiness-probe"},
+		{"exec readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = execProbe() }, "readiness-probe"},
 		{"grpc readiness", func(p *corev1.Pod) {
 			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 9000}}}
-		}, "readiness-probe-grpc"},
+		}, "readiness-probe"},
 		{"httpGet liveness", func(p *corev1.Pod) { p.Spec.Containers[0].LivenessProbe = httpProbe() }, "liveness-probe"},
 		{"startup", func(p *corev1.Pod) { p.Spec.Containers[0].StartupProbe = httpProbe() }, "startup-probe"},
+		{"stock chart: startup, liveness and readiness", func(p *corev1.Pod) {
+			p.Spec.Containers[0].StartupProbe = httpProbe()
+			p.Spec.Containers[0].LivenessProbe = httpProbe()
+			p.Spec.Containers[0].ReadinessProbe = httpProbe()
+		}, "liveness-probe"},
 		{"sidecar liveness", func(p *corev1.Pod) {
 			p.Spec.InitContainers = []corev1.Container{{Name: "side", LivenessProbe: httpProbe()}}
 		}, "liveness-probe"},
+		{"sidecar readiness", func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "side", ReadinessProbe: httpProbe()}}
+		}, "readiness-probe"},
 		{"readiness gate", func(p *corev1.Pod) {
 			p.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: "x/ready"}}
 		}, "readiness-gates"},
@@ -183,6 +191,11 @@ func TestAdmitProbesOptionA(t *testing.T) {
 		case c.rule != "" && (r == nil || r.Rule != c.rule):
 			t.Errorf("%s: got %v, want rule %s", c.name, r, c.rule)
 		}
+	}
+	p := guestPod("g")
+	p.Spec.Containers[0].ReadinessProbe = httpProbe()
+	if r := Admit(p, l4Policy()); r == nil || !strings.Contains(r.Message, `container "c" has a readinessProbe`) {
+		t.Errorf("the message must name the container and the field: %v", r)
 	}
 }
 
@@ -282,7 +295,6 @@ func TestCreatePodRejects(t *testing.T) {
 
 	good := guestPod("good")
 	good.UID = types.UID("good-uid")
-	good.Spec.Containers[0].ReadinessProbe = httpProbe()
 	if err := prov.CreatePod(ctx, good); err != nil || len(backend.created) != 1 {
 		t.Fatalf("good guest: err=%v created=%v", err, backend.created)
 	}
