@@ -261,7 +261,15 @@ make undeploy
 
 ## Outage guard: Node finalizer (option c of an open decision)
 
-The VK Node carries the finalizer `timeslice.io/virtual-node-protection`
+This branch runs option a (status quo): `--node-finalizer` defaults to
+false, so the VK Node has no finalizer. A delete during a VK outage (the
+cloud node lifecycle controller, about 50 s in) completes, pod GC removes
+the guests, and the returning VK registers a new Node. The ownerReference
+to the real Node stays. Option b is this plus `--mirror-owner-ref=false`.
+The rest of this section applies only with `--node-finalizer=true`.
+
+With `--node-finalizer=true` the VK Node carries the finalizer
+`timeslice.io/virtual-node-protection`
 and an ownerReference to the real Node. When anyone else deletes the VK
 Node during a VK outage (for example the cloud node lifecycle
 controller), the finalizer holds it (Terminating), so its guests are not

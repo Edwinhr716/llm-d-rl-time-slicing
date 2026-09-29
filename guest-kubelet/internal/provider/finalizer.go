@@ -27,8 +27,9 @@ const (
 	ReasonDeregister = "deregister" // the VK deregistered its own Node (end of an era)
 )
 
-// EnsureNodeGuard makes sure the virtual Node carries NodeFinalizer and the ownerReference to
-// the real Node from spec. It creates the Node from spec if it does not exist. A Node that is
+// EnsureNodeGuard makes sure the virtual Node carries NodeFinalizer (only if spec carries it,
+// D-VK-2 option c) and the ownerReference to the real Node from spec. It creates the Node from
+// spec if it does not exist. A Node that is
 // already being deleted cannot take new finalizers; it is left as it is (its finalizer, if
 // any, holds it until the donor controller or a deregistration releases it).
 func EnsureNodeGuard(ctx context.Context, client kubernetes.Interface, spec *corev1.Node) (string, error) {
@@ -65,6 +66,11 @@ func EnsureNodeGuard(ctx context.Context, client kubernetes.Interface, spec *cor
 	if err != nil {
 		return "", fmt.Errorf("guard virtual Node %s: %w", spec.Name, err)
 	}
+	if !slices.Contains(spec.Finalizers, NodeFinalizer) {
+		log.G(ctx).WithField("node", spec.Name).WithField("action", action).
+			WithField("owner", ownerNames(spec.OwnerReferences)).Info("node registered without finalizer")
+		return action, nil
+	}
 	logger := log.G(ctx).WithField("node", spec.Name).WithField("finalizer", NodeFinalizer).WithField("action", action)
 	if action == GuardTerminating {
 		logger.Warn("node is terminating; the finalizer holds it until the donor controller or deregistration releases it")
@@ -74,12 +80,12 @@ func EnsureNodeGuard(ctx context.Context, client kubernetes.Interface, spec *cor
 	return action, nil
 }
 
-// mergeGuard adds NodeFinalizer and spec's Node ownerReferences to cur. Node ownerReferences
+// mergeGuard adds NodeFinalizer (if spec carries it) and spec's Node ownerReferences to cur. Node ownerReferences
 // on cur that spec does not list (a host that was recreated with a new UID) are replaced.
 // It reports whether cur changed.
 func mergeGuard(cur, spec *corev1.Node) bool {
 	changed := false
-	if !slices.Contains(cur.Finalizers, NodeFinalizer) {
+	if slices.Contains(spec.Finalizers, NodeFinalizer) && !slices.Contains(cur.Finalizers, NodeFinalizer) {
 		cur.Finalizers = append(cur.Finalizers, NodeFinalizer)
 		changed = true
 	}

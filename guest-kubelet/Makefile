@@ -54,8 +54,8 @@ status:
 
 undeploy: ## namespace first (guests, then mirrors via ownerRef), then cluster-scoped objects
 	-$(KUBECTL) delete ns guest-kubelet-proto --wait=true
-# The VK Node carries the timeslice.io/virtual-node-protection finalizer (D-VK-2 option c): it stays
-# Terminating until the VK deregisters (guest-kubelet --deregister) or the donor controller releases it.
+# With --node-finalizer=true (D-VK-2 option c) the VK Node carries the timeslice.io/virtual-node-protection
+# finalizer: it stays Terminating until the VK deregisters or the donor controller releases it.
 	-$(KUBECTL) delete node $(VNODE) --wait=false
 	-$(KUBECTL) -n kube-node-lease delete lease $(VNODE)
 	-$(KUBECTL) delete clusterrole,clusterrolebinding guest-kubelet-proto
