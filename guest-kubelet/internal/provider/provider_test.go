@@ -149,7 +149,7 @@ func execProbe() *corev1.Probe {
 	return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}}}
 }
 
-func TestAdmitProbesOptionA(t *testing.T) {
+func TestAdmitProbes(t *testing.T) {
 	cases := []struct {
 		name string
 		mut  func(*corev1.Pod)
@@ -169,6 +169,14 @@ func TestAdmitProbesOptionA(t *testing.T) {
 		{"sidecar liveness", func(p *corev1.Pod) {
 			p.Spec.InitContainers = []corev1.Container{{Name: "side", LivenessProbe: httpProbe()}}
 		}, "liveness-probe"},
+		{"sidecar readiness", func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "side", ReadinessProbe: httpProbe()}}
+		}, ""},
+		{"stock chart: startup, liveness and readiness", func(p *corev1.Pod) {
+			p.Spec.Containers[0].StartupProbe = httpProbe()
+			p.Spec.Containers[0].LivenessProbe = httpProbe()
+			p.Spec.Containers[0].ReadinessProbe = httpProbe()
+		}, "liveness-probe"},
 		{"readiness gate", func(p *corev1.Pod) {
 			p.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: "x/ready"}}
 		}, "readiness-gates"},
@@ -183,6 +191,11 @@ func TestAdmitProbesOptionA(t *testing.T) {
 		case c.rule != "" && (r == nil || r.Rule != c.rule):
 			t.Errorf("%s: got %v, want rule %s", c.name, r, c.rule)
 		}
+	}
+	p := guestPod("g")
+	p.Spec.Containers[0].LivenessProbe = httpProbe()
+	if r := Admit(p, l4Policy()); r == nil || !strings.Contains(r.Message, `container "c" has a livenessProbe`) {
+		t.Errorf("the message must name the container and the field: %v", r)
 	}
 }
 

@@ -68,7 +68,7 @@ func HostGPUModel(n *corev1.Node) string {
 // Admit returns why a guest must be refused, or nil. It is a pure function of the pod and
 // the policy.
 func Admit(pod *corev1.Pod, pol AdmissionPolicy) *Rejection {
-	if r := checkProbesOptionA(pod); r != nil {
+	if r := checkProbes(pod); r != nil {
 		return r
 	}
 	return checkGPU(pod, pol)
@@ -81,15 +81,14 @@ func allContainers(pod *corev1.Pod) []corev1.Container {
 // onlyReadiness is the tail of every probe rejection: what a guest may have instead.
 const onlyReadiness = "only an httpGet or tcpSocket readinessProbe"
 
-// checkProbesOptionA is lead decision D-VK-5 option a, kept in one place so another option can
-// replace it. The mirror never gets probes (the real kubelet must not restart or un-ready a
-// guest the orchestrator froze on purpose), so a probe that only makes sense on the real
-// kubelet is refused rather than silently dropped:
+// checkProbes is the probe rule. The mirror never gets probes (the real kubelet must not
+// restart or un-ready a guest the orchestrator froze on purpose), so a probe that only makes
+// sense on the real kubelet is refused rather than silently dropped:
 //   - livenessProbe and startupProbe: refused (they restart the container).
 //   - readinessProbe: httpGet and tcpSocket are allowed (the guest kubelet can run them from
 //     outside the container); exec and grpc are refused.
 //   - readinessGates: refused.
-func checkProbesOptionA(pod *corev1.Pod) *Rejection {
+func checkProbes(pod *corev1.Pod) *Rejection {
 	containers := allContainers(pod)
 	for i := range containers {
 		ctr := &containers[i]
