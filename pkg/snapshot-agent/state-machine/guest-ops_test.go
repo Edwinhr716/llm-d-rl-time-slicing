@@ -705,12 +705,15 @@ func TestGuestOp_WorkerFailures(t *testing.T) {
 		res    statemachine.GuestResult
 		err    error
 		want   pb.ErrorReason
+		// wantState is the job state afterwards; FAULTED when unset.
+		wantState pb.JobState
 	}{
 		{
-			name:   "classified precondition",
-			intent: statemachine.OpTypeSuspend,
-			err:    statemachine.NewOpError(pb.ErrorReason_PRECONDITION_MEMORY, errors.New("not enough host memory")),
-			want:   pb.ErrorReason_PRECONDITION_MEMORY,
+			name:      "classified precondition",
+			intent:    statemachine.OpTypeSuspend,
+			err:       statemachine.NewOpError(pb.ErrorReason_PRECONDITION_MEMORY, errors.New("not enough host memory")),
+			want:      pb.ErrorReason_PRECONDITION_MEMORY,
+			wantState: pb.JobState_JOB_STATE_SUSPENDED,
 		},
 		{
 			name:   "wrapped verify failure",
@@ -740,7 +743,11 @@ func TestGuestOp_WorkerFailures(t *testing.T) {
 			if op.Error == "" {
 				t.Error("a failed operation must carry an error message")
 			}
-			checkJobState(t, sm, guestJob, pb.JobState_JOB_STATE_FAULTED)
+			wantState := tt.wantState
+			if wantState == pb.JobState_JOB_STATE_UNSPECIFIED {
+				wantState = pb.JobState_JOB_STATE_FAULTED
+			}
+			checkJobState(t, sm, guestJob, wantState)
 		})
 	}
 }
