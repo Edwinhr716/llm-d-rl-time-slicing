@@ -1,0 +1,120 @@
+# Time-slicing admission rules as a built-in ValidatingAdmissionPolicy (CEL).
+#
+# No webhook server and no mutation: the policy runs inside the API server and only accepts or
+# refuses. Users still write every time-slicing field by hand (guest toleration and steering,
+# donor job-id and group, client wiring). The policy checks what CEL can check:
+#
+#   W9  a guest carries no timeslice.io/group, timeslice.io/job-id or timeslice.io/role label
+#   W2  a guest references no ResourceClaim (guests request plain nvidia.com/gpu)
+#   W10 only the virtual-kubelet creates timeslice.io/role=background pods
+#   W6  a pod with timeslice.io/group also carries timeslice.io/job-id (refused, never defaulted)
+#   R4  a donor (timeslice.io/donor=true) carries both timeslice.io/job-id and timeslice.io/group.
+#       CEL cannot derive them from ray.io/cluster and ray.io/group, so a KubeRay donor must
+#       carry them by hand too.
+#
+# Every message starts with the rule id, for example "[W9]".
+#
+# Pods created by the virtual-kubelet (mirror pods) skip every rule (W7: leave mirrors alone).
+# UPDATE is checked only when it changes a timeslice.io/* label or adds a toleration, so pods
+# admitted before the policy existed keep working.
+#
+# Placeholders, replaced before apply:
+#   __VK_USERNAME__   the virtual-kubelet identity, for example
+#                     system:serviceaccount:<namespace>:guest-kubelet
+#   __GUEST_MARKER__  what makes a pod a guest:
+#                     toleration  a toleration with key timeslice.io/guest
+#                     label       the label timeslice.io/guest=true
+#                     either      either of the two (also used for any other value)
+#
+#   sed -e 's|__VK_USERNAME__|system:serviceaccount:<ns>:guest-kubelet|' \
+#       -e 's|__GUEST_MARKER__|toleration|' deploy/admission/timeslice-vap.yaml | kubectl apply -f -
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: timeslice-pod-rules
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: not-the-virtual-kubelet
+      expression: >-
+        request.userInfo.username != '__VK_USERNAME__'
+    - name: create-or-timeslice-change
+      expression: >-
+        request.operation == 'CREATE' ||
+        ['timeslice.io/donor', 'timeslice.io/guest', 'timeslice.io/group',
+        'timeslice.io/job-id', 'timeslice.io/role'].exists(k,
+        (has(object.metadata.labels) && k in object.metadata.labels ? object.metadata.labels[k] : '') !=
+        (has(oldObject.metadata.labels) && k in oldObject.metadata.labels ? oldObject.metadata.labels[k] : '')) ||
+        (has(object.spec.tolerations) ? size(object.spec.tolerations) : 0) !=
+        (has(oldObject.spec.tolerations) ? size(oldObject.spec.tolerations) : 0)
+  variables:
+    - name: labels
+      expression: >-
+        has(object.metadata.labels) ? object.metadata.labels : {}
+    - name: marker
+      expression: >-
+        '__GUEST_MARKER__' in ['toleration', 'label'] ? '__GUEST_MARKER__' : 'either'
+    - name: guestToleration
+      expression: >-
+        has(object.spec.tolerations) &&
+        object.spec.tolerations.exists(t, has(t.key) && t.key == 'timeslice.io/guest')
+    - name: guestLabel
+      expression: >-
+        'timeslice.io/guest' in variables.labels && variables.labels['timeslice.io/guest'] == 'true'
+    - name: isGuest
+      expression: >-
+        (variables.marker != 'label' && variables.guestToleration) ||
+        (variables.marker != 'toleration' && variables.guestLabel)
+    - name: isDonor
+      expression: >-
+        'timeslice.io/donor' in variables.labels && variables.labels['timeslice.io/donor'] == 'true'
+    - name: hasJobID
+      expression: >-
+        'timeslice.io/job-id' in variables.labels && variables.labels['timeslice.io/job-id'] != ''
+    - name: hasGroup
+      expression: >-
+        'timeslice.io/group' in variables.labels && variables.labels['timeslice.io/group'] != ''
+  validations:
+    - expression: >-
+        !variables.isGuest ||
+        !['timeslice.io/group', 'timeslice.io/job-id', 'timeslice.io/role'].exists(k, k in variables.labels)
+      message: >-
+        [W9] a guest pod must not carry the timeslice.io/group, timeslice.io/job-id or
+        timeslice.io/role label; the virtual-kubelet writes them on the mirror pod
+      reason: Forbidden
+    - expression: >-
+        !variables.isGuest || !has(object.spec.resourceClaims) || size(object.spec.resourceClaims) == 0
+      message: >-
+        [W2] a guest pod must not reference a ResourceClaim; request plain nvidia.com/gpu and the
+        virtual-kubelet puts the group's claim on the mirror pod
+      reason: Forbidden
+    - expression: >-
+        !('timeslice.io/role' in variables.labels) || variables.labels['timeslice.io/role'] != 'background'
+      message: >-
+        [W10] only the virtual-kubelet may create a pod with timeslice.io/role=background
+      reason: Forbidden
+    - expression: >-
+        !('timeslice.io/group' in variables.labels) || variables.hasJobID
+      message: >-
+        [W6] a pod with the timeslice.io/group label must also carry a non-empty timeslice.io/job-id label
+      reason: Invalid
+    - expression: >-
+        !variables.isDonor || (variables.hasJobID && variables.hasGroup)
+      message: >-
+        [R4] a donor pod (timeslice.io/donor=true) must carry both the timeslice.io/job-id and the
+        timeslice.io/group label; this policy does not derive them from ray.io/cluster and ray.io/group
+      reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: timeslice-pod-rules
+spec:
+  policyName: timeslice-pod-rules
+  validationActions: [Deny]
