@@ -352,8 +352,9 @@ enum Outcome {
   OUTCOME_SUSPENDED = 1;
   // The job had no process left; there was nothing to suspend.
   OUTCOME_RELEASED = 2;
-  // The job is thawed and restored.
-  OUTCOME_RESUMED = 3;
+  // A successful Resume reports no outcome; COMPLETE is the answer.
+  reserved 3;
+  reserved "OUTCOME_RESUMED";
   // Every process of the job was killed and the kill was confirmed.
   OUTCOME_KILLED = 4;
 }

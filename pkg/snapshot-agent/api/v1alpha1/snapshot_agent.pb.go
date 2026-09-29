@@ -194,8 +194,6 @@ const (
 	Outcome_OUTCOME_SUSPENDED Outcome = 1
 	// The job had no process left; there was nothing to suspend.
 	Outcome_OUTCOME_RELEASED Outcome = 2
-	// The job is thawed and restored.
-	Outcome_OUTCOME_RESUMED Outcome = 3
 	// Every process of the job was killed and the kill was confirmed.
 	Outcome_OUTCOME_KILLED Outcome = 4
 )
@@ -206,14 +204,12 @@ var (
 		0: "OUTCOME_UNSPECIFIED",
 		1: "OUTCOME_SUSPENDED",
 		2: "OUTCOME_RELEASED",
-		3: "OUTCOME_RESUMED",
 		4: "OUTCOME_KILLED",
 	}
 	Outcome_value = map[string]int32{
 		"OUTCOME_UNSPECIFIED": 0,
 		"OUTCOME_SUSPENDED":   1,
 		"OUTCOME_RELEASED":    2,
-		"OUTCOME_RESUMED":     3,
 		"OUTCOME_KILLED":      4,
 	}
 )
@@ -2635,13 +2631,12 @@ const file_snapshot_agent_proto_rawDesc = "" +
 	"\vSuspendMode\x12\x1c\n" +
 	"\x18SUSPEND_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14SUSPEND_MODE_OFFLOAD\x10\x01\x12\x18\n" +
-	"\x14SUSPEND_MODE_DISCARD\x10\x02*x\n" +
+	"\x14SUSPEND_MODE_DISCARD\x10\x02*z\n" +
 	"\aOutcome\x12\x17\n" +
 	"\x13OUTCOME_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11OUTCOME_SUSPENDED\x10\x01\x12\x14\n" +
-	"\x10OUTCOME_RELEASED\x10\x02\x12\x13\n" +
-	"\x0fOUTCOME_RESUMED\x10\x03\x12\x12\n" +
-	"\x0eOUTCOME_KILLED\x10\x04*\x8d\x02\n" +
+	"\x10OUTCOME_RELEASED\x10\x02\x12\x12\n" +
+	"\x0eOUTCOME_KILLED\x10\x04\"\x04\b\x03\x10\x03*\x0fOUTCOME_RESUMED*\x8d\x02\n" +
 	"\vErrorReason\x12\x1c\n" +
 	"\x18ERROR_REASON_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13DEADLINE_INFEASIBLE\x10\x01\x12\x15\n" +
