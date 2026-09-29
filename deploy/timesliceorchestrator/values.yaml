@@ -95,6 +95,21 @@ dispatchBudget:
   openDelay: "0s"
   externalRisingEdge: false
 
+# What happens when a guest Kill reaches the snapshot agent but is not
+# confirmed (the guest may still hold device memory). PENDING LEAD DECISION
+# D-NS-6.
+#   grant    (default, previous behaviour) hand the node back to the trainer at
+#            the end of the notice window with vram_unconfirmed = true.
+#   block    keep the trainer's Acquire waiting until the agent confirms the
+#            guest gone; the Kill is retried every second.
+#   escalate block, plus a graceful delete of the guest's mirror pod at step 1
+#            and marking the node not lendable at step 2. The chart then also
+#            grants "delete" on pods.
+# escalateAfter: the two steps, counted from the first unconfirmed Kill.
+unconfirmedKill:
+  mode: grant
+  escalateAfter: "10s,40s"
+
 resources: {}
   # limits:
   #   cpu: 100m

@@ -105,6 +105,9 @@ type flagValues struct {
 	retryMaxDelay            time.Duration
 	holderWaitRequeue        time.Duration
 	killPollInterval         time.Duration
+	unconfirmedKill          string
+	unconfirmedEscalateAfter string
+	escalateAfter            [2]time.Duration // parsed by validate
 	lockNamespace            string
 	lockConfigMap            string
 	watchNamespaces          string
@@ -151,6 +154,10 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 		"Re-reconcile delay while the lock holder waits for its job to be loaded; 0 disables it")
 	fs.DurationVar(&fv.killPollInterval, "kill-poll-interval", controller.DefaultKillPollInterval,
 		"How often a kill operation is polled")
+	fs.StringVar(&fv.unconfirmedKill, "unconfirmed-kill", controller.UnconfirmedKillGrant,
+		"What happens after an unconfirmed guest Kill: grant, block or escalate")
+	fs.StringVar(&fv.unconfirmedEscalateAfter, "unconfirmed-escalate-after", controller.DefaultEscalateAfterFlag,
+		"Escalation steps \"<step1>,<step2>\" after the first unconfirmed Kill")
 	fs.StringVar(&fv.lockNamespace, "lock-namespace", store.Namespace, "Namespace of the lock ConfigMap")
 	fs.StringVar(&fv.lockConfigMap, "lock-configmap", store.ConfigMapName, "Name of the lock ConfigMap")
 	fs.StringVar(&fv.watchNamespaces, "watch-namespaces", "", "Comma-separated namespaces whose pods are watched; empty watches all")
@@ -163,6 +170,14 @@ func (fv *flagValues) validate() error {
 	if err := controller.ValidateForegroundWait(fv.foregroundWait); err != nil {
 		return fmt.Errorf("--foreground-wait: %w", err)
 	}
+	if err := controller.ValidateUnconfirmedKill(fv.unconfirmedKill); err != nil {
+		return fmt.Errorf("--unconfirmed-kill: %w", err)
+	}
+	escalateAfter, err := controller.ParseEscalateAfter(fv.unconfirmedEscalateAfter)
+	if err != nil {
+		return fmt.Errorf("--unconfirmed-escalate-after: %w", err)
+	}
+	fv.escalateAfter = escalateAfter
 	if fv.foregroundOpTimeout < 0 {
 		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", fv.foregroundOpTimeout)
 	}
@@ -275,6 +290,9 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.NoticeWindow = fv.noticeWindow
 	ctrl.KillBudget = fv.killBudget
 	ctrl.BackgroundLiveness = fv.backgroundLiveness
+	ctrl.UnconfirmedKill = fv.unconfirmedKill
+	ctrl.EscalateAfter = fv.escalateAfter
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, scope.Namespaces)
 
 	informerFactories.Nodes.Start(ctx.Done())
 	for _, f := range informerFactories.Pods {

@@ -77,6 +77,11 @@ func (c *Controller) liveGuests(ctx context.Context, groupID string) (map[string
 			live[node] = true
 		}
 	}
+	// D-NS-6 block and escalate: a guest held after an unconfirmed Kill is
+	// live until the agent confirms it gone, even with its mirror pod gone.
+	for node := range c.heldNodes(groupID) {
+		live[node] = true
+	}
 	return live, nil
 }
 
@@ -176,6 +181,10 @@ func (c *Controller) grantIfVacant(ctx context.Context, group *store.Group, node
 	if unconfirmedKillOn(jobs, node) {
 		// D-NS-6 "keep": never lend a node again while a guest whose Kill was
 		// never confirmed may still be on it.
+		return false, nil
+	}
+	if c.nodeNotLendable(node) != "" {
+		// D-NS-6 escalate, step 2.
 		return false, nil
 	}
 	live, err := c.liveGuests(ctx, group.ID())
@@ -286,6 +295,11 @@ type delayedAdder interface {
 func (c *Controller) requeueDuringNotice(group *store.Group) {
 	noticeAt := group.Spec().NoticeAt()
 	retry, pending := c.nextKillRetry(group.ID())
+	// D-NS-6 block and escalate: wake up for the next "Grant blocked" line
+	// or escalation step of a held guest.
+	if wake, held := c.nextHoldWake(group.ID()); held && (!pending || wake < retry) {
+		retry, pending = wake, true
+	}
 	if noticeAt.IsZero() {
 		delay := time.Duration(0)
 		if group.Spec().BackgroundHeld() {

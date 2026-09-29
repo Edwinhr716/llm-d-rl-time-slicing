@@ -46,6 +46,8 @@ type killRecord struct {
 	reason      string
 	attempts    int
 	lastAttempt time.Time
+	// firstSent is when the first Kill attempt was sent.
+	firstSent time.Time
 	// reached is true once an attempt reached the agent (Kill returned an
 	// operation). It stays true when a later attempt cannot reach it.
 	reached bool
@@ -53,7 +55,11 @@ type killRecord struct {
 	// confirmed; signal says how (see unconfirmed_kill.go).
 	unconfirmed bool
 	signal      string
-	confirmed   bool
+	// counted is true once noteKillUnconfirmed ran for the guest, at
+	// unconfirmedSince (the first Kill seen unconfirmed).
+	counted          bool
+	unconfirmedSince time.Time
+	confirmed        bool
 	// handedBack is true once handBackUnconfirmed ran for the guest.
 	handedBack bool
 	// doneAt is when the Kill was confirmed or the node handed back.
@@ -152,6 +158,8 @@ func (c *Controller) reconcileKills(ctx context.Context, group *store.Group) err
 	if err != nil {
 		return fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
 	}
+	// D-NS-6 block and escalate: guests held after an unconfirmed Kill.
+	c.reconcileHolds(ctx, group, jobs, c.pastN(spec.NoticeAt()))
 	known := make(map[string]bool)
 	for _, job := range jobs {
 		if !job.Background() {
@@ -162,6 +170,7 @@ func (c *Controller) reconcileKills(ctx context.Context, group *store.Group) err
 			key := killKey(groupID, node, job.JobID())
 			known[key] = true
 			if guestVacated(job, states, node) || job.UnconfirmedKill(node) {
+				c.releaseHold(ctx, key, "agent-status")
 				continue
 			}
 			rec := c.killRecordFor(key)
@@ -188,14 +197,13 @@ func (c *Controller) reconcileKills(ctx context.Context, group *store.Group) err
 				c.killGuest(ctx, groupID, job, node, rec)
 			}
 			if job.Killed(node) {
+				c.releaseHold(ctx, key, "kill")
 				continue
 			}
 			if !rec.reached || !rec.unconfirmed {
 				continue
 			}
-			noticeAt = spec.NoticeAt()
-			pastN := !noticeAt.IsZero() && !time.Now().Before(noticeAt.Add(c.NoticeWindow))
-			if decision := c.onKillUnconfirmed(ctx, groupID, job, node, rec.signal, pastN); decision.grant {
+			if decision := c.onKillUnconfirmed(ctx, group, job, node, rec, c.pastN(spec.NoticeAt())); decision.grant {
 				c.handBackUnconfirmed(ctx, group, job, node, rec, decision.vramUnconfirmed)
 			}
 		}
@@ -211,8 +219,15 @@ func (c *Controller) killGuest(ctx context.Context, groupID string, job *store.J
 	deadline := start.Add(c.killBudget())
 	rec.lastAttempt = start
 	rec.attempts++
+	if rec.firstSent.IsZero() {
+		rec.firstSent = start
+	}
 	kctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	// The agent always gets the deadline K; how long this pass polls for
+	// the outcome may be shorter (killPollBound).
+	pctx, pcancel := context.WithDeadline(kctx, start.Add(c.killPollBound(rec)))
+	defer pcancel()
 
 	log := slog.With("group", groupID, "node", node, "job", job.JobID(), "reason", rec.reason, "attempt", rec.attempts)
 	log.InfoContext(ctx, "Kill sent", "deadline", deadline)
@@ -222,11 +237,12 @@ func (c *Controller) killGuest(ctx context.Context, groupID string, job *store.J
 		return
 	}
 	rec.reached = true
-	if signal, err := c.waitKillConfirmed(kctx, groupID, job.JobID(), node, resp.GetOperationId()); signal != "" {
+	if signal, err := c.waitKillConfirmed(pctx, groupID, job.JobID(), node, resp.GetOperationId()); signal != "" {
 		rec.unconfirmed = true
 		rec.signal = signal
 		log.WarnContext(ctx, "Kill not confirmed", "signal", signal,
 			"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+		c.noteKillUnconfirmed(ctx, groupID, job.JobID(), node, rec, err)
 		return
 	}
 	rec.unconfirmed = false
@@ -235,6 +251,13 @@ func (c *Controller) killGuest(ctx context.Context, groupID string, job *store.J
 	rec.confirmed = true
 	rec.doneAt = time.Now()
 	log.InfoContext(ctx, "Guest killed", "elapsed_ms", time.Since(start).Milliseconds())
+	slog.InfoContext(ctx, "Kill confirmed", "group", groupID, "node", node, "job", job.JobID(),
+		"elapsed_ms", time.Since(rec.firstSent).Milliseconds())
+}
+
+// pastN reports whether the notice that started at noticeAt has run past N.
+func (c *Controller) pastN(noticeAt time.Time) bool {
+	return !noticeAt.IsZero() && !time.Now().Before(noticeAt.Add(c.NoticeWindow))
 }
 
 func (c *Controller) killRecordFor(key string) *killRecord {
@@ -255,13 +278,14 @@ func (c *Controller) newKillRecord(key, reason string) *killRecord {
 }
 
 // pruneKills drops the records of the group's guests that are gone from the
-// job store (their mirror pod is gone).
+// job store (their mirror pod is gone), except those still held after an
+// unconfirmed Kill (D-NS-6 block and escalate).
 func (c *Controller) pruneKills(groupID string, known map[string]bool) {
 	prefix := groupID + "\x00"
 	c.killMu.Lock()
 	defer c.killMu.Unlock()
 	for key := range c.kills {
-		if strings.HasPrefix(key, prefix) && !known[key] {
+		if strings.HasPrefix(key, prefix) && !known[key] && c.holds[key] == nil {
 			delete(c.kills, key)
 		}
 	}

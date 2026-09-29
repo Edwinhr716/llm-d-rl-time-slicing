@@ -186,6 +186,18 @@ type Controller struct {
 	// killed.
 	BackgroundLiveness time.Duration
 
+	// UnconfirmedKill is what happens after a guest Kill that reached the
+	// agent is not confirmed (decision D-NS-6, --unconfirmed-kill): "grant"
+	// (the default, also for ""), "block" or "escalate". See
+	// unconfirmed_kill.go.
+	UnconfirmedKill string
+	// EscalateAfter holds the two escalation steps of "escalate", counted
+	// from the first unconfirmed Kill (--unconfirmed-escalate-after).
+	EscalateAfter [2]time.Duration
+	// Kube records Warning events and makes the escalation's pod deletes.
+	// Nil skips both.
+	Kube KubeActions
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
 
@@ -194,6 +206,10 @@ type Controller struct {
 
 	killMu sync.Mutex
 	kills  map[string]*killRecord
+	// holds and notLendable belong to the block and escalate options of
+	// D-NS-6 (unconfirmed_kill_block.go); guarded by killMu.
+	holds       map[string]*unconfirmedHold
+	notLendable map[string]string
 }
 
 // settleEntry remembers when a group's active job was first seen holding an
@@ -223,6 +239,8 @@ func NewController(
 		NoticeWindow:       defaultNoticeWindow,
 		KillBudget:         defaultKillBudget,
 		BackgroundLiveness: DefaultBackgroundLiveness,
+		UnconfirmedKill:    UnconfirmedKillGrant,
+		EscalateAfter:      DefaultEscalateAfter,
 		kills:              make(map[string]*killRecord),
 		settleSince:        make(map[string]settleEntry),
 		notices:            make(map[string]*noticeTrack),

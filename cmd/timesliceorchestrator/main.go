@@ -115,6 +115,15 @@ func run() error {
 			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
 	killPollInterval := flag.Duration("kill-poll-interval", controller.DefaultKillPollInterval,
 		"How often a kill operation is polled. PENDING LEAD DECISION.")
+	unconfirmedKill := flag.String("unconfirmed-kill", controller.UnconfirmedKillGrant,
+		"What happens when a guest Kill reaches the agent but is not confirmed. \"grant\" (the default) hands "+
+			"the node back at N with AcquireResponse.vram_unconfirmed = true. \"block\" keeps the foreground "+
+			"waiting until the agent confirms the guest gone, retrying the Kill every second. \"escalate\" is "+
+			"block plus a graceful delete of the mirror pod and then marking the node not lendable "+
+			"(--unconfirmed-escalate-after). PENDING LEAD DECISION D-NS-6.")
+	unconfirmedEscalateAfter := flag.String("unconfirmed-escalate-after", controller.DefaultEscalateAfterFlag,
+		"With --unconfirmed-kill=escalate, the two escalation steps as \"<step1>,<step2>\" after the first "+
+			"unconfirmed Kill: step 1 deletes the mirror pod gracefully, step 2 marks the node not lendable.")
 	lockNamespace := flag.String("lock-namespace", store.Namespace,
 		"Namespace of the ConfigMap that persists group lock holders. Give each orchestrator install in a "+
 			"cluster its own lock ConfigMap; two installs sharing one fight over the same groups.")
@@ -131,6 +140,13 @@ func run() error {
 
 	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {
 		return fmt.Errorf("--foreground-wait: %w", err)
+	}
+	if err := controller.ValidateUnconfirmedKill(*unconfirmedKill); err != nil {
+		return fmt.Errorf("--unconfirmed-kill: %w", err)
+	}
+	escalateAfter, err := controller.ParseEscalateAfter(*unconfirmedEscalateAfter)
+	if err != nil {
+		return fmt.Errorf("--unconfirmed-escalate-after: %w", err)
 	}
 	if *foregroundOpTimeout < 0 {
 		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", *foregroundOpTimeout)
@@ -226,6 +242,9 @@ func run() error {
 	ctrl.NoticeWindow = *noticeWindow
 	ctrl.KillBudget = *killBudget
 	ctrl.BackgroundLiveness = *backgroundLiveness
+	ctrl.UnconfirmedKill = *unconfirmedKill
+	ctrl.EscalateAfter = escalateAfter
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, scope.Namespaces)
 
 	// Start informers
 	informerFactories.Nodes.Start(ctx.Done())
@@ -271,6 +290,8 @@ func run() error {
 		"retryMaxDelay", *retryMaxDelay,
 		"holderWaitRequeue", *holderWaitRequeue,
 		"killPollInterval", *killPollInterval,
+		"unconfirmedKill", *unconfirmedKill,
+		"unconfirmedEscalateAfter", *unconfirmedEscalateAfter,
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,

@@ -281,7 +281,7 @@ func (s *Server) defaultCheckAcquire(
 		vramUnconfirmed := group.Spec().TakeVramUnconfirmed()
 		slog.InfoContext(ctx, "Acquire succeeded, job loaded and lock held")
 		slog.InfoContext(ctx, "Foreground granted", "group", groupID, "job", jobID,
-			"waited_ms", time.Since(startTime).Milliseconds(), "vramUnconfirmed", vramUnconfirmed)
+			"waited_ms", time.Since(startTime).Milliseconds(), "vram_unconfirmed", vramUnconfirmed)
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
 			Success:         true,

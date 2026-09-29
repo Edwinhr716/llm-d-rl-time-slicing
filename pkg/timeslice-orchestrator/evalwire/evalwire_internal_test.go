@@ -87,6 +87,13 @@ func TestEvalwire_FlagsMatchMain(t *testing.T) {
 	if fv.controllerWorkers != controller.DefaultWorkers {
 		t.Errorf("--controller-workers default = %d, want %d", fv.controllerWorkers, controller.DefaultWorkers)
 	}
+	if fv.unconfirmedKill != controller.UnconfirmedKillGrant {
+		t.Errorf("--unconfirmed-kill default = %q, want %q", fv.unconfirmedKill, controller.UnconfirmedKillGrant)
+	}
+	if fv.unconfirmedEscalateAfter != controller.DefaultEscalateAfterFlag {
+		t.Errorf("--unconfirmed-escalate-after default = %q, want %q",
+			fv.unconfirmedEscalateAfter, controller.DefaultEscalateAfterFlag)
+	}
 	if fv.killPollInterval != controller.DefaultKillPollInterval {
 		t.Errorf("--kill-poll-interval default = %v, want %v", fv.killPollInterval, controller.DefaultKillPollInterval)
 	}
@@ -101,6 +108,8 @@ func TestEvalwire_RejectsBadArgs(t *testing.T) {
 		{"--watch-namespaces=Bad_NS"},
 		{"--no-such-flag"},
 		{"--kill-budget=40s", "--notice-window=30s"},
+		{"--unconfirmed-kill=other"},
+		{"--unconfirmed-escalate-after=40s,10s"},
 		{"stray"},
 	} {
 		if orch, err := Start(context.Background(), Config{Clientset: cs, Args: args}); err == nil {
