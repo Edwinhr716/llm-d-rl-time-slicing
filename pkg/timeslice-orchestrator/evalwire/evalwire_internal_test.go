@@ -110,7 +110,6 @@ func TestEvalwire_FlagsMatchMain(t *testing.T) {
 func TestEvalwire_RejectsBadArgs(t *testing.T) {
 	cs := fake.NewClientset()
 	for _, args := range [][]string{
-		{"--foreground-wait=async"},
 		{"--foreground-wait=other"},
 		{"--foreground-op-timeout-action=other"},
 		{"--foreground-op-timeout-retries=-1"},
@@ -191,32 +190,40 @@ func checkMetrics(t *testing.T, addr string) {
 }
 
 func TestEvalwire_StartStopRestart(t *testing.T) {
-	const groupID = "g-eval"
-	cs := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{
-		Name:   "127.0.0.1",
-		Labels: map[string]string{infrastructure.NodeLabelPrefix + groupID: "true"},
-	}})
-	args := []string{
-		"--background-role=true",
-		"--min-bubble=1s",
-		"--background-liveness=3s",
-		"--lock-configmap=evalwire-locks",
-		"--foreground-wait=blocking",
-		"--controller-workers=4",
-		"--foreground-op-timeout=60s",
-		"--resync-period=30s",
-	}
+	for _, mode := range []string{
+		controller.ForegroundWaitBlocking,
+		controller.ForegroundWaitAsyncRequeue,
+		controller.ForegroundWaitAsync,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			const groupID = "g-eval"
+			cs := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name:   "127.0.0.1",
+				Labels: map[string]string{infrastructure.NodeLabelPrefix + groupID: "true"},
+			}})
+			args := []string{
+				"--background-role=true",
+				"--min-bubble=1s",
+				"--background-liveness=3s",
+				"--lock-configmap=evalwire-locks",
+				"--foreground-wait=" + mode,
+				"--controller-workers=4",
+				"--foreground-op-timeout=60s",
+				"--resync-period=30s",
+			}
 
-	// The second Start on the same clientset models an orchestrator restart.
-	for i := range 2 {
-		orch, err := Start(context.Background(), Config{Clientset: cs, AgentPort: 1, Args: args})
-		if err != nil {
-			t.Fatalf("Start #%d: %v", i+1, err)
-		}
-		waitForGroup(t, orch.Addr, groupID)
-		checkMetrics(t, orch.MetricsAddr)
-		orch.Stop()
-		orch.Stop() // idempotent
+			// The second Start on the same clientset models an orchestrator restart.
+			for i := range 2 {
+				orch, err := Start(context.Background(), Config{Clientset: cs, AgentPort: 1, Args: args})
+				if err != nil {
+					t.Fatalf("Start #%d: %v", i+1, err)
+				}
+				waitForGroup(t, orch.Addr, groupID)
+				checkMetrics(t, orch.MetricsAddr)
+				orch.Stop()
+				orch.Stop() // idempotent
+			}
+		})
 	}
 }
 

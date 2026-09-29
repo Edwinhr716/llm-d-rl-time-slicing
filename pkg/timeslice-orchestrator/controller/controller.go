@@ -41,27 +41,30 @@ const (
 
 // ForegroundWaitBlocking is option A for how reconcile waits on a foreground
 // snapshot or restore: it blocks on the agent operation, bounded by
-// Controller.ForegroundOpTimeout. It is the only mode implemented.
+// Controller.ForegroundOpTimeout. It is the default.
 //
-// PENDING LEAD DECISION (foreground wait, A or B): option B, which starts the
-// operation and checks it on a later requeue, is not implemented, and
-// ValidateForegroundWait refuses it until the lead decides.
+// PENDING LEAD DECISION D-ORCH-1 (foreground wait): this branch adds option B,
+// ForegroundWaitAsyncRequeue.
 const ForegroundWaitBlocking = "blocking"
 
-// ForegroundWaitAsync names option B. It is recognised only so that the
-// error can say why it is refused.
+// ForegroundWaitAsyncRequeue is option B (design section 6): reconcile starts
+// the foreground operation, keeps its ID in memory and checks it on a 1 s
+// requeue instead of blocking the worker. Acquire is unchanged and returns
+// once the operation has completed. See foreground_async.go.
+const ForegroundWaitAsyncRequeue = "async-requeue"
+
+// ForegroundWaitAsync is accepted as another name for
+// ForegroundWaitAsyncRequeue.
 const ForegroundWaitAsync = "async"
 
 // ValidateForegroundWait checks a --foreground-wait value.
 func ValidateForegroundWait(mode string) error {
 	switch mode {
-	case ForegroundWaitBlocking:
+	case ForegroundWaitBlocking, ForegroundWaitAsyncRequeue, ForegroundWaitAsync:
 		return nil
-	case ForegroundWaitAsync:
-		return fmt.Errorf("foreground wait %q (option B) is not implemented (PENDING LEAD DECISION); use %q",
-			mode, ForegroundWaitBlocking)
 	default:
-		return fmt.Errorf("unknown foreground wait %q: must be %q", mode, ForegroundWaitBlocking)
+		return fmt.Errorf("unknown foreground wait %q: must be %q or %q (alias %q)",
+			mode, ForegroundWaitBlocking, ForegroundWaitAsyncRequeue, ForegroundWaitAsync)
 	}
 }
 
@@ -171,6 +174,16 @@ type Controller struct {
 	// snapshot or restore operation. Zero leaves the wait bounded only by the
 	// context.
 	ForegroundOpTimeout time.Duration
+
+	// ForegroundWait selects how reconcile waits on a foreground operation:
+	// ForegroundWaitBlocking (default, also when empty) or
+	// ForegroundWaitAsyncRequeue. PENDING LEAD DECISION D-ORCH-1.
+	ForegroundWait string
+
+	// fgOps holds the in-flight foreground operations of the async mode,
+	// keyed by group and node. In memory only.
+	fgMu  sync.Mutex
+	fgOps map[string]*foregroundOp
 
 	// ForegroundOpTimeoutAction is what happens when a wait passes
 	// ForegroundOpTimeout: ForegroundOpTimeoutActionRetry (also when empty),
@@ -342,7 +355,15 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 
 		cycleCtx := logging.WithGroupID(ctx, groupID)
 
-		if err := c.reconcileGroup(cycleCtx, groupID); err != nil {
+		err := c.reconcileGroup(cycleCtx, groupID)
+		if errors.Is(err, errForegroundPending) {
+			// Async foreground wait: not a failure, check again shortly.
+			c.queue.Forget(groupID)
+			c.queue.AddAfter(groupID, foregroundCheckInterval)
+			slog.InfoContext(cycleCtx, "Foreground operation in flight, requeued", "after", foregroundCheckInterval)
+			return nil
+		}
+		if err != nil {
 			c.queue.AddRateLimited(groupID)
 			return fmt.Errorf("error syncing '%s': %s, requeuing", groupID, err.Error())
 		}
@@ -412,8 +433,21 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 	// 3. Act
 	// TODO: add optional fan out parallelism for node reconciliation
 	allGranted := true
-	for _, node := range group.Status().Nodes() {
+	nodes := group.Status().Nodes()
+	if c.asyncForeground() {
+		c.pruneForegroundOps(group.ID(), nodes)
+	}
+	pending := false
+	for _, node := range nodes {
 		if err := c.reconcileNode(ctx, group.ID(), node, activeJob); err != nil {
+			if errors.Is(err, errForegroundPending) {
+				// Async foreground wait: the other nodes still get their
+				// pass. A node with a foreground operation in flight is
+				// never lent.
+				pending = true
+				allGranted = false
+				continue
+			}
 			return fmt.Errorf("failed to reconcile node %s: %w", node, err)
 		}
 		if !lending {
@@ -429,13 +463,18 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		group.Spec().SetLend(false)
 	}
 
-	// 4. Update Status
-	if err := c.updateGroupStatus(ctx, group); err != nil {
+	// 4. Update Status. While any node has a foreground operation in flight
+	// (an outgoing snapshot or the incoming restore), no job counts as
+	// loaded, so Acquire cannot grant: fail closed (contract section 3).
+	if err := c.updateGroupStatus(ctx, group, pending); err != nil {
 		return fmt.Errorf("failed to update group status: %w", err)
 	}
 
 	metrics.QueueDepth.WithLabelValues(group.ID()).Set(float64(group.Snapshot().WaiterQueueDepth))
 
+	if pending {
+		return errForegroundPending
+	}
 	return nil
 }
 
@@ -466,31 +505,32 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 	ctx = logging.WithNodeName(ctx, nodeName)
 
 	// Never start an operation on a node while an earlier one that timed out
-	// may still be pending there.
-	if err := c.resumeTimedOutOp(ctx, groupID, nodeName); err != nil {
+	// may still be pending there. In async mode the in-flight record plays
+	// this role (checkForegroundOp), and nothing blocks.
+	if !c.asyncForeground() {
+		if err := c.resumeTimedOutOp(ctx, groupID, nodeName); err != nil {
+			return err
+		}
+	}
+
+	view, err := c.nodeJobStates(ctx, groupID, nodeName)
+	if err != nil {
 		return err
 	}
 
-	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
-	if err != nil {
-		return fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
+	// Foreground wait option B: check the node's in-flight operation first.
+	if c.asyncForeground() {
+		refreshed, err := c.checkForegroundOp(ctx, groupID, nodeName, view.states, view.timeoutFaulted)
+		if err != nil {
+			return err
+		}
+		if refreshed {
+			if view, err = c.nodeJobStates(ctx, groupID, nodeName); err != nil {
+				return err
+			}
+		}
 	}
-
-	timeoutFaulted := make(map[string]bool)
-	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
-	for _, job := range jobs {
-		if job.Background() {
-			continue
-		}
-		if _, ok := job.ForegroundTimeoutFault(nodeName); ok {
-			timeoutFaulted[job.JobID()] = true
-		}
-		state, ok := job.ContextState()[nodeName]
-		if !ok {
-			state = pb.SnapshotAgentJobState_STATE_UNSPECIFIED
-		}
-		agentJobStates[job.JobID()] = state
-	}
+	agentJobStates, timeoutFaulted := view.states, view.timeoutFaulted
 
 	slog.DebugContext(ctx, "Reconciling node", "activeJobID", activeJobID, "agentJobStates", agentJobStates)
 
@@ -534,6 +574,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 			resp, err := c.agentStore.Snapshot(ctx, nodeName, jobID, groupID)
 			if err != nil {
 				return fmt.Errorf("failed to trigger snapshot for job %s on node %s: %w", jobID, nodeName, err)
+			}
+			if c.asyncForeground() {
+				return c.startForegroundOp(ctx, groupID, jobID, nodeName, resp.OperationId, "snapshot")
 			}
 			if err := c.waitForOperation(ctx, groupID, jobID, nodeName, resp.OperationId, "snapshot"); err != nil {
 				if isForegroundOpTimeout(ctx, err) {
@@ -584,6 +627,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 		return fmt.Errorf("failed to trigger restore for active job %s on node %s: %w",
 			activeJobID, nodeName, err)
 	}
+	if c.asyncForeground() {
+		return c.startForegroundOp(ctx, groupID, activeJobID, nodeName, resp.OperationId, "restore")
+	}
 	if err := c.waitForOperation(ctx, groupID, activeJobID, nodeName, resp.OperationId, "restore"); err != nil {
 		if isForegroundOpTimeout(ctx, err) {
 			return c.onForegroundOpTimeout(ctx, groupID, nodeName, activeJobID, resp.OperationId, "restore", err)
@@ -596,6 +642,43 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 	}
 
 	return nil
+}
+
+// nodeJobs is what reconcileNode knows about the foreground jobs of a group on
+// one node.
+type nodeJobs struct {
+	// states is the last observed context state of each job (UNSPECIFIED
+	// where none was observed).
+	states map[string]pb.SnapshotAgentJobState_State
+	// timeoutFaulted holds the jobs marked FAULTED on the node by a
+	// foreground operation timeout.
+	timeoutFaulted map[string]bool
+}
+
+// nodeJobStates reads the foreground jobs of the group on the node from the
+// job store.
+func (c *Controller) nodeJobStates(ctx context.Context, groupID, nodeName string) (nodeJobs, error) {
+	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
+	if err != nil {
+		return nodeJobs{}, fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
+	}
+
+	timeoutFaulted := make(map[string]bool)
+	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
+	for _, job := range jobs {
+		if job.Background() {
+			continue
+		}
+		if _, ok := job.ForegroundTimeoutFault(nodeName); ok {
+			timeoutFaulted[job.JobID()] = true
+		}
+		state, ok := job.ContextState()[nodeName]
+		if !ok {
+			state = pb.SnapshotAgentJobState_STATE_UNSPECIFIED
+		}
+		agentJobStates[job.JobID()] = state
+	}
+	return nodeJobs{states: agentJobStates, timeoutFaulted: timeoutFaulted}, nil
 }
 
 // waitForGrantSettlement holds promotion of the next waiter while the current
@@ -711,7 +794,8 @@ func (c *Controller) tryDeduceActiveJob(ctx context.Context, group *store.Group)
 
 // isJobLoaded checks if a specific job is currently loaded on the nodes of the group.
 // A job J is considered loaded if, for every node N in the group, the job's state on N
-// is either STATE_RUNNING, or STATE_UNSPECIFIED/STATE_IDLE and no other job is running on N.
+// is either STATE_RUNNING, or STATE_UNSPECIFIED/STATE_IDLE and no other job is running or
+// TRANSITIONING on N.
 // STATE_IDLE means the job's pods exist but have not created an accelerator context yet
 // (pre-provisioned workloads, e.g. a Ray cluster deployed before the driver acquires the
 // lock); like STATE_UNSPECIFIED, there is nothing to restore, so the job is grantable.
@@ -743,6 +827,9 @@ func (c *Controller) isJobLoaded(ctx context.Context, group *store.Group, jobID 
 	// Map of node -> jobID of the job running on it.
 	// If multiple jobs are running on the same node, we error out.
 	nodeRunningJob := make(map[string]string)
+	// Map of node -> a job whose snapshot or restore is in progress on it. Its
+	// context may still be on the device, so the node is not free (fail closed).
+	nodeTransitioningJob := make(map[string]string)
 	for _, job := range jobs {
 		if job.Background() {
 			if job.JobID() == jobID {
@@ -751,6 +838,9 @@ func (c *Controller) isJobLoaded(ctx context.Context, group *store.Group, jobID 
 			continue
 		}
 		for node, state := range job.ContextState() {
+			if state == pb.SnapshotAgentJobState_STATE_TRANSITIONING && job.JobID() != jobID {
+				nodeTransitioningJob[node] = job.JobID()
+			}
 			if state == pb.SnapshotAgentJobState_STATE_RUNNING {
 				if current, ok := nodeRunningJob[node]; ok && current != job.JobID() {
 					return false, fmt.Errorf("impossible state: multiple jobs running on node %s: %s and %s", node, current, job.JobID())
@@ -791,6 +881,10 @@ func (c *Controller) isJobLoaded(ctx context.Context, group *store.Group, jobID 
 				// Another job is running on this node
 				return false, nil
 			}
+			if nodeTransitioningJob[node] != "" {
+				// Another job's snapshot or restore is still in progress here
+				return false, nil
+			}
 		default:
 			// STATE_SAVED, STATE_FAULTED, etc.
 			return false, nil
@@ -820,10 +914,15 @@ func determineGroupState(lockingJobID, activeJobID, loadedJobID string) pb.Group
 }
 
 // updateGroupStatus deduces the group status based on the current state and updates it in the store.
-func (c *Controller) updateGroupStatus(ctx context.Context, group *store.Group) error {
+// opInFlight is true while a node of the group has a foreground operation in
+// flight; the active job is then never reported loaded, whatever its own state.
+func (c *Controller) updateGroupStatus(ctx context.Context, group *store.Group, opInFlight bool) error {
 	activeJobID := group.Spec().ActiveJob()
 	activeJobLoaded := false
-	if activeJobID != "" {
+	if opInFlight && activeJobID != "" {
+		slog.DebugContext(ctx, "Foreground operation in flight, active job not reported loaded", "activeJobID", activeJobID)
+	}
+	if activeJobID != "" && !opInFlight {
 		var err error
 		activeJobLoaded, err = c.isJobLoaded(ctx, group, activeJobID)
 		if err != nil {
