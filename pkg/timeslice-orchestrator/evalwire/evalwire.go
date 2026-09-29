@@ -125,6 +125,7 @@ type flagValues struct {
 	retryBaseDelay           time.Duration
 	retryMaxDelay            time.Duration
 	holderWaitRequeue        time.Duration
+	settleTimeout            time.Duration
 	killPollInterval         time.Duration
 	maxServingOffwindow      time.Duration
 	lockNamespace            string
@@ -190,6 +191,8 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.DurationVar(&fv.retryBaseDelay, "retry-base-delay", 1*time.Second, "First retry delay after a failed reconcile")
 	fs.DurationVar(&fv.retryMaxDelay, "retry-max-delay", 30*time.Second, "Cap on the retry delay")
 	fs.DurationVar(&fv.holderWaitRequeue, "holder-wait-requeue", 1*time.Second, "Requeue while the lock holder is not loaded")
+	fs.DurationVar(&fv.settleTimeout, "settle-timeout", controller.DefaultSettleTimeout,
+		"Bound on the hold behind another job's unconsumed grant")
 	fs.DurationVar(&fv.killPollInterval, "kill-poll-interval", controller.DefaultKillPollInterval, "How often a kill operation is polled")
 	fs.DurationVar(&fv.maxServingOffwindow, "max-serving-offwindow", controller.DefaultMaxServingOffwindow,
 		"Alert threshold on a guest's off-window; 0 disables the alert")
@@ -352,6 +355,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	)
 	ctrl.ResyncPeriod = fv.resyncPeriod
 	ctrl.HolderWaitRequeue = fv.holderWaitRequeue
+	ctrl.SettleTimeout = fv.settleTimeout
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
 	ctrl.ForegroundOpTimeoutAction = fv.foregroundOpTimeoutAct
 	ctrl.ForegroundOpTimeoutRetries = fv.foregroundOpTimeoutRetry
@@ -422,6 +426,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"retryBaseDelay", fv.retryBaseDelay,
 		"retryMaxDelay", fv.retryMaxDelay,
 		"holderWaitRequeue", fv.holderWaitRequeue,
+		"settleTimeout", fv.settleTimeout,
 		"killPollInterval", fv.killPollInterval,
 		"maxServingOffwindow", fv.maxServingOffwindow,
 		"lockConfigMap", lockStore.ConfigMapRef(),

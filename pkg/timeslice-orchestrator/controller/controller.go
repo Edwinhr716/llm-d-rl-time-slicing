@@ -29,6 +29,10 @@ const (
 	// operation. PENDING LEAD DECISION (Q13).
 	DefaultKillPollInterval = 100 * time.Millisecond
 
+	// DefaultSettleTimeout bounds the hold on the next waiter while the active
+	// job's grant is unconsumed. See waitForGrantSettlement.
+	DefaultSettleTimeout = 30 * time.Second
+
 	// rateLimiterQPS and rateLimiterBurst are the overall bucket that
 	// client-go's default controller rate limiter also applies.
 	rateLimiterQPS   = 10
@@ -254,7 +258,7 @@ func NewController(
 		infraOrchestrator:   infraOrchestrator,
 		agentStore:          agentStore,
 		ResyncPeriod:        30 * time.Second,
-		SettleTimeout:       30 * time.Second,
+		SettleTimeout:       DefaultSettleTimeout,
 		KillPollInterval:    DefaultKillPollInterval,
 		MaxServingOffwindow: DefaultMaxServingOffwindow,
 		settleSince:         make(map[string]settleEntry),
@@ -609,6 +613,13 @@ func (c *Controller) waitForGrantSettlement(ctx context.Context, group *store.Gr
 	active := group.Spec().ActiveJob()
 	// No hold unless a promotion is actually pending behind an active job.
 	if active == "" || group.Spec().LockingJob() != "" || group.Spec().GetWaitingJobQueue().Len() == 0 {
+		c.clearSettle(groupID)
+		return nil
+	}
+	// The next waiter is the active job itself: it asks again before its engine was seen on
+	// the accelerator. Its grant is its own, so there is nothing to wait for; holding would
+	// make it wait on itself for SettleTimeout. Another job at the head is still held.
+	if next, ok := group.Spec().GetWaitingJobQueue().Peek(); ok && next == active {
 		c.clearSettle(groupID)
 		return nil
 	}

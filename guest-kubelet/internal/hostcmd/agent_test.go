@@ -86,8 +86,11 @@ func (a *hostBoundAgent) SuspendAll(_ context.Context, epoch int64, _ time.Time)
 	return a.result(a.host), nil
 }
 
-func (a *hostBoundAgent) ResumeAll(_ context.Context, epoch int64, _ time.Time) (*hostcmd.AgentResult, error) {
+func (a *hostBoundAgent) ResumeAll(ctx context.Context, epoch int64, _ time.Time) (*hostcmd.AgentResult, error) {
 	a.ev.add("ResumeAll %d", epoch)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if a.callErr != nil {
 		return nil, a.callErr
 	}

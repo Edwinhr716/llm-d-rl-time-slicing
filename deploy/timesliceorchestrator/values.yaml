@@ -110,6 +110,20 @@ dispatchBudget:
 # orchestrator default (4m); "0s" turns the alert off.
 maxServingOffwindow: ""
 
+# Host commands (D-NS-4 ns-push-vk, flag --host-command-port): the port of the
+# guest-kubelet host-command endpoint on every host of a group. A foreground
+# Acquire then commands each host to vacate by T and a lend commands it to
+# resume. 0 (default) = off: no flag is rendered and nothing changes. Each
+# guest-kubelet must list this orchestrator's pod IP (or its CIDR) in its
+# --host-command-allow; see guest-kubelet/deploy/daemonset.yaml.
+hostCommand:
+  port: 0
+
+# Bound on how long promotion of the next waiter is held while another job's
+# grant is unconsumed (granted, never seen on the accelerator); flag
+# --settle-timeout. "" = the orchestrator default (30s).
+settleTimeout: ""
+
 # Extra orchestrator flags, passed as is after the ones above, e.g.
 #   extraArgs: ["--background-role=true", "--min-bubble=30s"]
 extraArgs: []

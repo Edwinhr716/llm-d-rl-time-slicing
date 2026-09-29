@@ -182,7 +182,13 @@ time-slicing metrics on the metrics port (8080, `/metrics`):
   until it acked.
 
 
-The host metrics need `--host-command-port`.
+The host metrics need `--host-command-port` (value `hostCommand.port`, default
+0 = off). Each guest-kubelet must then allow this orchestrator in its
+`--host-command-allow`.
+
+`--settle-timeout` (value `settleTimeout`, default 30s) bounds how long the
+next waiter is held behind another job's unconsumed grant. A job that asks
+again while it holds the unconsumed grant itself is not held.
 
 `--max-serving-offwindow` (value `maxServingOffwindow`, default 4m) is an
 alert threshold, not a limit: past it the orchestrator logs

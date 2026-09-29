@@ -81,12 +81,13 @@ type Config struct {
 	// command acts before: a vacate right after a start must not miss a guest.
 	Ready <-chan struct{}
 
-	VacateMargin  time.Duration // taken off the vacate deadline for the ack's way back (250 ms)
-	ResumeBudget  time.Duration // bound on each guest's Freezer.Resume (30 s)
-	KillTimeout   time.Duration // bound on the kill sequence of one guest (30 s)
-	ServeInterval time.Duration // while lent, how often guests are looked at again (1 s)
-	PollInterval  time.Duration // how often a Resume looks for an engine that serves (200 ms)
-	ReplyMargin   time.Duration // an unfinished command is answered this long before the caller's RPC deadline (250 ms)
+	VacateMargin      time.Duration // taken off the vacate deadline for the ack's way back (250 ms)
+	ResumeBudget      time.Duration // bound on each guest's Freezer.Resume; see also resumeDeadline (30 s)
+	EngineStartBudget time.Duration // how long past its deadline a Resume waits for a starting engine (ResumeBudget)
+	KillTimeout       time.Duration // bound on the kill sequence of one guest (30 s)
+	ServeInterval     time.Duration // while lent, how often guests are looked at again (1 s)
+	PollInterval      time.Duration // how often a Resume looks for an engine that serves (200 ms)
+	ReplyMargin       time.Duration // an unfinished command is answered this long before the caller's RPC deadline (250 ms)
 }
 
 func (c *Config) defaults() {
@@ -97,6 +98,7 @@ func (c *Config) defaults() {
 	}
 	set(&c.VacateMargin, 250*time.Millisecond)
 	set(&c.ResumeBudget, 30*time.Second)
+	set(&c.EngineStartBudget, c.ResumeBudget)
 	set(&c.KillTimeout, 30*time.Second)
 	set(&c.ServeInterval, time.Second)
 	set(&c.PollInterval, 200*time.Millisecond)
@@ -157,6 +159,9 @@ type Server struct {
 
 	stateMu  sync.Mutex
 	released map[types.UID]bool // Ready released by this process (or restored as released)
+	// served holds the mirrors (by UID) whose engine served at least once in this process. A
+	// mirror that never served has no accelerator state worth a snapshot: a vacate deletes it.
+	served map[types.UID]bool
 }
 
 // New returns a server whose detached work lives until ctx ends.
@@ -168,7 +173,7 @@ func New(ctx context.Context, config *Config) (*Server, error) {
 	cfg.defaults()
 	return &Server{
 		cfg: cfg, ctx: ctx, nudge: make(chan struct{}, 1),
-		released: map[types.UID]bool{},
+		released: map[types.UID]bool{}, served: map[types.UID]bool{},
 	}, nil
 }
 
@@ -347,12 +352,24 @@ func (s *Server) startLending(op *operation) {
 	}()
 }
 
+// resumeDeadline is the deadline a Resume run works to: the caller's, but at least ResumeBudget
+// from now. The orchestrator retries a Resume that is not RESUMED with the same epoch and the
+// same deadline; a re-run after that deadline would otherwise fail at once on every API call
+// (and an agent ResumeAll with an expired deadline would get suspended guests killed).
+func (s *Server) resumeDeadline(deadline time.Time) time.Time {
+	if least := time.Now().Add(s.cfg.ResumeBudget); deadline.Before(least) {
+		return least
+	}
+	return deadline
+}
+
 // run carries out one command on every guest in parallel and records the outcome.
 func (s *Server) run(ctx context.Context, op *operation, deadline time.Time) {
 	defer close(op.done)
 	logger := log.G(ctx).WithField("command", op.command.String()).WithField("epoch", op.epoch)
 	start := time.Now()
 	if op.command == hcpb.Command_COMMAND_RESUME {
+		deadline = s.resumeDeadline(deadline)
 		// Lend once the command's own pass is over (before done is closed, so a vacate that
 		// supersedes it stops the serve loop), whatever the outcome: the orchestrator treats
 		// the node as lent from the Resume on.

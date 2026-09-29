@@ -128,7 +128,10 @@ func (h *fakeHost) ConfirmNotReady(_ context.Context, guest *corev1.Pod) error {
 	return nil
 }
 
-func (h *fakeHost) MirrorNow(_ context.Context, guest *corev1.Pod) (*corev1.Pod, bool, error) {
+func (h *fakeHost) MirrorNow(ctx context.Context, guest *corev1.Pod) (*corev1.Pod, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err // as client-go does: its rate limiter refuses an expired context
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	m := h.guests[guest.Name].Mirror

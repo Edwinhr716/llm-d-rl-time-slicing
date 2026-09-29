@@ -5,10 +5,10 @@ import (
 	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
-	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 // Startup and shutdown log lines for pending lead decision D-NS-11 (option keep: Deployment;
@@ -50,9 +50,15 @@ func lookupController(ctx context.Context, client kubernetes.Interface, namespac
 // started is the VK that logStart announced, for logStop. main and run share one goroutine.
 var started struct{ host, node string }
 
-// vkClient is run's API client. It also writes the "vk starting" line.
+// vkClient is run's API client, with the --kube-api-qps and --kube-api-burst rate limit. It
+// also writes the "vk starting" line.
 func vkClient(ctx context.Context, o *options) (*kubernetes.Clientset, error) {
-	client, err := nodeutil.ClientsetFromEnv(o.kubeconfig)
+	cfg, err := restConfig(o.kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	withRateLimit(cfg, o.kubeAPIQPS, o.kubeAPIBurst)
+	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -77,4 +83,17 @@ func logStop(ctx context.Context) {
 	}
 	log.G(context.WithoutCancel(ctx)).WithField("host", started.host).WithField("node", started.node).
 		WithField("deregister", false).Info("vk stopping; the virtual Node is left registered")
+}
+
+// withRateLimit sets the client-side rate limit; zero or less keeps client-go's default (5 QPS,
+// burst 10). At the default, a Resume that creates mirrors and reads donor pods while the
+// informers and status updates also call the API waits in the limiter until its context ends
+// ("client rate limiter Wait returned an error").
+func withRateLimit(cfg *rest.Config, qps float64, burst int) {
+	if qps > 0 {
+		cfg.QPS = float32(qps)
+	}
+	if burst > 0 {
+		cfg.Burst = burst
+	}
 }

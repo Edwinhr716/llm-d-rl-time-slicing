@@ -40,6 +40,36 @@ func (s *Server) setReleased(uid types.UID, released bool) {
 	}
 }
 
+// markServed records that the mirror's engine served; forgetServed drops a mirror that is gone.
+func (s *Server) markServed(mir *corev1.Pod) {
+	if mir == nil {
+		return
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.served[mir.UID] = true
+}
+
+func (s *Server) forgetServed(mir *corev1.Pod) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	delete(s.served, mir.UID)
+}
+
+// neverServed reports whether a running, not suspended mirror has not served yet: its Ready
+// was never released by this process and its engine does not serve now. Its process may have
+// initialized the accelerator without a context the agent can checkpoint and verify (an engine
+// that is still loading), so a vacate deletes it instead of suspending it; the guest stays
+// Pending and starts again on the next Resume.
+func (s *Server) neverServed(pod, mir *corev1.Pod) bool {
+	if suspendState(mir) != "" || s.isReleased(pod.UID) || s.cfg.EngineReady(pod, mir) {
+		return false
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return !s.served[mir.UID]
+}
+
 // suspendState is the guest's suspend state as recorded on its mirror: "" (running),
 // Suspending, Suspended or Resuming. The mirror is the record, so it survives a restart.
 func suspendState(m *corev1.Pod) string {
@@ -168,6 +198,7 @@ func (s *Server) waitGone(ctx, dctx context.Context, pod, mir *corev1.Pod, why s
 		return s.kill(ctx, pod, mir, "mirror not gone by the deadline")
 	}
 	s.setReleased(pod.UID, false)
+	s.forgetServed(mir)
 	log.G(ctx).WithField("guest", pod.Namespace+"/"+pod.Name).WithField("why", why).
 		WithField("took", time.Since(start).String()).Info("host command: mirror gone")
 	return nil
@@ -196,6 +227,7 @@ func (s *Server) kill(ctx context.Context, pod, mir *corev1.Pod, reason string) 
 	if err := s.cfg.Host.WaitMirrorGone(kctx, mir); err != nil {
 		return fmt.Errorf("%s; killed mirror not gone: %w", reason, err)
 	}
+	s.forgetServed(mir)
 	logger.Warn("host command: guest killed")
 	return nil
 }
@@ -214,7 +246,7 @@ func (s *Server) resumeGuest(ctx context.Context, guest mirror.Guest, deadline t
 	if err := s.startGuest(dctx, guest); err != nil {
 		return err
 	}
-	return s.waitReady(dctx, pod)
+	return s.waitServing(ctx, pod, deadline)
 }
 
 // startGuest makes the guest's mirror run: create it, or resume it if this process
@@ -296,6 +328,17 @@ func (s *Server) resumeMirror(ctx context.Context, pod, mir *corev1.Pod) error {
 	return nil
 }
 
+// waitServing waits for the guest's engine to serve, up to EngineStartBudget past the deadline:
+// an engine that starts cold (a new mirror: image pull, model load) can take minutes, and a
+// Resume that fails only because the engine is still loading makes the orchestrator retry it for
+// nothing. The wait still ends at once when the mirror ends (nothing to wait for) or a newer
+// command aborts it.
+func (s *Server) waitServing(ctx context.Context, pod *corev1.Pod, deadline time.Time) error {
+	wctx, cancel := context.WithDeadline(ctx, deadline.Add(s.cfg.EngineStartBudget))
+	defer cancel()
+	return s.waitReady(wctx, pod)
+}
+
 // waitReady releases the guest's Ready once its engine serves, or fails at ctx's end.
 func (s *Server) waitReady(ctx context.Context, pod *corev1.Pod) error {
 	tick := time.NewTicker(s.cfg.PollInterval)
@@ -335,6 +378,7 @@ func (s *Server) releaseIfReady(pod *corev1.Pod) (bool, error) {
 		}
 		s.cfg.Host.ReleaseReady(g.Pod)
 		s.setReleased(pod.UID, true)
+		s.markServed(g.Mirror)
 		log.G(s.ctx).WithField("guest", pod.Namespace+"/"+pod.Name).Info("host command: guest Ready")
 		return true, nil
 	}

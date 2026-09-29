@@ -160,6 +160,7 @@ func (s *Server) Restore(ctx context.Context, rec *Record, guests []mirror.Guest
 		case lent && guestLive(guest.Pod) && podReady(guest.Pod) && guest.Mirror.Status.Phase == corev1.PodRunning:
 			gates.RestoreGate(guest.Pod, true, "")
 			s.setReleased(guest.Pod.UID, true)
+			s.markServed(guest.Mirror)
 			out.Released++
 		}
 	}

@@ -56,6 +56,14 @@ spec:
             # Test hooks (M2: force a guest's readiness, read its Ready edges; M3: suspend and
             # resume by hand); loopback only.
             - --debug-addr=127.0.0.1:10261
+            # D-NS-4 ns-push-vk host commands, off by default. To turn them on, uncomment and set
+            # the port the orchestrator uses (its --host-command-port) and the allow-list: the
+            # orchestrator pod IPs or CIDRs allowed to send commands (empty allows every caller).
+            # --freezer=agent suspends through the node's snapshot agent at --snapshot-agent-port.
+            # - --host-command-port=9112
+            # - --host-command-allow=10.0.0.0/8
+            # - --freezer=agent
+            # - --snapshot-agent-port=9101
           env:
             - name: HOST_IP
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}

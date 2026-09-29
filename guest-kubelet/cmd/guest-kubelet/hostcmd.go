@@ -110,16 +110,17 @@ func (w *hostCommandWiring) build(
 	}
 	w.journal = &provider.NodeJournal{Nodes: nodes, Name: w.o.nodeName}
 	cfg := &hostcmd.Config{
-		Node:         w.o.hostNode,
-		Group:        func() (string, bool) { return resolver.Current().Group() },
-		Host:         backend,
-		IsGuest:      provider.MatchesGuest,
-		EngineReady:  backend.EngineReady,
-		VacateMargin: w.o.vacateMargin,
-		ResumeBudget: w.o.resumeBudget,
-		KillTimeout:  w.o.killTimeout,
-		Journal:      w.journal,
-		Ready:        w.readyCh,
+		Node:              w.o.hostNode,
+		Group:             func() (string, bool) { return resolver.Current().Group() },
+		Host:              backend,
+		IsGuest:           provider.MatchesGuest,
+		EngineReady:       backend.EngineReady,
+		VacateMargin:      w.o.vacateMargin,
+		ResumeBudget:      w.o.resumeBudget,
+		EngineStartBudget: w.o.engineStart,
+		KillTimeout:       w.o.killTimeout,
+		Journal:           w.journal,
+		Ready:             w.readyCh,
 	}
 	switch w.o.freezer {
 	case freezerAgent:

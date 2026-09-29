@@ -64,6 +64,7 @@ func parallel(items []*agentGuest, fn func(*agentGuest)) {
 // agentVacate: per guest, NotReady and confirm it (the agent does not) and write the epoch on
 // the mirror; then one SuspendAll with the host command epoch; then kill each guest the agent
 // did not suspend. A guest is vacated when it is suspended (or released) or its mirror is gone.
+// A guest whose engine never served is deleted instead of suspended (see neverServed).
 func (s *Server) agentVacate(ctx context.Context, epoch int64, deadline time.Time, items []*agentGuest) {
 	dctx, cancel := context.WithDeadline(ctx, deadline.Add(-s.cfg.VacateMargin))
 	defer cancel()
@@ -96,6 +97,12 @@ func (s *Server) agentVacate(ctx context.Context, epoch int64, deadline time.Tim
 		}
 		if err := s.cfg.Host.ConfirmNotReady(dctx, pod); err != nil {
 			it.finish(s.killUnlessAborted(ctx, pod, mir, err, "NotReady not confirmed by the deadline"))
+			return
+		}
+		if s.neverServed(pod, mir) {
+			// Not suspended: the agent would checkpoint a half-started engine and fail to verify
+			// it on the next ResumeAll (VERIFY_FAILED, then a kill loop).
+			it.finish(s.vacateByDelete(ctx, dctx, pod, mir, "engine never served; deleted, not suspended"))
 			return
 		}
 		upd, _, err := s.cfg.Host.SetMirrorSuspendState(dctx, mir, next, epoch)
@@ -139,7 +146,9 @@ func (s *Server) agentResume(ctx context.Context, epoch int64, deadline time.Tim
 			it.finish(nil)
 			return
 		}
-		mir, found, err := s.cfg.Host.MirrorNow(dctx, it.pod)
+		rctx, rcancel := context.WithTimeout(ctx, s.cfg.KillTimeout)
+		mir, found, err := s.cfg.Host.MirrorNow(rctx, it.pod)
+		rcancel()
 		switch {
 		case err != nil:
 			it.finish(fmt.Errorf("read mirror: %w", err))
@@ -187,7 +196,7 @@ func (s *Server) agentResume(ctx context.Context, epoch int64, deadline time.Tim
 	parallel(items, func(it *agentGuest) {
 		err := s.startGuest(dctx, mirror.Guest{Pod: it.pod})
 		if err == nil {
-			err = s.waitReady(dctx, it.pod)
+			err = s.waitServing(ctx, it.pod, deadline)
 		}
 		it.finish(err)
 	})

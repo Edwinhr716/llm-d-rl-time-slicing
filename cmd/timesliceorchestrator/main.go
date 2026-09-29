@@ -143,6 +143,9 @@ func run() error {
 	holderWaitRequeue := flag.Duration("holder-wait-requeue", 1*time.Second,
 		"Re-reconcile a group this long after a pass that ends with the lock holder not yet loaded, so an "+
 			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
+	settleTimeout := flag.Duration("settle-timeout", controller.DefaultSettleTimeout,
+		"Bound on how long promotion of the next waiter is held while another job's grant is unconsumed "+
+			"(granted, never seen on the accelerator). PENDING LEAD DECISION.")
 	killPollInterval := flag.Duration("kill-poll-interval", controller.DefaultKillPollInterval,
 		"How often a kill operation is polled. PENDING LEAD DECISION.")
 	maxServingOffwindow := flag.Duration("max-serving-offwindow", controller.DefaultMaxServingOffwindow,
@@ -305,6 +308,7 @@ func run() error {
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
 	ctrl.HolderWaitRequeue = *holderWaitRequeue
+	ctrl.SettleTimeout = *settleTimeout
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 	ctrl.ForegroundOpTimeoutAction = *foregroundOpTimeoutAction
 	ctrl.ForegroundOpTimeoutRetries = *foregroundOpTimeoutRetries

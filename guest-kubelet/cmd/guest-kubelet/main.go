@@ -56,6 +56,10 @@ type options struct {
 	kubeconfig                                 string
 	workers                                    int
 
+	// Client-side rate limit of the VK's API client.
+	kubeAPIQPS   float64
+	kubeAPIBurst int
+
 	// Guest CPU/RAM budget (PENDING LEAD DECISION D-NS-9)
 	guestBudget                      string
 	budgetMarginCPU, budgetMarginMem string
@@ -127,6 +131,7 @@ type options struct {
 	hcAgentPort      int
 	vacateMargin     time.Duration
 	resumeBudget     time.Duration
+	engineStart      time.Duration
 	killTimeout      time.Duration
 	fakeSuspendDelay time.Duration
 	fakeResumeDelay  time.Duration
@@ -167,6 +172,9 @@ func main() {
 	flag.DurationVar(&o.budgetRefresh, "budget-refresh", 30*time.Second, "computed budget: recompute interval (0 = once at start)")
 	flag.StringVar(&o.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "kubeconfig path; empty means in-cluster")
 	flag.IntVar(&o.workers, "workers", 4, "pod sync workers")
+	flag.Float64Var(&o.kubeAPIQPS, "kube-api-qps", 50,
+		"client-side QPS limit of the API client (client-go's default of 5 starves host commands of API calls)")
+	flag.IntVar(&o.kubeAPIBurst, "kube-api-burst", 100, "client-side burst of the API client (client-go default 10)")
 
 	flag.StringVar(&o.cpuHeadroom, "mirror-cpu-headroom", "1", "cap on each mirror container's cpu request (0 = no cap)")
 	flag.StringVar(&o.memHeadroom, "mirror-memory-headroom", "4Gi", "cap on each mirror container's memory request (0 = no cap)")
@@ -211,7 +219,11 @@ func main() {
 		"--freezer=agent: snapshot-agent host:port; empty means --host-ip:--snapshot-agent-port")
 	flag.IntVar(&o.hcAgentPort, "snapshot-agent-port", 9001, "--freezer=agent: snapshot-agent port on the real node")
 	flag.DurationVar(&o.vacateMargin, "vacate-margin", 250*time.Millisecond, "taken off each Vacate deadline for the ack's way back")
-	flag.DurationVar(&o.resumeBudget, "resume-budget", 30*time.Second, "bound on each guest Resume (--freezer=fake)")
+	flag.DurationVar(&o.resumeBudget, "resume-budget", 30*time.Second,
+		"bound on each guest Resume; also the least time a host-command Resume run gets")
+	flag.DurationVar(&o.engineStart, "engine-start-budget", 10*time.Minute,
+		"how long past its deadline a host-command Resume waits for a starting engine (a cold start: image pull, "+
+			"model load) before it fails; the wait ends earlier when the mirror ends or a newer command comes")
 	flag.DurationVar(&o.killTimeout, "kill-timeout", 30*time.Second, "bound on the kill sequence of one guest")
 	flag.DurationVar(&o.fakeSuspendDelay, "fake-freezer-suspend-delay", 12500*time.Millisecond,
 		"--freezer=fake: time a Suspend takes")

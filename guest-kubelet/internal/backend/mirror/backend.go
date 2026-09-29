@@ -468,15 +468,15 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	mirrorPod, err := b.client.CoreV1().Pods(guest.Namespace).Create(ctx, want, metav1.CreateOptions{})
 	switch {
 	case err == nil:
-		if cfg.Background && !b.opts.Gated {
-			b.mu.Lock()
-			b.attempts[guest.UID]++ // a mirror created again for this guest gets a new job id
-			b.mu.Unlock()
-		}
-		logger.WithField("mirrorUID", mirrorPod.UID).WithField("job", mirrorPod.Labels[LabelJobID]).Info("mirror created")
-		logResources(logger, ResourceSummary(guest, mirrorPod))
+		b.created(logger, guest, mirrorPod, cfg.Background)
 	case apierrors.IsAlreadyExists(err):
-		if mirrorPod, err = b.adoptOrReplace(ctx, guest, want); err != nil {
+		mirrorPod, err = b.adoptOrReplace(ctx, guest, want)
+		if apierrors.IsNotFound(err) {
+			// The clashing mirror was gone by the time it was read (a delete that just
+			// finished, for example a vacate's): create again, once.
+			mirrorPod, err = b.createAgain(ctx, logger, guest, want, cfg.Background)
+		}
+		if err != nil {
 			return err
 		}
 	default:
@@ -493,6 +493,30 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	}
 	b.emit(b.translate(guest, mirrorPod))
 	return nil
+}
+
+// created counts a new mirror's attempt (a mirror created again for this guest gets a new job id)
+// and logs it.
+func (b *Backend) created(logger log.Logger, guest, mirrorPod *corev1.Pod, background bool) {
+	if background && !b.opts.Gated {
+		b.mu.Lock()
+		b.attempts[guest.UID]++
+		b.mu.Unlock()
+	}
+	logger.WithField("mirrorUID", mirrorPod.UID).WithField("job", mirrorPod.Labels[LabelJobID]).Info("mirror created")
+	logResources(logger, ResourceSummary(guest, mirrorPod))
+}
+
+// createAgain is the one retry of a create whose name clash was gone by the time it was read.
+func (b *Backend) createAgain(
+	ctx context.Context, logger log.Logger, guest, want *corev1.Pod, background bool,
+) (*corev1.Pod, error) {
+	mirrorPod, err := b.client.CoreV1().Pods(guest.Namespace).Create(ctx, want, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("create mirror again: %w", err)
+	}
+	b.created(logger, guest, mirrorPod, background)
+	return mirrorPod, nil
 }
 
 // logResources is the "mirror resources" line: what the mirror requests and whether the

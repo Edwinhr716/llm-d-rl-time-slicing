@@ -53,6 +53,12 @@ spec:
             {{- with .Values.maxServingOffwindow }}
             - "--max-serving-offwindow={{ . }}"
             {{- end }}
+            {{- with .Values.hostCommand.port }}
+            - "--host-command-port={{ . }}"
+            {{- end }}
+            {{- with .Values.settleTimeout }}
+            - "--settle-timeout={{ . }}"
+            {{- end }}
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}
