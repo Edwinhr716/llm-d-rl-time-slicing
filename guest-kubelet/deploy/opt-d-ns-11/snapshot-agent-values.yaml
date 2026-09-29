@@ -1,0 +1,7 @@
+# Pending lead decision D-NS-11, option ns-ds: values overlay for the deploy/snapshot-agent chart,
+# so the agent DaemonSet runs only on nodes labelled timeslice.io/donor=true, next to the guest
+# kubelet DaemonSet (deploy/daemonset.yaml). Tolerations are the chart defaults, unchanged.
+#   helm install snapshot-agent deploy/snapshot-agent \
+#     -f guest-kubelet/deploy/opt-d-ns-11/snapshot-agent-values.yaml
+nodeSelector:
+  timeslice.io/donor: "true"
