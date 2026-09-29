@@ -63,9 +63,7 @@ func newHarness(t *testing.T, opts Options, objs ...runtime.Object) *harness {
 }
 
 func testOptions() Options {
-	cfg := testConfig()
-	cfg.OwnerRef = false
-	return Options{Config: cfg, ReserveClaim: true, OrphanGrace: time.Minute}
+	return Options{Config: testConfig(), ReserveClaim: true, OrphanGrace: time.Minute}
 }
 
 func cpuGuest(uid string) *corev1.Pod {

@@ -30,7 +30,7 @@ status:
 	$(KUBECTL) -n guest-kubelet-proto get pods -o wide
 	$(KUBECTL) -n guest-kubelet-proto get lease
 
-undeploy: ## namespace first (guests, then mirrors via ownerRef), then cluster-scoped objects
+undeploy: ## namespace first (guests and their mirrors), then cluster-scoped objects
 	-$(KUBECTL) delete ns guest-kubelet-proto --wait=true
 	-$(KUBECTL) delete node $(VNODE)
 	-$(KUBECTL) -n kube-node-lease delete lease $(VNODE)

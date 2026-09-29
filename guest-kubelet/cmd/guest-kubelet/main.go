@@ -49,7 +49,6 @@ type options struct {
 	cpuHeadroom, memHeadroom string
 	gpuClaim                 string
 	reserveClaim             bool
-	mirrorOwnerRef           bool
 	orphanGrace              time.Duration
 
 	// M1: surviving an outage
@@ -79,7 +78,6 @@ func main() {
 	// Off by default: measured in M1, kube-controller-manager's resourceclaim controller adds a
 	// pod that already has spec.nodeName to the claim's reservedFor about 1 s after creation.
 	flag.BoolVar(&o.reserveClaim, "reserve-claim", false, "add GPU mirrors to the claim's status.reservedFor (kube-controller-manager also does it)")
-	flag.BoolVar(&o.mirrorOwnerRef, "mirror-owner-ref", true, "make the guest the mirror's owner (false: mirrors survive guest force-deletion and can be re-adopted)")
 	flag.DurationVar(&o.orphanGrace, "orphan-grace", 10*time.Minute, "how long a mirror without a guest is kept for re-adoption")
 
 	// Off by default: GKE's ValidatingAdmissionPolicy validate-node-providerid denies a Node
@@ -193,7 +191,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	mopts := mirror.Options{
 		Config: mirror.Config{
 			HostNode: o.hostNode, VirtualNode: o.nodeName, GPUClaim: o.gpuClaim,
-			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey, OwnerRef: o.mirrorOwnerRef,
+			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey,
 		},
 		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
 	}

@@ -54,10 +54,6 @@ type Config struct {
 	HostTaints []corev1.Taint
 	// GuestTaintKey is the virtual node's taint. Its toleration is dropped from the mirror.
 	GuestTaintKey string
-	// OwnerRef makes the guest the mirror's owner, so deleting the guest garbage-collects the
-	// mirror. With false, the mirror outlives a guest that is force-deleted (for example after
-	// the virtual Node is deleted) and a guest re-created with the same name re-adopts it.
-	OwnerRef bool
 }
 
 // Name returns the mirror's name for a guest.
@@ -145,7 +141,7 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 		})
 	}
 
-	m := &corev1.Pod{
+	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      Name(guest.Name),
 			Namespace: guest.Namespace,
@@ -159,22 +155,13 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 				AnnotationGuestName:     guest.Name,
 				AnnotationGuestSpecHash: SpecHash(guest),
 			},
+			// No ownerReference: the mirror outlives a guest that is force-deleted (for example
+			// by pod GC after the virtual Node is deleted), so its process keeps running. A guest
+			// re-created with the same name re-adopts it; the backend deletes it after the orphan
+			// grace period otherwise, and on a normal guest delete.
 		},
 		Spec: spec,
-	}
-	if cfg.OwnerRef {
-		m.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
-	}
-	return m, nil
-}
-
-// OwnerRef is the reference from a mirror to its guest. blockOwnerDeletion is left unset: it
-// needs extra RBAC (pods/finalizers) and nothing waits on foreground deletion of guests.
-func OwnerRef(guest *corev1.Pod) metav1.OwnerReference {
-	return metav1.OwnerReference{
-		APIVersion: "v1", Kind: "Pod", Name: guest.Name, UID: guest.UID,
-		Controller: new(true),
-	}
+	}, nil
 }
 
 func mirrorTolerations(guestTols []corev1.Toleration, cfg Config) []corev1.Toleration {

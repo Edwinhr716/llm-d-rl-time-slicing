@@ -39,7 +39,6 @@ spec:
             - --gpu-claim=shared-m1-gpu-claim
             - --mirror-cpu-headroom=1
             - --mirror-memory-headroom=4Gi
-            - --mirror-owner-ref=true
           env:
             - name: HOST_IP
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}

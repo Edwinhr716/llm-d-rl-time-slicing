@@ -27,8 +27,8 @@ type Options struct {
 	// claim for a pod that is not in reservedFor.
 	ReserveClaim bool
 	// OrphanGrace is how long a mirror whose guest is gone is kept for a guest re-created with
-	// the same name (StatefulSet, LWS, a re-applied bare pod) to re-adopt. Only matters without
-	// OwnerRef; with it, the garbage collector deletes orphans first.
+	// the same name (StatefulSet, LWS, a re-applied bare pod) to re-adopt. Mirrors have no
+	// ownerReference, so nothing else deletes them.
 	OrphanGrace time.Duration
 	// Resync is the mirror informer's resync period.
 	Resync time.Duration
@@ -56,7 +56,7 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, opts Optio
 		opts.Resync = 30 * time.Second
 	}
 	// Like an LWS controller's Owns() watch, but filtered by label, not ownerRef: mirrors
-	// must still be found when they have no owner (OwnerRef=false, or the guest is gone).
+	// have no owner, and must still be found when their guest is gone.
 	f := informers.NewSharedInformerFactoryWithOptions(client, opts.Resync,
 		informers.WithTweakListOptions(func(lo *metav1.ListOptions) {
 			lo.LabelSelector = labels.Set{LabelMirrorNode: opts.VirtualNode}.String()
@@ -261,9 +261,6 @@ func (b *Backend) adoptOrReplace(ctx context.Context, guest, want *corev1.Pod) (
 		upd := cur.DeepCopy()
 		upd.Labels[LabelMirrorOf] = string(guest.UID)
 		upd.OwnerReferences = nil
-		if b.opts.OwnerRef {
-			upd.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
-		}
 		adopted, err := b.client.CoreV1().Pods(guest.Namespace).Update(ctx, upd, metav1.UpdateOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("adopt mirror: %w", err)
@@ -312,8 +309,8 @@ func (b *Backend) Delete(ctx context.Context, guest *corev1.Pod) error {
 	return nil
 }
 
-// orphanLoop deletes mirrors whose guest has been gone for longer than OrphanGrace. It is the
-// safety net for OwnerRef=false; with OwnerRef the garbage collector gets there first.
+// orphanLoop deletes mirrors whose guest has been gone for longer than OrphanGrace. Mirrors
+// have no ownerReference, so without it an orphan would run until someone deletes it.
 func (b *Backend) orphanLoop(ctx context.Context) {
 	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
