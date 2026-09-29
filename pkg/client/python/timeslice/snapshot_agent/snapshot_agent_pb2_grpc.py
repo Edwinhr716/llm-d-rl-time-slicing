@@ -75,6 +75,16 @@ class SnapshotAgentServiceStub:
                 request_serializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.KillRequest.SerializeToString,
                 response_deserializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.KillResponse.FromString,
                 _registered_method=True)
+        self.SuspendAll = channel.unary_unary(
+                '/snapshot_agent.v1alpha1.SnapshotAgentService/SuspendAll',
+                request_serializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.SuspendAllRequest.SerializeToString,
+                response_deserializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.SuspendAllResponse.FromString,
+                _registered_method=True)
+        self.ResumeAll = channel.unary_unary(
+                '/snapshot_agent.v1alpha1.SnapshotAgentService/ResumeAll',
+                request_serializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.ResumeAllRequest.SerializeToString,
+                response_deserializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.ResumeAllResponse.FromString,
+                _registered_method=True)
 
 
 class SnapshotAgentServiceServicer:
@@ -151,6 +161,32 @@ class SnapshotAgentServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SuspendAll(self, request, context):
+        """SuspendAll suspends every job of one role (the guests: "background") on
+        this node. The agent finds its targets itself when the call arrives: the
+        pods on its node that carry the label timeslice.io/role=<role> and a
+        timeslice.io/job-id label.
+        Each target then gets the same rules as a Suspend with the request's
+        epoch and deadline, and the targets run in parallel. Asynchronous: returns
+        one operation ID; GetOperation reports one result per target in
+        `targets`. The operation is COMPLETE only when every target is SUSPENDED
+        or RELEASED (also when there was no target): that is what "the host is
+        clear" means. Fenced by epoch (see SuspendAllRequest). Kill stays per job
+        and is the fallback for a target that failed.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ResumeAll(self, request, context):
+        """ResumeAll resumes every job of one role on this node, found and
+        fenced as for SuspendAll. The operation is COMPLETE only when every
+        target resumed.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SnapshotAgentServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -193,6 +229,16 @@ def add_SnapshotAgentServiceServicer_to_server(servicer, server):
                     servicer.Kill,
                     request_deserializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.KillRequest.FromString,
                     response_serializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.KillResponse.SerializeToString,
+            ),
+            'SuspendAll': grpc.unary_unary_rpc_method_handler(
+                    servicer.SuspendAll,
+                    request_deserializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.SuspendAllRequest.FromString,
+                    response_serializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.SuspendAllResponse.SerializeToString,
+            ),
+            'ResumeAll': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResumeAll,
+                    request_deserializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.ResumeAllRequest.FromString,
+                    response_serializer=timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.ResumeAllResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -412,6 +458,60 @@ class SnapshotAgentService:
             '/snapshot_agent.v1alpha1.SnapshotAgentService/Kill',
             timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.KillRequest.SerializeToString,
             timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.KillResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SuspendAll(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/snapshot_agent.v1alpha1.SnapshotAgentService/SuspendAll',
+            timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.SuspendAllRequest.SerializeToString,
+            timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.SuspendAllResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResumeAll(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/snapshot_agent.v1alpha1.SnapshotAgentService/ResumeAll',
+            timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.ResumeAllRequest.SerializeToString,
+            timeslice_dot_snapshot__agent_dot_snapshot__agent__pb2.ResumeAllResponse.FromString,
             options,
             channel_credentials,
             insecure,
