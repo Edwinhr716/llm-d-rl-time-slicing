@@ -4,7 +4,7 @@ A throwaway prototype of a *guest kubelet*: a [virtual-kubelet](https://github.c
 (v1.14.0) that registers a virtual Node (`vk-<host>`) next to a real GPU node and acts as the
 kubelet for the guest pods scheduled onto it.
 
-## Status: M1 (mirror pods)
+## Status: M2 (readiness)
 
 - Registers Node `vk-<host suffix>` (for example `vk-abcd`) with labels `type=virtual-kubelet`,
   `timeslice.io/virtual-node=true`, taint `timeslice.io/guest=true:NoSchedule`, capacity
@@ -26,8 +26,34 @@ kubelet for the guest pods scheduled onto it.
 - `--mirror-owner-ref=false` lets mirrors outlive guests that were force-deleted after a Node
   deletion. A guest re-created with the same name and the same containers re-adopts the mirror
   (same UID and IP). Orphans are deleted after `--orphan-grace`.
-- Not yet: probes (a guest is Ready when its container starts), logs/exec (use `kubectl logs
-  <guest>-m`), stats.
+- M2: the VK runs the guest's readinessProbe itself (`internal/probe`)
+  against the mirror's IP, with kubelet semantics: period, timeout and
+  thresholds with the kubelet's defaults; a verdict that starts not ready
+  and starts over when the container restarts; HTTP 200-399 without
+  keep-alive or redirects; named ports. The guest's ContainersReady and
+  Ready follow the verdicts (reason `ContainersNotReady`). httpGet and
+  tcpSocket only: a container with an exec or gRPC readiness probe stays
+  not ready, with one `ReadinessProbeUnsupported` Warning event.
+  `--readiness-probes=false` restores M1 (Ready follows the mirror).
+- `--debug-addr` (off by default, loopback only) serves
+  `POST /debug/readiness?pod=ns/name&ready=true|false|clear` (an override
+  that wins over the probes) and `GET /debug/ready-edges?pod=ns/name`
+  (when the VK sent each Ready change). Only the Q5 measurement uses it.
+- Admission (VK-A7) refuses a guest before it gets a mirror: a liveness
+  or startup probe, an exec or grpc readiness probe, readiness gates (an
+  httpGet or tcpSocket readinessProbe is allowed), a GPU resource other
+  than `nvidia.com/gpu`, or a GPU guest on a host whose model label is
+  not in `--gpu-allowlist` (default `nvidia-l4`; no label fails closed).
+  The guest gets a Warning event `GuestRejected` naming the rule and goes
+  `Failed` with reason `GuestRejected`.
+- A GPU mirror container's memory limit is its limit (or request) plus
+  the device reserve, `ceil(--gpu-memory x --mirror-memory-factor)`
+  (defaults `23034Mi` x `1.1`, about 24.7 GiB).
+- Outage (VK-A7 on this branch): the Node finalizer below holds the
+  virtual Node through a guest-kubelet outage; no keeper process.
+- Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Liveness and
+  startup probes are refused by admission (above), so an exec or gRPC
+  readinessProbe never reaches the prober.
 
 ## Layout
 
@@ -35,6 +61,8 @@ kubelet for the guest pods scheduled onto it.
 cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wiring; own event recorder
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
+internal/provider/marker.go          --guest-marker: what makes a pod a guest
+internal/provider/admission.go       admission: probes, gates, GPU allowlist
 internal/provider/events.go          drops events about non-guest pods
 internal/provider/finalizer.go       Node finalizer, ownerRef to host, release
 internal/donorstandin/               donor stand-in: releases Node on host death
@@ -43,10 +71,16 @@ internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
 internal/backend/mirror/claim.go     optional reservedFor write (kube-controller-manager also does it)
+internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
+internal/probe/debug.go              debug endpoint: override, Ready edges
+cmd/q5-measure/main.go               Q5 timings; runs in a pod
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
+deploy/guests/                       guest manifests: today, ns
+deploy/admission/                    W9 policies, one per guest marker
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
 deploy/opt-c/                        donor stand-in Deployment + RBAC
+deploy/m2/                           probed guests, pool, router, Q5 pods
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
 
@@ -57,6 +91,9 @@ make build        # Cloud Build: tidy check, go vet, go test -race, image -> Art
 make deploy       # namespace, RBAC, Deployment on the test cluster (HOST=<real node>)
 make test-guest   # CPU guest + Service
 make gpu-guest    # claim + trainer stand-in, then the vLLM guest
+make m2-deploy    # probed guests, pool, EPP, router, RBAC
+make q5-force     # Q5 run, readiness forced via the debug endpoint
+make q5-toggle    # Q5 run, a real probe flipped by the guest
 make status
 make undeploy
 ```
@@ -67,20 +104,125 @@ The VK Node carries the finalizer `timeslice.io/virtual-node-protection`
 and an ownerReference to the real Node. When anyone else deletes the VK
 Node during a VK outage (for example the cloud node lifecycle
 controller), the finalizer holds it (Terminating), so its guests are not
-garbage-collected. Only two actors remove the finalizer:
+garbage-collected. Only the VK and the donor controller remove the
+finalizer:
 
 - the donor controller, when the real Node is gone (`deploy/opt-c/`, a
   stand-in until the real controller exists; the VK cannot act on its
-  own host's death), and
+  own host's death);
 - the VK itself when it deregisters at the end of an era: stop the
-  serving VK, then run `guest-kubelet --deregister --node-name=<node>`.
+  serving VK, then run `guest-kubelet --deregister --node-name=<node>`;
+- the VK itself when it returns and finds its Node Terminating on a live
+  host (`--reclaim-terminating-node`, default true). A Terminating Node
+  cannot be un-deleted, so the VK removes its finalizer, waits for the
+  old object to go and registers the Node again (same name, new UID)
+  before the kubelet role starts. Guests are bound by Node name and pod
+  GC waits 40 s before it treats a Node as missing, so guests and mirrors
+  are untouched. It reclaims only a Node whose only finalizer is ours and
+  whose ownerReference names the host this VK runs on; a Node from a
+  recreated host stays held for the donor controller.
 
-A Terminating Node cannot be un-deleted: it keeps serving, but stays
-Terminating until one of the two releases it. A plain
-`kubectl delete node` also stays Terminating.
+With `--reclaim-terminating-node=false` a held Node keeps serving but
+stays Terminating until the donor controller or a deregistration
+releases it. A `kubectl delete node` made while the VK is down is also
+undone by the next start; use `--deregister` to remove the Node.
 
 The plan and the notes explaining this code are kept outside this repository
-(prototype plan, milestones M0 and M1).
+(prototype plan, milestones M0 to M2).
+
+## M2 results (the test cluster, 2026-09-28)
+
+Q5 spans in seconds, p50 / p90 / max, 25 edges each way per run
+(`make q5-force`, `make q5-toggle`):
+
+- notify: trigger -> the VK calls NotifyPods;
+- e1: notify -> pod status seen in a watch;
+- e2: pod Ready -> EndpointSlice endpoint ready;
+- e3: EndpointSlice -> first ClusterIP request with the new outcome;
+- pool: pod Ready -> first router (InferencePool) request with the new
+  outcome.
+
+Force mode (readiness forced through the debug endpoint):
+
+| span | rising | falling |
+| --- | --- | --- |
+| notify | 0.000 / 0.000 / 0.001 | 0.000 / 0.000 / 0.000 |
+| e1 | 0.036 / 0.042 / 0.247 | 0.036 / 0.044 / 0.045 |
+| e2 | 0.028 / 0.048 / 0.061 | 0.028 / 0.035 / 0.039 |
+| e3 | 7.042 / 7.352 / 7.445 | 5.848 / 6.422 / 6.592 |
+| pool | 0.005 / 0.016 / 0.025 | 0.007 / 0.017 / 0.019 |
+
+Probe mode (a real readinessProbe, period 1 s, flipped by the guest):
+
+| span | rising | falling |
+| --- | --- | --- |
+| notify | 0.457 / 0.959 / 0.977 | 0.432 / 0.884 / 0.995 |
+| e1 | 0.035 / 0.040 / 0.045 | 0.036 / 0.039 / 0.042 |
+| e2 | 0.026 / 0.030 / 0.030 | 0.025 / 0.029 / 0.031 |
+| e3 | 6.458 / 6.981 / 8.228 | 5.396 / 6.142 / 6.269 |
+
+- The guest's Ready follows the VK's probe: the inference simulator's
+  guest turned Ready about 9 s after creation, when `/metrics` first
+  answered, not when its container started.
+- notify in probe mode is the probe period (1 s) plus the probe itself.
+- e3 is the node's kube-proxy, which syncs rules at most once every 10 s
+  on the test cluster (`--iptables-min-sync-period=10s`). These runs flip
+  readiness every 4 to 10 s, so most changes wait for the next allowed
+  sync. A third force run with 12 s between edges (20 each way,
+  `--settle=12s`) gave e3 p50 0.517 s rising (bounded by the 0.5 s
+  request timeout) and 0.027 s falling. The router does not go through
+  the ClusterIP: its endpoint picker watches the pods, so a Ready change
+  reaches it in tens of milliseconds. Router requests are timed from when
+  they were sent, so a request sent just before the watch saw the change
+  can give a slightly negative span.
+
+## Guest steering options (pending decisions D-NS-2, D-VK-4, D-NS-3)
+
+Three pending lead decisions choose how a guest finds the virtual Node and
+what makes a pod a guest. Every option ships; flags and manifests pick one.
+The defaults are today's behaviour.
+
+- D-NS-2, labels of the virtual Node: `--guest-node-label`.
+  - `false` (default): `timeslice.io/virtual-node=true` only.
+  - `true`: also `timeslice.io/guest=true`.
+- D-VK-4, what makes a pod a guest: `--guest-marker`.
+  - `toleration` (default): the pod tolerates `timeslice.io/guest` by key.
+  - `label`: the pod carries the label `timeslice.io/guest=true`.
+  - `both`: either one.
+- D-NS-3, how a guest steers: the manifest in `deploy/guests/`.
+  - `guest-today.yaml`: the toleration and the nodeSelector
+    `timeslice.io/virtual-node: "true"`. It waits Pending when no
+    virtual Node exists or has room.
+  - `guest-ns.yaml`: the label `timeslice.io/guest=true`, the toleration and
+    a preferred node affinity (weight 100) on `timeslice.io/guest=true`.
+    It falls back to real nodes.
+- W9 for each marker: `deploy/admission/w9-<variant>.yaml`, a
+  ValidatingAdmissionPolicy and binding. It rejects `timeslice.io/group`,
+  `timeslice.io/job-id` and `timeslice.io/role` on guests and allows
+  `timeslice.io/guest`. The variants are `toleration`, `label`, `both`
+  (one per marker) and `either` (toleration or label, whatever the marker).
+
+Combinations that work together:
+
+- today: `--guest-node-label=false --guest-marker=toleration`,
+  `guest-today.yaml`, `w9-toleration.yaml`.
+- north star: `--guest-node-label=true --guest-marker=label`,
+  `guest-ns.yaml`, `w9-label.yaml`.
+- both forms (the D-NS-3 flag option): `--guest-node-label=true
+  --guest-marker=both`, either manifest, `w9-both.yaml`.
+
+`guest-ns.yaml` without `--guest-node-label=true` is admitted and runs,
+but has nothing to prefer: the scheduler puts it on any node that fits.
+The two flags need no new RBAC: the Node label is set when the Node is
+created. A cluster admin applies the W9 policies, one copy per namespace:
+
+```sh
+sed 's/__NS__/<namespace>/g' deploy/admission/w9-label.yaml | kubectl apply -f -
+```
+
+The `isGuest` CEL variable of each policy is the guest predicate of the
+matching `--guest-marker`. `internal/provider/guests_internal_test.go`
+checks that they agree and that both manifests steer as described.
 
 ## M1 results (the test cluster, 2026-09-25)
 

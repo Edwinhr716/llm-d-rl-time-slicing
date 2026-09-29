@@ -2,12 +2,15 @@ package provider
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 )
 
@@ -124,5 +127,167 @@ func TestNewNodeSpec(t *testing.T) {
 	}
 	if g := n.Status.Capacity[GPUResource]; g.Value() != 1 {
 		t.Errorf("gpu capacity: %v", g)
+	}
+}
+
+// Admission (VK-A7). In this file so the tests share its helpers.
+
+func l4Policy() AdmissionPolicy {
+	return AdmissionPolicy{GPUAllowlist: ParseGPUAllowlist("nvidia-l4"), HostGPUModel: "nvidia-l4"}
+}
+
+func withGPU(p *corev1.Pod, res corev1.ResourceName) *corev1.Pod {
+	p.Spec.Containers[0].Resources.Limits = corev1.ResourceList{res: resource.MustParse("1")}
+	return p
+}
+
+func httpProbe() *corev1.Probe {
+	return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/health"}}}
+}
+
+func execProbe() *corev1.Probe {
+	return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}}}
+}
+
+func TestAdmitProbesOptionA(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*corev1.Pod)
+		rule string // "" = admitted
+	}{
+		{"plain", func(*corev1.Pod) {}, ""},
+		{"httpGet readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = httpProbe() }, ""},
+		{"tcpSocket readiness", func(p *corev1.Pod) {
+			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{}}}
+		}, ""},
+		{"exec readiness", func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe = execProbe() }, "readiness-probe-exec"},
+		{"grpc readiness", func(p *corev1.Pod) {
+			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 9000}}}
+		}, "readiness-probe-grpc"},
+		{"httpGet liveness", func(p *corev1.Pod) { p.Spec.Containers[0].LivenessProbe = httpProbe() }, "liveness-probe"},
+		{"startup", func(p *corev1.Pod) { p.Spec.Containers[0].StartupProbe = httpProbe() }, "startup-probe"},
+		{"sidecar liveness", func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "side", LivenessProbe: httpProbe()}}
+		}, "liveness-probe"},
+		{"readiness gate", func(p *corev1.Pod) {
+			p.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: "x/ready"}}
+		}, "readiness-gates"},
+	}
+	for _, c := range cases {
+		p := guestPod("g")
+		c.mut(p)
+		r := Admit(p, l4Policy())
+		switch {
+		case c.rule == "" && r != nil:
+			t.Errorf("%s: rejected (%v), want admitted", c.name, r)
+		case c.rule != "" && (r == nil || r.Rule != c.rule):
+			t.Errorf("%s: got %v, want rule %s", c.name, r, c.rule)
+		}
+	}
+}
+
+func TestAdmitGPU(t *testing.T) {
+	if r := Admit(withGPU(guestPod("g"), GPUResource), l4Policy()); r != nil {
+		t.Errorf("L4 host, L4 allowlist: rejected %v", r)
+	}
+	pol := l4Policy()
+	pol.HostGPUModel = "nvidia-tesla-a100"
+	rej := Admit(withGPU(guestPod("g"), GPUResource), pol)
+	if rej == nil || rej.Rule != "gpu-allowlist" || !strings.Contains(rej.Message, "nvidia-tesla-a100") {
+		t.Errorf("host off the allowlist: got %v", rej)
+	}
+	if r := Admit(guestPod("g"), pol); r != nil {
+		t.Errorf("a CPU-only guest is admitted on any host: %v", r)
+	}
+	pol.HostGPUModel = ""
+	if r := Admit(withGPU(guestPod("g"), GPUResource), pol); r == nil || r.Rule != "gpu-allowlist" {
+		t.Errorf("unknown host model must fail closed: got %v", r)
+	}
+	if r := Admit(withGPU(guestPod("g"), "nvidia.com/mig-1g.5gb"), l4Policy()); r == nil || r.Rule != "gpu-resource" {
+		t.Errorf("MIG slice: got %v", r)
+	}
+	if r := Admit(withGPU(guestPod("g"), "amd.com/gpu"), l4Policy()); r == nil || r.Rule != "gpu-resource" {
+		t.Errorf("other vendor: got %v", r)
+	}
+	p := withGPU(guestPod("g"), GPUResource)
+	p.Spec.NodeSelector = map[string]string{"cloud.google.com/gke-accelerator": "nvidia-h100-80gb"}
+	if r := Admit(p, l4Policy()); r == nil || r.Rule != "gpu-allowlist" {
+		t.Errorf("selector naming another model: got %v", r)
+	}
+	p.Spec.NodeSelector = map[string]string{"nvidia.com/gpu.product": "NVIDIA-L4"}
+	if r := Admit(p, l4Policy()); r != nil {
+		t.Errorf("selector naming the allowed model: %v", r)
+	}
+}
+
+func TestHostGPUModelAndAllowlist(t *testing.T) {
+	node := &corev1.Node{}
+	node.Labels = map[string]string{"nvidia.com/gpu.product": "NVIDIA L4"}
+	if got := HostGPUModel(node); got != "nvidia-l4" {
+		t.Errorf("gpu.product: %q", got)
+	}
+	node.Labels["cloud.google.com/gke-accelerator"] = "nvidia-l4"
+	if got := HostGPUModel(node); got != "nvidia-l4" {
+		t.Errorf("gke-accelerator: %q", got)
+	}
+	got := ParseGPUAllowlist(" NVIDIA L4, nvidia_tesla_t4 ,,")
+	if len(got) != 2 || got[0] != "nvidia-l4" || got[1] != "nvidia-tesla-t4" {
+		t.Errorf("allowlist: %v", got)
+	}
+}
+
+// TestCreatePodRejects: a refused guest never reaches the backend, gets exactly one Warning
+// event, is reported Failed through the status callback, and the library's
+// ProviderCreateSuccess for it is dropped.
+func TestCreatePodRejects(t *testing.T) {
+	backend := &fakeBackend{}
+	fake := record.NewFakeRecorder(10)
+	rejected := NewRejectedSet()
+	rec := GuestOnlyRecorder{EventRecorder: fake, Rejected: rejected}
+	prov := New(backend).WithAdmission(&Admission{Policy: l4Policy(), Recorder: rec, Rejected: rejected})
+	got := make(chan *corev1.Pod, 4)
+	prov.NotifyPods(context.Background(), func(pod *corev1.Pod) { got <- pod })
+
+	bad := guestPod("bad")
+	bad.UID = types.UID("bad-uid")
+	bad.Spec.Containers[0].LivenessProbe = httpProbe()
+	ctx := context.Background()
+	for i := 0; i < 2; i++ { // a second offer must not repeat the event
+		if err := prov.CreatePod(ctx, bad); err != nil {
+			t.Fatal(err)
+		}
+		rec.Event(bad, corev1.EventTypeNormal, "ProviderCreateSuccess", "Create pod in provider successfully")
+	}
+	if len(backend.created) != 0 {
+		t.Fatalf("rejected guest reached the backend: %v", backend.created)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case st := <-got:
+			status := st.Status
+			failed := status.Phase == corev1.PodFailed && status.Reason == ReasonGuestRejected
+			if !failed || !strings.Contains(status.Message, "liveness-probe") {
+				t.Errorf("status: %+v", st.Status)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no Failed status pushed")
+		}
+	}
+	if n := len(fake.Events); n != 1 {
+		t.Fatalf("want exactly 1 event, got %d", n)
+	}
+	if e := <-fake.Events; !strings.HasPrefix(e, "Warning GuestRejected liveness-probe:") {
+		t.Errorf("event %q", e)
+	}
+
+	good := guestPod("good")
+	good.UID = types.UID("good-uid")
+	good.Spec.Containers[0].ReadinessProbe = httpProbe()
+	if err := prov.CreatePod(ctx, good); err != nil || len(backend.created) != 1 {
+		t.Fatalf("good guest: err=%v created=%v", err, backend.created)
+	}
+	rec.Event(good, corev1.EventTypeNormal, "ProviderCreateSuccess", "x")
+	if n := len(fake.Events); n != 1 {
+		t.Errorf("an admitted guest keeps its ProviderCreateSuccess; events=%d", n)
 	}
 }

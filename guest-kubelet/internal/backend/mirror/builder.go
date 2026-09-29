@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -58,6 +59,25 @@ type Config struct {
 	// mirror. With false, the mirror outlives a guest that is force-deleted (for example after
 	// the virtual Node is deleted) and a guest re-created with the same name re-adopts it.
 	OwnerRef bool
+	// DeviceMemoryReserve is added to the memory limit of every mirror container that asks for
+	// the GPU. On Suspend the snapshot agent copies the device memory into the container's
+	// memory cgroup, so memory.max must fit the process plus the device bytes. Build it with
+	// DeviceReserve (device memory x factor, default x1.1). Zero means "add nothing".
+	DeviceMemoryReserve resource.Quantity
+}
+
+// DeviceReserve is ceil(deviceMemory x factor), rounded up to a whole MiB: the memory the
+// snapshot agent needs in the mirror's cgroup to hold one GPU's memory on Suspend.
+func DeviceReserve(deviceMemory resource.Quantity, factor float64) (resource.Quantity, error) {
+	if factor < 1 {
+		return resource.Quantity{}, fmt.Errorf("device memory factor %v is below 1", factor)
+	}
+	if deviceMemory.Sign() < 0 {
+		return resource.Quantity{}, fmt.Errorf("device memory %s is negative", deviceMemory.String())
+	}
+	const mi = 1 << 20
+	b := math.Ceil(float64(deviceMemory.Value()) * factor)
+	return *resource.NewQuantity(int64(math.Ceil(b/mi))*mi, resource.BinarySI), nil
 }
 
 // Name returns the mirror's name for a guest.
@@ -136,7 +156,7 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 	for i := range spec.Containers {
 		c := &spec.Containers[i]
 		c.LivenessProbe, c.ReadinessProbe, c.StartupProbe = nil, nil, nil
-		c.Resources = mirrorResources(c.Resources, cfg, gpu)
+		c.Resources = mirrorResources(c.Resources, cfg, gpu, containerRequestsGPU(c))
 		c.Env = rewriteDownwardEnv(c.Env, guest)
 	}
 	if gpu {
@@ -203,10 +223,20 @@ func tolerated(tols []corev1.Toleration, want corev1.Toleration) bool {
 	return false
 }
 
+// containerRequestsGPU reports whether one container asks for nvidia.com/gpu.
+func containerRequestsGPU(c *corev1.Container) bool {
+	_, req := c.Resources.Requests[GPUResource]
+	_, lim := c.Resources.Limits[GPUResource]
+	return req || lim
+}
+
 // mirrorResources caps requests at the headroom and swaps the GPU for the claim. Limits are
 // kept (a memory limit is what protects the trainer from the guest), except that a capped
-// request never exceeds its limit.
-func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev1.ResourceRequirements {
+// request never exceeds its limit. A container that asks for the GPU gets the device reserve
+// on top of its memory limit (contract: limit = container limit + device reserve). With no
+// limit, the base is its memory request; with neither, the limit is the reserve alone, so the
+// mirror never has an unlimited memory.max (the agent refuses Suspend then).
+func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu, ownsGPU bool) corev1.ResourceRequirements {
 	out := *in.DeepCopy()
 	delete(out.Requests, GPUResource)
 	delete(out.Limits, GPUResource)
@@ -224,6 +254,19 @@ func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev
 		}
 	}
 	capAt(out.Requests, corev1.ResourceCPU, cfg.CPUHeadroom)
+	if ownsGPU && cfg.DeviceMemoryReserve.Sign() > 0 {
+		base := resource.Quantity{}
+		if lim, ok := out.Limits[corev1.ResourceMemory]; ok {
+			base = lim.DeepCopy()
+		} else if req, ok := out.Requests[corev1.ResourceMemory]; ok {
+			base = req.DeepCopy()
+		}
+		base.Add(cfg.DeviceMemoryReserve)
+		if out.Limits == nil {
+			out.Limits = corev1.ResourceList{}
+		}
+		out.Limits[corev1.ResourceMemory] = base
+	}
 	capAt(out.Requests, corev1.ResourceMemory, cfg.MemoryHeadroom)
 	if gpu {
 		out.Claims = append(out.Claims, corev1.ResourceClaim{Name: ClaimRefName})

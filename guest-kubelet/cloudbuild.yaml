@@ -37,6 +37,7 @@ steps:
         go test -race ./...
         CGO_ENABLED=0 go build -o out/guest-kubelet ./cmd/guest-kubelet
         CGO_ENABLED=0 go build -o out/donor-standin ./cmd/donor-standin
+        CGO_ENABLED=0 go build -o out/q5-measure ./cmd/q5-measure
   - id: image
     name: gcr.io/cloud-builders/docker
     args: ["build", "-t", "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/guest-kubelet:${_TAG}", "."]

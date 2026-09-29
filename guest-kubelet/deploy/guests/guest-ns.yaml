@@ -1,0 +1,26 @@
+# Guest manifest, north-star form (pending lead decision D-NS-3, option ns-preferred). The guest
+# carries timeslice.io/guest=true, tolerates the virtual Node's taint and prefers (does not
+# require) a Node labelled timeslice.io/guest=true, so it runs on ordinary capacity when no
+# virtual Node exists or has room. The Node label needs --guest-node-label=true (D-NS-2); the
+# pod label is what --guest-marker=label or both matches (D-VK-4).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: guest-ns
+  labels: {app: guest-ns, timeslice.io/guest: "true"}
+spec:
+  tolerations:
+    - {key: timeslice.io/guest, operator: Exists, effect: NoSchedule}
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - {key: timeslice.io/guest, operator: In, values: ["true"]}
+  containers:
+    - name: echo
+      image: registry.k8s.io/e2e-test-images/agnhost:2.53
+      args: ["netexec", "--http-port=8080"]
+      resources:
+        requests: {cpu: 100m, memory: 64Mi}
