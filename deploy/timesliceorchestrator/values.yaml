@@ -27,6 +27,8 @@ lock:
 #     pods bound to them are ignored. Group membership still comes from the
 #     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
 #     with the pod-scheduling nodeSelector further down.
+#     The selector must select every real host that carries the group label;
+#     mirrors are bound there. See examples/ for the two label layouts.
 scope:
   watchNamespaces: []
   nodeSelector: ""
