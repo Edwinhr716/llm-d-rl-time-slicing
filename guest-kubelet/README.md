@@ -98,7 +98,7 @@ internal/provider/probepolicy.go     --guest-probe-policy (D-VK-5 a, b, c); prob
 internal/provider/events.go          drops events about non-guest pods
 internal/group/                      the host node's group (timeslice.io/donor + timeslice.io/group), host watch
 internal/provider/finalizer.go       Node finalizer, ownerRef to host, release
-internal/donorstandin/               donor stand-in: releases Node on host death
+internal/donor/                      donor stand-in (D-VK-2 d): host death
 cmd/donor-standin/main.go            its command (same image as the VK)
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
@@ -130,7 +130,7 @@ deploy/guests/                       guest manifests: today, ns
 deploy/admission/                    W9 policies, one per guest marker
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
-deploy/opt-c/                        donor stand-in Deployment + RBAC
+deploy/opt-d/                        delete policy, donor stand-in
 deploy/m2/                           probed guests, pool, router, Q5 pods
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
@@ -261,16 +261,31 @@ make undeploy
 
 ## Outage guard: Node finalizer (option c of an open decision)
 
-The VK Node carries the finalizer `timeslice.io/virtual-node-protection`
+This branch runs option d: `--node-finalizer` defaults to false (no
+finalizer) and `deploy/opt-d/policy.yaml` (`make node-guard`) denies
+DELETE of the VK Node to everyone except the guest-kubelet, the
+donor-standin and the donor controller service accounts, so the node
+lifecycle controller's delete in an outage is denied and retried. On
+host death the stand-in (`deploy/opt-d/donor-standin.yaml`) or the donor
+controller (`--release-dead-hosts`) deletes the Node. An admin deletes
+the policy binding first. Without the policy the branch behaves as
+option a (status quo): the VK Node has no finalizer. A delete during a
+VK outage (the cloud node lifecycle controller, about 50 s in)
+completes, pod GC removes the guests, and the returning VK registers a
+new Node. The ownerReference to the real Node stays. Option b is this
+plus `--mirror-owner-ref=false`.
+The rest of this section applies only with `--node-finalizer=true`.
+
+With `--node-finalizer=true` the VK Node carries the finalizer
+`timeslice.io/virtual-node-protection`
 and an ownerReference to the real Node. When anyone else deletes the VK
 Node during a VK outage (for example the cloud node lifecycle
 controller), the finalizer holds it (Terminating), so its guests are not
 garbage-collected. Only the VK and the donor controller remove the
 finalizer:
 
-- the donor controller, when the real Node is gone (`deploy/opt-c/`, a
-  stand-in until the real controller exists; the VK cannot act on its
-  own host's death);
+- the donor controller, when the real Node is gone
+  (`--release-dead-hosts`; the VK cannot act on its own host's death);
 - the VK itself when it deregisters at the end of an era: stop the
   serving VK, then run `guest-kubelet --deregister --node-name=<node>`;
 - the VK itself when it returns and finds its Node Terminating on a live

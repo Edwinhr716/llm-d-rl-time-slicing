@@ -1,16 +1,16 @@
-# D-VK-2 option c: a stand-in for the donor controller's host-death duty. When the real Node
-# __HOST__ is gone, it releases the virtual Node __VK_NODE__ (deletes it and removes the VK
-# finalizer timeslice.io/virtual-node-protection). The VK cannot do this on host death: it
-# runs on that host. It runs on a CPU node, never on __HOST__, and may touch only these two
-# Nodes. Stand-in only: the real donor controller does not exist yet.
-# Placeholders: __IMAGE__ (the guest-kubelet image, which also holds /donor-standin),
-# __HOST__, __VK_NODE__; guest-kubelet-proto is the VK's namespace.
+# D-VK-2 option d: stand-in for the donor controller's host-death duty. When the real Node
+# __HOST__ is gone for good it deletes the virtual Node __VK_NODE__ (the policy in policy.yaml
+# lets only this service account and the guest-kubelet do that); the pod garbage collector then
+# deletes the guests, so their controllers retry elsewhere. It must not run on __HOST__: on host
+# death the guest-kubelet dies with the host, the stand-in must not.
+# Placeholders as in policy.yaml, plus __IMAGE__ (the guest-kubelet image; it holds both binaries).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: donor-standin
   namespace: guest-kubelet-proto
 ---
+# Only Node objects, and only these two.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -23,7 +23,7 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     resourceNames: ["__VK_NODE__"]
-    verbs: ["update", "delete"]
+    verbs: ["delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -43,26 +43,21 @@ kind: Deployment
 metadata:
   name: donor-standin
   namespace: guest-kubelet-proto
+  labels: {app: donor-standin, timeslice.io/eval-role: donor-standin}
 spec:
   replicas: 1
+  strategy: {type: Recreate}
   selector:
     matchLabels: {app: donor-standin}
   template:
     metadata:
-      labels:
-        app: donor-standin
-        timeslice.io/eval-role: donor-standin
+      labels: {app: donor-standin, timeslice.io/eval-role: donor-standin}
     spec:
       serviceAccountName: donor-standin
       terminationGracePeriodSeconds: 5
+      # A CPU node, never the host (GKE's default node pool; change it for other clusters).
       nodeSelector:
         cloud.google.com/gke-nodepool: default-pool
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - {key: kubernetes.io/hostname, operator: NotIn, values: ["__HOST__"]}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -74,9 +69,8 @@ spec:
           args:
             - --vk-node=__VK_NODE__
             - --host-node=__HOST__
-            - --interval=5s
           resources:
-            requests: {cpu: 10m, memory: 64Mi}
+            requests: {cpu: 10m, memory: 32Mi}
             limits: {cpu: 100m, memory: 64Mi}
           securityContext:
             allowPrivilegeEscalation: false

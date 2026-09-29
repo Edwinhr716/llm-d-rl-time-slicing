@@ -1,0 +1,62 @@
+# D-VK-2 option d: only the guest-kubelet and the donor controller may delete this virtual Node.
+#
+# Without it, the cloud node lifecycle controller deletes the virtual Node about a minute into a
+# guest-kubelet outage (the Node is NotReady and no cloud instance has its name), and the pod
+# garbage collector then deletes the guests. With it, that delete is denied and retried until the
+# guest-kubelet is back; on real host death the donor controller (donor-standin.yaml) deletes it.
+#
+# Placeholders: __VK_NODE__ is the virtual Node; __DONOR_NS__ is the donor controller's namespace
+# (deploy/donor-controller; its --release-dead-hosts deletes the Node of a dead host).
+# guest-kubelet-proto is the guest-kubelet namespace and also prefixes the object names, so each
+# virtual Node gets its own policy.
+# Needs admissionregistration.k8s.io/v1 (Kubernetes 1.30+).
+#
+# An admin who must delete the Node by hand deletes the binding first:
+#   kubectl delete validatingadmissionpolicybinding guest-kubelet-proto-vk-node-delete
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: guest-kubelet-proto-vk-node-delete
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["nodes"]
+    # Virtual Nodes only (for DELETE the selector is matched against the stored object).
+    objectSelector:
+      matchLabels:
+        timeslice.io/virtual-node: "true"
+  variables:
+    - name: allowed
+      expression: >-
+        ["system:serviceaccount:guest-kubelet-proto:guest-kubelet",
+        "system:serviceaccount:guest-kubelet-proto:donor-standin",
+        "system:serviceaccount:__DONOR_NS__:donor-controller"]
+  validations:
+    - expression: request.userInfo.username in variables.allowed
+      reason: Forbidden
+      # Names the policy, so the denial is recognisable in audit logs and kubectl output.
+      messageExpression: >-
+        "ValidatingAdmissionPolicy guest-kubelet-proto-vk-node-delete: only the guest-kubelet or
+        donor-controller service account may delete virtual Node " + request.name +
+        "; denied for " + request.userInfo.username
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: guest-kubelet-proto-vk-node-delete
+spec:
+  policyName: guest-kubelet-proto-vk-node-delete
+  # Audit also records each denial as an annotation on the audit event.
+  validationActions: [Deny, Audit]
+  # Scoped to this guest-kubelet's own virtual Node; other virtual Nodes are untouched.
+  matchResources:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["nodes"]
+        resourceNames: ["__VK_NODE__"]

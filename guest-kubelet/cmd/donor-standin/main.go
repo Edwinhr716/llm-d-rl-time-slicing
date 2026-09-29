@@ -1,11 +1,9 @@
-// Command donor-standin stands in for the donor controller on host death: when the real Node
-// is gone, it releases the virtual Node that ran on it (deletes it and removes the VK
-// finalizer). It must run on a different node than the host it watches.
+// Command donor-standin is a stand-in for the donor controller's host-death duty (D-VK-2
+// option d): when --host-node is gone for good, it deletes --vk-node. See internal/donor.
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"log/slog"
 	"os"
@@ -13,40 +11,39 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/virtual-kubelet/virtual-kubelet/log"
-	vkslog "github.com/virtual-kubelet/virtual-kubelet/log/slog"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 
-	"github.com/edwinhr716/guest-kubelet/internal/donorstandin"
+	"github.com/edwinhr716/guest-kubelet/internal/donor"
 )
 
 func main() {
-	var cfg donorstandin.Config
+	os.Exit(run())
+}
+
+func run() int {
+	var standin donor.Standin
 	var kubeconfig string
-	flag.StringVar(&cfg.VirtualNode, "vk-node", "", "the virtual Node to release when the host is gone")
-	flag.StringVar(&cfg.HostNode, "host-node", "", "the real Node the virtual Node runs on")
-	flag.DurationVar(&cfg.Interval, "interval", 5*time.Second, "how often the host Node is checked")
+	flag.StringVar(&standin.VKNode, "vk-node", "", "virtual Node to delete when the host is gone (required)")
+	flag.StringVar(&standin.HostNode, "host-node", "", "real Node the virtual Node lives on (required)")
+	flag.DurationVar(&standin.Poll, "poll", 2*time.Second, "time between polls of the host Node")
+	flag.IntVar(&standin.Confirm, "confirm", 3, "polls in a row that must find the host Node absent")
 	flag.StringVar(&kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "kubeconfig path; empty means in-cluster")
 	flag.Parse()
 
-	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := run(ctx, cfg, kubeconfig)
-	cancel()
-	if err != nil && !errors.Is(err, context.Canceled) {
-		log.G(ctx).WithError(err).Error("donor-standin exited")
-		os.Exit(1)
+	standin.Log = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if standin.VKNode == "" || standin.HostNode == "" || standin.Poll <= 0 || standin.Confirm < 1 {
+		standin.Log.Error("need --vk-node, --host-node, --poll > 0 and --confirm >= 1")
+		return 2
 	}
-}
-
-func run(ctx context.Context, cfg donorstandin.Config, kubeconfig string) error {
 	client, err := nodeutil.ClientsetFromEnv(kubeconfig)
 	if err != nil {
-		return err
+		standin.Log.Error("kube client", "err", err)
+		return 1
 	}
-	s, err := donorstandin.New(client, cfg)
-	if err != nil {
-		return err
-	}
-	return s.Run(ctx)
+	standin.Client = client
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	standin.Run(ctx)
+	return 0
 }

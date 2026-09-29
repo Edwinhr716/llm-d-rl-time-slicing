@@ -91,6 +91,8 @@ type options struct {
 	deregister bool
 	// VK-A7 on D-VK-2 c: replace a Node held Terminating by the finalizer when the VK returns.
 	reclaimNode bool
+	// D-VK-2: false = option a (no finalizer on the virtual Node), true = option c.
+	nodeFinalizer bool
 
 	// M2: readiness
 	readinessProbes bool
@@ -230,6 +232,9 @@ func main() {
 	flag.DurationVar(&o.fakeResumeDelay, "fake-freezer-resume-delay", 6*time.Second, "--freezer=fake: time a Resume takes")
 	flag.BoolVar(&o.deregister, "deregister", false,
 		"one-shot: delete the virtual Node, remove its finalizer and exit (end of an era; stop the serving VK first)")
+	flag.BoolVar(&o.nodeFinalizer, "node-finalizer", false,
+		"D-VK-2: hold the virtual Node with the "+provider.NodeFinalizer+" finalizer (option c). false (option a): "+
+			"no finalizer, so a delete during a VK outage (GKE's node lifecycle controller) completes and the VK registers a new Node")
 	flag.BoolVar(&o.reclaimNode, "reclaim-terminating-node", true,
 		"on start, replace the virtual Node if a delete (for example GKE during a VK outage) holds it Terminating: "+
 			"remove our finalizer and register it again; guests stay bound by name. false leaves it Terminating")
@@ -573,7 +578,7 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 	cfg := provider.NodeConfig{
 		Name: o.nodeName, InternalIP: o.hostIP, KubeletPort: int32(o.kubeletPort),
 		KubeletVersion: o.kubeletVersion, GPUs: o.gpus, GuestNodeLabel: o.guestNodeLabel,
-		HostName: host.Name, HostUID: host.UID,
+		HostName: host.Name, HostUID: host.UID, Finalizer: o.nodeFinalizer,
 	}
 	if o.providerIDFromHost {
 		cfg.ProviderID = host.Spec.ProviderID
@@ -647,15 +652,18 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
 		return err
 	}
-	// D-VK-2 option c: register the Node ourselves with the finalizer and the ownerReference to
-	// the host (or add them to an existing Node), so the library finds it and only patches status.
+	// Register the Node ourselves with the ownerReference to the host (and, with
+	// --node-finalizer, D-VK-2 option c, the finalizer), or add them to an existing Node, so the
+	// library finds it and only patches status.
 	action, err := provider.EnsureNodeGuard(ctx, client, &nodeSpec)
 	if err != nil {
 		return err
 	}
 	// VK-A7: a Terminating Node cannot be un-deleted. On a live host (we run on it), swap it for
 	// a fresh one before the library starts, so the outage leaves no trace on the Node.
-	if action == provider.GuardTerminating && o.reclaimNode {
+	// Without the finalizer (option a) a Terminating Node goes by itself; reRegisterOnNotFound
+	// registers it again once it is gone.
+	if action == provider.GuardTerminating && o.reclaimNode && o.nodeFinalizer {
 		if _, err := provider.ReclaimNode(ctx, client, &nodeSpec, reclaimTimeout); err != nil {
 			return err
 		}
@@ -901,6 +909,10 @@ func reRegisterOnNotFound(client kubernetes.Interface, current func() *corev1.No
 		fresh.ResourceVersion = ""
 		if _, err := client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{}); err != nil {
 			return err
+		}
+		if len(fresh.Finalizers) == 0 {
+			log.G(ctx).WithField("node", fresh.Name).WithField("action", "re-registered").Info("node registered without finalizer")
+			return nil
 		}
 		log.G(ctx).WithField("node", fresh.Name).WithField("finalizer", provider.NodeFinalizer).
 			WithField("action", "re-registered").Info("node finalizer set")

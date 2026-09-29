@@ -8,10 +8,12 @@ CONTEXT ?= YOUR_KUBE_CONTEXT
 KUBECTL := kubectl --context $(CONTEXT)
 HOST    ?= YOUR_GPU_NODE
 VNODE   ?= vk-$(lastword $(subst -, ,$(HOST)))
+# Namespace of the donor controller (deploy/donor-controller), allowed by the option d delete policy.
+DONOR_NS ?= timeslice-system
 SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|' \
-	-e 's|__PLUGIN_IMAGE__|$(PLUGIN_IMAGE)|'
+	-e 's|__PLUGIN_IMAGE__|$(PLUGIN_IMAGE)|' -e 's|__VK_NODE__|$(VNODE)|g' -e 's|__DONOR_NS__|$(DONOR_NS)|g'
 
-.PHONY: build build-gpu-shadow deploy deploy-ds deploy-deviceplugin test-guest gpu-guest m2-deploy q5-force q5-toggle status undeploy
+.PHONY: build build-gpu-shadow deploy deploy-ds node-guard deploy-deviceplugin test-guest gpu-guest m2-deploy q5-force q5-toggle status undeploy
 
 build: ## vet, test, build and push the image remotely
 	gcloud builds submit --project=$(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
@@ -27,6 +29,9 @@ deploy: ## namespace, RBAC, Deployment (image tag = TAG)
 deploy-ds: ## D-NS-11 ns-ds: namespace, RBAC, DaemonSet on nodes labelled timeslice.io/donor=true
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
 	$(SUBST) deploy/daemonset.yaml | $(KUBECTL) apply -f -
+node-guard: ## D-VK-2 option d: delete policy for the virtual Node plus the donor-controller stand-in
+	for f in deploy/opt-d/*.yaml; do $(SUBST) $$f | $(KUBECTL) apply -f - || exit 1; done
+
 deploy-deviceplugin: ## --gpu-mode=deviceplugin: shadow plugin and admission policy (the Deployment still needs the flag)
 	$(SUBST) deploy/opt-deviceplugin/*.yaml | $(KUBECTL) apply -f -
 
@@ -54,8 +59,9 @@ status:
 
 undeploy: ## namespace first (guests, then mirrors via ownerRef), then cluster-scoped objects
 	-$(KUBECTL) delete ns guest-kubelet-proto --wait=true
-# The VK Node carries the timeslice.io/virtual-node-protection finalizer (D-VK-2 option c): it stays
-# Terminating until the VK deregisters (guest-kubelet --deregister) or the donor controller releases it.
+	-for f in deploy/opt-d/*.yaml; do $(SUBST) $$f | $(KUBECTL) delete --ignore-not-found -f -; done
+# With --node-finalizer=true (D-VK-2 option c) the VK Node carries the timeslice.io/virtual-node-protection
+# finalizer: it stays Terminating until the VK deregisters or the donor controller releases it.
 	-$(KUBECTL) delete node $(VNODE) --wait=false
 	-$(KUBECTL) -n kube-node-lease delete lease $(VNODE)
 	-$(KUBECTL) delete clusterrole,clusterrolebinding guest-kubelet-proto

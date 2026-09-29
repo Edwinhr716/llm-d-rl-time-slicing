@@ -26,7 +26,9 @@ const (
 )
 
 func guardedSpec() corev1.Node {
-	return provider.NewNodeSpec(provider.NodeConfig{Name: vkNode, InternalIP: "10.0.0.1", HostName: "host", HostUID: hostUID})
+	return provider.NewNodeSpec(provider.NodeConfig{
+		Name: vkNode, InternalIP: "10.0.0.1", HostName: "host", HostUID: hostUID, Finalizer: true,
+	})
 }
 
 // logCtx returns a context whose logger writes JSON lines to the returned buffer.
@@ -63,7 +65,7 @@ func TestNodeGuard_SpecCarriesFinalizerAndHostOwner(t *testing.T) {
 	if ref.APIVersion != "v1" || ref.Controller != nil || ref.BlockOwnerDeletion != nil {
 		t.Errorf("owner ref must be a plain v1 reference, got %+v", ref)
 	}
-	noHost := provider.NewNodeSpec(provider.NodeConfig{Name: vkNode})
+	noHost := provider.NewNodeSpec(provider.NodeConfig{Name: vkNode, Finalizer: true})
 	if len(noHost.OwnerReferences) != 0 {
 		t.Errorf("no host UID: want no ownerReferences, got %+v", noHost.OwnerReferences)
 	}
