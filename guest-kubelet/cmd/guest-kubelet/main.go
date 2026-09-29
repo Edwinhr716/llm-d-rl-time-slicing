@@ -44,6 +44,7 @@ import (
 	"github.com/edwinhr716/guest-kubelet/internal/gpushadow/api"
 	"github.com/edwinhr716/guest-kubelet/internal/group"
 	"github.com/edwinhr716/guest-kubelet/internal/hostcmd"
+	"github.com/edwinhr716/guest-kubelet/internal/keeper"
 	"github.com/edwinhr716/guest-kubelet/internal/probe"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
@@ -91,6 +92,13 @@ type options struct {
 	deregister bool
 	// VK-A7 on D-VK-2 c: replace a Node held Terminating by the finalizer when the VK returns.
 	reclaimNode bool
+	// D-VK-2: false = option a (no finalizer on the virtual Node), true = option c.
+	nodeFinalizer bool
+	// D-NS-14 guard (VK-A7 outage guard): a separate process of the same binary.
+	nodeKeeper        bool
+	keeperStaleAfter  time.Duration
+	keeperOutageGrace time.Duration
+	keeperInterval    time.Duration
 
 	// M2: readiness
 	readinessProbes bool
@@ -230,6 +238,16 @@ func main() {
 	flag.DurationVar(&o.fakeResumeDelay, "fake-freezer-resume-delay", 6*time.Second, "--freezer=fake: time a Resume takes")
 	flag.BoolVar(&o.deregister, "deregister", false,
 		"one-shot: delete the virtual Node, remove its finalizer and exit (end of an era; stop the serving VK first)")
+	flag.BoolVar(&o.nodeFinalizer, "node-finalizer", false,
+		"D-VK-2: hold the virtual Node with the "+provider.NodeFinalizer+" finalizer (option c). false (option a): "+
+			"no finalizer, so a delete during a VK outage (GKE's node lifecycle controller) completes and the VK registers a new Node")
+	flag.BoolVar(&o.nodeKeeper, "node-keeper", false,
+		"run as the outage guard instead of the kubelet: keep the virtual Node's Lease fresh while every guest-kubelet replica is down")
+	flag.DurationVar(&o.keeperStaleAfter, "keeper-stale-after", 15*time.Second,
+		"node keeper: renew the Lease once the guest kubelet has not renewed it for this long")
+	flag.DurationVar(&o.keeperOutageGrace, "keeper-outage-grace", 15*time.Minute,
+		"node keeper: stop renewing this long after the guest kubelet was last seen, so a dead guest kubelet still ends in NotReady")
+	flag.DurationVar(&o.keeperInterval, "keeper-interval", 5*time.Second, "node keeper: time between checks")
 	flag.BoolVar(&o.reclaimNode, "reclaim-terminating-node", true,
 		"on start, replace the virtual Node if a delete (for example GKE during a VK outage) holds it Terminating: "+
 			"remove our finalizer and register it again; guests stay bound by name. false leaves it Terminating")
@@ -314,6 +332,25 @@ func main() {
 func run(ctx context.Context, opts *options) error {
 	if opts.deregister {
 		return deregister(ctx, opts.nodeName, opts.hostNode, opts.kubeconfig)
+	}
+	if opts.nodeKeeper {
+		if opts.hostNode == "" {
+			return fmt.Errorf("--host-node (env NODE_NAME) is required")
+		}
+		if opts.nodeName == "" {
+			opts.nodeName = defaultNodeName(opts.hostNode)
+		}
+		// Not vkClient: the keeper is not a guest kubelet, so it writes no "vk starting" line.
+		cfg, err := restConfig(opts.kubeconfig)
+		if err != nil {
+			return err
+		}
+		withRateLimit(cfg, opts.kubeAPIQPS, opts.kubeAPIBurst)
+		client, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			return err
+		}
+		return runNodeKeeper(ctx, client, opts.keeperConfig())
 	}
 	if opts.hostIP == "" || opts.hostNode == "" {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
@@ -573,7 +610,7 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 	cfg := provider.NodeConfig{
 		Name: o.nodeName, InternalIP: o.hostIP, KubeletPort: int32(o.kubeletPort),
 		KubeletVersion: o.kubeletVersion, GPUs: o.gpus, GuestNodeLabel: o.guestNodeLabel,
-		HostName: host.Name, HostUID: host.UID,
+		HostName: host.Name, HostUID: host.UID, Finalizer: o.nodeFinalizer,
 	}
 	if o.providerIDFromHost {
 		cfg.ProviderID = host.Spec.ProviderID
@@ -647,15 +684,18 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
 		return err
 	}
-	// D-VK-2 option c: register the Node ourselves with the finalizer and the ownerReference to
-	// the host (or add them to an existing Node), so the library finds it and only patches status.
+	// Register the Node ourselves with the ownerReference to the host (and, with
+	// --node-finalizer, D-VK-2 option c, the finalizer), or add them to an existing Node, so the
+	// library finds it and only patches status.
 	action, err := provider.EnsureNodeGuard(ctx, client, &nodeSpec)
 	if err != nil {
 		return err
 	}
 	// VK-A7: a Terminating Node cannot be un-deleted. On a live host (we run on it), swap it for
 	// a fresh one before the library starts, so the outage leaves no trace on the Node.
-	if action == provider.GuardTerminating && o.reclaimNode {
+	// Without the finalizer (option a) a Terminating Node goes by itself; reRegisterOnNotFound
+	// registers it again once it is gone.
+	if action == provider.GuardTerminating && o.reclaimNode && o.nodeFinalizer {
 		if _, err := provider.ReclaimNode(ctx, client, &nodeSpec, reclaimTimeout); err != nil {
 			return err
 		}
@@ -902,6 +942,10 @@ func reRegisterOnNotFound(client kubernetes.Interface, current func() *corev1.No
 		if _, err := client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{}); err != nil {
 			return err
 		}
+		if len(fresh.Finalizers) == 0 {
+			log.G(ctx).WithField("node", fresh.Name).WithField("action", "re-registered").Info("node registered without finalizer")
+			return nil
+		}
 		log.G(ctx).WithField("node", fresh.Name).WithField("finalizer", provider.NodeFinalizer).
 			WithField("action", "re-registered").Info("node finalizer set")
 		return nil
@@ -911,4 +955,31 @@ func reRegisterOnNotFound(client kubernetes.Interface, current func() *corev1.No
 // probeOnce is one readiness probe attempt with the M2 prober's semantics (the resume check).
 func probeOnce(ctx context.Context, podIP string, c *corev1.Container) error {
 	return probe.NetProber{}.Probe(ctx, probe.Target{PodIP: podIP, Container: c})
+}
+
+// keeperConfig is the node keeper's part of the flags.
+func (o *options) keeperConfig() keeper.Config {
+	return keeper.Config{
+		HostNode:    o.hostNode,
+		VirtualNode: o.nodeName,
+		StaleAfter:  o.keeperStaleAfter,
+		OutageGrace: o.keeperOutageGrace,
+		Interval:    o.keeperInterval,
+	}
+}
+
+// runNodeKeeper is the outage guard (--node-keeper): a separate workload of this binary on the
+// host (deploy/guard/), that keeps the virtual Node's Lease fresh while every guest-kubelet
+// replica is down, for at most --keeper-outage-grace. See internal/keeper.
+func runNodeKeeper(ctx context.Context, client kubernetes.Interface, cfg keeper.Config) error {
+	log.G(ctx).WithField("node", cfg.VirtualNode).WithField("host", cfg.HostNode).
+		WithField("staleAfter", cfg.StaleAfter.String()).WithField("outageGrace", cfg.OutageGrace.String()).
+		Info("node keeper started")
+	return keeper.New(client, cfg).Run(ctx, func(msg string, kv ...any) {
+		entry := log.G(ctx).WithField("node", cfg.VirtualNode)
+		for i := 0; i+1 < len(kv); i += 2 {
+			entry = entry.WithField(fmt.Sprint(kv[i]), kv[i+1])
+		}
+		entry.Info(msg)
+	})
 }

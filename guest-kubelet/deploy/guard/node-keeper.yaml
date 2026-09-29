@@ -1,0 +1,52 @@
+# VK-A7 outage guard: keeps the virtual Node's Lease fresh while every guest-kubelet replica is
+# down (crash loop, bad rollout), so the Node is not marked NotReady and deleted and its guests
+# are not garbage-collected. At most --keeper-outage-grace after the guest kubelet was last seen;
+# never while the host itself is not Ready. See internal/keeper.
+# `make deploy` replaces __IMAGE__ and __HOST__ (the same values as deployment.yaml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guest-kubelet-node-keeper
+  namespace: guest-kubelet-proto
+spec:
+  replicas: 1
+  strategy:
+    # One keeper per Node; a restart is a few seconds and the guest kubelet renews the Lease
+    # meanwhile. It holds no state (the Lease annotations do).
+    type: Recreate
+  selector:
+    matchLabels: {app: guest-kubelet-node-keeper}
+  template:
+    metadata:
+      labels: {app: guest-kubelet-node-keeper}
+    spec:
+      serviceAccountName: guest-kubelet
+      # Pinned to the host: if the host dies the keeper dies with it, and the normal
+      # NotReady/delete path cleans up the virtual Node.
+      nodeSelector:
+        kubernetes.io/hostname: __HOST__
+      tolerations:
+        - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: node-keeper
+          image: __IMAGE__
+          args:
+            - --node-keeper=true
+            - --keeper-stale-after=15s
+            - --keeper-outage-grace=15m
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 50m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}

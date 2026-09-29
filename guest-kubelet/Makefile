@@ -20,13 +20,15 @@ build-gpu-shadow: ## the GPU shadow device plugin image, for --gpu-mode=devicepl
 	gcloud builds submit --project=$(PROJECT) --config cloudbuild-gpu-shadow.yaml \
 		--substitutions=_REGISTRY=$(patsubst %/,%,$(dir $(PLUGIN_IMAGE))),_TAG=$(TAG) .
 
-deploy: ## namespace, RBAC, Deployment (image tag = TAG)
+deploy: ## namespace, RBAC, Deployment and the outage guard (image tag = TAG)
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
 	$(SUBST) deploy/deployment.yaml | $(KUBECTL) apply -f -
+	$(SUBST) deploy/guard/node-keeper.yaml | $(KUBECTL) apply -f -
 
-deploy-ds: ## D-NS-11 ns-ds: namespace, RBAC, DaemonSet on nodes labelled timeslice.io/donor=true
+deploy-ds: ## D-NS-11 ns-ds: namespace, RBAC, DaemonSet and outage guard on nodes labelled timeslice.io/donor=true
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
 	$(SUBST) deploy/daemonset.yaml | $(KUBECTL) apply -f -
+	$(SUBST) deploy/guard/node-keeper-daemonset.yaml | $(KUBECTL) apply -f -
 deploy-deviceplugin: ## --gpu-mode=deviceplugin: shadow plugin and admission policy (the Deployment still needs the flag)
 	$(SUBST) deploy/opt-deviceplugin/*.yaml | $(KUBECTL) apply -f -
 
@@ -54,8 +56,8 @@ status:
 
 undeploy: ## namespace first (guests, then mirrors via ownerRef), then cluster-scoped objects
 	-$(KUBECTL) delete ns guest-kubelet-proto --wait=true
-# The VK Node carries the timeslice.io/virtual-node-protection finalizer (D-VK-2 option c): it stays
-# Terminating until the VK deregisters (guest-kubelet --deregister) or the donor controller releases it.
+# With --node-finalizer=true (D-VK-2 option c) the VK Node carries the timeslice.io/virtual-node-protection
+# finalizer: it stays Terminating until the VK deregisters or the donor controller releases it.
 	-$(KUBECTL) delete node $(VNODE) --wait=false
 	-$(KUBECTL) -n kube-node-lease delete lease $(VNODE)
 	-$(KUBECTL) delete clusterrole,clusterrolebinding guest-kubelet-proto

@@ -49,6 +49,9 @@ type NodeConfig struct {
 	HostUID  types.UID
 	// GuestNodeLabel adds the label GuestNodeLabel=true next to VirtualNodeLabel (D-NS-2).
 	GuestNodeLabel bool
+	// Finalizer puts NodeFinalizer on the Node (D-VK-2 option c, --node-finalizer). Without it
+	// (option a) any delete of the Node completes, as with a kubelet Node.
+	Finalizer bool
 }
 
 // HostOwnerRef is the ownerReference from the virtual Node to the real Node it runs on.
@@ -78,11 +81,15 @@ func NewNodeSpec(cfg NodeConfig) corev1.Node {
 	if cfg.HostUID != "" {
 		owners = []metav1.OwnerReference{HostOwnerRef(cfg.HostName, cfg.HostUID)}
 	}
+	var finalizers []string
+	if cfg.Finalizer {
+		finalizers = []string{NodeFinalizer}
+	}
 
 	return corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            cfg.Name,
-			Finalizers:      []string{NodeFinalizer},
+			Finalizers:      finalizers,
 			OwnerReferences: owners,
 			// Tells the cluster autoscaler never to pick this Node for scale-down. It matters
 			// if the Node ever carries the host's providerID (the autoscaler would then map it

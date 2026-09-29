@@ -145,7 +145,7 @@ func TestReclaim_SkipsNodesNotOurs(t *testing.T) {
 // The VK needs the host's UID to tell a live host from a recreated one.
 func TestReclaim_SkipsWithoutHostUID(t *testing.T) {
 	client := testutil.NewClient(heldNode())
-	spec := provider.NewNodeSpec(provider.NodeConfig{Name: vkNode, InternalIP: "10.0.0.1"})
+	spec := provider.NewNodeSpec(provider.NodeConfig{Name: vkNode, InternalIP: "10.0.0.1", Finalizer: true})
 	got, err := provider.ReclaimNode(context.Background(), client, &spec, time.Second)
 	if err != nil || got != provider.ReclaimSkipped {
 		t.Errorf("reclaim=%q err=%v, want skipped", got, err)

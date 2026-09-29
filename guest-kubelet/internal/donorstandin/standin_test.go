@@ -30,7 +30,7 @@ func hostNode(uid types.UID) *corev1.Node {
 }
 
 func virtualNode() *corev1.Node {
-	node := provider.NewNodeSpec(provider.NodeConfig{Name: vkNode, HostName: hostName, HostUID: "host-uid"})
+	node := provider.NewNodeSpec(provider.NodeConfig{Name: vkNode, HostName: hostName, HostUID: "host-uid", Finalizer: true})
 	return &node
 }
 

@@ -80,8 +80,17 @@ kubelet for the guest pods scheduled onto it.
 - A GPU mirror container's memory limit is its limit (or request) plus
   the device reserve, `ceil(--gpu-memory x --mirror-memory-factor)`
   (defaults `23034Mi` x `1.1`, about 24.7 GiB).
-- Outage (VK-A7 on this branch): the Node finalizer below holds the
-  virtual Node through a guest-kubelet outage; no keeper process.
+- Outage guard (VK-A7, D-NS-14 guard on this branch): `deploy/guard/`
+  runs the same binary with `--node-keeper` on the host, as a DaemonSet
+  on `timeslice.io/donor=true` nodes next to the guest kubelet DaemonSet
+  (`node-keeper-daemonset.yaml`, `make deploy-ds`) or as one pinned
+  Recreate replica (`node-keeper.yaml`, `make deploy`). While the host is
+  Ready and the guest kubelet was seen within `--keeper-outage-grace`
+  (15m), it renews the virtual Node's Lease whenever the guest kubelet
+  has not for `--keeper-stale-after` (15s). The Node stays Ready through
+  a guest-kubelet outage, so it is not deleted and its guests and
+  mirrors keep running. Past the grace it stops and the Node goes
+  NotReady as before. No Node finalizer (below, option a).
 - Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Liveness and
   startup probes are refused by admission (above), so an exec or gRPC
   readinessProbe never reaches the prober.
@@ -96,6 +105,7 @@ internal/provider/marker.go          --guest-marker: what makes a pod a guest
 internal/provider/admission.go       admission: probes, gates, GPU allowlist
 internal/provider/probepolicy.go     --guest-probe-policy (D-VK-5 a, b, c); probes_b.go
 internal/provider/events.go          drops events about non-guest pods
+internal/keeper/keeper.go            outage guard (keeps the Node Lease fresh)
 internal/group/                      the host node's group (timeslice.io/donor + timeslice.io/group), host watch
 internal/provider/finalizer.go       Node finalizer, ownerRef to host, release
 internal/donorstandin/               donor stand-in: releases Node on host death
@@ -131,6 +141,7 @@ deploy/admission/                    W9 policies, one per guest marker
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
 deploy/opt-c/                        donor stand-in Deployment + RBAC
+deploy/guard/                        node keeper (outage guard)
 deploy/m2/                           probed guests, pool, router, Q5 pods
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
@@ -249,7 +260,8 @@ probe verdict is re-learned after a restart.
 
 ```
 make build        # Cloud Build: tidy check, go vet, go test -race, image -> Artifact Registry
-make deploy       # namespace, RBAC, Deployment on the test cluster (HOST=<real node>)
+make deploy       # namespace, RBAC, Deployment, node keeper (HOST=<real node>)
+make deploy-ds    # namespace, RBAC, DaemonSet and node keeper on donor nodes
 make test-guest   # CPU guest + Service
 make gpu-guest    # claim + trainer stand-in, then the vLLM guest
 make m2-deploy    # probed guests, pool, EPP, router, RBAC
@@ -261,7 +273,17 @@ make undeploy
 
 ## Outage guard: Node finalizer (option c of an open decision)
 
-The VK Node carries the finalizer `timeslice.io/virtual-node-protection`
+This branch runs option a (status quo): `--node-finalizer` defaults to
+false, so the VK Node has no finalizer. A delete during a VK outage (the
+cloud node lifecycle controller, about 50 s in) completes, pod GC removes
+the guests, and the returning VK registers a new Node. The ownerReference
+to the real Node stays. Option b is this plus `--mirror-owner-ref=false`.
+On this branch the node keeper (above) keeps that delete from happening
+during an outage shorter than its grace.
+The rest of this section applies only with `--node-finalizer=true`.
+
+With `--node-finalizer=true` the VK Node carries the finalizer
+`timeslice.io/virtual-node-protection`
 and an ownerReference to the real Node. When anyone else deletes the VK
 Node during a VK outage (for example the cloud node lifecycle
 controller), the finalizer holds it (Terminating), so its guests are not
