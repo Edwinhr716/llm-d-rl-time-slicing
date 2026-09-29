@@ -165,7 +165,8 @@ type Controller struct {
 
 	// ForegroundOpTimeout bounds how long a reconcile waits for one agent
 	// snapshot or restore operation. Zero leaves the wait bounded only by the
-	// context.
+	// context. On expiry the job is marked FAULTED on the node
+	// (onForegroundOpTimeout).
 	ForegroundOpTimeout time.Duration
 
 	// Hosts commands the hosts of each group to vacate and resume (D-NS-4
@@ -423,10 +424,14 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 		return fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
 	}
 
+	timeoutFaulted := make(map[string]bool)
 	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
 	for _, job := range jobs {
 		if c.hostsGuardGuests(job) {
 			continue
+		}
+		if _, ok := job.ForegroundTimeoutFault(nodeName); ok {
+			timeoutFaulted[job.JobID()] = true
 		}
 		state, ok := job.ContextState()[nodeName]
 		if !ok {
@@ -464,6 +469,13 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 			continue
 		}
 
+		// A job marked FAULTED by a foreground operation timeout may still hold
+		// the accelerator: its operation never finished. Fail closed.
+		if timeoutFaulted[jobID] {
+			return fmt.Errorf("job %s is FAULTED by a foreground operation timeout on node %s, requires human intervention",
+				jobID, nodeName)
+		}
+
 		switch state {
 		case pb.SnapshotAgentJobState_STATE_RUNNING:
 			slog.InfoContext(ctx, "Triggering snapshot for job", "jobID", jobID, "state", state)
@@ -472,6 +484,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 				return fmt.Errorf("failed to trigger snapshot for job %s on node %s: %w", jobID, nodeName, err)
 			}
 			if err := c.waitForOperation(ctx, groupID, jobID, nodeName, resp.OperationId, "snapshot"); err != nil {
+				if isForegroundOpTimeout(ctx, err) {
+					return c.onForegroundOpTimeout(ctx, groupID, nodeName, jobID, resp.OperationId, "snapshot", err)
+				}
 				return fmt.Errorf("failed while waiting for snapshot operation %s for job %s on node %s: %w",
 					resp.OperationId, jobID, nodeName, err)
 			}
@@ -506,6 +521,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 			activeJobID, nodeName, err)
 	}
 	if err := c.waitForOperation(ctx, groupID, activeJobID, nodeName, resp.OperationId, "restore"); err != nil {
+		if isForegroundOpTimeout(ctx, err) {
+			return c.onForegroundOpTimeout(ctx, groupID, nodeName, activeJobID, resp.OperationId, "restore", err)
+		}
 		return fmt.Errorf("failed waiting for restore op %s for job %s on %s: %w",
 			resp.OperationId, activeJobID, nodeName, err)
 	}
@@ -833,8 +851,8 @@ func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeN
 	defer cancel()
 	err := c.pollOperation(opCtx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
 	if err != nil && ctx.Err() == nil && errors.Is(opCtx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("%s operation %s did not finish within the foreground operation timeout %s: %w",
-			operationType, operationID, c.ForegroundOpTimeout, err)
+		return fmt.Errorf("%s operation %s did not finish within the foreground operation timeout %s (%w): %w",
+			operationType, operationID, c.ForegroundOpTimeout, ErrForegroundOpTimeout, err)
 	}
 	return err
 }
