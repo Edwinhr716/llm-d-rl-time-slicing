@@ -361,6 +361,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		server.WithLendPolicy(fv.lendPolicy),
 		server.WithMinBubble(fv.minBubble),
 		server.WithNoticeTiming(fv.noticeWindow, fv.killBudget),
+		server.WithForegroundWait(fv.foregroundWait),
 	}
 	var publisher *budget.Publisher
 	if fv.budgetRedisAddr != "" {

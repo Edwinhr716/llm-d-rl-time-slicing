@@ -1,13 +1,17 @@
 import contextlib
 import datetime
 import json
+import time
 from typing import Any, List, Optional, Tuple, Union
 
 import grpc
 from google.protobuf import duration_pb2
 
 from timeslice.orchestrator._generated import pb2, pb2_grpc
-from timeslice.orchestrator.exceptions import wrap_grpc_error
+from timeslice.orchestrator.exceptions import (
+    OrchestratorTimeoutError,
+    wrap_grpc_error,
+)
 from timeslice.orchestrator.types import (
     AgentJobState,
     AcquireResult,
@@ -45,6 +49,17 @@ DEFAULT_SERVICE_CONFIG = json.dumps(
 DEFAULT_CHANNEL_OPTIONS: List[Tuple[str, Any]] = [
     ("grpc.service_config", DEFAULT_SERVICE_CONFIG),
 ]
+
+# Request metadata that asks the orchestrator to answer Acquire at once
+# (success=false until granted) so the client polls. A server started with
+# --foreground-wait=async-poll honours it; any other server ignores it and
+# blocks, which acquire() also handles.
+ACQUIRE_MODE_METADATA: Tuple[Tuple[str, str], ...] = (
+    ("x-timeslice-acquire-mode", "poll"),
+)
+
+# Seconds between Acquire polls while the job is not granted yet.
+DEFAULT_ACQUIRE_POLL_INTERVAL_SEC = 1.0
 
 # An expected_idle hint: seconds as a number, or a timedelta.
 ExpectedIdle = Union[float, int, datetime.timedelta]
@@ -111,38 +126,69 @@ class TimeSliceOrchestratorClient:
         job_id: Optional[str] = None,
         group_id: Optional[str] = None,
         timeout_sec: Optional[float] = None,
+        poll_interval_sec: float = DEFAULT_ACQUIRE_POLL_INTERVAL_SEC,
     ) -> AcquireResult:
         """Acquires exclusive access to the time-slice group.
 
-        This call blocks until access is granted or timeout is reached.
+        This call returns once access is granted, or raises when timeout_sec
+        passes. Each Acquire RPC asks the server to answer at once; while the
+        job is not granted yet the server answers success=false and the client
+        polls again every poll_interval_sec. A server that does not answer at
+        once simply blocks the first RPC until it is granted.
 
         Args:
             job_id: Optional job_id to override the constructor value.
             group_id: Optional group_id to override the constructor value.
-            timeout_sec: Optional timeout in seconds for the RPC call.
+            timeout_sec: Optional overall timeout in seconds, across all polls.
+            poll_interval_sec: Seconds between polls while not granted.
 
         Returns:
             AcquireResult containing success, waited_ms, and context_restored.
 
         Raises:
-            ValueError: If job_id or group_id is not provided either here or in the constructor.
-            OrchestratorError: If the RPC fails.
+            ValueError: If job_id or group_id is not provided either here or in
+                the constructor, or if poll_interval_sec is not positive.
+            OrchestratorTimeoutError: If the job is not granted within timeout_sec.
+            OrchestratorError: If an RPC fails.
         """
         resolved_job_id = self._resolve_job_id(job_id)
         resolved_group_id = self._resolve_group_id(group_id)
+        if poll_interval_sec <= 0:
+            raise ValueError("poll_interval_sec must be positive.")
 
         request = pb2.AcquireRequest(job_id=resolved_job_id, group_id=resolved_group_id)
-        try:
-            # Note: timeout in grpc is passed as 'timeout' keyword argument in seconds
-            response = self._stub.Acquire(request, timeout=timeout_sec)
-            return AcquireResult(
-                success=response.success,
-                waited_ms=response.waited_ms,
-                context_restored=response.context_restored,
-                vram_unconfirmed=response.vram_unconfirmed,
-            )
-        except grpc.RpcError as e:
-            raise wrap_grpc_error(e) from e
+        deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
+        # The first RPC gets the whole timeout, later ones what is left of it.
+        rpc_timeout = timeout_sec
+        while True:
+            try:
+                response = self._stub.Acquire(
+                    request, timeout=rpc_timeout, metadata=ACQUIRE_MODE_METADATA
+                )
+            except grpc.RpcError as e:
+                raise wrap_grpc_error(e) from e
+            if response.success:
+                return AcquireResult(
+                    success=response.success,
+                    waited_ms=response.waited_ms,
+                    context_restored=response.context_restored,
+                    vram_unconfirmed=response.vram_unconfirmed,
+                )
+
+            if deadline is None:
+                time.sleep(poll_interval_sec)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OrchestratorTimeoutError(
+                    f"Acquire of group {resolved_group_id} for job "
+                    f"{resolved_job_id} not granted within {timeout_sec}s "
+                    f"(waited {response.waited_ms} ms)"
+                )
+            time.sleep(min(poll_interval_sec, remaining))
+            # At or past the deadline the last poll fails with
+            # DEADLINE_EXCEEDED, which raises OrchestratorTimeoutError.
+            rpc_timeout = max(deadline - time.monotonic(), 0.0)
 
     def release(
         self,

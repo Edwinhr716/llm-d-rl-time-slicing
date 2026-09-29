@@ -21,9 +21,11 @@ import (
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/infrastructure"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -196,27 +198,29 @@ func TestEvalwire_StartStopRestart(t *testing.T) {
 		Name:   "127.0.0.1",
 		Labels: map[string]string{infrastructure.NodeLabelPrefix + groupID: "true"},
 	}})
-	args := []string{
-		"--background-role=true",
-		"--min-bubble=1s",
-		"--background-liveness=3s",
-		"--lock-configmap=evalwire-locks",
-		"--foreground-wait=blocking",
-		"--controller-workers=4",
-		"--foreground-op-timeout=60s",
-		"--resync-period=30s",
-	}
-
-	// The second Start on the same clientset models an orchestrator restart.
-	for i := range 2 {
-		orch, err := Start(context.Background(), Config{Clientset: cs, AgentPort: 1, Args: args})
-		if err != nil {
-			t.Fatalf("Start #%d: %v", i+1, err)
+	for _, mode := range []string{controller.ForegroundWaitBlocking, controller.ForegroundWaitAsyncPoll} {
+		args := []string{
+			"--background-role=true",
+			"--min-bubble=1s",
+			"--background-liveness=3s",
+			"--lock-configmap=evalwire-locks",
+			"--foreground-wait=" + mode,
+			"--controller-workers=4",
+			"--foreground-op-timeout=60s",
+			"--resync-period=30s",
 		}
-		waitForGroup(t, orch.Addr, groupID)
-		checkMetrics(t, orch.MetricsAddr)
-		orch.Stop()
-		orch.Stop() // idempotent
+
+		// The second Start on the same clientset models an orchestrator restart.
+		for i := range 2 {
+			orch, err := Start(context.Background(), Config{Clientset: cs, AgentPort: 1, Args: args})
+			if err != nil {
+				t.Fatalf("%s: Start #%d: %v", mode, i+1, err)
+			}
+			waitForGroup(t, orch.Addr, groupID)
+			checkMetrics(t, orch.MetricsAddr)
+			orch.Stop()
+			orch.Stop() // idempotent
+		}
 	}
 }
 
@@ -391,5 +395,82 @@ func TestNodeSelectorExemptBackground_BackgroundAcquire(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestForegroundWait_AsyncPoll_Evalwire checks the async-poll wiring end to
+// end: polling reaches a grant, an Acquire with the poll metadata that cannot
+// be granted returns at once with success=false, and without the metadata the
+// Acquire still blocks.
+func TestForegroundWait_AsyncPoll_Evalwire(t *testing.T) {
+	const groupID = "g-poll"
+	cs := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   "127.0.0.1",
+		Labels: map[string]string{infrastructure.NodeLabelPrefix + groupID: "true"},
+	}})
+	orch, err := Start(context.Background(), Config{Clientset: cs, AgentPort: 1, Args: []string{
+		"--foreground-wait=" + controller.ForegroundWaitAsyncPoll,
+		"--controller-workers=4",
+		"--foreground-op-timeout=60s",
+	}})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer orch.Stop()
+	waitForGroup(t, orch.Addr, groupID)
+
+	conn, err := grpc.NewClient(orch.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial %s: %v", orch.Addr, err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Logf("close conn: %v", err)
+		}
+	}()
+	client := pb.NewTimeSliceOrchestratorServiceClient(conn)
+	pollCtx, cancel := context.WithTimeout(
+		metadata.AppendToOutgoingContext(context.Background(), server.AcquireModeMetadataKey, server.AcquireModePoll),
+		10*time.Second)
+	defer cancel()
+
+	// job-0 has no pods, so the controller counts it as loaded once it holds
+	// the lock: polling reaches the grant through the real reconcile loop.
+	holder := &pb.AcquireRequest{JobId: "job-0", GroupId: groupID}
+	granted := false
+	for polls := 1; !granted; polls++ {
+		resp, err := client.Acquire(pollCtx, holder)
+		if err != nil {
+			t.Fatalf("job-0 poll %d: Acquire = %v", polls, err)
+		}
+		granted = resp.GetSuccess()
+		if !granted {
+			if polls >= 50 {
+				t.Fatalf("job-0 not granted after %d polls", polls)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// job-0 never yields, so job-1 cannot be granted.
+	req := &pb.AcquireRequest{JobId: "job-1", GroupId: groupID}
+	for i := range 2 {
+		start := time.Now()
+		resp, err := client.Acquire(pollCtx, req)
+		if err != nil {
+			t.Fatalf("poll %d: Acquire = %v", i+1, err)
+		}
+		if resp.GetSuccess() {
+			t.Fatalf("poll %d: Acquire succeeded while job-0 holds the lock, want success=false", i+1)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("poll %d: Acquire took %v, want an immediate answer", i+1, elapsed)
+		}
+	}
+
+	blockCtx, cancelBlock := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancelBlock()
+	if _, err := client.Acquire(blockCtx, req); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("Acquire without poll metadata = %v, want DeadlineExceeded (blocking)", err)
 	}
 }
