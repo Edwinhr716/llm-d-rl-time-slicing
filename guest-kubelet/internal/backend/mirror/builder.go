@@ -54,10 +54,6 @@ type Config struct {
 	HostTaints []corev1.Taint
 	// GuestTaintKey is the virtual node's taint. Its toleration is dropped from the mirror.
 	GuestTaintKey string
-	// OwnerRef makes the guest the mirror's owner, so deleting the guest garbage-collects the
-	// mirror. With false, the mirror outlives a guest that is force-deleted (for example after
-	// the virtual Node is deleted) and a guest re-created with the same name re-adopts it.
-	OwnerRef bool
 }
 
 // Name returns the mirror's name for a guest.
@@ -159,11 +155,11 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 				AnnotationGuestName:     guest.Name,
 				AnnotationGuestSpecHash: SpecHash(guest),
 			},
+			// The guest owns its mirror: deleting the guest, by the user or by pod GC after the
+			// virtual Node is deleted, garbage-collects the mirror, so a mirror never outlives it.
+			OwnerReferences: []metav1.OwnerReference{OwnerRef(guest)},
 		},
 		Spec: spec,
-	}
-	if cfg.OwnerRef {
-		m.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
 	}
 	return m, nil
 }

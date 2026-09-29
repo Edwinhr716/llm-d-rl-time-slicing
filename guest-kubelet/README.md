@@ -23,9 +23,11 @@ kubelet for the guest pods scheduled onto it.
   soon as the mirror has stopped.
 - Leader election (`--leader-elect`, Lease `guest-kubelet-<vnode>`) runs 2 replicas. On restart
   or failover, existing mirrors are found again and nothing is re-created.
-- `--mirror-owner-ref=false` lets mirrors outlive guests that were force-deleted after a Node
-  deletion. A guest re-created with the same name and the same containers re-adopts the mirror
-  (same UID and IP). Orphans are deleted after `--orphan-grace`.
+- The guest owns its mirror (ownerReference), so deleting the guest, by a user or by pod GC
+  after the virtual Node is deleted, garbage-collects the mirror: a mirror never outlives its
+  guest. A guest re-created with the same name and the same containers before the collector
+  gets there re-adopts the mirror (same UID and IP). A mirror left without a guest is deleted
+  after `--orphan-grace`.
 - Not yet: probes (a guest is Ready when its container starts), logs/exec (use `kubectl logs
   <guest>-m`), stats.
 

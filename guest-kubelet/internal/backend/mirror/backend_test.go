@@ -63,9 +63,7 @@ func newHarness(t *testing.T, opts Options, objs ...runtime.Object) *harness {
 }
 
 func testOptions() Options {
-	cfg := testConfig()
-	cfg.OwnerRef = false
-	return Options{Config: cfg, ReserveClaim: true, OrphanGrace: time.Minute}
+	return Options{Config: testConfig(), ReserveClaim: true, OrphanGrace: time.Minute}
 }
 
 func cpuGuest(uid string) *corev1.Pod {
@@ -147,6 +145,9 @@ func TestReadoptOrphanWithSameSpec(t *testing.T) {
 	m := h.mirror("vllm-m")
 	if m.UID != "mirror-uid" || m.Labels[LabelMirrorOf] != "new-uid" || m.Status.PodIP != "10.9.9.9" {
 		t.Errorf("want the same mirror re-adopted, got uid=%s of=%s ip=%s", m.UID, m.Labels[LabelMirrorOf], m.Status.PodIP)
+	}
+	if len(m.OwnerReferences) != 1 || m.OwnerReferences[0].UID != "new-uid" {
+		t.Errorf("want the new guest as owner, got %v", m.OwnerReferences)
 	}
 }
 

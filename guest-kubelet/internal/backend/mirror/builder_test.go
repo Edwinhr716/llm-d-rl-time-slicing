@@ -16,7 +16,6 @@ func testConfig() Config {
 		GPUClaim:      "shared-gpu",
 		HostTaints:    []corev1.Taint{{Key: "nvidia.com/gpu", Value: "present", Effect: corev1.TaintEffectNoSchedule}},
 		GuestTaintKey: "timeslice.io/guest",
-		OwnerRef:      true,
 	}
 }
 
@@ -126,20 +125,19 @@ func TestBuildMirror(t *testing.T) {
 	}
 }
 
-func TestBuildNoOwnerRefAndNoGPU(t *testing.T) {
+func TestBuildNoGPU(t *testing.T) {
 	g := testGuest()
 	c := &g.Spec.Containers[0]
 	delete(c.Resources.Requests, GPUResource)
 	delete(c.Resources.Limits, GPUResource)
 	cfg := testConfig()
-	cfg.OwnerRef = false
 	cfg.GPUClaim = ""
 	m, err := Build(g, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.OwnerReferences != nil || m.Spec.ResourceClaims != nil || m.Spec.Containers[0].Resources.Claims != nil {
-		t.Errorf("unexpected owner/claims: %v %v", m.OwnerReferences, m.Spec.ResourceClaims)
+	if m.Spec.ResourceClaims != nil || m.Spec.Containers[0].Resources.Claims != nil {
+		t.Errorf("unexpected claims: %v %v", m.Spec.ResourceClaims, m.Spec.Containers[0].Resources.Claims)
 	}
 }
 

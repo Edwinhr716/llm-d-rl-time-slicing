@@ -1,5 +1,7 @@
-# Re-adoption test: a StatefulSet re-creates its pod with the same name (new UID) after the
-# old one is force-deleted, so the guest kubelet can re-adopt the surviving mirror.
+# StatefulSet guest: after the old pod is force-deleted, the StatefulSet re-creates it with the
+# same name and a new UID. The old mirror is garbage-collected with the old pod (its owner) and
+# the guest kubelet creates a new one for the new pod, or re-adopts the old mirror if the
+# collector has not reached it yet.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
