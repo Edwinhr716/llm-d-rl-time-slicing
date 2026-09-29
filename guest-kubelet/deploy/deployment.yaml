@@ -40,6 +40,10 @@ spec:
             - --mirror-cpu-headroom=1
             - --mirror-memory-headroom=4Gi
             - --mirror-owner-ref=true
+            # The virtual Node is cordoned while the donor holds this group's lock. Without a
+            # reachable orchestrator it is cordoned after 3 s (fail closed).
+            - --hold-group=__GROUP__
+            - --orchestrator-addr=__ORCH_ADDR__
           env:
             - name: HOST_IP
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}

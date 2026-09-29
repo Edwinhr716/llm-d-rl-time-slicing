@@ -23,6 +23,17 @@ kubelet for the guest pods scheduled onto it.
   soon as the mirror has stopped.
 - Leader election (`--leader-elect`, Lease `guest-kubelet-<vnode>`) runs 2 replicas. On restart
   or failover, existing mirrors are found again and nothing is re-created.
+- The virtual Node is cordoned (`SchedulingDisabled`) while the donor holds
+  the group lock, so no new guest binds while the GPU is lent out. Guests
+  already bound keep running. A stand-in watcher (`internal/hold`) polls
+  `GetGroupStatus` for `--hold-group` at `--orchestrator-addr` every 0.5 s,
+  as participant `vk/<host node>`; both flags are required. Held means
+  `LOCKED`, `SWITCHING` or `VACATING`, or no answer for more than 3 s (fail
+  closed). The VK patches only `spec.unschedulable` and the annotation
+  `timeslice.io/cordoned-by=guest-kubelet`, and removes only a cordon that
+  carries it, so an admin cordon made before a hold stays. The cordon is
+  kept across a restart and a re-registered Node, and is not removed on
+  shutdown. `Cordoned` and `Uncordoned` events are recorded on the Node.
 - `--mirror-owner-ref=false` lets mirrors outlive guests that were force-deleted after a Node
   deletion. A guest re-created with the same name and the same containers re-adopts the mirror
   (same UID and IP). Orphans are deleted after `--orphan-grace`.
@@ -33,7 +44,10 @@ kubelet for the guest pods scheduled onto it.
 
 ```
 cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wiring; own event recorder
+api/orchestrator/v1alpha1/           orchestrator .proto copy, Go stubs
+internal/hold/watcher.go             hold watcher: GetGroupStatus poll
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
+internal/provider/cordon.go          cordon while held
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
 internal/provider/events.go          drops events about non-guest pods
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
@@ -56,6 +70,10 @@ make gpu-guest    # claim + trainer stand-in, then the vLLM guest
 make status
 make undeploy
 ```
+
+`make deploy` also takes `GROUP=<donor group>` and `ORCH=<host:port>` (default:
+the orchestrator chart's Service). Without a reachable orchestrator the
+virtual Node is cordoned after 3 s.
 
 The plan and the notes explaining this code are kept outside this repository
 (prototype plan, milestones M0 and M1).

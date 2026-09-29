@@ -2,15 +2,45 @@
 #   gcloud builds submit --project=YOUR_PROJECT --config cloudbuild.yaml --substitutions=_TAG=$(git rev-parse --short HEAD)
 # First build only (no go.sum yet): add _ALLOW_TIDY=true, then commit the go.mod/go.sum
 # that the build uploads to gs://${PROJECT_ID}_cloudbuild/guest-kubelet/${BUILD_ID}/.
+# After changing a .proto under api/: add _ALLOW_PROTOGEN=true and commit the generated Go that
+# the build uploads to the same place (out/api/...).
 substitutions:
   _REGION: YOUR_REGION
   _REPO: guest-kubelet
   _TAG: dev
   _ALLOW_TIDY: "false"
+  _ALLOW_PROTOGEN: "false"
 options:
   logging: GCS_ONLY
   machineType: E2_HIGHCPU_8
 steps:
+  # Go stubs for the orchestrator API. The .proto is a copy of the orchestrator's; only the Go
+  # package differs (M option), so the wire names stay the same.
+  - id: protogen
+    name: golang:1.26
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        apt-get update -qq >/dev/null && apt-get install -y -qq protobuf-compiler >/dev/null
+        GOBIN=/tmp/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+        GOBIN=/tmp/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+        export PATH=/tmp/bin:$$PATH
+        protoc --version
+        dir=api/orchestrator/v1alpha1
+        mopt=Mtimeslice_orchestrator.proto=github.com/edwinhr716/guest-kubelet/$$dir
+        mkdir -p /tmp/gen out/$$dir
+        protoc -I $$dir --go_out=/tmp/gen --go_opt=paths=source_relative,$$mopt \
+          --go-grpc_out=/tmp/gen --go-grpc_opt=paths=source_relative,$$mopt timeslice_orchestrator.proto
+        for f in timeslice_orchestrator.pb.go timeslice_orchestrator_grpc.pb.go; do
+          if ! cmp -s /tmp/gen/$$f $$dir/$$f; then
+            if [ "${_ALLOW_PROTOGEN}" != "true" ]; then echo "$$dir/$$f is not up to date"; exit 1; fi
+            echo "$$dir/$$f was regenerated (allowed); commit out/$$dir/$$f"
+            cp /tmp/gen/$$f $$dir/$$f
+          fi
+          cp $$dir/$$f out/$$dir/
+        done
   - id: tidy
     name: golang:1.26
     entrypoint: bash
@@ -44,4 +74,8 @@ images:
 artifacts:
   objects:
     location: gs://${PROJECT_ID}_cloudbuild/guest-kubelet/${BUILD_ID}/
-    paths: ["out/go.mod", "out/go.sum"]
+    paths:
+      - out/go.mod
+      - out/go.sum
+      - out/api/orchestrator/v1alpha1/timeslice_orchestrator.pb.go
+      - out/api/orchestrator/v1alpha1/timeslice_orchestrator_grpc.pb.go

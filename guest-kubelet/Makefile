@@ -7,14 +7,17 @@ CONTEXT ?= YOUR_KUBE_CONTEXT
 KUBECTL := kubectl --context $(CONTEXT)
 HOST    ?= YOUR_GPU_NODE
 VNODE   ?= vk-$(lastword $(subst -, ,$(HOST)))
-SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|'
+GROUP   ?= YOUR_GROUP
+ORCH    ?= timeslice-timesliceorchestrator.timeslice-system.svc:50051
+SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|' \
+	-e 's|__GROUP__|$(GROUP)|' -e 's|__ORCH_ADDR__|$(ORCH)|'
 
 .PHONY: build deploy test-guest gpu-guest status undeploy
 
 build: ## vet, test, build and push the image remotely
 	gcloud builds submit --project=$(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
 
-deploy: ## namespace, RBAC, Deployment (image tag = TAG)
+deploy: ## namespace, RBAC, Deployment (image tag = TAG; GROUP = the donor's group, ORCH = orchestrator)
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
 	$(SUBST) deploy/deployment.yaml | $(KUBECTL) apply -f -
 

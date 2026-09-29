@@ -21,6 +21,8 @@ import (
 	vkslog "github.com/virtual-kubelet/virtual-kubelet/log/slog"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -33,7 +35,9 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
 
+	orchv1 "github.com/edwinhr716/guest-kubelet/api/orchestrator/v1alpha1"
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/hold"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
 
@@ -57,6 +61,10 @@ type options struct {
 	leaderElect        bool
 	leaseNamespace     string
 	podName            string
+
+	// The virtual Node is cordoned while the donor holds this group's lock.
+	holdGroup        string
+	orchestratorAddr string
 }
 
 func main() {
@@ -89,6 +97,12 @@ func main() {
 	flag.BoolVar(&o.leaderElect, "leader-elect", false, "run several replicas; only the Lease holder acts as the kubelet")
 	flag.StringVar(&o.leaseNamespace, "leader-elect-namespace", os.Getenv("POD_NAMESPACE"), "namespace of the leader-election Lease (env POD_NAMESPACE)")
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
+
+	// The virtual Node is unschedulable while the donor holds the group lock. Both flags are
+	// temporary: the orchestrator loop will take the group from the real node and the hold from
+	// its own poll.
+	flag.StringVar(&o.holdGroup, "hold-group", "", "group whose lock the hold watcher polls (required)")
+	flag.StringVar(&o.orchestratorAddr, "orchestrator-addr", "", "orchestrator gRPC address host:port (required)")
 	flag.Parse()
 
 	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -104,6 +118,9 @@ func main() {
 func run(ctx context.Context, o options) error {
 	if o.hostIP == "" || o.hostNode == "" {
 		return fmt.Errorf("--host-ip and --host-node (env HOST_IP, NODE_NAME) are required")
+	}
+	if o.holdGroup == "" || o.orchestratorAddr == "" {
+		return fmt.Errorf("--hold-group and --orchestrator-addr are required")
 	}
 	if o.nodeName == "" {
 		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
@@ -214,6 +231,10 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	eb := record.NewBroadcaster()
 	eb.StartRecordingToSink(&corev1client.EventSinkImpl{Interface: client.CoreV1().Events(corev1.NamespaceAll)})
 	defer eb.Shutdown()
+	// Cordons the virtual Node while the donor holds the lock. A Node registered again after
+	// someone deleted it is created from cordoner.Template, so it carries the current cordon.
+	cordonRecorder := eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "cordon")})
+	cordoner := provider.NewCordoner(client.CoreV1().Nodes(), &nodeSpec, cordonRecorder)
 	recorder := provider.GuestOnlyRecorder{
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
@@ -235,7 +256,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			// the mirror, so the guest kubelet never needs it.
 			c.SkipDownwardAPIResolution = true
 			c.HTTPListenAddr = fmt.Sprintf(":%d", o.kubeletPort) // no TLS config, so no server starts yet
-			c.NodeStatusUpdateErrorHandler = reRegisterOnNotFound(client, &nodeSpec)
+			c.NodeStatusUpdateErrorHandler = provider.ReRegisterOnNotFound(client, cordoner.Template)
 			return nil
 		},
 	)
@@ -247,6 +268,11 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if err := backend.Start(ctx); err != nil {
 		return err
 	}
+	stop, err := startHoldWatcher(ctx, o.orchestratorAddr, o.holdGroup, o.hostNode, cordoner)
+	if err != nil {
+		return err
+	}
+	defer stop()
 	go func() {
 		if err := n.WaitReady(ctx, 0); err == nil {
 			log.G(ctx).WithField("node", o.nodeName).WithField("host", o.hostNode).
@@ -283,17 +309,29 @@ func ensureProviderID(ctx context.Context, client kubernetes.Interface, name, id
 	}
 }
 
-// reRegisterOnNotFound recreates the Node if someone deleted it (for example the cloud
-// node lifecycle controller). The loud log line is how we record that it happened.
-func reRegisterOnNotFound(client kubernetes.Interface, spec *corev1.Node) node.ErrorHandler {
-	return func(ctx context.Context, err error) error {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-		log.G(ctx).WithField("node", spec.Name).Warn("Node object was deleted by someone else; re-registering")
-		fresh := spec.DeepCopy()
-		fresh.ResourceVersion = ""
-		_, err = client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{})
-		return err
+// startHoldWatcher starts the stand-in hold watcher: every poll with a decision sets the
+// cordon. It returns a function that closes the orchestrator connection.
+func startHoldWatcher(ctx context.Context, addr, group, hostNode string, cordoner *provider.Cordoner) (func(), error) {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("--orchestrator-addr: %w", err)
 	}
+	watcher := &hold.Watcher{
+		Client:      orchv1.NewTimeSliceOrchestratorServiceClient(conn),
+		Group:       group,
+		Participant: "vk/" + hostNode,
+		OnPoll:      cordoner.Set,
+	}
+	log.G(ctx).WithField("group", watcher.Group).WithField("participant", watcher.Participant).
+		WithField("orchestrator", addr).Info("hold watcher started; cordon while held")
+	go func() {
+		if err := watcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.G(ctx).WithError(err).Error("hold watcher stopped")
+		}
+	}()
+	return func() {
+		if err := conn.Close(); err != nil {
+			log.G(ctx).WithError(err).Warn("closing the orchestrator connection")
+		}
+	}, nil
 }
