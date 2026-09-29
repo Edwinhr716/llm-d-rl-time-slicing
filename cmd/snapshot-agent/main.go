@@ -33,6 +33,11 @@ import (
 )
 
 func main() {
+	// "snapshot-agent scrub ..." scrubs the GPU at one handoff boundary and exits.
+	if len(os.Args) > 1 && os.Args[1] == "scrub" {
+		os.Exit(runScrubCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	// Initialize slog with ContextHandler
 	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
 	ctxHandler := logging.NewContextHandler(jsonHandler)
