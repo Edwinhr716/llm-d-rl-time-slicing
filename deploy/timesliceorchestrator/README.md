@@ -32,7 +32,7 @@ To deploy the orchestrator using the local Helm chart:
     ```
     This will deploy the orchestrator and set up the required RBAC permissions:
     *   Creating a `ServiceAccount` for the orchestrator in the release namespace.
-    *   Creating a `ClusterRole` and `ClusterRoleBinding` granting the service account cluster-wide read-only permissions (`get`, `list`, `watch`) for `pods` and `nodes`.
+    *   Creating a `ClusterRole` and `ClusterRoleBinding` granting the service account cluster-wide read-only permissions (`get`, `list`, `watch`) for `pods` and `nodes`, and `create` for `events` (Warning events when a guest's Kill is not confirmed).
     *   Creating a `Role` and `RoleBinding` **specifically in the `timeslice-system` namespace** granting the service account read-write permissions (`get`, `list`, `watch`, `create`, `update`, `patch`, `delete`) for `configmaps` in that namespace.
     *   Configuring the orchestrator pod to use this `ServiceAccount`.
 

@@ -95,6 +95,12 @@ dispatchBudget:
   openDelay: "0s"
   externalRisingEdge: false
 
+# When a guest's Kill is not confirmed by T + K: false (the default) keeps the
+# foreground grant blocked until it is (the Kill is retried, and the operator
+# alerted); true hands the host back at the end of the notice window with
+# vram_unconfirmed = true.
+grantUnconfirmed: false
+
 resources: {}
   # limits:
   #   cpu: 100m

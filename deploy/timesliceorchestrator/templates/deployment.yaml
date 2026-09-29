@@ -32,6 +32,7 @@ spec:
             - "--dispatch-budget-job={{ .Values.dispatchBudget.job }}"
             - "--dispatch-budget-open-delay={{ .Values.dispatchBudget.openDelay | default "0s" }}"
             - "--dispatch-budget-external-rising-edge={{ .Values.dispatchBudget.externalRisingEdge | default false }}"
+            - "--grant-unconfirmed={{ .Values.grantUnconfirmed | default false }}"
             {{- $lockNamespace := include "timesliceorchestrator.lockNamespace" . }}
             {{- if ne $lockNamespace "timeslice-system" }}
             - "--lock-namespace={{ $lockNamespace }}"

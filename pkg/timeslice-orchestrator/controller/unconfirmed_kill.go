@@ -13,10 +13,14 @@ import (
 )
 
 // This file holds what happens when a Kill reached the agent but the guest is
-// not confirmed gone (decision D-NS-6). Every such case goes through
-// onKillUnconfirmed, so the decision can be swapped in one place.
+// not confirmed gone. By default the foreground is never granted over such a
+// guest: its host stays not clear, the grant is blocked and the operator is
+// alerted (unconfirmed_kill_block.go) until the agent confirms the guest gone
+// or its mirror pod is gone. With --grant-unconfirmed the host is handed back
+// at the end of the notice window instead, and the grant carries
+// AcquireResponse.vram_unconfirmed.
 
-// Signals that a Kill that reached the agent was not confirmed (D-NS-6 H4).
+// Signals that a Kill that reached the agent was not confirmed.
 const (
 	// unconfirmedKillTimeout: the kill operation was not COMPLETE within K.
 	unconfirmedKillTimeout = "kill-timeout"
@@ -31,6 +35,44 @@ const (
 	unconfirmedDeviceBytes = "device-bytes"
 )
 
+// Actions on an unconfirmed Kill, as logged.
+const (
+	unconfirmedActionBlock = "block"
+	unconfirmedActionGrant = "grant"
+)
+
+// UnconfirmedKube is what the unconfirmed-kill path does through the
+// Kubernetes API. It is implemented by infrastructure.KubeActions.
+type UnconfirmedKube interface {
+	// GuestEvent records a Warning event on the guest's mirror pods on node.
+	GuestEvent(ctx context.Context, group, job, node, reason, message string) error
+	// ForegroundEvent records a Warning event on the pods of a foreground
+	// job of the group.
+	ForegroundEvent(ctx context.Context, group, job, reason, message string) error
+}
+
+// Kubernetes Warning event reasons.
+const (
+	eventKillUnconfirmed = "KillUnconfirmed"
+	eventGrantBlocked    = "GrantBlocked"
+)
+
+// kubeCallTimeout bounds each UnconfirmedKube call.
+const kubeCallTimeout = 5 * time.Second
+
+// kubeCall runs one UnconfirmedKube call, bounded by kubeCallTimeout, and logs
+// a failure. It does nothing when no UnconfirmedKube is set.
+func (c *Controller) kubeCall(ctx context.Context, what string, call func(context.Context, UnconfirmedKube) error) {
+	if c.Kube == nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, kubeCallTimeout)
+	defer cancel()
+	if err := call(cctx, c.Kube); err != nil {
+		slog.WarnContext(ctx, "Kubernetes call for an unconfirmed kill failed", "call", what, "error", err)
+	}
+}
+
 // unconfirmedDecision is what onKillUnconfirmed decided.
 type unconfirmedDecision struct {
 	// grant: hand the host back to the foreground now.
@@ -40,24 +82,36 @@ type unconfirmedDecision struct {
 	vramUnconfirmed bool
 }
 
-// onKillUnconfirmed is the D-NS-6 H2 seam. It is called from vacateHost
-// (kill.go), inside killOverdueHosts, the controller's decision for a host
-// that is not clear at the deadline T (or unseen for L), for a guest whose
-// Kill reached the agent but was not confirmed. since is when the first Kill
-// for the guest in this barrier was sent. It decides whether the host is
-// handed back to the foreground now and whether that grant carries
-// AcquireResponse.vram_unconfirmed. It is called on every reconcile pass until
-// it grants.
-//
-// Today's behaviour: grant once the notice window N has run out
-// (noticeAt + N), and never before the Kill had its full budget K
-// (since + K), with vram_unconfirmed = true.
+// onKillUnconfirmed is called from vacateHost (kill.go), inside
+// killOverdueHosts, for a host that is not clear at the deadline T (or unseen
+// for L), for a guest whose Kill reached the agent but was not confirmed.
+// since is when the first Kill for the guest in this barrier was sent. The
+// decision is taken once the notice window N has run out (noticeAt + N), and
+// never before the Kill had its full budget K (since + K). By default the
+// grant is then recorded as blocked and the operator alerted; with
+// GrantUnconfirmed the host is handed back with vram_unconfirmed. It is
+// called on every reconcile pass until it grants or the guest is vacated.
 func (c *Controller) onKillUnconfirmed(
 	ctx context.Context, group, node, job string, since time.Time,
 ) unconfirmedDecision {
+	decideAt, ok := c.unconfirmedDecisionAt(ctx, group, since)
+	if !ok || time.Now().Before(decideAt) {
+		return unconfirmedDecision{}
+	}
+	if c.GrantUnconfirmed {
+		return unconfirmedDecision{grant: true, vramUnconfirmed: true}
+	}
+	c.holdUnconfirmed(ctx, group, node, job, since, decideAt)
+	return unconfirmedDecision{}
+}
+
+// unconfirmedDecisionAt returns when the unconfirmed-kill decision for a guest
+// whose first Kill was sent at since is taken: at noticeAt + N, and not before
+// since + K. It reports false when the group has no running barrier.
+func (c *Controller) unconfirmedDecisionAt(ctx context.Context, group string, since time.Time) (time.Time, bool) {
 	bar, ok := c.Hosts.Barrier(group)
 	if !ok {
-		return unconfirmedDecision{}
+		return time.Time{}, false
 	}
 	noticeAt := bar.NoticeAt
 	if g, err := c.groupStore.Get(ctx, group); err == nil {
@@ -65,16 +119,11 @@ func (c *Controller) onKillUnconfirmed(
 			noticeAt = n
 		}
 	}
-	grantAt := noticeAt.Add(bar.NoticeWindow)
-	if floor := since.Add(bar.KillBudget); floor.After(grantAt) {
-		grantAt = floor
+	decideAt := noticeAt.Add(bar.NoticeWindow)
+	if floor := since.Add(bar.KillBudget); floor.After(decideAt) {
+		decideAt = floor
 	}
-	if time.Now().Before(grantAt) {
-		return unconfirmedDecision{}
-	}
-	slog.DebugContext(ctx, "Unconfirmed kill decided", "group", group, "node", node, "job", job,
-		"grant", true, "vramUnconfirmed", true)
-	return unconfirmedDecision{grant: true, vramUnconfirmed: true}
+	return decideAt, true
 }
 
 // handBackUnconfirmed applies a grant decided by onKillUnconfirmed: it counts
@@ -91,9 +140,15 @@ func (c *Controller) handBackUnconfirmed(
 	}
 	metrics.KillUnconfirmedTotal.Inc()
 	rec.handedBack = true
+	elapsed := time.Since(rec.firstSent)
 	slog.WarnContext(ctx, "Kill unconfirmed", "group", group.ID(), "node", node, "job", job.JobID(),
-		"elapsed_ms", time.Since(rec.firstSent).Milliseconds(), "action", "grant",
+		"elapsed_ms", elapsed.Milliseconds(), "action", unconfirmedActionGrant,
 		"reason", rec.reason, "signal", rec.signal, "attempts", rec.attempts, "vram_unconfirmed", vramUnconfirmed)
+	c.kubeCall(ctx, "event "+eventKillUnconfirmed, func(ctx context.Context, k UnconfirmedKube) error {
+		return k.GuestEvent(ctx, group.ID(), job.JobID(), node, eventKillUnconfirmed, fmt.Sprintf(
+			"Kill of guest %s on node %s not confirmed after %v (%s); host handed back to the foreground "+
+				"with vram_unconfirmed", job.JobID(), node, elapsed.Round(time.Millisecond), rec.signal))
+	})
 }
 
 // waitKillConfirmed polls the kill operation every KillPollInterval until it

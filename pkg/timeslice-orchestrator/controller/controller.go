@@ -180,14 +180,25 @@ type Controller struct {
 	// Zero means DefaultBackgroundLiveness.
 	BackgroundLiveness time.Duration
 
+	// GrantUnconfirmed is --grant-unconfirmed: when a guest Kill reached the
+	// agent but was not confirmed, hand the host back at the end of the
+	// notice window with vram_unconfirmed instead of blocking the grant.
+	GrantUnconfirmed bool
+
+	// Kube records the Warning events of the unconfirmed-kill path. Nil
+	// skips them (they are still logged).
+	Kube UnconfirmedKube
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
 
-	// killMu guards kills, agentSeen and holdLogged (kill path, kill.go).
+	// killMu guards kills, agentSeen and holdLogged (kill path, kill.go),
+	// and blocks (unconfirmed_kill_block.go).
 	killMu     sync.Mutex
 	kills      map[string]*killRecord
 	agentSeen  map[string]time.Time
 	holdLogged map[string]time.Time
+	blocks     map[string]*blockState
 }
 
 // settleEntry remembers when a group's active job was first seen holding an

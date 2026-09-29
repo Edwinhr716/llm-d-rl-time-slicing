@@ -107,6 +107,10 @@ func run() error {
 	backgroundLiveness := flag.Duration("background-liveness", controller.DefaultBackgroundLiveness,
 		"Background liveness L: with host commands on, a host whose commands have failed this long during a "+
 			"vacate counts as unseen and its guests are killed through their snapshot agent.")
+	grantUnconfirmed := flag.Bool("grant-unconfirmed", false,
+		"When a guest's Kill is not confirmed by T + K, hand the host back to the foreground at the end of the "+
+			"notice window with vram_unconfirmed = true. Off (the default), the grant is blocked until the Kill "+
+			"is confirmed or the guest is otherwise vacated, the Kill is retried and the operator alerted.")
 	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
 	// are proposals awaiting the lead's sign-off.
 	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
@@ -235,6 +239,8 @@ func run() error {
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 	ctrl.KillPollInterval = *killPollInterval
 	ctrl.BackgroundLiveness = *backgroundLiveness
+	ctrl.GrantUnconfirmed = *grantUnconfirmed
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, infraOrch)
 
 	// Start informers
 	informerFactories.Nodes.Start(ctx.Done())
@@ -289,6 +295,7 @@ func run() error {
 		"killBudget", *killBudget,
 		"hostCommandPort", *hostCommandPort,
 		"backgroundLiveness", *backgroundLiveness,
+		"grantUnconfirmed", *grantUnconfirmed,
 		"controllerWorkers", *controllerWorkers,
 		"agentRPCTimeout", *agentRPCTimeout,
 		"retryBaseDelay", *retryBaseDelay,

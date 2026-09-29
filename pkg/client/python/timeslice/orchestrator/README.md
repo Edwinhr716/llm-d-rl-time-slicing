@@ -83,9 +83,10 @@ client.yield_(expected_idle=45)
 
 `get_status()` reports `group.background_protocol` (1 when the server supports
 background guests) and, while guests are being asked to leave,
-`group.vacate_within` as a `timedelta`. `AcquireResult.vram_unconfirmed` is
-true when the accelerator was returned after a guest kill that could not be
-confirmed.
+`group.vacate_within` as a `timedelta`. By default the server never grants
+the accelerator over a guest whose kill could not be confirmed.
+`AcquireResult.vram_unconfirmed` is true only when the server runs with
+`--grant-unconfirmed` and returned the accelerator after such a kill.
 
 ### Optional Initialization & Dynamic Overrides
 

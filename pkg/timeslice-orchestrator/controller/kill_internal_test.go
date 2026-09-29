@@ -319,11 +319,12 @@ const (
 	unconfirmedK = 100 * time.Millisecond
 )
 
-// unconfirmedCase runs one unconfirmed Kill signal and checks today's H2
-// default: the host is handed back at noticeAt + N, not before, with
-// vram_unconfirmed and the metric.
+// unconfirmedCase runs one unconfirmed Kill signal with --grant-unconfirmed:
+// the host is handed back at noticeAt + N, not before, with vram_unconfirmed
+// and the metric.
 func unconfirmedCase(t *testing.T, fx *killFixture, noticeAt time.Time, wantSignal string) {
 	t.Helper()
+	fx.ctrl.GrantUnconfirmed = true
 	window := unconfirmedN
 	before := testutil.ToFloat64(metrics.KillUnconfirmedTotal)
 	cleared := fx.passUntilClear(t, 3*time.Second)
@@ -390,10 +391,12 @@ func TestUnconfirmedKill_Grant_DeviceBytesAfterComplete(t *testing.T) {
 	unconfirmedCase(t, fx, noticeAt, unconfirmedDeviceBytes)
 }
 
-// TestUnconfirmedKill_Grant_NotBeforeKillBudget: the hand-back never comes
-// before the Kill had its full budget K, even when N already ran out.
+// TestUnconfirmedKill_Grant_NotBeforeKillBudget: with --grant-unconfirmed the
+// hand-back never comes before the Kill had its full budget K, even when N
+// already ran out.
 func TestUnconfirmedKill_Grant_NotBeforeKillBudget(t *testing.T) {
 	fx := newKillFixture(t, time.Now().Add(-10*time.Second), 400*time.Millisecond, 100*time.Millisecond)
+	fx.ctrl.GrantUnconfirmed = true
 	start := time.Now()
 	if fx.ctrl.onKillUnconfirmed(context.Background(), killGroup, killNode, killGuest, start).grant {
 		t.Fatal("granted before since + K")

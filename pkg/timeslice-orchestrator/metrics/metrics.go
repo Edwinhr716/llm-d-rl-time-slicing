@@ -102,15 +102,26 @@ var (
 		},
 	)
 
-	// KillUnconfirmedTotal counts hosts handed back to the foreground at the end
-	// of the notice window after a guest Kill that was never confirmed
-	// (decision D-NS-6, today's behaviour). Each one makes the next foreground
-	// grant carry AcquireResponse.vram_unconfirmed = true.
+	// KillUnconfirmedTotal counts guest Kills that were not confirmed when the
+	// unconfirmed-kill decision was taken, once per guest, node and vacate
+	// barrier. Each one blocks the foreground grant until the guest is gone,
+	// or, with --grant-unconfirmed, makes the next foreground grant carry
+	// AcquireResponse.vram_unconfirmed = true.
 	KillUnconfirmedTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "timeslice_kill_unconfirmed_total",
-			Help: "Number of hosts handed back to the foreground after a guest kill that was not confirmed.",
+			Help: "Number of guest kills that were not confirmed when the unconfirmed-kill decision was taken.",
 		},
+	)
+
+	// GrantBlocked is 1 while a host holds back the foreground grant because a
+	// guest Kill on it is not confirmed.
+	GrantBlocked = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "timeslice_grant_blocked",
+			Help: "1 while the foreground grant of the group is held back by an unconfirmed guest kill on the node.",
+		},
+		[]string{"group", "node"},
 	)
 )
 
@@ -135,5 +146,6 @@ func Register() {
 		DispatchBudgetHeldTotal,
 		DispatchBudgetRisingEdgeSkippedTotal,
 		KillUnconfirmedTotal,
+		GrantBlocked,
 	)
 }

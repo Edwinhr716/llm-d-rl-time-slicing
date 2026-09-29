@@ -30,7 +30,9 @@ import (
 // bounded by K. A Kill the agent cannot be reached for is retried every
 // killRetryInterval and the host stays not clear (fail closed). A Kill that
 // reached the agent but was not confirmed is decided by onKillUnconfirmed
-// (unconfirmed_kill.go, D-NS-6 H2).
+// (unconfirmed_kill.go): by default the host stays not clear and the grant is
+// blocked; with --grant-unconfirmed the host is handed back at the end of the
+// notice window.
 
 // Kill reasons, sent to the agent and logged.
 const (
@@ -152,6 +154,8 @@ func (c *Controller) killOverdueHosts(ctx context.Context, group *store.Group) b
 	groupID := group.ID()
 	bar, ok := c.Hosts.Barrier(groupID)
 	if !ok {
+		// No barrier: nothing holds a grant back any more.
+		c.releaseBlocks(ctx, groupID, func(*blockState) bool { return false })
 		return c.Hosts.AllClear(groupID)
 	}
 	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
@@ -161,6 +165,7 @@ func (c *Controller) killOverdueHosts(ctx context.Context, group *store.Group) b
 		return false
 	}
 	c.pruneKills(groupID, jobs)
+	c.releaseSettledBlocks(ctx, groupID, jobs, &bar)
 
 	now := time.Now()
 	liveness := c.backgroundLiveness()
@@ -242,6 +247,7 @@ func (c *Controller) vacateHost(
 			c.killGuest(ctx, groupID, job, node, rec, bar.KillBudget)
 		}
 		if job.Killed(node) {
+			c.releaseBlock(ctx, groupID, node, job.JobID())
 			continue
 		}
 		if !rec.unconfirmed {
@@ -250,8 +256,7 @@ func (c *Controller) vacateHost(
 			allDone = false
 			continue
 		}
-		// H2 seam (D-NS-6): a Kill that reached the agent but was not
-		// confirmed.
+		// A Kill that reached the agent but was not confirmed.
 		decision := c.onKillUnconfirmed(ctx, groupID, node, job.JobID(), rec.firstSent)
 		if !decision.grant {
 			allDone = false
@@ -398,6 +403,28 @@ func (c *Controller) forgetKills(groupID string) {
 			delete(c.holdLogged, key)
 		}
 	}
+}
+
+// releaseSettledBlocks drops the blocked grants of the group that no longer
+// hold: the host is clear or no longer in the barrier, or the guest left the
+// store, is no longer on the node or is vacated.
+func (c *Controller) releaseSettledBlocks(ctx context.Context, groupID string, jobs []*store.Job, bar *hostcmd.Barrier) {
+	notClear := make(map[string]bool, len(bar.NotClear))
+	for _, h := range bar.NotClear {
+		notClear[h.Node] = true
+	}
+	byID := make(map[string]*store.Job, len(jobs))
+	for _, job := range jobs {
+		byID[job.JobID()] = job
+	}
+	c.releaseBlocks(ctx, groupID, func(st *blockState) bool {
+		job, ok := byID[st.job]
+		if !ok || !notClear[st.node] {
+			return false
+		}
+		states := job.ContextState()
+		return guestOnNode(job, states, st.node) && !guestVacated(job, states, st.node)
+	})
 }
 
 // guestRef names a guest and the node it is on.

@@ -96,6 +96,7 @@ type flagValues struct {
 	killBudget               time.Duration
 	hostCommandPort          int
 	backgroundLiveness       time.Duration
+	grantUnconfirmed         bool
 	agentRPCTimeout          time.Duration
 	retryBaseDelay           time.Duration
 	retryMaxDelay            time.Duration
@@ -141,6 +142,8 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.IntVar(&fv.hostCommandPort, "host-command-port", 0, "Port of the per-host command endpoint; 0 disables host commands")
 	fs.DurationVar(&fv.backgroundLiveness, "background-liveness", controller.DefaultBackgroundLiveness,
 		"Background liveness L: a host whose commands have failed this long during a vacate counts as unseen")
+	fs.BoolVar(&fv.grantUnconfirmed, "grant-unconfirmed", false,
+		"Hand the host back at N with vram_unconfirmed when a guest's Kill is not confirmed, instead of blocking")
 	fs.DurationVar(&fv.agentRPCTimeout, "agent-rpc-timeout", 5*time.Second, "Bound on every call to a snapshot agent")
 	fs.DurationVar(&fv.retryBaseDelay, "retry-base-delay", 1*time.Second, "First retry delay after a failed reconcile")
 	fs.DurationVar(&fv.retryMaxDelay, "retry-max-delay", 30*time.Second, "Cap on the retry delay")
@@ -269,6 +272,8 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
 	ctrl.KillPollInterval = fv.killPollInterval
 	ctrl.BackgroundLiveness = fv.backgroundLiveness
+	ctrl.GrantUnconfirmed = fv.grantUnconfirmed
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, infraOrch)
 
 	informerFactories.Nodes.Start(ctx.Done())
 	for _, f := range informerFactories.Pods {
@@ -312,6 +317,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"killBudget", fv.killBudget,
 		"hostCommandPort", fv.hostCommandPort,
 		"backgroundLiveness", fv.backgroundLiveness,
+		"grantUnconfirmed", fv.grantUnconfirmed,
 		"agentRPCTimeout", fv.agentRPCTimeout,
 		"retryBaseDelay", fv.retryBaseDelay,
 		"retryMaxDelay", fv.retryMaxDelay,

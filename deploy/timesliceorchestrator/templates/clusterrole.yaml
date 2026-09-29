@@ -9,4 +9,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "nodes"]
     verbs: ["get", "list", "watch"]
+  # Warning events of an unconfirmed guest Kill (KillUnconfirmed,
+  # GrantBlocked).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
 {{- end }}

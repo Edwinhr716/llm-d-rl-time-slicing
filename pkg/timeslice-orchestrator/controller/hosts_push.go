@@ -37,14 +37,15 @@ type HostCommander interface {
 }
 
 // forgetHostsIfGroupDeleted drops the host registry and the kill path state
-// (kill records and hold log marks, kill.go) of a group that the observe step
-// deleted from the store, so host state, commands and kill state do not
-// outlive the group.
+// (kill records and hold log marks, kill.go; blocked grants,
+// unconfirmed_kill_block.go) of a group that the observe step deleted from the
+// store, so host state, commands and kill state do not outlive the group.
 func (c *Controller) forgetHostsIfGroupDeleted(ctx context.Context, groupID string) {
 	if _, err := c.groupStore.Get(ctx, groupID); errors.Is(err, store.ErrNotFound) {
 		slog.InfoContext(ctx, "Group deleted: forgetting its hosts")
 		c.Hosts.Forget(groupID)
 		c.forgetKills(groupID)
+		c.releaseBlocks(ctx, groupID, func(*blockState) bool { return false })
 	}
 }
 

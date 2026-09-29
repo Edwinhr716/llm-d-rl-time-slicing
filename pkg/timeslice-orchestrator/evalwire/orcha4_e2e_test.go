@@ -422,8 +422,9 @@ func TestORCHA4_AgentUnreachable_HungHostHeld(t *testing.T) {
 }
 
 // TestORCHA4_UnconfirmedKill_GrantedAtN: the agent cannot confirm the Kill.
-// D-NS-6 today: the trainer is granted at N with vram_unconfirmed (returned on
-// the next 1s Acquire poll), and timeslice_kill_unconfirmed_total counts it.
+// With --grant-unconfirmed the trainer is granted at N with vram_unconfirmed
+// (returned on the next 1s Acquire poll), and timeslice_kill_unconfirmed_total
+// counts it.
 func TestORCHA4_UnconfirmedKill_GrantedAtN(t *testing.T) {
 	sink := captureLogs(t)
 	clu := newA4Cluster(t, map[string]string{e2eNodes[0]: killConfirm, e2eNodes[1]: killUnconfirmed})
@@ -431,7 +432,7 @@ func TestORCHA4_UnconfirmedKill_GrantedAtN(t *testing.T) {
 	hung.hang.Store(true)
 	t.Cleanup(func() { close(hung.release) })
 	clu.startHostsOn(t, e2eNodes...)
-	orch := clu.startOrch(t)
+	orch := clu.startOrch(t, "--grant-unconfirmed=true")
 	api := client(t, orch)
 	waitGuestsKnown(t, sink)
 
