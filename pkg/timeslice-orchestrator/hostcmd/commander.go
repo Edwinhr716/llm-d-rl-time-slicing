@@ -17,6 +17,7 @@ import (
 	"time"
 
 	hcpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/hostcommand/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -104,6 +105,9 @@ type host struct {
 	// notClearLogged is set once the host was logged as not clear at the
 	// current barrier's deadline.
 	notClearLogged bool
+	// sentAt is when the running command was first sent, for the vacate and
+	// resume latency metrics. Zero once it was observed.
+	sentAt time.Time
 	// cancel stops the command goroutine of this host, if one runs.
 	cancel context.CancelFunc
 }
@@ -191,6 +195,7 @@ func (c *Commander) SyncHosts(group string, nodes []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	gh := c.groupLocked(group)
+	metrics.InitGroupSeries(group)
 	want := make(map[string]bool, len(nodes))
 	changed := false
 	joinedLate := false
@@ -201,6 +206,9 @@ func (c *Commander) SyncHosts(group string, nodes []string) {
 		}
 		hst := &host{node: node, state: StateUnknown}
 		gh.hosts[node] = hst
+		metrics.InitHostSeries(node)
+		// A host never commanded counts as present until a command fails.
+		metrics.BackgroundParticipants.WithLabelValues(node).Set(1)
 		changed = true
 		if bar := gh.barrier; bar != nil {
 			c.log.Info("Host joined a running vacate", "group", group, "node", node,
@@ -220,6 +228,7 @@ func (c *Commander) SyncHosts(group string, nodes []string) {
 				hst.cancel()
 			}
 			delete(gh.hosts, node)
+			metrics.BackgroundParticipants.DeleteLabelValues(node)
 			changed = true
 		}
 	}
@@ -250,6 +259,7 @@ func (c *Commander) Forget(group string) {
 		if hst.cancel != nil {
 			hst.cancel()
 		}
+		metrics.BackgroundParticipants.DeleteLabelValues(hst.node)
 	}
 	if gh.barrier != nil {
 		gh.barrier.timer.Stop()
@@ -380,6 +390,7 @@ func (c *Commander) ClearByOrchestrator(group, node, how string) {
 	}
 	hst.epoch = c.epochs.Next()
 	hst.state = StateClear
+	observeVacateLocked(hst, how)
 	c.log.Info("Host clear", "group", group, "node", node, "how", how, "epoch", hst.epoch)
 	c.finishBarrierIfClearLocked(group, gh)
 }
@@ -468,6 +479,11 @@ func (c *Commander) sendLocked(group string, hst *host, command string, epoch in
 	hst.cancel = cancel
 	hst.epoch = epoch
 	hst.notClearLogged = false
+	// A Vacate that replaces a running Vacate (for example a new barrier)
+	// keeps the first send time: the host has been asked to vacate since.
+	if command != commandVacate || hst.state != StateVacating || hst.sentAt.IsZero() {
+		hst.sentAt = time.Now()
+	}
 	if command == commandVacate {
 		hst.state = StateVacating
 	} else {
@@ -577,7 +593,8 @@ func (c *Commander) handle(
 		}
 		c.reachableLocked(group, hst)
 		hst.state = StateClear
-		c.log.Info("Host clear", "group", group, "node", node, "how", "ack", "epoch", epoch)
+		observeVacateLocked(hst, clearHowAck)
+		c.log.Info("Host clear", "group", group, "node", node, "how", clearHowAck, "epoch", epoch)
 		c.finishBarrierIfClearLocked(group, gh)
 		return epoch, true
 	case hcpb.Outcome_OUTCOME_RESUMED:
@@ -585,6 +602,10 @@ func (c *Commander) handle(
 			break
 		}
 		c.reachableLocked(group, hst)
+		if !hst.sentAt.IsZero() {
+			metrics.HostResumeSeconds.WithLabelValues(node).Observe(time.Since(hst.sentAt).Seconds())
+			hst.sentAt = time.Time{}
+		}
 		return epoch, true
 	case hcpb.Outcome_OUTCOME_STALE_EPOCH:
 		// The host has seen a higher epoch, for example from an earlier
@@ -605,6 +626,7 @@ func (c *Commander) failedLocked(group string, hst *host, command string, err er
 	hst.failures++
 	if hst.failures == 1 {
 		hst.failingSince = time.Now()
+		metrics.BackgroundParticipants.WithLabelValues(hst.node).Set(0)
 		c.log.Warn("Host command failed", "group", group, "node", hst.node, "command", command,
 			"epoch", hst.epoch, "error", err)
 		// The reconcile loop times the background liveness L from here
@@ -622,6 +644,21 @@ func (c *Commander) reachableLocked(group string, hst *host) {
 	}
 	hst.failures = 0
 	hst.failingSince = time.Time{}
+	metrics.BackgroundParticipants.WithLabelValues(hst.node).Set(1)
+}
+
+// clearHowAck is how a host that acked its Vacate cleared, in log lines and
+// in the how label of timeslice_host_vacate_seconds.
+const clearHowAck = "ack"
+
+// observeVacateLocked records the time from the host's first Vacate to now,
+// once per vacate. c.mu is held.
+func observeVacateLocked(hst *host, how string) {
+	if hst.sentAt.IsZero() {
+		return
+	}
+	metrics.HostVacateSeconds.WithLabelValues(hst.node, how).Observe(time.Since(hst.sentAt).Seconds())
+	hst.sentAt = time.Time{}
 }
 
 // finishBarrierIfClearLocked ends the barrier once every host is clear and
@@ -633,8 +670,10 @@ func (c *Commander) finishBarrierIfClearLocked(group string, gh *groupHosts) {
 	bar := gh.barrier
 	bar.timer.Stop()
 	gh.barrier = nil
+	metrics.NoticeSeconds.WithLabelValues(group).Observe(time.Since(bar.noticeAt).Seconds())
 	c.log.Info("All hosts clear", "group", group, "epoch", bar.epoch,
-		"elapsed_ms", time.Since(bar.started).Milliseconds())
+		"elapsed_ms", time.Since(bar.started).Milliseconds(),
+		"notice_ms", time.Since(bar.noticeAt).Milliseconds())
 	if c.cfg.Enqueue != nil {
 		go c.cfg.Enqueue(group)
 	}

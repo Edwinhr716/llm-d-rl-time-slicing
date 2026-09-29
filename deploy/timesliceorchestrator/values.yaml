@@ -95,6 +95,34 @@ dispatchBudget:
   openDelay: "0s"
   externalRisingEdge: false
 
+# Alert threshold on a guest's off-window, the time it stays suspended while
+# the RL job runs (flag --max-serving-offwindow). Past it the orchestrator logs
+# a warning and counts timeslice_guest_offwindow_exceeded_total; it never cuts
+# the RL job short. Requests held on a frozen guest start failing once the
+# off-window passes the request timeout of whatever holds them. "" = the
+# orchestrator default (4m); "0s" turns the alert off.
+maxServingOffwindow: ""
+
+# Extra orchestrator flags, passed as is after the ones above, e.g.
+#   extraArgs: ["--background-role=true", "--min-bubble=30s"]
+extraArgs: []
+
+# Prometheus scraping and alerting through Google Cloud Managed Service for
+# Prometheus (monitoring.googleapis.com/v1 CRDs). Both are off by default.
+#   podMonitoring: a PodMonitoring that scrapes the metrics port.
+#   rules: a Rules object with the TimesliceGuestOffwindowExceeded alert, which
+#     fires while a guest's off-window is over --max-serving-offwindow
+#     (timeslice_max_serving_offwindow_seconds), and
+#     TimesliceAgentUnreachable, which fires while a grant waits on an
+#     unreachable snapshot agent.
+monitoring:
+  podMonitoring:
+    enabled: false
+    interval: 15s
+  rules:
+    enabled: false
+    agentUnreachableFor: 1m
+
 resources: {}
   # limits:
   #   cpu: 100m

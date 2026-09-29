@@ -250,6 +250,7 @@ func (s *Server) defaultCheckAcquire(
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get group: %v", err), true
 	}
+	metrics.InitGroupSeries(groupID)
 
 	// Check the jobs' agent states. Only a foreground job can fault the group.
 	faults, err := s.groupFaults(ctx, groupID, jobID)
@@ -297,6 +298,7 @@ func (s *Server) defaultCheckAcquire(
 				"vram_unconfirmed", vramUnconfirmed)
 		}
 		metrics.AcquireWaitDuration.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
+		metrics.ForegroundWaitSeconds.WithLabelValues(groupID).Observe(time.Since(startTime).Seconds())
 		return &pb.AcquireResponse{
 			Success:         true,
 			ContextRestored: true, // Default to true, as we don't have enough info to determine if it was zero-overhead

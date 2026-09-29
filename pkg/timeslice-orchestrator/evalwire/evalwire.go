@@ -101,6 +101,7 @@ type flagValues struct {
 	retryMaxDelay            time.Duration
 	holderWaitRequeue        time.Duration
 	killPollInterval         time.Duration
+	maxServingOffwindow      time.Duration
 	lockNamespace            string
 	lockConfigMap            string
 	watchNamespaces          string
@@ -146,6 +147,8 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.DurationVar(&fv.retryMaxDelay, "retry-max-delay", 30*time.Second, "Cap on the retry delay")
 	fs.DurationVar(&fv.holderWaitRequeue, "holder-wait-requeue", 1*time.Second, "Requeue while the lock holder is not loaded")
 	fs.DurationVar(&fv.killPollInterval, "kill-poll-interval", controller.DefaultKillPollInterval, "How often a kill operation is polled")
+	fs.DurationVar(&fv.maxServingOffwindow, "max-serving-offwindow", controller.DefaultMaxServingOffwindow,
+		"Alert threshold on a guest's off-window; 0 disables the alert")
 	fs.StringVar(&fv.lockNamespace, "lock-namespace", store.Namespace, "Namespace of the lock ConfigMap")
 	fs.StringVar(&fv.lockConfigMap, "lock-configmap", store.ConfigMapName, "Name of the lock ConfigMap")
 	fs.StringVar(&fv.watchNamespaces, "watch-namespaces", "", "Comma-separated namespaces whose pods are watched; empty watches all")
@@ -173,6 +176,9 @@ func (fv *flagValues) validate() error {
 	}
 	if fv.backgroundLiveness <= 0 {
 		return fmt.Errorf("--background-liveness must be positive, got %v", fv.backgroundLiveness)
+	}
+	if fv.maxServingOffwindow < 0 {
+		return fmt.Errorf("--max-serving-offwindow must not be negative, got %v", fv.maxServingOffwindow)
 	}
 	if fv.budgetRedisAddr != "" && fv.budgetJob == "" {
 		return errors.New("--dispatch-budget-job is required when --dispatch-budget-redis-addr is set")
@@ -269,6 +275,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
 	ctrl.KillPollInterval = fv.killPollInterval
 	ctrl.BackgroundLiveness = fv.backgroundLiveness
+	ctrl.MaxServingOffwindow = fv.maxServingOffwindow
 
 	informerFactories.Nodes.Start(ctx.Done())
 	for _, f := range informerFactories.Pods {
@@ -317,6 +324,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"retryMaxDelay", fv.retryMaxDelay,
 		"holderWaitRequeue", fv.holderWaitRequeue,
 		"killPollInterval", fv.killPollInterval,
+		"maxServingOffwindow", fv.maxServingOffwindow,
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,

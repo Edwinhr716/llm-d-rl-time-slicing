@@ -180,6 +180,14 @@ type Controller struct {
 	// Zero means DefaultBackgroundLiveness.
 	BackgroundLiveness time.Duration
 
+	// MaxServingOffwindow is the alert threshold for a guest's off-window
+	// (offwindow.go). It never stops the foreground. Zero turns the alert
+	// off; the off-window is still exported.
+	MaxServingOffwindow time.Duration
+
+	// offwindow holds the running guest off-windows (offwindow.go).
+	offwindow offwindows
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
 
@@ -206,15 +214,16 @@ func NewController(
 	agentStore store.SnapshotAgentStore,
 ) *Controller {
 	return &Controller{
-		queue:             queue,
-		groupStore:        groupStore,
-		jobStore:          jobStore,
-		infraOrchestrator: infraOrchestrator,
-		agentStore:        agentStore,
-		ResyncPeriod:      30 * time.Second,
-		SettleTimeout:     30 * time.Second,
-		KillPollInterval:  DefaultKillPollInterval,
-		settleSince:       make(map[string]settleEntry),
+		queue:               queue,
+		groupStore:          groupStore,
+		jobStore:            jobStore,
+		infraOrchestrator:   infraOrchestrator,
+		agentStore:          agentStore,
+		ResyncPeriod:        30 * time.Second,
+		SettleTimeout:       30 * time.Second,
+		KillPollInterval:    DefaultKillPollInterval,
+		MaxServingOffwindow: DefaultMaxServingOffwindow,
+		settleSince:         make(map[string]settleEntry),
 	}
 }
 
@@ -263,6 +272,10 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 			}
 		}, c.ResyncPeriod)
 	}()
+
+	// Guest off-windows and their alert (offwindow.go).
+	metrics.MaxServingOffwindowSeconds.Set(c.MaxServingOffwindow.Seconds())
+	go until(ctx, c.updateOffwindows, OffwindowTick)
 
 	slog.InfoContext(ctx, "Started workers")
 	<-ctx.Done()
@@ -798,6 +811,9 @@ func (c *Controller) observeNodeJobContext(ctx context.Context, groupID, nodeNam
 		state := translateJobState(js.State)
 		if err := c.jobStore.UpdateContextState(ctx, groupID, js.JobId, nodeName, state); err != nil {
 			return fmt.Errorf("failed to update job context state for job %s on node %s: %w", js.JobId, nodeName, err)
+		}
+		if job.Background() {
+			c.noteGuestState(groupID, js.JobId, nodeName, state)
 		}
 		slog.DebugContext(ctx, "Updated job context state", "job", js.JobId, "node", nodeName, "state", state)
 	}

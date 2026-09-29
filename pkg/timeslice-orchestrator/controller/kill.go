@@ -9,6 +9,7 @@ import (
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/hostcmd"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
 )
 
@@ -74,6 +75,22 @@ type killRecord struct {
 	signal      string
 	// handedBack is set once handBackUnconfirmed ran for the guest.
 	handedBack bool
+	// counted is set once the Kill was counted in
+	// timeslice_guest_kills_total.
+	counted bool
+}
+
+// killMetricReason maps a kill reason to the reason label of
+// timeslice_guest_kills_total.
+func killMetricReason(reason string) string {
+	switch reason {
+	case killReasonVKUnseen:
+		return metrics.KillReasonDisconnected
+	case killReasonFaulted:
+		return metrics.KillReasonFaulted
+	default:
+		return metrics.KillReasonDeadline
+	}
 }
 
 func killKey(groupID, node, jobID string) string {
@@ -104,6 +121,7 @@ func (c *Controller) markAgentSeen(node string) {
 		c.agentSeen = make(map[string]time.Time)
 	}
 	c.agentSeen[node] = time.Now()
+	metrics.AgentUnreachable.WithLabelValues(node).Set(0)
 }
 
 // agentSeenWithin reports whether the agent of node answered a status call in
@@ -225,6 +243,7 @@ func (c *Controller) vacateHost(
 		// answered recently; otherwise a guest may be there that no
 		// mirror pod shows (fail closed).
 		if !c.agentSeenWithin(node, c.backgroundLiveness()) {
+			metrics.AgentUnreachable.WithLabelValues(node).Set(1)
 			if c.firstHoldLog(groupID, node, bar.NoticeAt) {
 				slog.WarnContext(ctx, "Host not clear and its agent is not seen: holding the grant",
 					"group", groupID, "node", node, "reason", reason)
@@ -328,9 +347,17 @@ func (c *Controller) killGuest(
 	log.InfoContext(ctx, "Kill sent", "deadline", deadline)
 	resp, err := c.agentStore.Kill(kctx, node, job.JobID(), rec.reason, deadline)
 	if err != nil {
+		metrics.AgentUnreachable.WithLabelValues(node).Set(1)
 		log.WarnContext(ctx, "Kill not delivered: agent unreachable, will retry", "retryIn", killRetryInterval,
 			"error", err)
 		return
+	}
+	metrics.AgentUnreachable.WithLabelValues(node).Set(0)
+	if !rec.counted {
+		// Counted once per guest per notice, when the agent first accepts
+		// the Kill; retries and polls do not count again.
+		rec.counted = true
+		metrics.GuestKillsTotal.WithLabelValues(killMetricReason(rec.reason), node).Inc()
 	}
 	if signal, err := c.waitKillConfirmed(kctx, groupID, job.JobID(), node, resp.GetOperationId()); signal != "" {
 		rec.unconfirmed = true

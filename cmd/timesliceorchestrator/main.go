@@ -122,6 +122,10 @@ func run() error {
 			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
 	killPollInterval := flag.Duration("kill-poll-interval", controller.DefaultKillPollInterval,
 		"How often a kill operation is polled. PENDING LEAD DECISION.")
+	maxServingOffwindow := flag.Duration("max-serving-offwindow", controller.DefaultMaxServingOffwindow,
+		"Alert threshold on a guest's off-window (how long it stays suspended). Past it the orchestrator "+
+			"logs a warning and counts timeslice_guest_offwindow_exceeded_total; it never cuts the foreground "+
+			"short. 0 disables the alert; timeslice_guest_offwindow_seconds is exported either way.")
 	lockNamespace := flag.String("lock-namespace", store.Namespace,
 		"Namespace of the ConfigMap that persists group lock holders. Give each orchestrator install in a "+
 			"cluster its own lock ConfigMap; two installs sharing one fight over the same groups.")
@@ -155,6 +159,9 @@ func run() error {
 	}
 	if *backgroundLiveness <= 0 {
 		return fmt.Errorf("--background-liveness must be positive, got %v", *backgroundLiveness)
+	}
+	if *maxServingOffwindow < 0 {
+		return fmt.Errorf("--max-serving-offwindow must not be negative, got %v", *maxServingOffwindow)
 	}
 
 	scope, err := infrastructure.ParseScope(*watchNamespaces, *nodeSelector)
@@ -235,6 +242,7 @@ func run() error {
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 	ctrl.KillPollInterval = *killPollInterval
 	ctrl.BackgroundLiveness = *backgroundLiveness
+	ctrl.MaxServingOffwindow = *maxServingOffwindow
 
 	// Start informers
 	informerFactories.Nodes.Start(ctx.Done())
@@ -295,6 +303,7 @@ func run() error {
 		"retryMaxDelay", *retryMaxDelay,
 		"holderWaitRequeue", *holderWaitRequeue,
 		"killPollInterval", *killPollInterval,
+		"maxServingOffwindow", *maxServingOffwindow,
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,

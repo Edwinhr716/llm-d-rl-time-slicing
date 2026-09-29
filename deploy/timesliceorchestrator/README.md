@@ -141,3 +141,56 @@ helm upgrade --install demo-orchestrator ./timesliceorchestrator \
 
 The chart still grants read access to pods and nodes cluster-wide through a
 `ClusterRole`.
+
+## Guest metrics, off-window alert and dashboard
+
+With the background protocol on, the orchestrator exports the guest
+time-slicing metrics on the metrics port (8080, `/metrics`):
+
+* `timeslice_notice_seconds{group_id}` (histogram): notice start until every
+  guest of the group is vacated.
+* `timeslice_guest_kills_total{reason,node}` (counter): guests killed through
+  their snapshot agent, once per guest per notice. `reason` is `deadline`
+  (not clear at T), `faulted` (agent reported FAULTED) or `disconnected`
+  (host unseen for the background liveness).
+* `timeslice_kill_unconfirmed_total` (counter): kills the agent did not
+  confirm within the kill budget.
+* `timeslice_agent_unreachable{node}` (gauge): 1 while a grant is blocked on
+  the node's unreachable snapshot agent, 0 once it answers.
+* `timeslice_foreground_wait_seconds{group_id}` (histogram): wait of each
+  granted foreground Acquire, notice included.
+* `timeslice_guest_offwindow_seconds{group_id,job_id,node}` (gauge): how long
+  the guest has been suspended, from its agent's state. The series goes when
+  the guest runs again or is gone.
+* `timeslice_max_serving_offwindow_seconds` (gauge): `--max-serving-offwindow`
+  in seconds, 0 when the alert is off.
+* `timeslice_guest_offwindow_exceeded_total{group_id}` (counter): off-windows
+  that passed `--max-serving-offwindow`.
+* `timeslice_background_participants{node}` (gauge): 1 while the node's host
+  command endpoint answers, 0 while its commands fail.
+* `timeslice_host_vacate_seconds{node,how}` (histogram): Vacate sent to a host
+  until the host is clear. `how` is `ack`, `kill`, `unconfirmed-kill` or
+  `no-live-guest`.
+* `timeslice_host_resume_seconds{node}` (histogram): Resume sent to a host
+  until it acked.
+
+
+The host metrics need `--host-command-port`.
+
+`--max-serving-offwindow` (value `maxServingOffwindow`, default 4m) is an
+alert threshold, not a limit: past it the orchestrator logs
+`Guest off-window over the limit` once per off-window and counts
+`timeslice_guest_offwindow_exceeded_total`. The RL job is never cut short.
+Read it next to the dispatcher's own exceeded-deadline counter.
+
+On GKE with Managed Service for Prometheus, `monitoring.podMonitoring.enabled`
+scrapes the orchestrator and `monitoring.rules.enabled` adds the
+`TimesliceGuestOffwindowExceeded` and `TimesliceAgentUnreachable` alerts. A
+Cloud Monitoring dashboard over these metrics is in
+`dashboards/timeslice-guest.json`:
+
+```bash
+cd deploy/timesliceorchestrator
+gcloud monitoring dashboards create --project=<project> \
+  --config-from-file=dashboards/timeslice-guest.json
+```
