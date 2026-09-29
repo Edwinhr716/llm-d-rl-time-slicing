@@ -132,8 +132,9 @@ func run() error {
 			"orchestrator and join no group. Empty (the default) watches all namespaces.")
 	nodeSelector := flag.String("node-selector", "",
 		"Label selector (kubectl syntax, e.g. pool=demo) limiting the nodes this orchestrator sees. "+
-			"Nodes outside it contribute to no group, and pods bound to them are ignored. Group membership "+
-			"still comes from the group.timeslice.io/<group> node label. Empty (the default) watches all nodes.")
+			"Nodes outside it contribute to no group, and pods bound to them are ignored, except pods labelled "+
+			"timeslice.io/role=background, which stay in their group. Group membership still comes from the "+
+			"group.timeslice.io/<group> node label. Empty (the default) watches all nodes.")
 	flag.Parse()
 
 	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {

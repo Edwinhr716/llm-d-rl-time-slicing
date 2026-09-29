@@ -88,7 +88,7 @@ func WithPodInformers(podInformers ...corev1informers.PodInformer) Option {
 // WithNodeScopedPods ignores pods bound to a node that the node informer does
 // not see. Set it when the node informer is limited by --node-selector, so a
 // pod on a node outside the selector joins no group. Pods not yet bound to a
-// node are kept.
+// node are kept, and so are background pods (see podOnWatchedNode).
 func WithNodeScopedPods() Option {
 	return func(k *KubernetesOrchestrator) {
 		k.nodeScopedPods = true
@@ -127,13 +127,25 @@ func (k *KubernetesOrchestrator) addPodInformer(pi corev1informers.PodInformer) 
 
 // podOnWatchedNode reports whether the pod may join a group: always, unless
 // WithNodeScopedPods is set and the pod is bound to a node outside the node
-// informer's scope.
-func (k *KubernetesOrchestrator) podOnWatchedNode(pod *corev1.Pod) bool {
+// informer's scope. A background pod (label timeslice.io/role=background)
+// bound to such a node is kept anyway. Only the pod is kept: the node still
+// contributes to no group, so the group's node list and every check that a
+// node belongs to a group are unchanged.
+func (k *KubernetesOrchestrator) podOnWatchedNode(ctx context.Context, pod *corev1.Pod) bool {
 	if !k.nodeScopedPods || pod.Spec.NodeName == "" {
 		return true
 	}
-	_, err := k.nodeLister.Get(pod.Spec.NodeName)
-	return err == nil
+	if _, err := k.nodeLister.Get(pod.Spec.NodeName); err == nil {
+		return true
+	}
+	if pod.Labels[RoleLabelKey] != RoleBackground {
+		return false
+	}
+	slog.InfoContext(ctx, "Keeping background pod bound to a node outside --node-selector",
+		"pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name),
+		"node", pod.Spec.NodeName,
+		"group", pod.Labels[PodLabelKey])
+	return true
 }
 
 // Init initializes the KubernetesOrchestrator by waiting for informer caches to sync.
@@ -160,7 +172,7 @@ func (k *KubernetesOrchestrator) getNodesForGroup(groupID string) ([]string, err
 }
 
 // getPodsForGroup returns the pods that are tied to the given group.
-func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, error) {
+func (k *KubernetesOrchestrator) getPodsForGroup(ctx context.Context, groupID string) ([]PodInfo, error) {
 	selector := labels.SelectorFromSet(labels.Set{PodLabelKey: groupID})
 	pods := make([]*corev1.Pod, 0)
 	for _, lister := range k.podListers {
@@ -173,7 +185,7 @@ func (k *KubernetesOrchestrator) getPodsForGroup(groupID string) ([]PodInfo, err
 	var podInfos []PodInfo
 	for _, pod := range pods {
 		jobID := pod.Labels[JobLabelKey]
-		if jobID == "" || !k.podOnWatchedNode(pod) {
+		if jobID == "" || !k.podOnWatchedNode(ctx, pod) {
 			continue
 		}
 		background := pod.Labels[RoleLabelKey] == RoleBackground
@@ -203,7 +215,7 @@ func (k *KubernetesOrchestrator) ObserveGroupState(ctx context.Context, groupID 
 	}
 
 	// 2. Find pods tied to the group
-	pods, err := k.getPodsForGroup(groupID)
+	pods, err := k.getPodsForGroup(ctx, groupID)
 	if err != nil {
 		return fmt.Errorf("failed to get pods for group %s: %w", groupID, err)
 	}
@@ -436,7 +448,7 @@ func (k *KubernetesOrchestrator) enqueuePod(ctx context.Context, obj interface{}
 
 	// Before the node cache has synced every node looks unknown; the node's
 	// own Add event enqueues its groups once it arrives.
-	if k.nodeSynced() && !k.podOnWatchedNode(pod) {
+	if k.nodeSynced() && !k.podOnWatchedNode(ctx, pod) {
 		slog.InfoContext(ctx, "Ignoring pod bound to a node outside --node-selector",
 			"pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), "node", pod.Spec.NodeName)
 		return

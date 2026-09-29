@@ -117,8 +117,12 @@ chart values (and the flags they set) narrow that down:
   Pods elsewhere join no group.
 * `scope.nodeSelector`, flag `--node-selector` (default `""`, all nodes):
   label selector limiting the nodes the orchestrator sees. Nodes outside it
-  contribute to no group, and pods bound to them are ignored. Group
-  membership still comes from the `group.timeslice.io/<group>` node label.
+  contribute to no group, and pods bound to them are ignored, except pods
+  labelled `timeslice.io/role=background` (the virtual kubelet's mirror pods),
+  which stay in their group. Only those pods are kept: a node outside the
+  selector still never joins a group, so the orchestrator never commands it.
+  Group membership still comes from the `group.timeslice.io/<group>` node
+  label.
 * `strategy` (default `type: Recreate`): the old pod stops before the new one
   starts, so two replicas never act on the lock ConfigMap at once.
 

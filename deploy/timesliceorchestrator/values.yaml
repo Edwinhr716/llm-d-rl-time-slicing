@@ -24,9 +24,11 @@ lock:
 #     join no group. [] = all namespaces.
 #   nodeSelector: label selector (kubectl syntax, e.g. "pool=demo") limiting the
 #     nodes this orchestrator sees; nodes outside it contribute to no group and
-#     pods bound to them are ignored. Group membership still comes from the
-#     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
-#     with the pod-scheduling nodeSelector further down.
+#     pods bound to them are ignored, except pods labelled
+#     timeslice.io/role=background, which stay in their group. Group
+#     membership still comes from the group.timeslice.io/<group> node label.
+#     "" = all nodes. Not to be confused with the pod-scheduling nodeSelector
+#     further down.
 scope:
   watchNamespaces: []
   nodeSelector: ""
