@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/budget"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/hostcmd"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/infrastructure"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
@@ -97,6 +99,11 @@ func run() error {
 	killBudget := flag.Duration("kill-budget", server.DefaultKillBudget,
 		"Kill budget K reserved at the end of the notice window; guests must vacate by T = notice + N - K. "+
 			"PENDING LEAD DECISION.")
+	hostCommandPort := flag.Int("host-command-port", 0,
+		"Port of the per-host command endpoint. When set, a foreground Acquire commands "+
+			"every host of the group at <node InternalIP>:<port> to vacate by T = notice + N - K and is granted only "+
+			"after every host acked; a lend (Yield with --min-bubble) commands the hosts to resume. 0 (the default) "+
+			"disables host commands.")
 	flag.Parse()
 
 	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {
@@ -111,6 +118,10 @@ func run() error {
 	if *noticeWindow <= 0 || *killBudget <= 0 || *killBudget >= *noticeWindow {
 		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
 			*killBudget, *noticeWindow)
+	}
+
+	if *hostCommandPort < 0 || *hostCommandPort > 65535 {
+		return fmt.Errorf("--host-command-port must be 0 or a port number, got %d", *hostCommandPort)
 	}
 
 	if *budgetRedisAddr != "" && *budgetJob == "" {
@@ -191,6 +202,20 @@ func run() error {
 		server.WithMinBubble(*minBubble),
 		server.WithNoticeTiming(*noticeWindow, *killBudget),
 	}
+	if *hostCommandPort > 0 {
+		hosts := hostcmd.New(ctx, hostcmd.Config{
+			Resolve:      hostResolver(infraOrch, *hostCommandPort),
+			NoticeWindow: *noticeWindow,
+			KillBudget:   *killBudget,
+			Enqueue:      ctrl.EnqueueWork,
+		})
+		defer func() {
+			stop() // Close waits for the command goroutines, which stop with ctx.
+			hosts.Close()
+		}()
+		ctrl.Hosts = hosts
+		opts = append(opts, server.WithHostCommander(hosts))
+	}
 	if *budgetRedisAddr != "" {
 		publisher := budget.NewPublisher(budget.NewRedisWriter(*budgetRedisAddr), *budgetKey, *budgetJob).
 			WithOpenDelay(*budgetOpenDelay).
@@ -216,8 +241,21 @@ func run() error {
 		"minBubble", *minBubble,
 		"noticeWindow", *noticeWindow,
 		"killBudget", *killBudget,
+		"hostCommandPort", *hostCommandPort,
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
+}
+
+// hostResolver returns the address of the command endpoint of a node:
+// <node InternalIP>:<port>.
+func hostResolver(infraOrch *infrastructure.KubernetesOrchestrator, port int) func(string) (string, error) {
+	return func(node string) (string, error) {
+		addr, err := infraOrch.NodeAddress(node)
+		if err != nil {
+			return "", err
+		}
+		return net.JoinHostPort(addr, strconv.Itoa(port)), nil
+	}
 }
 
 // envString returns the value of the named environment variable, or def if it
