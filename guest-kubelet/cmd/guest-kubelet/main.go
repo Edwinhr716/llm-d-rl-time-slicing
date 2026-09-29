@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/freeze"
 	"github.com/edwinhr716/guest-kubelet/internal/probe"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
@@ -69,8 +70,6 @@ type options struct {
 
 	// M2: readiness
 	readinessProbes bool
-	debugAddr       string
-
 	// Pending lead decision D-NS-2: false = keep (today), true = ns-label.
 	guestNodeLabel bool
 
@@ -78,10 +77,25 @@ type options struct {
 	gpuAllowlist       string
 	gpuMemory          string
 	mirrorMemoryFactor float64
+
+	// M3: suspend and resume by cgroup freeze
+	cgroupRoot         string
+	notReadyTimeout    time.Duration
+	freezeTimeout      time.Duration
+	resumeReadyTimeout time.Duration
+
+	// Pending lead decision D-NS-8: true = ns-cordon (NS stack default), false = skip (today).
+	cordonWhileHeld bool
+
+	// M2 and M3 test hooks
+	debugAddr string
 }
 
 // edgeLogSize is how many Ready edges per guest the debug endpoint keeps.
 const edgeLogSize = 256
+
+// cordonPoll is how often the ns-cordon loop re-reads the hold, besides the pokes.
+const cordonPoll = 500 * time.Millisecond
 
 // reclaimTimeout bounds the wait for a Terminating Node to go once its finalizer is removed.
 const reclaimTimeout = 30 * time.Second
@@ -123,9 +137,21 @@ func main() {
 			"remove our finalizer and register it again; guests stay bound by name. false leaves it Terminating")
 	flag.BoolVar(&o.readinessProbes, "readiness-probes", true,
 		"run the guests' readinessProbes (httpGet, tcpSocket) and report Ready from them; false copies the mirror's ready flags (M1)")
-	// Off by default. The endpoint can force a guest Ready, so only loopback addresses are accepted.
+	flag.StringVar(&o.cgroupRoot, "cgroup-root", "/host/cgroup",
+		"host cgroup v2 hierarchy as mounted in this container; empty disables suspend/resume")
+	flag.DurationVar(&o.notReadyTimeout, "suspend-notready-timeout", 5*time.Second,
+		"how long a suspend waits for the guest's Ready=False to reach the API before freezing")
+	flag.DurationVar(&o.freezeTimeout, "freeze-timeout", 10*time.Second, "deadline for each cgroup freeze or thaw")
+	flag.DurationVar(&o.resumeReadyTimeout, "resume-ready-timeout", 60*time.Second,
+		"how long a resume waits for the guest's readiness probe to pass after the thaw")
+	flag.BoolVar(&o.cordonWhileHeld, "cordon-while-held", true,
+		"set spec.unschedulable on the virtual Node while the donor holds the GPU (M3: while a guest is suspending "+
+			"or suspended), so no new guest lands on it; false never touches spec.unschedulable")
+	// Off by default. The endpoint can force a guest Ready or freeze it, so only loopback addresses
+	// are accepted.
 	flag.StringVar(&o.debugAddr, "debug-addr", "",
-		"loopback host:port for the M2 test hooks (/debug/readiness, /debug/ready-edges); empty disables them")
+		"loopback host:port for the test hooks (M2: /debug/readiness, /debug/ready-edges; "+
+			"M3: /debug/suspend, /debug/resume); empty disables them")
 	flag.BoolVar(&o.guestNodeLabel, "guest-node-label", false,
 		"also label the virtual Node timeslice.io/guest=true, for guests with a preferred node affinity (virtual-node=true stays)")
 
@@ -198,16 +224,14 @@ func deregister(ctx context.Context, name, hostNode, kubeconfig string) error {
 	return nil
 }
 
-// checkDebug validates --debug-addr: loopback only, and only with the prober it drives.
+// checkDebug validates --debug-addr: loopback only. Without --readiness-probes it serves only the
+// M3 hooks.
 func (o *options) checkDebug() error {
 	if o.debugAddr == "" {
 		return nil
 	}
 	if err := probe.CheckLoopback(o.debugAddr); err != nil {
 		return err
-	}
-	if !o.readinessProbes {
-		return errors.New("--debug-addr needs --readiness-probes")
 	}
 	return nil
 }
@@ -344,6 +368,29 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		Rejected:      rejected,
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
+	if o.cgroupRoot != "" {
+		// M3: the guest kubelet freezes the mirror's cgroup itself. M4 swaps this backend for
+		// the snapshot agent.
+		mopts.Suspend = mirror.SuspendOptions{
+			Freezer:         &freeze.Cgroup{Root: o.cgroupRoot},
+			NotReadyTimeout: o.notReadyTimeout,
+			FreezeTimeout:   o.freezeTimeout,
+			ReadyCheck:      mirror.ProbeUntilReady(100*time.Millisecond, probeOnce),
+			ReadyTimeout:    o.resumeReadyTimeout,
+			Recorder:        recorder,
+		}
+	}
+	// D-NS-8 ns-cordon: poked by every suspend-state change, polled every cordonPoll.
+	var cordonPoke chan struct{}
+	if o.cordonWhileHeld && o.cgroupRoot != "" {
+		cordonPoke = make(chan struct{}, 1)
+		mopts.Suspend.OnHoldChange = func() {
+			select {
+			case cordonPoke <- struct{}{}:
+			default: // a poke is already pending
+			}
+		}
+	}
 
 	// The prober reports verdict changes to the backend, which re-translates the guest's status.
 	var backend *mirror.Backend
@@ -360,7 +407,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		mopts.Prober = prober
 	}
 	var edges *probe.EdgeLog
-	if o.debugAddr != "" {
+	if o.debugAddr != "" && prober != nil {
 		edges = probe.NewEdgeLog(edgeLogSize)
 	}
 	n, err := nodeutil.NewNode(o.nodeName,
@@ -395,8 +442,15 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if err := backend.Start(ctx); err != nil {
 		return err
 	}
-	if edges != nil {
-		go probe.Serve(ctx, o.debugAddr, probe.DebugHandler(prober, edges))
+	if o.debugAddr != "" {
+		go probe.Serve(ctx, o.debugAddr, debugHandler(backend, prober, edges))
+	}
+	if cordonPoke != nil {
+		cordoner := provider.NewCordoner(client.CoreV1().Nodes(), o.nodeName,
+			eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "cordon")}))
+		log.G(ctx).WithField("node", o.nodeName).WithField("pollMs", cordonPoll.Milliseconds()).
+			Info("cordon while held: on (D-NS-8 ns-cordon)")
+		go cordoner.RunCordon(ctx, cordonPoll, backend.Hold, cordonPoke)
 	}
 	go func() {
 		if err := n.WaitReady(ctx, 0); err == nil {
@@ -452,4 +506,9 @@ func reRegisterOnNotFound(client kubernetes.Interface, spec *corev1.Node) node.E
 			WithField("action", "re-registered").Info("node finalizer set")
 		return nil
 	}
+}
+
+// probeOnce is one readiness probe attempt with the M2 prober's semantics (the resume check).
+func probeOnce(ctx context.Context, podIP string, c *corev1.Container) error {
+	return probe.NetProber{}.Probe(ctx, probe.Target{PodIP: podIP, Container: c})
 }
