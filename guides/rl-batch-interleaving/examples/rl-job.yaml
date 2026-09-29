@@ -600,6 +600,14 @@ spec:
     - name: EXP_NAME
       value: "rl-batch-code"
     # --- timeslice trainer (timeslice_verl, pip install from repo) ---
+    # Client wiring: these four entries are the default (TIMESLICE_CLIENT_WIRING
+    # unset = keep). With TIMESLICE_CLIENT_WIRING=ns-downward the one entry
+    #   - name: TIMESLICE_CLIENT_WIRING
+    #     value: "ns-downward"
+    # replaces all four: the hooks activate, job id and group come from this
+    # pod's timeslice.io labels (the timeslice-podinfo volume below), the
+    # orchestrator address defaults to its Service DNS name, and a pod without
+    # the labels fails at trainer start. Any TIMESLICE_* entry kept overrides.
     - name: TIMESLICE_FULLY_ASYNC
       value: "1"
     - name: TIMESLICE_JOB_ID
@@ -634,6 +642,9 @@ spec:
       mountPath: /workspace/results
     - name: dshm
       mountPath: /dev/shm
+    - name: timeslice-podinfo       # read only by TIMESLICE_CLIENT_WIRING=ns-downward
+      mountPath: /etc/timeslice/podinfo
+      readOnly: true
   volumes:
   - name: scripts
     configMap:
@@ -645,6 +656,15 @@ spec:
     emptyDir:
       medium: Memory
       sizeLimit: 16Gi
+  # The pod's own labels as a file (/etc/timeslice/podinfo/labels), the
+  # identity source for TIMESLICE_CLIENT_WIRING=ns-downward. An admission
+  # webhook may inject the same volume instead of the manifest.
+  - name: timeslice-podinfo
+    downwardAPI:
+      items:
+        - path: labels
+          fieldRef:
+            fieldPath: metadata.labels
 ---
 apiVersion: v1
 kind: Pod
@@ -691,6 +711,10 @@ spec:
     # is a CPU-only Ray actor that can be scheduled on either Ray node and
     # inherits the raylet's env, not the driver's - keep the timeslice env
     # identical on both pods.
+    # Under TIMESLICE_CLIENT_WIRING=ns-downward this pod has no timeslice.io
+    # labels (on purpose). A driver actor placed here reads the identity on the
+    # head pod through a zero-CPU Ray task pinned to trainer_node, so only
+    # TIMESLICE_CLIENT_WIRING is needed here too.
     - name: TIMESLICE_FULLY_ASYNC
       value: "1"
     - name: TIMESLICE_JOB_ID
