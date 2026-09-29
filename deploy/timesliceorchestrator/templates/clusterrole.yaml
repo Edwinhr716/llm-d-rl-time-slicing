@@ -9,4 +9,16 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "nodes"]
     verbs: ["get", "list", "watch"]
+  # Warning events (KillUnconfirmed, GrantBlocked, NodeNotLendable) on the
+  # group's pods after an unconfirmed guest kill (--unconfirmed-kill).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  {{- if eq (.Values.unconfirmedKill.mode | default "grant") "escalate" }}
+  # Escalation step 1 deletes the guest's mirror pod gracefully (never with a
+  # zero grace period). No access to Node objects is needed or granted.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  {{- end }}
 {{- end }}

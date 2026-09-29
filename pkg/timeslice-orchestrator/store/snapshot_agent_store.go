@@ -11,6 +11,7 @@ import (
 	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // SnapshotAgentStore defines the interface for communicating with snapshot agents.
@@ -20,6 +21,9 @@ type SnapshotAgentStore interface {
 	Snapshot(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.SnapshotResponse, error)
 	GetOperation(ctx context.Context, nodeName, operationID string) (*agentpb.GetOperationResponse, error)
 	Restore(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error)
+	// Kill asks the agent to kill jobID now, from any state, by deadline. It
+	// returns the kill operation to poll.
+	Kill(ctx context.Context, nodeName, jobID, reason string, deadline time.Time) (*agentpb.KillResponse, error)
 }
 
 type clientEntry struct {
@@ -39,6 +43,7 @@ type GRPCSnapshotAgentStore struct {
 	cache       map[string]*cacheEntry
 	cacheTTL    time.Duration
 	defaultPort int
+	rpcTimeout  time.Duration
 }
 
 // NewGRPCSnapshotAgentStore creates a new GRPCSnapshotAgentStore.
@@ -50,6 +55,29 @@ func NewGRPCSnapshotAgentStore(ttl time.Duration, defaultPort int) *GRPCSnapshot
 		cacheTTL:    ttl,
 		defaultPort: defaultPort,
 	}
+}
+
+// WithRPCTimeout bounds every call this store makes to an agent, including each
+// Status and GetOperation poll, by d. Zero (the default) leaves calls unbounded.
+// It is needed even when the operation itself is fine: one wedged GetOperation
+// call otherwise holds a controller worker after the agent has finished. Call it
+// before the store is used.
+func (s *GRPCSnapshotAgentStore) WithRPCTimeout(d time.Duration) *GRPCSnapshotAgentStore {
+	s.rpcTimeout = d
+	return s
+}
+
+// RPCTimeout returns the per-call bound set by WithRPCTimeout.
+func (s *GRPCSnapshotAgentStore) RPCTimeout() time.Duration {
+	return s.rpcTimeout
+}
+
+// rpcContext derives the context for one agent call.
+func (s *GRPCSnapshotAgentStore) rpcContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.rpcTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, s.rpcTimeout)
 }
 
 func (s *GRPCSnapshotAgentStore) getClient(address string) (agentpb.SnapshotAgentServiceClient, error) {
@@ -95,6 +123,8 @@ func (s *GRPCSnapshotAgentStore) GetStatus(ctx context.Context, nodeName string)
 		return nil, err
 	}
 
+	ctx, cancel := s.rpcContext(ctx)
+	defer cancel()
 	resp, err := client.Status(ctx, &agentpb.StatusRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get status from agent at %s: %w", address, err)
@@ -122,6 +152,8 @@ func (s *GRPCSnapshotAgentStore) Snapshot(
 		return nil, err
 	}
 
+	ctx, cancel := s.rpcContext(ctx)
+	defer cancel()
 	resp, err := client.Snapshot(ctx, &agentpb.SnapshotRequest{
 		JobId: jobID,
 		Group: groupID,
@@ -143,6 +175,8 @@ func (s *GRPCSnapshotAgentStore) GetOperation(
 		return nil, err
 	}
 
+	ctx, cancel := s.rpcContext(ctx)
+	defer cancel()
 	resp, err := client.GetOperation(ctx, &agentpb.GetOperationRequest{
 		OperationId: operationID,
 	})
@@ -163,12 +197,39 @@ func (s *GRPCSnapshotAgentStore) Restore(
 		return nil, err
 	}
 
+	ctx, cancel := s.rpcContext(ctx)
+	defer cancel()
 	resp, err := client.Restore(ctx, &agentpb.RestoreRequest{
 		JobId: jobID,
 		Group: groupID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to trigger restore for job %s on agent at %s: %w", jobID, address, err)
+	}
+
+	return resp, nil
+}
+
+// Kill asks the agent on the node to kill a job by deadline. Kill has no epoch
+// and works from any state.
+func (s *GRPCSnapshotAgentStore) Kill(
+	ctx context.Context, nodeName, jobID, reason string, deadline time.Time,
+) (*agentpb.KillResponse, error) {
+	address := s.resolveNodeAddress(nodeName)
+	client, err := s.getClient(address)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := s.rpcContext(ctx)
+	defer cancel()
+	resp, err := client.Kill(ctx, &agentpb.KillRequest{
+		JobId:    jobID,
+		Deadline: timestamppb.New(deadline),
+		Reason:   reason,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to kill job %s on agent at %s: %w", jobID, address, err)
 	}
 
 	return resp, nil

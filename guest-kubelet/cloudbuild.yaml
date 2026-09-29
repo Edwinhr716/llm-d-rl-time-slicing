@@ -12,9 +12,9 @@ options:
   logging: GCS_ONLY
   machineType: E2_HIGHCPU_8
 steps:
-  # Generates the orchestrator client from api/ (copied from the fork's orchestrator proto) and
-  # checks it matches the committed code. _ALLOW_REGEN=true writes the new code into api/ for
-  # the later steps and uploads it; commit what the build uploads.
+  # Generates the orchestrator and snapshot-agent clients from api/ (copies of the fork's
+  # protos) and checks they match the committed code. _ALLOW_REGEN=true writes the new code into
+  # api/ for the later steps and uploads it; commit what the build uploads.
   - id: proto
     name: golang:1.26
     entrypoint: bash
@@ -28,18 +28,20 @@ steps:
         GOBIN=/tmp/protoc/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
         GOBIN=/tmp/protoc/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
         export PATH=/tmp/protoc/bin:$$PATH
-        D=api/timeslice_orchestrator/v1alpha1
-        M=Mtimeslice_orchestrator.proto=github.com/edwinhr716/guest-kubelet/$$D
-        mkdir -p out/$$D
-        protoc -I $$D -I /tmp/protoc/include \
-          --go_out=out/$$D --go_opt=paths=source_relative,$$M \
-          --go-grpc_out=out/$$D --go-grpc_opt=paths=source_relative,$$M \
-          $$D/timeslice_orchestrator.proto
-        if ! diff -r -q out/$$D $$D --exclude='*.proto'; then
-          if [ "${_ALLOW_REGEN}" != "true" ]; then echo "generated code is stale; rerun with _ALLOW_REGEN=true"; exit 1; fi
-          cp out/$$D/*.pb.go $$D/
-          echo "generated code was rewritten (allowed); commit out/$$D/*.pb.go"
-        fi
+        for P in timeslice_orchestrator snapshot_agent; do
+          D=api/$$P/v1alpha1
+          M=M$$P.proto=github.com/edwinhr716/guest-kubelet/$$D
+          mkdir -p out/$$D
+          protoc -I $$D -I /tmp/protoc/include \
+            --go_out=out/$$D --go_opt=paths=source_relative,$$M \
+            --go-grpc_out=out/$$D --go-grpc_opt=paths=source_relative,$$M \
+            $$D/$$P.proto
+          if ! diff -r -q out/$$D $$D --exclude='*.proto'; then
+            if [ "${_ALLOW_REGEN}" != "true" ]; then echo "generated code is stale; rerun with _ALLOW_REGEN=true"; exit 1; fi
+            cp out/$$D/*.pb.go $$D/
+            echo "generated code was rewritten (allowed); commit out/$$D/*.pb.go"
+          fi
+        done
   - id: tidy
     name: golang:1.26
     entrypoint: bash
@@ -74,4 +76,4 @@ images:
 artifacts:
   objects:
     location: gs://${PROJECT_ID}_cloudbuild/guest-kubelet/${BUILD_ID}/
-    paths: ["out/go.mod", "out/go.sum", "out/api/timeslice_orchestrator/v1alpha1/*.pb.go"]
+    paths: ["out/go.mod", "out/go.sum", "out/api/timeslice_orchestrator/v1alpha1/*.pb.go", "out/api/snapshot_agent/v1alpha1/*.pb.go"]

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"google.golang.org/grpc"
@@ -22,7 +21,7 @@ const (
 	groupSourceNodeLabel = "node-label"
 	freezerDelete        = "delete"
 	freezerFake          = "fake"
-	freezerCgroup        = "cgroup"
+	freezerAgent         = "agent"
 )
 
 // orchestratorWiring builds and runs the orchestrator loop (VK-A6) when --orchestrator-addr
@@ -32,6 +31,10 @@ type orchestratorWiring struct {
 	o      *options
 	conn   *grpc.ClientConn
 	loop   *orchestrator.Loop
+
+	// isGuest selects the guests the loop gives a mirror (default provider.IsActiveGuest). main sets it to
+	// also require admission (VK-A7), so the loop never creates a mirror for a refused guest.
+	isGuest func(*corev1.Pod) bool
 }
 
 func newOrchestratorWiring(client kubernetes.Interface, opts *options) (*orchestratorWiring, error) {
@@ -44,12 +47,12 @@ func newOrchestratorWiring(client kubernetes.Interface, opts *options) (*orchest
 	}
 	switch opts.freezer {
 	case freezerDelete, freezerFake:
-	case freezerCgroup:
-		if opts.cgroupRoot == "" {
-			return nil, fmt.Errorf("--freezer=%s needs --cgroup-root", freezerCgroup)
+	case freezerAgent:
+		if opts.agentAddr == "" {
+			return nil, fmt.Errorf("--freezer=%s needs --agent-addr", freezerAgent)
 		}
 	default:
-		return nil, fmt.Errorf("--freezer=%q: want %q, %q or %q", opts.freezer, freezerDelete, freezerFake, freezerCgroup)
+		return nil, fmt.Errorf("--freezer=%q: want %q, %q or %q", opts.freezer, freezerDelete, freezerFake, freezerAgent)
 	}
 	conn, err := grpc.NewClient(opts.orchAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -70,10 +73,10 @@ func (w *orchestratorWiring) build(backend *mirror.Backend) (*orchestrator.Loop,
 		freezer = &orchestrator.FakeFreezer{
 			SuspendDelay: w.o.fakeSuspendDelay, ResumeDelay: w.o.fakeResumeDelay, Annotate: backend.AnnotateMirror,
 		}
-	case freezerCgroup:
+	case freezerAgent:
 		lf, err := backend.LoopFreezer()
 		if err != nil {
-			return nil, fmt.Errorf("--freezer=%s: %w", freezerCgroup, err)
+			return nil, fmt.Errorf("--freezer=%s: %w", freezerAgent, err)
 		}
 		freezer = lf
 	}
@@ -83,7 +86,7 @@ func (w *orchestratorWiring) build(backend *mirror.Backend) (*orchestrator.Loop,
 		Group:        orchestrator.NodeLabelGroup(w.client, w.o.hostNode),
 		Host:         backend,
 		Freezer:      freezer,
-		IsGuest:      provider.IsGuest,
+		IsGuest:      w.guestFilter(),
 		EngineReady:  backend.EngineReady,
 		PollInterval: w.o.orchPoll,
 		Liveness:     w.o.liveness,
@@ -96,6 +99,14 @@ func (w *orchestratorWiring) build(backend *mirror.Backend) (*orchestrator.Loop,
 	}
 	w.loop = loop
 	return loop, nil
+}
+
+// guestFilter is isGuest, or provider.IsActiveGuest when unset.
+func (w *orchestratorWiring) guestFilter() func(*corev1.Pod) bool {
+	if w.isGuest != nil {
+		return w.isGuest
+	}
+	return provider.IsActiveGuest
 }
 
 // start runs the loop in the background until ctx ends. Only the leader gets here.
@@ -132,15 +143,11 @@ func (w *orchestratorWiring) relist(ctx context.Context, backend *mirror.Backend
 		}
 	case w.conn != nil && w.o.freezer == freezerDelete:
 		// Mirrors are deleted to vacate, never frozen: no host fact to read.
-	case w.o.cgroupRoot != "":
-		// --freezer=cgroup, or M3 without the loop: the cgroup freezer writes the suspend
-		// state, so the host fact corrects it. Without the host cgroup tree there is no fact.
-		if _, err := os.Stat(w.o.cgroupRoot); err == nil {
-			opts.Frozen = backend.HostFrozen
-			opts.RecordState = true
-		} else {
-			log.G(ctx).WithError(err).Warn("recover: no host cgroup tree; trusting the recorded suspend state")
-		}
+	case w.o.agentAddr != "":
+		// --freezer=agent, or M4 without the loop: the agent's Status is the host fact, and it
+		// corrects the recorded suspend state. An agent that cannot be read leaves it trusted.
+		opts.Frozen = backend.HostFrozen
+		opts.RecordState = true
 	}
 	if w.loop != nil {
 		opts.OnAdopt = func(a provider.Adopted) { w.loop.Adopt(a.Guest.UID, a.Suspended, a.Released) }

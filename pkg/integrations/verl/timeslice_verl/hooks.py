@@ -46,10 +46,27 @@ Environment contract:
   TIMESLICE_ORCH_ADDR          orchestrator gRPC address (e.g. "127.0.0.1:50051")
   TIMESLICE_GROUP              trainers-pool group id (e.g. "trainers")
                                (gate on + these missing => warn-once no-op locks)
+  TIMESLICE_CLIENT_WIRING      keep (default) or ns-downward (D-NS-16). ns-downward:
+                               activates the hooks without TIMESLICE_FULLY_ASYNC
+                               (=0 still turns them off), takes job id and group
+                               from the pod labels (downward API, dir
+                               TIMESLICE_PODINFO_DIR), defaults the address to the
+                               orchestrator Service DNS name, lets the three vars
+                               above override, and fails trainer construction
+                               (timeslice.wiring.WiringError) when no donor pod
+                               identity is found (see ns_downward.py)
   TIMESLICE_EMPTY_CACHE_BEFORE_YIELD=1
                                experimental: torch.cuda.empty_cache() right
                                before each yield's release (best-effort probe
                                for smaller cuda-checkpoint snapshots)
+  TIMESLICE_EXPECTED_IDLE      expected_idle hint sent with each yield
+                               (timeslice_verl.estimator): "off" (default,
+                               no hint), "auto" (per yield point, EWMA of the
+                               measured gaps between that point's yield and
+                               the next acquire; no hint on a point's first
+                               yield) or a fixed number of seconds. The
+                               orchestrator lends the GPU to guests on a hint
+                               >= its --min-bubble (--lend-policy=hint).
 
 Config this module depends on directly: async_training.trainer_name=timeslice
 selects the subclass (see trainer.py); trainer.save_freq=-1 is enforced by the
@@ -61,8 +78,10 @@ verl integration guide (guides/rl-frameworks/verl/).
 import asyncio
 import os
 import threading
+from time import monotonic as _now
 
-from timeslice_verl.locks import PhaseLocks, _log
+from timeslice_verl import estimator, ns_downward
+from timeslice_verl.locks import ENV_WIRING, PhaseLocks, _log, resolve_wiring
 
 ENV_ENABLE = "TIMESLICE_FULLY_ASYNC"
 # EXPERIMENTAL: when "1", call torch.cuda.empty_cache() immediately before each
@@ -76,7 +95,14 @@ def _flag(name: str) -> bool:
 
 
 def enabled() -> bool:
+    if _ns_downward_selected():
+        # D-NS-16 ns-downward: selecting the plugin activates it; =0 is an escape hatch.
+        return os.environ.get(ENV_ENABLE, "").strip().lower() not in ("0", "false", "no")
     return _flag(ENV_ENABLE)
+
+
+def _ns_downward_selected() -> bool:
+    return os.environ.get(ENV_WIRING, "").strip().lower() == "ns-downward"
 
 
 class TimesliceHooksMixin:
@@ -89,13 +115,38 @@ class TimesliceHooksMixin:
     job_id, group_id)` is injectable for grpc-free tests.
     """
 
-    def __init__(self, client_factory=None):
+    def __init__(self, client_factory=None, donor_resource: str | None = None):
         self._client_factory = client_factory
         self._state_lock = threading.Lock()
         self._locks: PhaseLocks | None = None
         self._warned: set = set()
-        if enabled():
+        # expected_idle estimator state, and the (point, monotonic time) of
+        # the last yield whose gap to the next acquire is not measured yet.
+        self._idle_state = estimator.new()
+        self._pending_gap: tuple[str, float] | None = None
+        self._wiring = None
+        if not enabled():
+            return
+        if not _ns_downward_selected():
             _log("fully_async: timeslice lifecycle hooks active (TIMESLICE_FULLY_ASYNC=1)")
+            return
+        _log("fully_async: timeslice lifecycle hooks active (TIMESLICE_CLIENT_WIRING=ns-downward)")
+        self._resolve_ns_downward(donor_resource)
+
+    def _resolve_ns_downward(self, donor_resource: str | None) -> None:
+        """D-NS-16 ns-downward: resolve the identity when the trainer is built, so an
+        unlabelled pod fails here and not at the first lock point. When this actor
+        runs outside the donor pod, the identity is read on a donor pod through Ray
+        (ns_downward.ray_donor_podinfo)."""
+        from timeslice import wiring
+
+        resource = ns_downward.donor_resource(donor_resource)
+        try:
+            self._wiring = resolve_wiring(mode="ns-downward", donor_podinfo=ns_downward.ray_donor_podinfo(resource))
+        except wiring.WiringError as e:
+            _log(str(e))
+            raise
+        wiring.log_once(self._wiring)
 
     # ------------------------------------------------------------ lifecycle hooks
 
@@ -179,7 +230,7 @@ class TimesliceHooksMixin:
         if self._locks is None:
             with self._state_lock:
                 if self._locks is None:
-                    self._locks = PhaseLocks.from_env(client_factory=self._client_factory)
+                    self._locks = PhaseLocks.from_env(client_factory=self._client_factory, resolution=self._wiring)
         return self._locks
 
     async def _ensure_lock(self, point: str) -> None:
@@ -187,16 +238,44 @@ class TimesliceHooksMixin:
         event loop stays free (the wait can be minutes while the other job
         holds the group). Acquire errors propagate."""
         locks = await asyncio.to_thread(self._get_locks)
+        self._observe_gap(locks)
         await asyncio.to_thread(locks.ensure)
 
     async def _yield_lock(self, point: str) -> None:
         """Idempotent release (PhaseLocks.drop_all: errors logged, never
-        raised), run in a worker thread."""
+        raised), run in a worker thread. Sends the expected_idle hint for
+        `point` (TIMESLICE_EXPECTED_IDLE) and starts timing the gap to the
+        next acquire."""
         locks = self._locks
         if locks is None or not locks.enabled or not locks.held:
             return
         await asyncio.to_thread(self._maybe_empty_cache, point)  # experimental, inert by default
-        await asyncio.to_thread(locks.drop_all)
+        await asyncio.to_thread(locks.drop_all, self._expected_idle(point))
+        self._pending_gap = (point, _now())
+
+    # ------------------------------------------------------------ expected_idle
+
+    def _expected_idle(self, point: str) -> float | None:
+        """The hint for a yield at `point` in seconds, or None for no hint."""
+        try:
+            mode, seconds = estimator.parse_mode(os.environ.get(estimator.ENV_MODE))
+        except ValueError as e:
+            self._warn_once("expected_idle_mode", f"{e}; sending no expected_idle hint")
+            return None
+        if mode == estimator.MODE_FIXED:
+            return seconds
+        if mode == estimator.MODE_AUTO:
+            return estimator.next(self._idle_state, point)
+        return None
+
+    def _observe_gap(self, locks: PhaseLocks) -> None:
+        """Feed the estimator the gap from the last yield to this acquire
+        (only when the acquire is real, i.e. the lock is not held)."""
+        pending, self._pending_gap = self._pending_gap, None
+        if pending is None or not locks.enabled or locks.held:
+            return
+        point, yielded_at = pending
+        estimator.observe(self._idle_state, point, _now() - yielded_at)
 
     # ------------------------------------------------------------ misc
 

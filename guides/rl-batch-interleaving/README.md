@@ -381,6 +381,20 @@ Every time-sliced verl job must carry this contract:
     `trainers`).
   * `TIMESLICE_ORCH_ADDR` — orchestrator gRPC address
     (`timeslice-timesliceorchestrator.timeslice-system.svc:50051`).
+  * `TIMESLICE_CLIENT_WIRING` — `keep` (default) uses the variables above.
+    `ns-downward` replaces them: it activates the hooks, reads the job id and
+    group from the pod's `timeslice.io/job-id` and `timeslice.io/group` labels
+    through a downward API volume (`/etc/timeslice/podinfo/labels`, see the
+    head pod's `timeslice-podinfo` volume; override the directory with
+    `TIMESLICE_PODINFO_DIR`), and defaults the address to the Service DNS name
+    above. Each `TIMESLICE_*` variable still overrides its value. When the
+    trainer driver actor lands on the unlabeled rollout pod, it reads the
+    labels on a trainer pod through a zero-CPU Ray task pinned to the
+    `trainer_pool` resource of `ray_pg_extra_resources` (override with
+    `TIMESLICE_DONOR_RAY_RESOURCE`). If no identity is found, trainer start
+    fails with one `[timeslice] FATAL wiring:` line. `TIMESLICE_FULLY_ASYNC=0`
+    still turns the hooks off. `python -m timeslice.wiring` prints what the
+    client resolved, and from where, as JSON.
 * **Pod labels** on the head pod ONLY (the trainer is the sole time-sliced
   process in the RL job; the rollout pod stays unlabeled):
   `timeslice.io/job-id: <job id>` and `timeslice.io/group: <group>` — the

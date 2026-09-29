@@ -187,3 +187,101 @@ func TestSpecHashIgnoresTokenMount(t *testing.T) {
 		t.Error("SpecHash modified the guest")
 	}
 }
+
+func TestBuildAgentJob(t *testing.T) {
+	cfg := testConfig()
+	m, err := Build(testGuest(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Labels[LabelJobID]; ok || m.Spec.RestartPolicy == corev1.RestartPolicyNever {
+		t.Errorf("without AgentJob the mirror is not an agent job: %v %s", m.Labels, m.Spec.RestartPolicy)
+	}
+	cfg.AgentJob, cfg.Attempt = true, 3
+	if m, err = Build(testGuest(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Labels[LabelJobID]; got != "guest-uid-3" {
+		t.Errorf("job id = %q, want guest-uid-3", got)
+	}
+	if m.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Errorf("an agent job must never be restarted by the kubelet: %s", m.Spec.RestartPolicy)
+	}
+}
+
+func TestDeviceReserve(t *testing.T) {
+	// L4: 23034 MiB of device memory; x1.1 = 25337.4 MiB, rounded up to 25338 MiB.
+	got, err := DeviceReserve(resource.MustParse("23034Mi"), 1.1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cmp(resource.MustParse("25338Mi")) != 0 {
+		t.Errorf("reserve = %s, want 25338Mi", got.String())
+	}
+	if _, err := DeviceReserve(resource.MustParse("1Gi"), 0.9); err == nil {
+		t.Error("a factor below 1 must be refused")
+	}
+	if z, err := DeviceReserve(resource.Quantity{}, 1.1); err != nil || !z.IsZero() {
+		t.Errorf("zero device memory: %s, %v", z.String(), err)
+	}
+}
+
+func TestMirrorMemoryLimitAddsDeviceReserve(t *testing.T) {
+	cfg := testConfig()
+	cfg.DeviceMemoryReserve = resource.MustParse("25338Mi")
+	build := func(guest *corev1.Pod) *corev1.Pod {
+		t.Helper()
+		mirror, err := Build(guest, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mirror
+	}
+	limit := func(mirror *corev1.Pod, i int) resource.Quantity {
+		return mirror.Spec.Containers[i].Resources.Limits[corev1.ResourceMemory]
+	}
+
+	// GPU container with a 30Gi limit: limit = 30Gi + reserve; request still capped.
+	mirror := build(testGuest())
+	want := resource.MustParse("30Gi")
+	want.Add(resource.MustParse("25338Mi"))
+	if q := limit(mirror, 0); q.Cmp(want) != 0 {
+		t.Errorf("gpu limit = %s, want %s", q.String(), want.String())
+	}
+	if q := mirror.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory]; q.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Errorf("request = %s, want the 4Gi headroom", q.String())
+	}
+
+	// No limit: the base is the (uncapped) request.
+	guest := testGuest()
+	delete(guest.Spec.Containers[0].Resources.Limits, corev1.ResourceMemory)
+	want = resource.MustParse("24Gi")
+	want.Add(resource.MustParse("25338Mi"))
+	if q := limit(build(guest), 0); q.Cmp(want) != 0 {
+		t.Errorf("no-limit gpu limit = %s, want %s", q.String(), want.String())
+	}
+
+	// Neither limit nor request: the reserve alone (never unlimited).
+	guest = testGuest()
+	delete(guest.Spec.Containers[0].Resources.Limits, corev1.ResourceMemory)
+	delete(guest.Spec.Containers[0].Resources.Requests, corev1.ResourceMemory)
+	if q := limit(build(guest), 0); q.Cmp(resource.MustParse("25338Mi")) != 0 {
+		t.Errorf("bare gpu limit = %s, want the reserve", q.String())
+	}
+
+	// A sidecar without the GPU keeps its own limit; a CPU-only guest is unchanged.
+	guest = testGuest()
+	side := corev1.Container{Name: "side", Image: "busybox"}
+	side.Resources.Limits = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")}
+	guest.Spec.Containers = append(guest.Spec.Containers, side)
+	if q := limit(build(guest), 1); q.Cmp(resource.MustParse("1Gi")) != 0 {
+		t.Errorf("sidecar limit = %s, want 1Gi", q.String())
+	}
+	echo := corev1.Container{Name: "echo", Image: "agnhost"}
+	echo.Resources.Requests = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Mi")}
+	cpuOnly := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "echo"}}
+	cpuOnly.Spec.Containers = []corev1.Container{echo}
+	if got := build(cpuOnly).Spec.Containers[0].Resources.Limits; got != nil {
+		t.Errorf("cpu-only guest got limits %v", got)
+	}
+}

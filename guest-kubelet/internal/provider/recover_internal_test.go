@@ -10,7 +10,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
-	"github.com/edwinhr716/guest-kubelet/internal/freeze"
 )
 
 type adoptCall struct {
@@ -73,12 +72,12 @@ func (host *fakeRecoverHost) add(name, state, attempt string, ready bool) addedP
 	return addedPods{guest: guest, mp: mp}
 }
 
-// frozenSet is a host fact: which mirrors are frozen, and which have no cgroup.
-func frozenSet(frozen map[string]bool, noCgroup ...string) func(*corev1.Pod) (bool, error) {
+// frozenSet is a host fact: which mirrors are frozen, and for which the host fact cannot be read.
+func frozenSet(frozen map[string]bool, noFact ...string) func(*corev1.Pod) (bool, error) {
 	return func(m *corev1.Pod) (bool, error) {
-		for _, n := range noCgroup {
+		for _, n := range noFact {
 			if m.Name == n {
-				return false, freeze.ErrNoCgroup
+				return false, mirror.ErrNoHostFact
 			}
 		}
 		return frozen[m.Name], nil
@@ -179,22 +178,6 @@ func TestRecover_UnreadableHostTrustsTheAnnotation(t *testing.T) {
 	}
 }
 
-func TestRecover_NoCgroupMeansNotFrozen(t *testing.T) {
-	host := newFakeRecoverHost()
-	added := host.add("guest", mirror.StateSuspended, "1", false)
-	guest, m := added.guest, added.mp
-	got, err := Recover(context.Background(), host, RecoverOptions{Frozen: frozenSet(nil, m.Name), RecordState: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0].Suspended || got[0].Released {
-		t.Fatalf("got %+v", got)
-	}
-	if s, ok := host.recorded[guest.UID]; !ok || s != "" {
-		t.Errorf("want Suspended cleared, recorded %q (%t)", s, ok)
-	}
-}
-
 func TestRecover_RecordStateOffLeavesTheAnnotation(t *testing.T) {
 	host := newFakeRecoverHost()
 	m := host.add("guest", "", "0", false).mp
@@ -240,4 +223,16 @@ func TestRecover_NotReadyGuestIsNotReleased(t *testing.T) {
 // addedPods is a guest and its mirror, as add made them.
 type addedPods struct {
 	guest, mp *corev1.Pod
+}
+
+func TestRecover_AgentWithoutFactTrustsTheAnnotation(t *testing.T) {
+	host := newFakeRecoverHost()
+	m := host.add("guest", mirror.StateSuspended, "1", false).mp
+	got, err := Recover(context.Background(), host, RecoverOptions{Frozen: frozenSet(nil, m.Name), RecordState: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].Suspended || len(host.recorded) != 0 {
+		t.Fatalf("got %+v, recorded %v", got, host.recorded)
+	}
 }

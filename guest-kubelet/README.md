@@ -40,32 +40,63 @@ kubelet for the guest pods scheduled onto it.
   that wins over the probes) and `GET /debug/ready-edges?pod=ns/name`
   (when the VK sent each Ready change). Only the Q5 measurement uses it.
   The same address serves the M3 suspend and resume hooks (below).
-- Not yet: liveness and startup probes, logs/exec
-  (use `kubectl logs <guest>-m`), stats.
+- Admission (VK-A7) refuses a guest before it gets a mirror: a liveness
+  or startup probe, an exec or grpc readiness probe, readiness gates (an
+  httpGet or tcpSocket readinessProbe is allowed), a GPU resource other
+  than `nvidia.com/gpu`, or a GPU guest on a host whose model label is
+  not in `--gpu-allowlist` (default `nvidia-l4`; no label fails closed).
+  The guest gets a Warning event `GuestRejected` naming the rule and goes
+  `Failed` with reason `GuestRejected`.
+- Which probes a guest may carry is lead decision D-VK-5, selected with
+  `--guest-probe-policy` (default `a`, the rule above). `b` refuses every
+  probe and readiness gates. `c` refuses none: liveness probes are dropped,
+  the VK runs readiness and startup probes of any kind (exec through
+  `pods/exec` on the mirror, gRPC health), holds Ready false until the
+  startup probe passes and until every readiness gate is true, and its
+  status writes keep the gate conditions (`internal/backend/mirror/gates.go`).
+  The mirror carries no probes under every policy.
+- A GPU mirror container's memory limit is its limit (or request) plus
+  the device reserve, `ceil(--gpu-memory x --mirror-memory-factor)`
+  (defaults `23034Mi` x `1.1`, about 24.7 GiB).
+- Outage guard (VK-A7): `deploy/guard/node-keeper.yaml` runs the same
+  binary with `--node-keeper` (1 replica, Recreate, pinned to the host).
+  While the host is Ready and the guest kubelet was seen within
+  `--keeper-outage-grace` (15m), it renews the virtual Node's Lease
+  whenever the guest kubelet has not for `--keeper-stale-after` (15s).
+  The Node stays Ready through a guest-kubelet outage, so it is not
+  deleted and its guests and mirrors keep running. Past the grace it
+  stops and the Node goes NotReady as before.
+- Not yet: logs/exec (use `kubectl logs <guest>-m`), stats. Liveness and
+  startup probes are refused by admission (above), so an exec or gRPC
+  readinessProbe never reaches the prober.
 
 ## Layout
 
-```
+```text
 cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wiring; own event recorder
 internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
+internal/provider/admission.go       admission: probes, gates, GPU allowlist
+internal/provider/marker.go          --guest-marker: what makes a pod a guest
+internal/provider/probepolicy.go     --guest-probe-policy (D-VK-5 a/b/c)
 internal/provider/events.go          drops events about non-guest pods
+internal/keeper/keeper.go            outage guard (keeps the Node Lease fresh)
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
 internal/backend/mirror/status.go    mirror status -> guest status
 internal/backend/mirror/backend.go   create/adopt/delete mirrors, mirror informer, orphan GC
 internal/backend/mirror/claim.go     optional reservedFor write (kube-controller-manager also does it)
 internal/probe/probe.go              readiness prober (httpGet, tcpSocket)
+internal/probe/startup.go            startup gate (D-VK-5 c)
+internal/probe/handlers.go           exec and gRPC probes (D-VK-5 c)
+internal/backend/mirror/gates.go     readiness gates kept (D-VK-5 c)
 internal/probe/debug.go              debug endpoint: override, Ready edges
 cmd/q5-measure/main.go               Q5 timings; runs in a pod
-internal/backend/mirror/suspend.go   M3 suspend/resume, state on the mirror,
-                                     guest status overlay
-internal/backend/mirror/readiness.go MarkNotReady, the one NotReady signal;
-                                     wait for NotReady in the API
-internal/backend/mirror/readycheck.go
-                                     after a resume, run the guest
-                                     readinessProbe until it passes
-internal/freeze/                     freeze.Backend; Cgroup: cgroup v2
-                                     freezer on the pod cgroup
+internal/backend/mirror/suspend.go   suspend/resume/kill, state on the mirror
+internal/backend/mirror/readiness.go MarkNotReady, the one NotReady signal
+internal/backend/mirror/readycheck.go readinessProbe after a resume
+internal/freeze/                     freeze.Backend: Suspend, Resume, Kill
+internal/handshake/                  freeze.Backend over the agent's gRPC API
+api/snapshot_agent/v1alpha1/         agent proto copy; Go code from Cloud Build
 cmd/guest-kubelet/debug.go           the --debug-addr mux: M2 hooks,
                                      POST /debug/suspend, /debug/resume,
                                      GET /debug/freeze-state
@@ -74,61 +105,94 @@ cmd/guest-kubelet/orchestrator.go    --orchestrator-addr: the orchestrator
 internal/orchestrator/               the orchestrator loop (Acquire,
                                      heartbeat, serve, vacate, Yield)
 internal/backend/mirror/loopfreezer.go
-                                     the loop's cgroup freezer; relist
+                                     the loop's agent freezer; relist
                                      helpers (ListMirrors, GuestNow, Adopt)
 internal/provider/recover.go         M5: relist mirrors after a restart and
                                      rebuild the lost state
 deploy/                              namespace + SA, RBAC, Deployment, CPU test guest + Service
+deploy/guard/                        node keeper Deployment (outage guard)
+deploy/guests/                       guest manifests: today, ns
+deploy/admission/                    W9 policies, one per guest marker
 deploy/m1/                           claim + trainer stand-in, vLLM guest, StatefulSet guest,
                                      rollout-test DaemonSet, curl client, driver installer, VAP test
 deploy/m2/                           probed guests, pool, router, Q5 pods
 cloudbuild.yaml                      tidy check, vet, test, build, image push (nothing runs locally)
 ```
 
-## M3: suspend and resume by cgroup freeze
+## M3/M4: suspend and resume through the snapshot agent
 
-Interim step: the VK freezes the mirror's pod cgroup itself. It sits behind
-`freeze.Backend` (`internal/freeze`), so M4 swaps it for the snapshot agent's
-Suspend/Resume and the VK stops touching cgroups.
+M3 froze the mirror's pod cgroup from the VK. Since M4 the node's snapshot
+agent does it (checkpoint, freeze, verify), behind `freeze.Backend`
+(`internal/freeze`), implemented by `internal/handshake`: the VK never
+touches cgroups or the GPU. `--agent-addr` (host:port of the agent on the
+node; empty disables suspend) turns it on.
 
-- Suspend (`Backend.Suspend`), in this order: raise `timeslice.io/guest-epoch`
-  and set `timeslice.io/suspend-state=Suspending` on the mirror
-  (compare-and-swap on its resourceVersion); the guest turns NotReady
-  (`MarkNotReady`, the same function the prober uses for a failed probe, with
-  reason `Suspending`); wait until the API shows the guest NotReady
-  (`--suspend-notready-timeout`); write `1` to `cgroup.freeze` on the
-  pod-level cgroup and wait for `frozen 1` in `cgroup.events`
-  (`--freeze-timeout`); record `Suspended`. No drain. If the wait or the
-  freeze fails, the pod is thawed and put back to Running.
-- While frozen the guest shows phase Running, Ready=False, condition
+- Mirrors are agent jobs: label `timeslice.io/job-id` =
+  `<guest UID>-<attempt>` (an adopted mirror keeps its id),
+  `restartPolicy: Never` (a kubelet restart of a suspended or killed process
+  would run behind the agent's back), and the guest as owner
+  (`--mirror-owner-ref`, required: the agent reads the guest's Ready through
+  it). The memory limit of each GPU container grows by the device reserve
+  (VK-A7, below the admission rules): the agent checkpoints device memory
+  into the pod's memory cgroup and refuses a pod without room.
+- Suspend (`Backend.Suspend`), in this order: raise
+  `timeslice.io/guest-epoch` and set `timeslice.io/suspend-state=Suspending`
+  on the mirror (compare-and-swap on its resourceVersion); the guest turns
+  NotReady (`MarkNotReady`, with reason `Suspending`); wait until the API
+  shows the guest NotReady (`--suspend-notready-timeout`); require the job
+  in the agent's `Status`; agent `Suspend(job_id, epoch, deadline)` with
+  deadline `--agent-suspend-timeout` (or the caller's earlier one), polled
+  through `GetOperation`; record `Suspended`. No drain. If the NotReady wait
+  fails, the agent was never called and the guest goes back to Running.
+- While suspended the guest shows phase Running, Ready=False, condition
   `timeslice.io/suspended=True`, and its containers Waiting with reason
   `Suspended`, so `kubectl get pods` prints `0/1 Suspended`. Restart counts
   do not change.
 - Resume (`Backend.Resume`): raise the epoch, record `Resuming` (still
-  NotReady), thaw, run the guest's httpGet/tcpSocket readinessProbe against
-  the mirror (one attempt at a time with the prober's HTTP and TCP semantics)
+  NotReady), agent `Resume` (`--agent-resume-timeout`; outcome RESUMED or
+  none), run the guest's httpGet/tcpSocket readinessProbe against the mirror
   until it passes (`--resume-ready-timeout`), then clear the state; from then
-  on the prober's verdict decides Ready, as for any guest. Any failure leaves
-  it `Resuming`, so it is never Ready on a process that did not come back.
+  on the prober's verdict decides Ready.
+- Kill sequence (Q6): any failure of the agent's Suspend or Resume (a
+  refusal, a FAILED operation, a missed deadline, `Unimplemented`, a job the
+  agent does not list or reports FAULTED, an outcome such as RELEASED) and a
+  failed ready check after a Resume: record `Killing` (NotReady), agent
+  `Kill` (`--agent-kill-timeout`), delete the mirror with its normal grace
+  period (never a force delete), record `Killed` on the terminating mirror
+  and report the guest Failed with reason `SnapshotAgentKilled`. Each step
+  runs even if the one before failed, so a hung or crashed agent still ends
+  with the mirror gone and the guest Failed. A later suspend or resume of a
+  guest left `Killing` finishes the sequence.
+- Agent calls follow the Q13 defaults: every RPC times out after
+  `--agent-rpc-timeout` (5s), pending operations are polled every
+  `--agent-poll` (100ms), and a call that does not reach the agent
+  (Unavailable, a timed-out RPC: a hung agent) or whose operation the agent
+  lost (GetOperation NotFound after a restart) is re-issued with the same
+  epoch, backing off from `--agent-retry-initial` (1s) to
+  `--agent-retry-max` (30s), never past the deadline. The agent is told a
+  deadline `--agent-deadline-grace` (1s) earlier than the VK's own, so its
+  verdict is still read. The agent's refusal reason (the `ErrorReason` name
+  that prefixes its message) is logged and recorded in the event.
 - The suspend state is applied after the prober's verdict, so a probe that
   still passes (or a debug override) never shows a suspended guest Ready.
 - One suspend or resume per guest at a time. The state lives on the mirror,
-  so a restarted VK or a new leader derives the same guest status. Deleting a
-  suspended guest thaws the mirror first, so it can act on SIGTERM.
-- Deployment: the VK container is privileged, runs as root and mounts the
-  host's `/sys/fs/cgroup` read-write at `/host/cgroup` (`--cgroup-root`;
-  empty disables suspend). The cgroup is found under both kubelet cgroup
-  drivers (systemd `kubepods.slice/...` and cgroupfs `kubepods/...`). Mirror
-  pods stay unprivileged.
-- With `--orchestrator-addr` and `--freezer=cgroup` the orchestrator loop
-  (VK-A6) freezes and thaws through the same backend (`LoopFreezer`).
-  Otherwise suspend and resume are triggered by hand through `--debug-addr`
-  (loopback only, for example `127.0.0.1:10261`, reached with
-  `kubectl port-forward` to the leader pod; it works with
-  `--readiness-probes=false` too):
+  so a restarted VK or a new leader derives the same guest status. Deleting
+  a guest that is not Running has the agent kill the mirror first, so it
+  does not sit out the grace period frozen.
+- Deployment: the VK is unprivileged (no cgroup mount) and reaches the agent
+  over the host network (`--agent-addr=127.0.0.1:9001` in
+  `deploy/deployment.yaml`).
+- With `--orchestrator-addr` and `--freezer=agent` the orchestrator loop
+  (VK-A6) suspends, resumes and kills through the same agent client
+  (`LoopFreezer`); a failed loop suspend or resume ends in the loop's kill
+  sequence (agent Kill, mirror delete, guest Failed). Otherwise suspend and
+  resume are triggered by hand through `--debug-addr` (loopback only, e.g.
+  `127.0.0.1:10261`, reached with `kubectl port-forward` to the leader pod;
+  it works with `--readiness-probes=false` too):
   `POST /debug/suspend?namespace=<ns>&name=<guest>` and
-  `POST /debug/resume?...`. The reply is the step timings as JSON.
-  It has no authentication: enable it only in test deployments.
+  `POST /debug/resume?...`. The reply is the step timings as JSON; a call
+  that ended in the kill sequence answers 410 with the error. It has no
+  authentication: enable it only in test deployments.
 
 ## M5: restart and relist
 
@@ -165,9 +229,9 @@ controller and the orchestrator loop start (`internal/provider/recover.go`):
 
 ## Build and deploy
 
-```
+```text
 make build        # Cloud Build: tidy check, go vet, go test -race, image -> Artifact Registry
-make deploy       # namespace, RBAC, Deployment on the test cluster (HOST=<real node>)
+make deploy       # namespace, RBAC, Deployment, node keeper (HOST=<real node>)
 make test-guest   # CPU guest + Service
 make gpu-guest    # claim + trainer stand-in, then the vLLM guest
 make m2-deploy    # probed guests, pool, EPP, router, RBAC
@@ -225,6 +289,54 @@ Probe mode (a real readinessProbe, period 1 s, flipped by the guest):
   reaches it in tens of milliseconds. Router requests are timed from when
   they were sent, so a request sent just before the watch saw the change
   can give a slightly negative span.
+
+## Guest steering options (pending decisions D-NS-2, D-VK-4, D-NS-3)
+
+Three pending lead decisions choose how a guest finds the virtual Node and
+what makes a pod a guest. Every option ships; flags and manifests pick one.
+The defaults are today's behaviour.
+
+- D-NS-2, labels of the virtual Node: `--guest-node-label`.
+  - `false` (default): `timeslice.io/virtual-node=true` only.
+  - `true`: also `timeslice.io/guest=true`.
+- D-VK-4, what makes a pod a guest: `--guest-marker`.
+  - `toleration` (default): the pod tolerates `timeslice.io/guest` by key.
+  - `label`: the pod carries the label `timeslice.io/guest=true`.
+  - `both`: either one.
+- D-NS-3, how a guest steers: the manifest in `deploy/guests/`.
+  - `guest-today.yaml`: the toleration and the nodeSelector
+    `timeslice.io/virtual-node: "true"`. It waits Pending when no
+    virtual Node exists or has room.
+  - `guest-ns.yaml`: the label `timeslice.io/guest=true`, the toleration and
+    a preferred node affinity (weight 100) on `timeslice.io/guest=true`.
+    It falls back to real nodes.
+- W9 for each marker: `deploy/admission/w9-<variant>.yaml`, a
+  ValidatingAdmissionPolicy and binding. It rejects `timeslice.io/group`,
+  `timeslice.io/job-id` and `timeslice.io/role` on guests and allows
+  `timeslice.io/guest`. The variants are `toleration`, `label`, `both`
+  (one per marker) and `either` (toleration or label, whatever the marker).
+
+Combinations that work together:
+
+- today: `--guest-node-label=false --guest-marker=toleration`,
+  `guest-today.yaml`, `w9-toleration.yaml`.
+- north star: `--guest-node-label=true --guest-marker=label`,
+  `guest-ns.yaml`, `w9-label.yaml`.
+- both forms (the D-NS-3 flag option): `--guest-node-label=true
+  --guest-marker=both`, either manifest, `w9-both.yaml`.
+
+`guest-ns.yaml` without `--guest-node-label=true` is admitted and runs,
+but has nothing to prefer: the scheduler puts it on any node that fits.
+The two flags need no new RBAC: the Node label is set when the Node is
+created. A cluster admin applies the W9 policies, one copy per namespace:
+
+```sh
+sed 's/__NS__/<namespace>/g' deploy/admission/w9-label.yaml | kubectl apply -f -
+```
+
+The `isGuest` CEL variable of each policy is the guest predicate of the
+matching `--guest-marker`. `internal/provider/guests_internal_test.go`
+checks that they agree and that both manifests steer as described.
 
 ## M1 results (the test cluster, 2026-09-25)
 

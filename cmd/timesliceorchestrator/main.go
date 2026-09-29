@@ -18,8 +18,6 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -42,7 +40,9 @@ func run() error {
 	port := flag.Int("port", 50051, "The server port")
 	metricsPort := flag.Int("metrics-port", 8080, "The metrics server port")
 	kubeconfig := flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	controllerWorkers := flag.Int("controller-workers", 1, "The number of workers for the controller")
+	controllerWorkers := flag.Int("controller-workers", controller.DefaultWorkers,
+		"The number of workers for the controller. More than one lets other groups and the resync proceed "+
+			"while one group waits on a slow agent.")
 	snapshotAgentPort := flag.Int("snapshot-agent-port", 9001, "The default port for snapshot agents")
 	resyncPeriod := flag.Duration("resync-period", 30*time.Second, "The period for periodic resync of agent states")
 	servingQuantum := flag.Duration("serving-quantum", envDuration("TIMESLICE_SERVING_QUANTUM", 0),
@@ -77,7 +77,137 @@ func run() error {
 			"timeslice_orchestrator_dispatch_budget_rising_edge_skipped_total to see the orchestrator "+
 			"declining to open it. Supersedes --dispatch-budget-open-delay. "+
 			"Overridable with the TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE environment variable.")
+	foregroundWait := flag.String("foreground-wait", controller.ForegroundWaitBlocking,
+		"How reconcile waits on a foreground snapshot or restore. \"blocking\" (option A, the default and the "+
+			"only mode implemented) blocks on the agent operation, bounded by --foreground-op-timeout. "+
+			"PENDING LEAD DECISION: option B (\"async\") is refused until decided.")
+	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
+		"Upper bound on each blocking wait for a foreground snapshot or restore operation. What happens on "+
+			"expiry is set by --foreground-op-timeout-action. 0 means unbounded.")
+	foregroundOpTimeoutAction := flag.String("foreground-op-timeout-action", controller.ForegroundOpTimeoutActionRetry,
+		"What happens when a foreground snapshot or restore passes --foreground-op-timeout. \"retry\" (the "+
+			"default) returns an error and the group is retried with the --retry-base-delay backoff, waiting on the "+
+			"same operation and never starting a new one while it is pending. \"faulted\" marks the job FAULTED on "+
+			"that node, so the group is faulted until the job's pods are replaced. \"bounded\" retries up to "+
+			"--foreground-op-timeout-retries more timeouts of the same operation, then marks the job FAULTED. "+
+			"PENDING LEAD DECISION (D-ORCH-3).")
+	foregroundOpTimeoutRetries := flag.Int("foreground-op-timeout-retries", controller.DefaultForegroundOpTimeoutRetries,
+		"With --foreground-op-timeout-action=bounded: how many more timed-out waits on the same operation are "+
+			"retried before the job is marked FAULTED.")
+	backgroundRole := flag.Bool("background-role", false,
+		"Enable the background participant protocol: Acquire/Yield with ROLE_BACKGROUND, participant_id "+
+			"heartbeats and GroupStatus.background_protocol = 1. Off (the default) reports "+
+			"background_protocol = 0 and refuses ROLE_BACKGROUND; foreground callers are unaffected.")
+	lendPolicy := flag.String("lend-policy", envString(server.EnvLendPolicy, server.LendPolicyHint),
+		"When a foreground Yield records a lend hint. \"hint\" (the default) only when the Yield carries "+
+			"expected_idle >= --min-bubble. \"always\" on every foreground Yield, with or without expected_idle; "+
+			"--min-bubble is ignored. PENDING LEAD DECISION (D-NS-17). "+
+			"Overridable with the TIMESLICE_LEND_POLICY environment variable.")
+	minBubble := flag.Duration("min-bubble", 0,
+		"Smallest Yield expected_idle that records a lend hint under --lend-policy=hint. 0 (the default) never "+
+			"lends: the group goes IDLE_YIELDED as before. PENDING LEAD DECISION: suggested demo value 30s.")
+	noticeWindow := flag.Duration("notice-window", server.DefaultNoticeWindow,
+		"Notice window N: time from a foreground Acquire to the foreground getting the accelerator back while "+
+			"background guests hold it. PENDING LEAD DECISION.")
+	killBudget := flag.Duration("kill-budget", server.DefaultKillBudget,
+		"Kill budget K reserved at the end of the notice window; guests must vacate by T = notice + N - K. "+
+			"PENDING LEAD DECISION.")
+	backgroundLiveness := flag.Duration("background-liveness", controller.DefaultBackgroundLiveness,
+		"Background liveness L: a background participant that holds a grant or a claim and has not polled "+
+			"GetGroupStatus for this long loses the grant and its guests are killed.")
+	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
+	// are proposals awaiting the lead's sign-off.
+	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
+		"Bound on every call to a snapshot agent, including each status and operation poll. 0 disables it. "+
+			"PENDING LEAD DECISION.")
+	retryBaseDelay := flag.Duration("retry-base-delay", 1*time.Second,
+		"First retry delay after a failed reconcile of a group; it doubles on each further failure. "+
+			"PENDING LEAD DECISION.")
+	retryMaxDelay := flag.Duration("retry-max-delay", 30*time.Second,
+		"Cap on the retry delay after failed reconciles of a group. PENDING LEAD DECISION.")
+	holderWaitRequeue := flag.Duration("holder-wait-requeue", 1*time.Second,
+		"Re-reconcile a group this long after a pass that ends with the lock holder not yet loaded, so an "+
+			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
+	killPollInterval := flag.Duration("kill-poll-interval", controller.DefaultKillPollInterval,
+		"How often a kill operation is polled. PENDING LEAD DECISION.")
+	unconfirmedKill := flag.String("unconfirmed-kill", controller.UnconfirmedKillGrant,
+		"What happens when a guest Kill reaches the agent but is not confirmed. \"grant\" (the default) hands "+
+			"the node back at N with AcquireResponse.vram_unconfirmed = true. \"block\" keeps the foreground "+
+			"waiting until the agent confirms the guest gone, retrying the Kill every second. \"escalate\" is "+
+			"block plus a graceful delete of the mirror pod and then marking the node not lendable "+
+			"(--unconfirmed-escalate-after). PENDING LEAD DECISION D-NS-6.")
+	unconfirmedEscalateAfter := flag.String("unconfirmed-escalate-after", controller.DefaultEscalateAfterFlag,
+		"With --unconfirmed-kill=escalate, the two escalation steps as \"<step1>,<step2>\" after the first "+
+			"unconfirmed Kill: step 1 deletes the mirror pod gracefully, step 2 marks the node not lendable.")
+	lockNamespace := flag.String("lock-namespace", store.Namespace,
+		"Namespace of the ConfigMap that persists group lock holders. Give each orchestrator install in a "+
+			"cluster its own lock ConfigMap; two installs sharing one fight over the same groups.")
+	lockConfigMap := flag.String("lock-configmap", store.ConfigMapName,
+		"Name of the ConfigMap that persists group lock holders.")
+	watchNamespaces := flag.String("watch-namespaces", "",
+		"Comma-separated namespaces whose pods are watched. Pods elsewhere are invisible to this "+
+			"orchestrator and join no group. Empty (the default) watches all namespaces.")
+	nodeSelector := flag.String("node-selector", "",
+		"Label selector (kubectl syntax, e.g. pool=demo) limiting the nodes this orchestrator sees. "+
+			"Nodes outside it contribute to no group, and pods bound to them are ignored. Group membership "+
+			"still comes from the group.timeslice.io/<group> node label. Empty (the default) watches all nodes.")
+	nodeSelectorExemptBackground := flag.Bool("node-selector-exempt-background", false,
+		"Keep pods labelled timeslice.io/role=background in their group even when they are bound to a node "+
+			"outside --node-selector. Only pods are exempt: such a node still contributes to no group. "+
+			"False (the default) drops them like any other pod. No effect without --node-selector.")
+	nodeGroupLabels := flag.String("node-group-labels", infrastructure.NodeGroupLabelsPrefix,
+		"Which node labels put a node in a group. \"prefix\" (the default) reads group.timeslice.io/<group>=true; "+
+			"pair it with an empty --node-selector. \"ns\" reads timeslice.io/donor=true plus "+
+			"timeslice.io/group=<namespace>.<job-id>.<group> (the value the donor pods carry); pair it with "+
+			"--node-selector=timeslice.io/donor=true. \"either\" accepts both forms (a node whose two forms name "+
+			"different groups is in none); pair it with an empty --node-selector. In every mode a node naming "+
+			"more than one group, or a half-written label, is in no group. PENDING LEAD DECISION D-NS-1.")
 	flag.Parse()
+
+	if err := infrastructure.ValidateNodeGroupLabels(*nodeGroupLabels); err != nil {
+		return fmt.Errorf("--node-group-labels: %w", err)
+	}
+
+	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {
+		return fmt.Errorf("--foreground-wait: %w", err)
+	}
+	if err := controller.ValidateUnconfirmedKill(*unconfirmedKill); err != nil {
+		return fmt.Errorf("--unconfirmed-kill: %w", err)
+	}
+	escalateAfter, err := controller.ParseEscalateAfter(*unconfirmedEscalateAfter)
+	if err != nil {
+		return fmt.Errorf("--unconfirmed-escalate-after: %w", err)
+	}
+	if *foregroundOpTimeout < 0 {
+		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", *foregroundOpTimeout)
+	}
+	if err := controller.ValidateForegroundOpTimeoutAction(*foregroundOpTimeoutAction); err != nil {
+		return fmt.Errorf("--foreground-op-timeout-action: %w", err)
+	}
+	if *foregroundOpTimeoutRetries < 0 {
+		return fmt.Errorf("--foreground-op-timeout-retries must not be negative, got %d", *foregroundOpTimeoutRetries)
+	}
+	if *minBubble < 0 {
+		return fmt.Errorf("--min-bubble must not be negative, got %v", *minBubble)
+	}
+	if *backgroundLiveness <= 0 {
+		return fmt.Errorf("--background-liveness must be positive, got %v", *backgroundLiveness)
+	}
+	if err := server.ValidateLendPolicy(*lendPolicy); err != nil {
+		return fmt.Errorf("--lend-policy: %w", err)
+	}
+	if *lendPolicy == server.LendPolicyAlways && *minBubble > 0 {
+		slog.Warn("--min-bubble is ignored when --lend-policy=always", "minBubble", *minBubble)
+	}
+	if *noticeWindow <= 0 || *killBudget <= 0 || *killBudget >= *noticeWindow {
+		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
+			*killBudget, *noticeWindow)
+	}
+
+	scope, err := infrastructure.ParseScope(*watchNamespaces, *nodeSelector)
+	if err != nil {
+		return err
+	}
 
 	if *budgetRedisAddr != "" && *budgetJob == "" {
 		// Defaulting here would silently publish "0" forever and stall the
@@ -108,31 +238,42 @@ func run() error {
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	nodeInformerFactory := informers.NewSharedInformerFactory(clientset, time.Minute*30)
-	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Minute*30,
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = "timeslice.io/group"
-		}),
-	)
+	informerFactories := scope.NewInformerFactories(clientset, time.Minute*30)
 
-	lockStore := store.NewConfigMapLockStore(clientset)
+	lockStore := store.NewConfigMapLockStore(clientset, store.WithConfigMap(*lockNamespace, *lockConfigMap))
 	groupStore := store.NewGroupStore(lockStore)
 	jobStore := store.NewJobStore()
-	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, *snapshotAgentPort)
+	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, *snapshotAgentPort).WithRPCTimeout(*agentRPCTimeout)
 	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
-		workqueue.DefaultTypedControllerRateLimiter[string](),
+		controller.NewRateLimiter(*retryBaseDelay, *retryMaxDelay),
 		workqueue.TypedRateLimitingQueueConfig[string]{
 			Name: "groups",
 		},
 	)
 
+	infraOpts := make([]infrastructure.Option, 0, len(informerFactories.Pods))
+	for _, f := range informerFactories.Pods[1:] {
+		infraOpts = append(infraOpts, infrastructure.WithPodInformers(f.Core().V1().Pods()))
+	}
+	if !scope.AllNodes() {
+		infraOpts = append(infraOpts, infrastructure.WithNodeScopedPods())
+		if *nodeSelectorExemptBackground {
+			infraOpts = append(infraOpts, infrastructure.WithNodeSelectorExemptBackground())
+		}
+	} else if *nodeSelectorExemptBackground {
+		slog.Warn("--node-selector-exempt-background has no effect without --node-selector")
+	}
 	infraOrch := infrastructure.NewKubernetesOrchestrator(
-		nodeInformerFactory.Core().V1().Nodes(),
-		podInformerFactory.Core().V1().Pods(),
+		informerFactories.Nodes.Core().V1().Nodes(),
+		informerFactories.Pods[0].Core().V1().Pods(),
 		groupStore,
 		jobStore,
 		snapshotAgentStore,
+		infraOpts...,
 	)
+	if err := infraOrch.SetNodeGroupLabels(*nodeGroupLabels); err != nil {
+		return fmt.Errorf("--node-group-labels: %w", err)
+	}
 	if err := infraOrch.Start(ctx, queue); err != nil {
 		return fmt.Errorf("failed to start infrastructure orchestrator: %w", err)
 	}
@@ -145,12 +286,31 @@ func run() error {
 		snapshotAgentStore,
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
+	ctrl.HolderWaitRequeue = *holderWaitRequeue
+	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
+	ctrl.ForegroundOpTimeoutAction = *foregroundOpTimeoutAction
+	ctrl.ForegroundOpTimeoutRetries = *foregroundOpTimeoutRetries
+	ctrl.KillPollInterval = *killPollInterval
+	ctrl.NoticeWindow = *noticeWindow
+	ctrl.KillBudget = *killBudget
+	ctrl.BackgroundLiveness = *backgroundLiveness
+	ctrl.UnconfirmedKill = *unconfirmedKill
+	ctrl.EscalateAfter = escalateAfter
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, scope.Namespaces)
 
 	// Start informers
-	nodeInformerFactory.Start(ctx.Done())
-	podInformerFactory.Start(ctx.Done())
+	informerFactories.Nodes.Start(ctx.Done())
+	for _, f := range informerFactories.Pods {
+		f.Start(ctx.Done())
+	}
 
-	opts := []server.Option{server.WithServingQuantum(*servingQuantum)}
+	opts := []server.Option{
+		server.WithServingQuantum(*servingQuantum),
+		server.WithBackgroundRole(*backgroundRole),
+		server.WithLendPolicy(*lendPolicy),
+		server.WithMinBubble(*minBubble),
+		server.WithNoticeTiming(*noticeWindow, *killBudget),
+	}
 	if *budgetRedisAddr != "" {
 		publisher := budget.NewPublisher(budget.NewRedisWriter(*budgetRedisAddr), *budgetKey, *budgetJob).
 			WithOpenDelay(*budgetOpenDelay).
@@ -170,6 +330,30 @@ func run() error {
 		"dispatchBudgetJob", *budgetJob,
 		"dispatchBudgetOpenDelay", *budgetOpenDelay,
 		"dispatchBudgetExternalRisingEdge", *budgetExternalRisingEdge,
+		"foregroundWait", *foregroundWait,
+		"foregroundOpTimeout", *foregroundOpTimeout,
+		"foregroundOpTimeoutAction", *foregroundOpTimeoutAction,
+		"foregroundOpTimeoutRetries", *foregroundOpTimeoutRetries,
+		"backgroundRole", *backgroundRole,
+		"lendPolicy", *lendPolicy,
+		"minBubble", *minBubble,
+		"noticeWindow", *noticeWindow,
+		"killBudget", *killBudget,
+		"backgroundLiveness", *backgroundLiveness,
+		"controllerWorkers", *controllerWorkers,
+		"agentRPCTimeout", *agentRPCTimeout,
+		"retryBaseDelay", *retryBaseDelay,
+		"retryMaxDelay", *retryMaxDelay,
+		"holderWaitRequeue", *holderWaitRequeue,
+		"killPollInterval", *killPollInterval,
+		"unconfirmedKill", *unconfirmedKill,
+		"unconfirmedEscalateAfter", *unconfirmedEscalateAfter,
+		"lockConfigMap", lockStore.ConfigMapRef(),
+		"watchNamespaces", scope.Namespaces,
+		"nodeSelector", scope.NodeSelector,
+		"nodeSelectorExemptBackground", *nodeSelectorExemptBackground,
+		"nodeGroupLabels", *nodeGroupLabels,
+		"recommendedNodeSelector", infrastructure.RecommendedNodeSelector(*nodeGroupLabels),
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
 }

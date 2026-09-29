@@ -4,6 +4,8 @@ package snapshot_agent.v1alpha1;
 
 option go_package = "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1;v1alpha1";
 
+import "google/protobuf/timestamp.proto";
+
 // SnapshotAgentService provides APIs for managing accelerator snapshots.
 service SnapshotAgentService {
   // Snapshot triggers an asynchronous snapshot of the accelerator context for a job.
@@ -29,6 +31,20 @@ service SnapshotAgentService {
   // its own node, and Snapshot/Restore requests carrying an AppChannelConfig
   // must be sent to that same agent.
   rpc WorkloadChannel(stream WorkloadMessage) returns (stream AgentCommand);
+
+  // Suspend checkpoints and freezes a background (guest) job so that it holds
+  // no device memory. Asynchronous: returns an operation ID to poll with
+  // GetOperation. Fenced by epoch (see SuspendRequest).
+  rpc Suspend(SuspendRequest) returns (SuspendResponse);
+
+  // Resume thaws and restores a suspended background (guest) job.
+  // Asynchronous and epoch-fenced like Suspend.
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+
+  // Kill terminates every process of a job and confirms the device memory is
+  // free, from any job state. It carries no epoch and supersedes any running
+  // operation of the job. Asynchronous: returns an operation ID.
+  rpc Kill(KillRequest) returns (KillResponse);
 }
 
 enum Backend {
@@ -250,6 +266,9 @@ message SnapshotRequest {
   // If omitted, the default backend (CUDA) will be used with default discovery
   // based on the deployment mode.
   BackendConfig backend_config = 4;
+  // deadline is an optional absolute time by which the snapshot must finish.
+  // If unset, the operation is not bounded by a deadline.
+  google.protobuf.Timestamp deadline = 5;
 }
 
 message SnapshotResponse {
@@ -266,10 +285,92 @@ message RestoreRequest {
   Backend backend = 3 [deprecated = true];
   // backend_config specifies the backend-specific configuration for the restoration.
   BackendConfig backend_config = 4;
+  // deadline is an optional absolute time by which the restore must finish.
+  // If unset, the operation is not bounded by a deadline.
+  google.protobuf.Timestamp deadline = 5;
 }
 
 message RestoreResponse {
   string operation_id = 1;
+}
+
+// SuspendRequest asks the agent to suspend a background (guest) job.
+//
+// Epoch fencing: the caller writes the epoch on the job's mirror pod as the
+// annotation timeslice.io/guest-epoch before calling, and uses each epoch for
+// exactly one call. A lower epoch than the last one seen is refused with
+// STALE_EPOCH. The same epoch and the same call returns the same operation_id.
+// The same epoch with a different call is refused with STALE_EPOCH. A higher
+// epoch while an operation runs aborts the running operation.
+message SuspendRequest {
+  // job_id is the unique identifier for the job, unique per agent.
+  string job_id = 1;
+  // epoch fences late or duplicate calls (see above).
+  int64 epoch = 2;
+  // deadline is the absolute time by which the operation must finish.
+  google.protobuf.Timestamp deadline = 3;
+}
+
+message SuspendResponse {
+  string operation_id = 1;
+}
+
+// ResumeRequest asks the agent to resume a suspended background (guest) job.
+// Epoch fencing is the same as for SuspendRequest.
+message ResumeRequest {
+  // job_id is the unique identifier for the job, unique per agent.
+  string job_id = 1;
+  // epoch fences late or duplicate calls (see SuspendRequest).
+  int64 epoch = 2;
+  // deadline is the absolute time by which the operation must finish.
+  google.protobuf.Timestamp deadline = 3;
+}
+
+message ResumeResponse {
+  string operation_id = 1;
+}
+
+// KillRequest asks the agent to kill every process of a job. Kill has no
+// epoch and works from any job state.
+message KillRequest {
+  // job_id is the unique identifier for the job, unique per agent.
+  string job_id = 1;
+  // deadline is the absolute time by which the kill must be confirmed.
+  google.protobuf.Timestamp deadline = 2;
+  // reason is a free-form explanation recorded by the agent.
+  string reason = 3;
+}
+
+message KillResponse {
+  string operation_id = 1;
+}
+
+// Outcome is the result of a completed Suspend, Resume or Kill operation.
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  // The job is checkpointed and frozen and holds no device memory.
+  OUTCOME_SUSPENDED = 1;
+  // The job had no process left; there was nothing to suspend.
+  OUTCOME_RELEASED = 2;
+  // The job is thawed and restored.
+  OUTCOME_RESUMED = 3;
+  // Every process of the job was killed and the kill was confirmed.
+  OUTCOME_KILLED = 4;
+}
+
+// ErrorReason classifies why an operation failed or a call was refused.
+enum ErrorReason {
+  ERROR_REASON_UNSPECIFIED = 0;
+  DEADLINE_INFEASIBLE = 1;
+  DEADLINE_EXCEEDED = 2;
+  STALE_EPOCH = 3;
+  PRECONDITION_READINESS = 4;
+  PRECONDITION_PROBES = 5;
+  PRECONDITION_MEMORY = 6;
+  PRECONDITION_NODE = 7;
+  BACKEND_ERROR = 8;
+  VERIFY_FAILED = 9;
+  KILL_UNCONFIRMED = 10;
 }
 
 message GetOperationRequest {
@@ -292,6 +393,12 @@ message GetOperationResponse {
   int64 elapsed_ms = 4;
   // error is set on FAILED
   optional string error = 5;
+  // outcome is set on COMPLETE for Suspend, Resume and Kill operations.
+  Outcome outcome = 6;
+  // error_reason is set on FAILED for Suspend, Resume and Kill operations.
+  ErrorReason error_reason = 7;
+  // host_bytes_pinned is the host memory the job holds after the operation.
+  int64 host_bytes_pinned = 8;
 }
 
 message StatusRequest {}
@@ -303,11 +410,20 @@ enum JobState {
     JOB_STATE_TRANSITIONING = 3;
     JOB_STATE_SAVED = 4;
     JOB_STATE_FAULTED = 5;
+    // Checkpointed and frozen; holds no device memory.
+    JOB_STATE_SUSPENDED = 6;
 }
 
 message JobStatus {
     string job_id = 1;
     JobState state = 2;
+    // last_outcome is the outcome of the job's last completed operation
+    // (OUTCOME_KILLED after a confirmed Kill).
+    Outcome last_outcome = 3;
+    int64 device_bytes = 4;
+    int64 host_bytes_pinned = 5;
+    // epoch is the last epoch seen for the job.
+    int64 epoch = 6;
 }
 
 message AcceleratorStatus {

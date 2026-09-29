@@ -20,6 +20,7 @@ from verl.experimental.fully_async_policy.fully_async_trainer import (
     register_trainer,
 )
 
+from timeslice_verl import ns_downward
 from timeslice_verl.hooks import TimesliceHooksMixin
 
 
@@ -28,7 +29,9 @@ class TimesliceFullyAsyncTrainer(TimesliceHooksMixin, FullyAsyncTrainer):
     """FullyAsyncTrainer whose lifecycle hooks drive the timeslice group lock."""
 
     def __init__(self, **kwargs):
-        TimesliceHooksMixin.__init__(self)
+        # D-NS-16 ns-downward: the donor Ray resource, from ray_pg_extra_resources.
+        donor = ns_downward.resource_from_config(kwargs.get("config"))
+        TimesliceHooksMixin.__init__(self, donor_resource=donor)
         FullyAsyncTrainer.__init__(self, **kwargs)
 
     async def _fit_update_weights(self) -> dict | None:

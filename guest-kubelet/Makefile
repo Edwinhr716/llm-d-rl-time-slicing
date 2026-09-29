@@ -14,9 +14,11 @@ SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE
 build: ## vet, test, build and push the image remotely
 	gcloud builds submit --project=$(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
 
-deploy: ## namespace, RBAC, Deployment (image tag = TAG)
+deploy: ## namespace, RBAC, Deployment and the outage guard (image tag = TAG)
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
 	$(SUBST) deploy/deployment.yaml | $(KUBECTL) apply -f -
+	$(SUBST) deploy/guard/node-keeper.yaml | $(KUBECTL) apply -f -
+| $(KUBECTL) apply -f -
 
 test-guest: ## step one: CPU-only guest and a Service selecting it
 	$(SUBST) deploy/test-guest.yaml | $(KUBECTL) apply -f -

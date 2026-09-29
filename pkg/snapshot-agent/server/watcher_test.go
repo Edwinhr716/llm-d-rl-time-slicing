@@ -226,3 +226,136 @@ func TestWatcher(t *testing.T) {
 		})
 	}
 }
+
+func TestWatcherSeedsGuestEpoch(t *testing.T) {
+	origGetK8sClient := podutils.GetK8sClient
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() {
+		podutils.GetK8sClient = origGetK8sClient
+		podutils.GetPodPIDs = origGetPodPIDs
+	}()
+	t.Setenv("NODE_NAME", "test-node")
+
+	fakeClient := fakek8s.NewSimpleClientset()
+	podutils.GetK8sClient = func() (kubernetes.Interface, error) {
+		return fakeClient, nil
+	}
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) {
+		return nil, nil
+	}
+
+	state := sm.NewStateManager()
+	watcher, err := server.NewWatcher(fakeClient, state)
+	if err != nil {
+		t.Fatalf("Failed to create watcher: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+
+	mirror := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mirror-1",
+			Namespace:   "default",
+			Labels:      map[string]string{podutils.JobIDLabel: "guest-1", podutils.GroupLabel: "group-1"},
+			Annotations: map[string]string{podutils.GuestEpochAnnotation: "7"},
+		},
+		Spec: corev1.PodSpec{NodeName: "test-node"},
+	}
+	if _, err := fakeClient.CoreV1().Pods("default").Create(ctx, mirror, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create pod: %v", err)
+	}
+	waitForEpoch(t, state, 7)
+
+	setEpoch := func(value string) {
+		t.Helper()
+		updated := mirror.DeepCopy()
+		updated.Annotations[podutils.GuestEpochAnnotation] = value
+		if _, err := fakeClient.CoreV1().Pods("default").Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("Failed to update pod: %v", err)
+		}
+	}
+
+	setEpoch("9")
+	waitForEpoch(t, state, 9)
+
+	// Lower and invalid values are ignored (the state-machine tests cover
+	// that the fence never goes down); the watcher keeps going.
+	setEpoch("3")
+	setEpoch("not-a-number")
+	setEpoch("10")
+	waitForEpoch(t, state, 10)
+
+	// A late call below the annotation is refused.
+	_, err = state.StartGuestOp("guest-1", sm.OpTypeResume, 8, time.Now().Add(time.Minute),
+		func(context.Context) (sm.GuestResult, error) {
+			t.Error("worker must not run")
+			return sm.GuestResult{}, nil
+		})
+	if got := sm.ErrorReasonOf(err); got != pb.ErrorReason_STALE_EPOCH {
+		t.Errorf("expected STALE_EPOCH, got %v (%v)", got, err)
+	}
+}
+
+func waitForEpoch(t *testing.T, state *sm.StateManager, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var got int64
+	for time.Now().Before(deadline) {
+		for _, st := range state.GetJobStatus() {
+			if st.GetJobId() == "guest-1" {
+				got = st.GetEpoch()
+			}
+		}
+		if got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected epoch %d, got %d", want, got)
+}
+
+// TestWatcherLocalJobs checks that restart recovery sees every cached job,
+// registered with its mirror's epoch, as soon as the cache has synced.
+func TestWatcherLocalJobs(t *testing.T) {
+	t.Setenv("NODE_NAME", "test-node")
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() { podutils.GetPodPIDs = origGetPodPIDs }()
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) { return nil, nil }
+	pod := func(name, jobID, epoch string) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{}},
+			Spec:       corev1.PodSpec{NodeName: "test-node"},
+		}
+		if jobID != "" {
+			p.Labels[podutils.JobIDLabel] = jobID
+		}
+		if epoch != "" {
+			p.Annotations = map[string]string{podutils.GuestEpochAnnotation: epoch}
+		}
+		return p
+	}
+	fakeClient := fakek8s.NewSimpleClientset(
+		pod("b", "job-b", ""), pod("a", "guest-1", "12"), pod("a2", "guest-1", ""), pod("plain", "", ""))
+	state := sm.NewStateManager()
+	watcher, err := server.NewWatcher(fakeClient, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+	if !watcher.Synced() {
+		t.Fatal("cache not synced after Start")
+	}
+	if got, want := watcher.LocalJobs(), []string{"guest-1", "job-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("LocalJobs %v, want %v", got, want)
+	}
+	epochs := map[string]int64{}
+	for _, st := range state.GetJobStatus() {
+		epochs[st.GetJobId()] = st.GetEpoch()
+	}
+	if want := map[string]int64{"guest-1": 12, "job-b": 0}; !reflect.DeepEqual(epochs, want) {
+		t.Errorf("registered jobs %v, want %v", epochs, want)
+	}
+}

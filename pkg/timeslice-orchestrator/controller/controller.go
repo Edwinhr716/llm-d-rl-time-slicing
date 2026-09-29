@@ -14,11 +14,68 @@ import (
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
+	"golang.org/x/time/rate"
+	"k8s.io/client-go/util/workqueue"
 )
 
 const (
 	operationPollInterval = 1 * time.Second
+
+	// DefaultWorkers is the number of reconcile workers. With one worker, a
+	// single hung agent call stalls every group and the periodic resync.
+	DefaultWorkers = 4
+
+	// DefaultKillPollInterval is how often WaitForKillOperation polls a kill
+	// operation. PENDING LEAD DECISION (Q13).
+	DefaultKillPollInterval = 100 * time.Millisecond
+
+	// DefaultBackgroundLiveness is L, how long a background participant that
+	// holds a grant or a claim may go without a status poll.
+	DefaultBackgroundLiveness = 3 * time.Second
+
+	// rateLimiterQPS and rateLimiterBurst are the overall bucket that
+	// client-go's default controller rate limiter also applies.
+	rateLimiterQPS   = 10
+	rateLimiterBurst = 100
 )
+
+// ForegroundWaitBlocking is option A for how reconcile waits on a foreground
+// snapshot or restore: it blocks on the agent operation, bounded by
+// Controller.ForegroundOpTimeout. It is the only mode implemented.
+//
+// PENDING LEAD DECISION (foreground wait, A or B): option B, which starts the
+// operation and checks it on a later requeue, is not implemented, and
+// ValidateForegroundWait refuses it until the lead decides.
+const ForegroundWaitBlocking = "blocking"
+
+// ForegroundWaitAsync names option B. It is recognised only so that the
+// error can say why it is refused.
+const ForegroundWaitAsync = "async"
+
+// ValidateForegroundWait checks a --foreground-wait value.
+func ValidateForegroundWait(mode string) error {
+	switch mode {
+	case ForegroundWaitBlocking:
+		return nil
+	case ForegroundWaitAsync:
+		return fmt.Errorf("foreground wait %q (option B) is not implemented (PENDING LEAD DECISION); use %q",
+			mode, ForegroundWaitBlocking)
+	default:
+		return fmt.Errorf("unknown foreground wait %q: must be %q", mode, ForegroundWaitBlocking)
+	}
+}
+
+// NewRateLimiter returns the controller's retry limiter: per group, the first
+// retry waits baseDelay and each further failure doubles it up to maxDelay, and
+// an overall 10 qps bucket applies on top. client-go's default is 5 ms to
+// 1000 s, which retries a failing group nine times in under a second and then
+// backs off far past any useful wait.
+func NewRateLimiter(baseDelay, maxDelay time.Duration) workqueue.TypedRateLimiter[string] {
+	return workqueue.NewTypedMaxOfRateLimiter(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[string](baseDelay, maxDelay),
+		&workqueue.TypedBucketRateLimiter[string]{Limiter: rate.NewLimiter(rate.Limit(rateLimiterQPS), rateLimiterBurst)},
+	)
+}
 
 // handleCrash is a helper that recovers from panics, logs the panic and stack trace.
 // It is intended to be used in `defer` statements in goroutines.
@@ -62,6 +119,8 @@ type WorkQueue interface {
 	// AddRateLimited enqueues the group ID using a rate limiter.
 	// This is typically used to requeue a group ID after a reconciliation failure.
 	AddRateLimited(groupID string)
+	// AddAfter enqueues the group ID after the given delay.
+	AddAfter(groupID string, delay time.Duration)
 	// Forget resets the rate limit tracking for the group ID,
 	// usually called after a successful reconciliation.
 	Forget(groupID string)
@@ -102,8 +161,71 @@ type Controller struct {
 	// observed RUNNING). See waitForGrantSettlement.
 	SettleTimeout time.Duration
 
+	// HolderWaitRequeue re-reconciles a group this long after any pass that
+	// ends with the lock held but the holder not yet loaded, so the holder
+	// sees RUNNING without waiting for the retry backoff or the resync. Zero
+	// disables it.
+	HolderWaitRequeue time.Duration
+
+	// ForegroundOpTimeout bounds how long a reconcile waits for one agent
+	// snapshot or restore operation. Zero leaves the wait bounded only by the
+	// context.
+	ForegroundOpTimeout time.Duration
+
+	// ForegroundOpTimeoutAction is what happens when a wait passes
+	// ForegroundOpTimeout: ForegroundOpTimeoutActionRetry (also when empty),
+	// ForegroundOpTimeoutActionFaulted or ForegroundOpTimeoutActionBounded.
+	// PENDING LEAD DECISION (D-ORCH-3).
+	ForegroundOpTimeoutAction string
+
+	// ForegroundOpTimeoutRetries is how many further timed-out waits on the
+	// same operation the bounded action retries before it marks the job
+	// FAULTED.
+	ForegroundOpTimeoutRetries int
+
+	// KillPollInterval is how often WaitForKillOperation polls.
+	KillPollInterval time.Duration
+
+	// NoticeWindow (N) and KillBudget (K) set the vacate deadline of a
+	// notice to the background, T = start + N - K. They must match the
+	// server's --notice-window and --kill-budget.
+	NoticeWindow time.Duration
+	KillBudget   time.Duration
+
+	// BackgroundLiveness (L): a participant that holds a grant or a claim and
+	// has not been seen for this long loses the grant and its guests are
+	// killed.
+	BackgroundLiveness time.Duration
+
+	// UnconfirmedKill is what happens after a guest Kill that reached the
+	// agent is not confirmed (decision D-NS-6, --unconfirmed-kill): "grant"
+	// (the default, also for ""), "block" or "escalate". See
+	// unconfirmed_kill.go.
+	UnconfirmedKill string
+	// EscalateAfter holds the two escalation steps of "escalate", counted
+	// from the first unconfirmed Kill (--unconfirmed-escalate-after).
+	EscalateAfter [2]time.Duration
+	// Kube records Warning events and makes the escalation's pod deletes.
+	// Nil skips both.
+	Kube KubeActions
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
+
+	noticeMu sync.Mutex
+	notices  map[string]*noticeTrack
+
+	killMu sync.Mutex
+	kills  map[string]*killRecord
+	// holds and notLendable belong to the block and escalate options of
+	// D-NS-6 (unconfirmed_kill_block.go); guarded by killMu.
+	holds       map[string]*unconfirmedHold
+	notLendable map[string]string
+
+	// timedOutOps holds, per group and node, a foreground operation that
+	// timed out and may still be pending on the agent. See resumeTimedOutOp.
+	timedOutMu  sync.Mutex
+	timedOutOps map[string]*timedOutOp
 }
 
 // settleEntry remembers when a group's active job was first seen holding an
@@ -122,14 +244,26 @@ func NewController(
 	agentStore store.SnapshotAgentStore,
 ) *Controller {
 	return &Controller{
-		queue:             queue,
-		groupStore:        groupStore,
-		jobStore:          jobStore,
-		infraOrchestrator: infraOrchestrator,
-		agentStore:        agentStore,
-		ResyncPeriod:      30 * time.Second,
-		SettleTimeout:     30 * time.Second,
-		settleSince:       make(map[string]settleEntry),
+		queue:              queue,
+		groupStore:         groupStore,
+		jobStore:           jobStore,
+		infraOrchestrator:  infraOrchestrator,
+		agentStore:         agentStore,
+		ResyncPeriod:       30 * time.Second,
+		SettleTimeout:      30 * time.Second,
+		KillPollInterval:   DefaultKillPollInterval,
+		NoticeWindow:       defaultNoticeWindow,
+		KillBudget:         defaultKillBudget,
+		BackgroundLiveness: DefaultBackgroundLiveness,
+		UnconfirmedKill:    UnconfirmedKillGrant,
+		EscalateAfter:      DefaultEscalateAfter,
+		kills:              make(map[string]*killRecord),
+		settleSince:        make(map[string]settleEntry),
+		notices:            make(map[string]*noticeTrack),
+
+		ForegroundOpTimeoutAction:  ForegroundOpTimeoutActionRetry,
+		ForegroundOpTimeoutRetries: DefaultForegroundOpTimeoutRetries,
+		timedOutOps:                make(map[string]*timedOutOp),
 	}
 }
 
@@ -229,6 +363,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 // Expects to be the only thread reconciling that particular group at any time.
 func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 	slog.InfoContext(ctx, "Reconciling group")
+	defer c.requeueWhileHolderWaits(ctx, groupID)
 
 	// 1. Observe Current State and update stores
 	if err := c.infraOrchestrator.ObserveGroupState(ctx, groupID); err != nil {
@@ -257,14 +392,41 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		return fmt.Errorf("failed to promote next job: %w", err)
 	}
 
+	// Background participant protocol: lend when the foreground left a
+	// bubble, and run the notice when the foreground wants the accelerator
+	// back while a node is busy. Kills (at T, on a FAULTED guest, and when a
+	// holding participant is unseen for L) run before the notice bookkeeping.
+	defer c.requeueDuringNotice(group)
+	lending := c.prepareLend(ctx, group)
+	if err := c.reconcileKills(ctx, group); err != nil {
+		return err
+	}
+	live, err := c.liveGuests(ctx, group.ID())
+	if err != nil {
+		return err
+	}
+	c.reconcileNotice(ctx, group, live)
+
 	activeJob := group.Spec().ActiveJob()
 
 	// 3. Act
 	// TODO: add optional fan out parallelism for node reconciliation
+	allGranted := true
 	for _, node := range group.Status().Nodes() {
 		if err := c.reconcileNode(ctx, group.ID(), node, activeJob); err != nil {
 			return fmt.Errorf("failed to reconcile node %s: %w", node, err)
 		}
+		if !lending {
+			continue
+		}
+		granted, err := c.grantIfVacant(ctx, group, node)
+		if err != nil {
+			return err
+		}
+		allGranted = allGranted && granted
+	}
+	if lending && allGranted {
+		group.Spec().SetLend(false)
 	}
 
 	// 4. Update Status
@@ -277,16 +439,52 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 	return nil
 }
 
+// requeueWhileHolderWaits schedules another pass HolderWaitRequeue from now if
+// the lock is held but the holder is not loaded yet. It runs on every exit from
+// reconcileGroup, including errors: an agent state change is otherwise seen only
+// at the next rate-limited retry or resync, which is what the holder's Acquire
+// was waiting on. An earlier AddRateLimited for the same group is not delayed,
+// because the queue keeps the earliest ready time.
+func (c *Controller) requeueWhileHolderWaits(ctx context.Context, groupID string) {
+	if c.HolderWaitRequeue <= 0 {
+		return
+	}
+	group, err := c.groupStore.Get(ctx, groupID)
+	if err != nil {
+		return
+	}
+	holder := group.Spec().LockingJob()
+	if holder == "" || group.Status().LoadedJob() == holder {
+		return
+	}
+	slog.DebugContext(ctx, "Lock holder is not loaded yet, requeuing", "holder", holder, "after", c.HolderWaitRequeue)
+	c.queue.AddAfter(groupID, c.HolderWaitRequeue)
+}
+
 // reconcileNode reconciles the state of a single node for the active job.
 func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activeJobID string) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
+
+	// Never start an operation on a node while an earlier one that timed out
+	// may still be pending there.
+	if err := c.resumeTimedOutOp(ctx, groupID, nodeName); err != nil {
+		return err
+	}
+
 	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
 	if err != nil {
 		return fmt.Errorf("failed to list jobs for group %s: %w", groupID, err)
 	}
 
+	timeoutFaulted := make(map[string]bool)
 	agentJobStates := make(map[string]pb.SnapshotAgentJobState_State)
 	for _, job := range jobs {
+		if job.Background() {
+			continue
+		}
+		if _, ok := job.ForegroundTimeoutFault(nodeName); ok {
+			timeoutFaulted[job.JobID()] = true
+		}
 		state, ok := job.ContextState()[nodeName]
 		if !ok {
 			state = pb.SnapshotAgentJobState_STATE_UNSPECIFIED
@@ -323,6 +521,13 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 			continue
 		}
 
+		// A job marked FAULTED by a foreground operation timeout may still hold
+		// the accelerator: its operation never finished. Fail closed.
+		if timeoutFaulted[jobID] {
+			return fmt.Errorf("job %s is FAULTED by a foreground operation timeout on node %s, requires human intervention",
+				jobID, nodeName)
+		}
+
 		switch state {
 		case pb.SnapshotAgentJobState_STATE_RUNNING:
 			slog.InfoContext(ctx, "Triggering snapshot for job", "jobID", jobID, "state", state)
@@ -331,6 +536,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 				return fmt.Errorf("failed to trigger snapshot for job %s on node %s: %w", jobID, nodeName, err)
 			}
 			if err := c.waitForOperation(ctx, groupID, jobID, nodeName, resp.OperationId, "snapshot"); err != nil {
+				if isForegroundOpTimeout(ctx, err) {
+					return c.onForegroundOpTimeout(ctx, groupID, nodeName, jobID, resp.OperationId, "snapshot", err)
+				}
 				return fmt.Errorf("failed while waiting for snapshot operation %s for job %s on node %s: %w",
 					resp.OperationId, jobID, nodeName, err)
 			}
@@ -358,6 +566,18 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 		return nil
 	}
 
+	// Guard (fail closed): never restore the foreground onto a node whose
+	// background participant holds a grant or a claim, or where a guest is
+	// still live.
+	busy, err := c.nodeBusy(ctx, groupID, nodeName)
+	if err != nil {
+		return err
+	}
+	if busy {
+		slog.InfoContext(ctx, "Restore held: the node is busy with the background", "jobID", activeJobID)
+		return nil
+	}
+
 	slog.InfoContext(ctx, "Triggering restore for active job", "jobID", activeJobID, "state", state)
 	resp, err := c.agentStore.Restore(ctx, nodeName, activeJobID, groupID)
 	if err != nil {
@@ -365,6 +585,9 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 			activeJobID, nodeName, err)
 	}
 	if err := c.waitForOperation(ctx, groupID, activeJobID, nodeName, resp.OperationId, "restore"); err != nil {
+		if isForegroundOpTimeout(ctx, err) {
+			return c.onForegroundOpTimeout(ctx, groupID, nodeName, activeJobID, resp.OperationId, "restore", err)
+		}
 		return fmt.Errorf("failed waiting for restore op %s for job %s on %s: %w",
 			resp.OperationId, activeJobID, nodeName, err)
 	}
@@ -460,6 +683,9 @@ func (c *Controller) tryDeduceActiveJob(ctx context.Context, group *store.Group)
 
 	var loadedJob string
 	for _, job := range jobs {
+		if job.Background() {
+			continue
+		}
 		loaded, err := c.isJobLoaded(ctx, group, job.JobID())
 		if err != nil {
 			return fmt.Errorf("failed to check if job %s is loaded: %w", job.JobID(), err)
@@ -504,10 +730,26 @@ func (c *Controller) isJobLoaded(ctx context.Context, group *store.Group, jobID 
 		return false, nil
 	}
 
+	// Fail closed: nothing foreground is loaded while a node is busy with the
+	// background, or while a notice host has not been seen clear.
+	busy, err := c.anyNodeBusy(ctx, group)
+	if err != nil {
+		return false, err
+	}
+	if busy || c.noticeHostsPending(group) {
+		return false, nil
+	}
+
 	// Map of node -> jobID of the job running on it.
 	// If multiple jobs are running on the same node, we error out.
 	nodeRunningJob := make(map[string]string)
 	for _, job := range jobs {
+		if job.Background() {
+			if job.JobID() == jobID {
+				return false, nil
+			}
+			continue
+		}
 		for node, state := range job.ContextState() {
 			if state == pb.SnapshotAgentJobState_STATE_RUNNING {
 				if current, ok := nodeRunningJob[node]; ok && current != job.JobID() {
@@ -631,7 +873,7 @@ func (c *Controller) observeNodeJobContext(ctx context.Context, groupID, nodeNam
 
 	for _, js := range resp.JobStatuses {
 		// Only update if the job is known in this group
-		_, err := c.jobStore.Get(ctx, groupID, js.JobId)
+		job, err := c.jobStore.Get(ctx, groupID, js.JobId)
 		if errors.Is(err, store.ErrNotFound) {
 			continue
 		} else if err != nil {
@@ -641,6 +883,11 @@ func (c *Controller) observeNodeJobContext(ctx context.Context, groupID, nodeNam
 		state := translateJobState(js.State)
 		if err := c.jobStore.UpdateContextState(ctx, groupID, js.JobId, nodeName, state); err != nil {
 			return fmt.Errorf("failed to update job context state for job %s on node %s: %w", js.JobId, nodeName, err)
+		}
+		// A KILLED guest that still shows device memory is not vacated; the
+		// kill path treats it as an unconfirmed kill (unconfirmed_kill.go).
+		if job.Background() && js.GetLastOutcome() == agentpb.Outcome_OUTCOME_KILLED && js.GetDeviceBytes() == 0 {
+			job.SetKilled(nodeName, true)
 		}
 		slog.DebugContext(ctx, "Updated job context state", "job", js.JobId, "node", nodeName, "state", state)
 	}
@@ -659,20 +906,55 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 		return pb.SnapshotAgentJobState_STATE_SAVED
 	case agentpb.JobState_JOB_STATE_FAULTED:
 		return pb.SnapshotAgentJobState_STATE_FAULTED
+	case agentpb.JobState_JOB_STATE_SUSPENDED:
+		return pb.SnapshotAgentJobState_STATE_SUSPENDED
 	default:
 		return pb.SnapshotAgentJobState_STATE_UNSPECIFIED
 	}
 }
 
-// waitForOperation blocks until the given operation on the node completes or fails.
+// waitForOperation blocks until the given snapshot or restore operation on the
+// node completes or fails, or until ForegroundOpTimeout passes.
 func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
+	if c.ForegroundOpTimeout <= 0 {
+		return c.pollOperation(ctx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
+	}
+	opCtx, cancel := context.WithTimeout(ctx, c.ForegroundOpTimeout)
+	defer cancel()
+	err := c.pollOperation(opCtx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
+	if err != nil && ctx.Err() == nil && errors.Is(opCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%s operation %s did not finish within the foreground operation timeout %s (%w): %w",
+			operationType, operationID, c.ForegroundOpTimeout, ErrForegroundOpTimeout, err)
+	}
+	return err
+}
+
+// WaitForKillOperation blocks until the given kill operation on the node
+// completes or fails. It polls every KillPollInterval rather than every second,
+// because the lock handoff waits on it. The caller bounds it with ctx.
+func (c *Controller) WaitForKillOperation(ctx context.Context, groupID, jobID, nodeName, operationID string) error {
+	interval := c.KillPollInterval
+	if interval <= 0 {
+		interval = DefaultKillPollInterval
+	}
+	return c.pollOperation(ctx, interval, groupID, jobID, nodeName, operationID, "kill")
+}
+
+// pollOperation polls the operation every interval until it completes, fails,
+// or ctx is done. A failed poll is retried at the next tick; each poll is
+// bounded by the agent store's per-call timeout.
+func (c *Controller) pollOperation(
+	ctx context.Context,
+	interval time.Duration,
+	groupID, jobID, nodeName, operationID, operationType string,
+) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
 	ctx = logging.WithOperationID(ctx, operationID)
 
-	ticker := time.NewTicker(operationPollInterval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	slog.InfoContext(ctx, "Waiting for agent operation to complete")
+	slog.InfoContext(ctx, "Waiting for agent operation to complete", "type", operationType)
 
 	for {
 		select {

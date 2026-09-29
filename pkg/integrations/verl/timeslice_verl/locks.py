@@ -7,6 +7,12 @@ Configuration comes from the environment:
 
 If any variable is missing the helper runs in NO-OP mode (with a one-time warning)
 so the same image works without the time-slicing platform.
+
+That is the default client wiring (TIMESLICE_CLIENT_WIRING=keep, D-NS-16). With
+TIMESLICE_CLIENT_WIRING=ns-downward the job id and group come from the pod labels
+(downward API), the address defaults to the orchestrator Service DNS name, the
+env vars above override, and an unlabelled pod raises timeslice.wiring.WiringError.
+Both go through timeslice.wiring.resolve().
 """
 
 import atexit
@@ -18,6 +24,7 @@ from collections.abc import Iterable
 ENV_JOB_ID = "TIMESLICE_JOB_ID"
 ENV_ORCH_ADDR = "TIMESLICE_ORCH_ADDR"
 ENV_GROUP = "TIMESLICE_GROUP"
+ENV_WIRING = "TIMESLICE_CLIENT_WIRING"
 
 
 def _log(msg: str) -> None:
@@ -37,6 +44,23 @@ def _import_client():
         from timeslice import TimeSliceOrchestratorClient
 
         return TimeSliceOrchestratorClient
+
+
+def wiring_mode() -> str:
+    return os.environ.get(ENV_WIRING, "").strip().lower() or "keep"
+
+
+def resolve_wiring(**kwargs):
+    """timeslice.wiring.resolve(**kwargs), imported lazily so the plugin stays
+    importable without the client. Returns None in keep mode when the client
+    is not installed (the caller then reads the env vars itself, as before)."""
+    try:
+        from timeslice import wiring
+    except ImportError:
+        if wiring_mode() == "keep":
+            return None
+        raise
+    return wiring.resolve(**kwargs)
 
 
 class PhaseLocks:
@@ -83,13 +107,23 @@ class PhaseLocks:
         atexit.register(self._atexit_cleanup)
 
     @classmethod
-    def from_env(cls, client_factory=None) -> "PhaseLocks":
-        return cls(
-            job_id=os.environ.get(ENV_JOB_ID),
-            orch_addr=os.environ.get(ENV_ORCH_ADDR),
-            group=os.environ.get(ENV_GROUP),
-            client_factory=client_factory,
-        )
+    def from_env(cls, client_factory=None, resolution=None) -> "PhaseLocks":
+        """Build from the client wiring (timeslice.wiring.resolve, mode from
+        TIMESLICE_CLIENT_WIRING). ``resolution`` is a timeslice.wiring.Wiring that
+        was already resolved (the hooks resolve at startup in ns-downward).
+        ns-downward raises timeslice.wiring.WiringError when this pod is unlabelled."""
+        res = resolution if resolution is not None else resolve_wiring()
+        if res is None:  # keep, without the timeslice client installed: as before
+            return cls(
+                job_id=os.environ.get(ENV_JOB_ID),
+                orch_addr=os.environ.get(ENV_ORCH_ADDR),
+                group=os.environ.get(ENV_GROUP),
+                client_factory=client_factory,
+            )
+        from timeslice import wiring
+
+        wiring.log_once(res)
+        return cls(job_id=res.job_id, orch_addr=res.orch_addr, group=res.group, client_factory=client_factory)
 
     # ------------------------------------------------------------------ core
     @property
@@ -125,17 +159,24 @@ class PhaseLocks:
                 f"context_restored={getattr(result, 'context_restored', '?')}"
             )
 
-    def drop_all(self) -> None:
-        """Release every held group. Idempotent; release errors are logged, not raised."""
+    def drop_all(self, expected_idle: float | None = None) -> None:
+        """Release every held group. Idempotent; release errors are logged, not raised.
+
+        `expected_idle` (seconds) is passed to the client's release() as the
+        Yield's expected_idle hint. None sends no hint and does not pass the
+        argument at all, so clients without it keep working.
+        """
         if not self.enabled:
             return
+        kwargs = {} if expected_idle is None else {"expected_idle": expected_idle}
+        hint = "" if expected_idle is None else f" expected_idle={expected_idle:.3f}s"
         for g in list(self._held):
             try:
-                result = self._client.release(group_id=g)
+                result = self._client.release(group_id=g, **kwargs)
                 _log(
                     f"job={self.job_id} RELEASE group={g} "
                     f"pending_waiters={getattr(result, 'pending_waiters', '?')} "
-                    f"snapshot_deferred={getattr(result, 'snapshot_deferred', '?')}"
+                    f"snapshot_deferred={getattr(result, 'snapshot_deferred', '?')}{hint}"
                 )
             except Exception as e:  # noqa: BLE001 - never let a release error kill the job
                 _log(f"job={self.job_id} RELEASE group={g} FAILED: {e}")

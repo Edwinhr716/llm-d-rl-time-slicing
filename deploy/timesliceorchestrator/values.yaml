@@ -1,5 +1,43 @@
 replicaCount: 1
 
+# Namespace for the Deployment, Service, ServiceAccount and bindings. Keep the
+# default unless you run a second, independent orchestrator install.
+namespace: timeslice-system
+
+# Recreate stops the old pod before the new one starts, so two orchestrator
+# replicas never run at once and never both act on the lock ConfigMap during
+# an upgrade. A RollingUpdate would briefly run two.
+strategy:
+  type: Recreate
+
+# Where group lock holders are persisted. Each orchestrator install in a
+# cluster needs its own ConfigMap; two installs sharing one fight over the same
+# groups. namespace "" = the chart namespace above. configMap "" = the
+# orchestrator's default name (timeslice-orchestrator-locks). The chart grants
+# ConfigMap access in the lock namespace.
+lock:
+  namespace: ""
+  configMap: ""
+
+# What this orchestrator watches. Defaults watch everything, as before.
+#   watchNamespaces: pods are watched only in these namespaces; pods elsewhere
+#     join no group. [] = all namespaces.
+#   nodeSelector: label selector (kubectl syntax, e.g. "pool=demo") limiting the
+#     nodes this orchestrator sees; nodes outside it contribute to no group and
+#     pods bound to them are ignored. Group membership still comes from the
+#     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
+#     with the pod-scheduling nodeSelector further down.
+#     The selector must select every real host that carries the group label;
+#     mirrors are bound there. See examples/ for the two label layouts.
+#   nodeSelectorExemptBackground: keep pods labelled timeslice.io/role=background
+#     in their group even when they are bound to a node outside nodeSelector.
+#     Only pods are exempt: such a node still contributes to no group. false =
+#     they are dropped like any other pod. No effect without nodeSelector.
+scope:
+  watchNamespaces: []
+  nodeSelector: ""
+  nodeSelectorExemptBackground: false
+
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator
   pullPolicy: Always
@@ -64,6 +102,21 @@ dispatchBudget:
   openDelay: "0s"
   externalRisingEdge: false
 
+# What happens when a guest Kill reaches the snapshot agent but is not
+# confirmed (the guest may still hold device memory). PENDING LEAD DECISION
+# D-NS-6.
+#   grant    (default, previous behaviour) hand the node back to the trainer at
+#            the end of the notice window with vram_unconfirmed = true.
+#   block    keep the trainer's Acquire waiting until the agent confirms the
+#            guest gone; the Kill is retried every second.
+#   escalate block, plus a graceful delete of the guest's mirror pod at step 1
+#            and marking the node not lendable at step 2. The chart then also
+#            grants "delete" on pods.
+# escalateAfter: the two steps, counted from the first unconfirmed Kill.
+unconfirmedKill:
+  mode: grant
+  escalateAfter: "10s,40s"
+
 resources: {}
   # limits:
   #   cpu: 100m
@@ -72,6 +125,7 @@ resources: {}
   #   cpu: 100m
   #   memory: 128Mi
 
+# Scheduling of the orchestrator pod itself.
 nodeSelector: {}
 tolerations: []
 affinity: {}

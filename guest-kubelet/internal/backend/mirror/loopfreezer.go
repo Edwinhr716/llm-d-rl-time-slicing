@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
@@ -19,12 +20,25 @@ import (
 // ErrNoFreezer means no freeze backend is configured (Options.Suspend.Freezer is nil).
 var ErrNoFreezer = errors.New("no freeze backend configured")
 
-// LoopFreezer is the orchestrator loop's freezer for --freezer=cgroup: the M3 freeze backend
+// killRecordTimeout bounds the Killing write before the agent Kill.
+const killRecordTimeout = 5 * time.Second
+
+// ErrNoHostFact means the freeze backend cannot say whether a mirror is suspended now.
+var ErrNoHostFact = errors.New("the freeze backend reports no host state")
+
+// HostFact is implemented by a freeze backend that can report whether a mirror's job is
+// suspended now (the agent's Status, M4). Recovery (M5) trusts it over the annotation.
+type HostFact interface {
+	Frozen(ctx context.Context, pod *corev1.Pod) (bool, error)
+}
+
+// LoopFreezer is the orchestrator loop's freezer for --freezer=agent: the M4 agent client
 // (Options.Suspend.Freezer) driven by the loop. Like Backend.Suspend and Backend.Resume it
-// records the suspend state on the mirror, so the guest shows Suspended while frozen and a
+// records the suspend state on the mirror, so the guest shows Suspended while suspended and a
 // restarted guest kubelet finds the state again (M5). The loop has already held the guest
 // NotReady, confirmed it, and raised the epoch before it calls Suspend or Resume; the
-// deadline is the context's.
+// deadline is the context's. Any error leaves the state for the loop's kill sequence, which
+// calls Kill (agent Kill) and then deletes the mirror.
 type LoopFreezer struct{ b *Backend }
 
 // LoopFreezer returns the orchestrator loop's freezer.
@@ -35,9 +49,9 @@ func (b *Backend) LoopFreezer() (*LoopFreezer, error) {
 	return &LoopFreezer{b: b}, nil
 }
 
-// Suspend records Suspending, freezes the mirror and records Suspended. If the freeze fails
-// the mirror is thawed and put back to Running, and the error is returned (the loop then runs
-// the kill sequence).
+// Suspend records Suspending, has the agent suspend the mirror and records Suspended. A failed
+// agent Suspend returns the error with the guest still Suspending (NotReady): Q6 never puts a
+// guest whose state is unknown back to Running, and the loop kills it.
 func (f *LoopFreezer) Suspend(ctx context.Context, m *corev1.Pod, epoch int64) error {
 	guest, err := f.b.lockMirrorGuest(m)
 	if err != nil {
@@ -50,23 +64,23 @@ func (f *LoopFreezer) Suspend(ctx context.Context, m *corev1.Pod, epoch int64) e
 	}
 	f.b.emit(f.b.translate(guest, cur))
 	if err := f.b.opts.Suspend.Freezer.Suspend(ctx, cur, epoch); err != nil {
-		// The loop's deadline may be what failed; the thaw gets its own time.
-		return f.b.abortSuspend(context.WithoutCancel(ctx), guest, cur, epoch, fmt.Errorf("freeze: %w", err))
+		f.b.event(guest, corev1.EventTypeWarning, EventSuspendFailed, "agent suspend: "+err.Error())
+		return fmt.Errorf("agent suspend: %w", err)
 	}
-	// The readiness verdict from before the freeze must not outlive it: the prober starts over
+	// The readiness verdict from before the suspend must not outlive it: the prober starts over
 	// from not ready, so after the resume the guest is released only once the engine answers.
 	f.b.forgetProbes(cur)
 	if cur, err = f.b.setSuspendState(ctx, guest, StateSuspended, false); err != nil {
-		return fmt.Errorf("frozen, but recording %s failed: %w", StateSuspended, err)
+		return fmt.Errorf("suspended, but recording %s failed: %w", StateSuspended, err)
 	}
 	f.b.emit(f.b.translate(guest, cur))
-	f.b.event(guest, corev1.EventTypeNormal, EventSuspended, fmt.Sprintf("frozen by the orchestrator loop (epoch %d)", epoch))
+	f.b.event(guest, corev1.EventTypeNormal, EventSuspended, fmt.Sprintf("suspended by the orchestrator loop (epoch %d)", epoch))
 	return nil
 }
 
-// Resume records Resuming, thaws the mirror and clears the suspend state. A failed thaw leaves
-// the guest Resuming (NotReady) and returns the error. The loop runs the engine check before
-// it releases Ready.
+// Resume records Resuming, has the agent resume the mirror and clears the suspend state. A
+// failed resume leaves the guest Resuming (NotReady) and returns the error; the loop kills it.
+// The loop runs the engine check before it releases Ready.
 func (f *LoopFreezer) Resume(ctx context.Context, m *corev1.Pod, epoch int64) error {
 	guest, err := f.b.lockMirrorGuest(m)
 	if err != nil {
@@ -79,14 +93,36 @@ func (f *LoopFreezer) Resume(ctx context.Context, m *corev1.Pod, epoch int64) er
 	}
 	f.b.emit(f.b.translate(guest, cur))
 	if err := f.b.opts.Suspend.Freezer.Resume(ctx, cur, epoch); err != nil {
-		f.b.event(guest, corev1.EventTypeWarning, EventResumeFailed, "thaw: "+err.Error())
-		return fmt.Errorf("thaw: %w", err)
+		f.b.event(guest, corev1.EventTypeWarning, EventResumeFailed, "agent resume: "+err.Error())
+		return fmt.Errorf("agent resume: %w", err)
 	}
 	if cur, err = f.b.setSuspendState(ctx, guest, "", false); err != nil {
-		return fmt.Errorf("thawed, but clearing %s failed: %w", StateResuming, err)
+		return fmt.Errorf("resumed, but clearing %s failed: %w", StateResuming, err)
 	}
 	f.b.emit(f.b.translate(guest, cur))
-	f.b.event(guest, corev1.EventTypeNormal, EventResumed, fmt.Sprintf("thawed by the orchestrator loop (epoch %d)", epoch))
+	f.b.event(guest, corev1.EventTypeNormal, EventResumed, fmt.Sprintf("resumed by the orchestrator loop (epoch %d)", epoch))
+	return nil
+}
+
+// Kill is the first step of the loop's kill sequence: record Killing (the guest turns
+// NotReady and, once the mirror stops or is deleted, Failed with ReasonKilled), then agent
+// Kill. The loop deletes the mirror afterwards whatever this returns. It does not take the
+// guest's operation lock: a hung Suspend may still hold it.
+func (f *LoopFreezer) Kill(ctx context.Context, m *corev1.Pod, reason string) error {
+	if guest := f.b.guestFor(m); guest != nil {
+		kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), killRecordTimeout)
+		if cur, err := f.b.setSuspendState(kctx, guest, StateKilling, false); err == nil {
+			m = cur
+			f.b.emit(f.b.translate(guest, cur))
+		} else {
+			log.G(ctx).WithError(err).WithField("mirror", m.Name).Warn("could not record Killing; killing anyway")
+		}
+		cancel()
+		f.b.event(guest, corev1.EventTypeWarning, EventKilled, "orchestrator loop kill: "+reason)
+	}
+	if err := f.b.opts.Suspend.Freezer.Kill(ctx, m, reason); err != nil {
+		return fmt.Errorf("agent kill: %w", err)
+	}
 	return nil
 }
 
@@ -102,13 +138,25 @@ func (b *Backend) lockMirrorGuest(m *corev1.Pod) (*corev1.Pod, error) {
 	return guest, nil
 }
 
-// HostFrozen reports whether the host has the mirror's processes stopped now (the freeze
-// backend's Frozen). It returns ErrNoFreezer when no freeze backend is configured.
+// HostFrozen reports whether the host has the mirror's job suspended now (the freeze backend's
+// HostFact: the agent's Status). It returns ErrNoFreezer when no freeze backend is configured
+// and ErrNoHostFact when the backend cannot tell.
 func (b *Backend) HostFrozen(m *corev1.Pod) (bool, error) {
+	return b.hostFrozen(context.Background(), m)
+}
+
+// hostFrozen is HostFrozen under the caller's context (bounded by killRecordTimeout).
+func (b *Backend) hostFrozen(parent context.Context, m *corev1.Pod) (bool, error) {
 	if b.opts.Suspend.Freezer == nil {
 		return false, ErrNoFreezer
 	}
-	return b.opts.Suspend.Freezer.Frozen(m)
+	hf, ok := b.opts.Suspend.Freezer.(HostFact)
+	if !ok {
+		return false, ErrNoHostFact
+	}
+	ctx, cancel := context.WithTimeout(parent, killRecordTimeout)
+	defer cancel()
+	return hf.Frozen(ctx, m)
 }
 
 // Attempt returns the attempt counter in a mirror's job id (<guest UID>-<attempt>).
@@ -193,13 +241,7 @@ type FreezeState struct {
 	State     string `json:"state"`
 	Epoch     int64  `json:"epoch"`
 	Frozen    bool   `json:"frozen"`
-	Procs     int    `json:"procs"`
 	HostError string `json:"hostError,omitempty"`
-}
-
-// ProcCounter counts the processes in a mirror's pod cgroup. freeze.Cgroup implements it.
-type ProcCounter interface {
-	Procs(pod *corev1.Pod) (int, error)
 }
 
 // FreezeStateOf reads a guest's mirror from the API and the host's freeze state of it.
@@ -213,11 +255,8 @@ func (b *Backend) FreezeStateOf(ctx context.Context, namespace, name string) (Fr
 	}
 	state, epoch := SuspendState(m)
 	fs := FreezeState{Mirror: m.Name, MirrorUID: string(m.UID), JobID: m.Labels[LabelJobID], State: state, Epoch: epoch}
-	frozen, ferr := b.HostFrozen(m)
+	frozen, ferr := b.hostFrozen(ctx, m)
 	fs.Frozen = frozen
-	if pc, ok := b.opts.Suspend.Freezer.(ProcCounter); ok && ferr == nil {
-		fs.Procs, ferr = pc.Procs(m)
-	}
 	if ferr != nil {
 		fs.HostError = ferr.Error()
 		log.G(ctx).WithError(ferr).WithField("mirror", m.Name).Debug("freeze state: host read failed")

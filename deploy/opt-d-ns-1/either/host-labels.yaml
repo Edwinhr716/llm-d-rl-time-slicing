@@ -1,0 +1,11 @@
+# Host labels for --node-group-labels=either (D-NS-1 option "both"). Pending lead decision.
+# The demo writes the ns form; nodes still carrying group.timeslice.io/<group>=true keep working,
+# unless that label names a different group, in which case the node is in no group.
+# Replace __GROUP__ with <namespace>.<job-id>.<group>, the same value the donor pods carry in
+# timeslice.io/group (at most 63 characters), then:
+#   kubectl patch node __HOST__ --type=merge --patch-file=host-labels.yaml
+# Orchestrator --node-selector for this mode: empty (watch all nodes).
+metadata:
+  labels:
+    timeslice.io/donor: "true"
+    timeslice.io/group: "__GROUP__"

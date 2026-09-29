@@ -36,15 +36,15 @@ func TestLoopFreezer_RecordsTheSuspendState(t *testing.T) {
 		t.Fatalf("state must be cleared after the resume: %v", hrn.mirror("vllm-m").Annotations)
 	}
 	// The loop, not the freezer, runs the engine check: no readycheck call.
-	if got, want := strings.Join(ff.callList(), ","), "freeze:5,thaw:6"; got != want {
+	if got, want := strings.Join(ff.callList(), ","), "suspend:5,resume:6"; got != want {
 		t.Fatalf("calls = %s, want %s", got, want)
 	}
 	hrn.settled("not suspended", func(p *corev1.Pod) bool { return !suspendedCond(p) })
 }
 
-func TestLoopFreezer_FreezeFailureThawsAndClears(t *testing.T) {
+func TestLoopFreezer_SuspendFailureStaysSuspending(t *testing.T) {
 	hrn, ff := suspendHarness(t)
-	ff.suspendErr = errors.New("stuck task")
+	ff.suspendErr = errors.New("deadline exceeded")
 	lf, err := hrn.b.LoopFreezer()
 	if err != nil {
 		t.Fatal(err)
@@ -52,13 +52,55 @@ func TestLoopFreezer_FreezeFailureThawsAndClears(t *testing.T) {
 	if err := lf.Suspend(context.Background(), hrn.mirror("vllm-m"), 3); err == nil {
 		t.Fatal("want an error")
 	}
-	if got := strings.Join(ff.callList(), ","); got != "freeze:3,thaw:3" {
+	// No resume: the loop runs the kill sequence on a failed suspend (Q6).
+	if got := strings.Join(ff.callList(), ","); got != "suspend:3" {
 		t.Fatalf("calls = %s", got)
 	}
-	if _, ok := hrn.mirror("vllm-m").Annotations[AnnotationSuspendState]; ok {
-		t.Fatalf("state must be cleared: %v", hrn.mirror("vllm-m").Annotations)
+	if s := hrn.mirror("vllm-m").Annotations[AnnotationSuspendState]; s != StateSuspending {
+		t.Fatalf("state = %q, want %s", s, StateSuspending)
 	}
 }
+
+func TestLoopFreezer_KillRecordsKillingThenCallsTheAgent(t *testing.T) {
+	hrn, ff := suspendHarness(t)
+	lf, err := hrn.b.LoopFreezer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lf.Kill(context.Background(), hrn.mirror("vllm-m"), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(ff.callList(), ","); got != "kill" {
+		t.Fatalf("calls = %s", got)
+	}
+	if s := hrn.mirror("vllm-m").Annotations[AnnotationSuspendState]; s != StateKilling {
+		t.Fatalf("state = %q, want %s", s, StateKilling)
+	}
+	ff.killErr = errors.New("kill unconfirmed")
+	if err := lf.Kill(context.Background(), hrn.mirror("vllm-m"), "test"); err == nil {
+		t.Fatal("want the agent's kill error")
+	}
+}
+
+func TestLoopFreezer_HostFrozenIsTheAgentFact(t *testing.T) {
+	hrn, ff := suspendHarness(t)
+	ff.frozen = true
+	if got, err := hrn.b.HostFrozen(hrn.mirror("vllm-m")); err != nil || !got {
+		t.Fatalf("HostFrozen = %v, %v; want true", got, err)
+	}
+	opts := testOptions()
+	opts.Suspend.Freezer = noFactFreezer{}
+	if _, err := newHarness(t, opts).b.HostFrozen(&corev1.Pod{}); !errors.Is(err, ErrNoHostFact) {
+		t.Fatalf("err = %v, want ErrNoHostFact", err)
+	}
+}
+
+// noFactFreezer is a freeze backend without a host fact.
+type noFactFreezer struct{}
+
+func (noFactFreezer) Suspend(context.Context, *corev1.Pod, int64) error { return nil }
+func (noFactFreezer) Resume(context.Context, *corev1.Pod, int64) error  { return nil }
+func (noFactFreezer) Kill(context.Context, *corev1.Pod, string) error   { return nil }
 
 func TestLoopFreezer_ThawFailureStaysResuming(t *testing.T) {
 	hrn, ff := suspendHarness(t)

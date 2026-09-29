@@ -10,7 +10,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
-	"github.com/edwinhr716/guest-kubelet/internal/freeze"
 )
 
 // RecoverHost is what recovery needs from the mirror backend. *mirror.Backend implements it.
@@ -31,7 +30,7 @@ type RecoverOptions struct {
 	// no host fact (no freezer), and the recorded state is trusted.
 	Frozen func(m *corev1.Pod) (bool, error)
 	// RecordState makes the mirror's suspend-state annotation match the host when they differ.
-	// Set it when the freezer is the one that writes that annotation (--freezer=cgroup).
+	// Set it when the freezer is the one that writes that annotation (--freezer=agent).
 	RecordState bool
 	// OnAdopt is called for each adopted guest, for example to seed the orchestrator loop.
 	OnAdopt func(Adopted)
@@ -140,8 +139,8 @@ func hostFact(ctx context.Context, opts RecoverOptions, mp *corev1.Pod) hostStat
 	switch {
 	case err == nil && frozen:
 		return hostFrozen
-	case err == nil, errors.Is(err, freeze.ErrNoCgroup):
-		// No pod cgroup (not started yet, or already gone): nothing is frozen.
+	case err == nil:
+		// The agent does not list the job as suspended (or not at all): nothing is frozen.
 		return hostThawed
 	default:
 		log.G(ctx).WithField("mirror", mp.Namespace+"/"+mp.Name).WithError(err).

@@ -27,11 +27,17 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/gpucr"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/server"
+	statemachine "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/tpu"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
 )
 
 func main() {
+	// "snapshot-agent scrub ..." runs one handoff scrub decision and exits (D-NS-7).
+	if len(os.Args) > 1 && os.Args[1] == "scrub" {
+		os.Exit(runScrubCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	// Initialize slog with ContextHandler
 	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
 	ctxHandler := logging.NewContextHandler(jsonHandler)
@@ -44,7 +50,77 @@ func main() {
 	defaultBackend := flag.String("default-backend", string(backends.BackendCuda),
 		"Backend used when a request carries no backend_config (the orchestrator never sends one, "+
 			"so this selects the backend for orchestrator-driven snapshots/restores)")
+	// PENDING LEAD DECISION ("drop RESUMED" scope): the default keeps
+	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
+	reportResumed := flag.Bool("report-resumed-outcome", true,
+		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
+	// PENDING LEAD DECISION D-AGENT-3: the default aborts a running guest
+	// operation when a higher epoch arrives; "aborted" refuses the new call.
+	higherEpoch := flag.String("higher-epoch", statemachine.HigherEpochAbort,
+		"Higher-epoch Suspend or Resume while one runs: 'abort' aborts the running operation, "+
+			"'aborted' refuses the new call with Aborted (pending decision)")
+	// PENDING LEAD DECISION D-AGENT-4: the default completes a Suspend of an
+	// unknown job with RELEASED; "precondition" refuses it.
+	unknownJobSuspend := flag.String("unknown-job-suspend", statemachine.UnknownJobSuspendReleased,
+		"Suspend of a job the agent does not know: 'released' completes it with RELEASED, "+
+			"'precondition' refuses it with FailedPrecondition (pending decision)")
+	// PENDING LEAD DECISION (D-AGENT-5): the default accepts epoch 0;
+	// "require" refuses a Suspend or Resume with epoch 0 with InvalidArgument.
+	epochZero := flag.String("epoch-zero", statemachine.EpochZeroAccept,
+		"Suspend or Resume with epoch 0: 'accept' fences it like any epoch, 'require' refuses it (pending decision)")
+	// PENDING LEAD DECISION (D-AGENT-6): the default raises the stored epoch
+	// for a call refused after fencing; "accepted-only" raises it only for
+	// an accepted call.
+	epochOnRefusal := flag.String("epoch-on-refusal", statemachine.EpochOnRefusalRaise,
+		"Whether a Suspend or Resume refused after epoch fencing raises the stored epoch: "+
+			"'raise' or 'accepted-only' (pending decision)")
+	// PENDING LEAD DECISION (D-AGENT-9): the default leaves a job FAULTED
+	// after a failed precondition; "unchanged" keeps its state before the
+	// operation.
+	preconditionRefusal := flag.String("precondition-refusal", statemachine.PreconditionRefusalFaulted,
+		"Job state after a Suspend or Resume fails a precondition: "+
+			"'faulted' or 'unchanged' (pending decision)")
+	scrubFlags := addScrubPolicyFlags(flag.CommandLine)
+	// One --vram-zeroing-qualified flag serves the Suspend precondition and the scrub policy.
+	vramZeroingQualified := scrubFlags.qualified
 	flag.Parse()
+
+	if !statemachine.ValidPreconditionRefusal(*preconditionRefusal) {
+		slog.Error("Invalid --precondition-refusal, must be 'faulted' or 'unchanged'", "value", *preconditionRefusal)
+		os.Exit(1)
+	}
+
+	if !statemachine.ValidEpochOnRefusal(*epochOnRefusal) {
+		slog.Error("Invalid --epoch-on-refusal, must be 'raise' or 'accepted-only'", "value", *epochOnRefusal)
+		os.Exit(1)
+	}
+
+	if !statemachine.ValidEpochZero(*epochZero) {
+		slog.Error("Invalid --epoch-zero, must be 'accept' or 'require'", "value", *epochZero)
+		os.Exit(1)
+	}
+
+	if err := statemachine.ValidateUnknownJobSuspend(*unknownJobSuspend); err != nil {
+		slog.Error("Invalid --unknown-job-suspend", "error", err)
+		os.Exit(1)
+	}
+
+	if err := statemachine.ValidateHigherEpoch(*higherEpoch); err != nil {
+		slog.Error("Invalid --higher-epoch", "error", err)
+		os.Exit(1)
+	}
+
+	// VRAM_ZEROING_QUALIFIED overrides the flag: the Helm chart configures
+	// the agent through env vars.
+	qualifiedSpec := *vramZeroingQualified
+	if env := os.Getenv("VRAM_ZEROING_QUALIFIED"); env != "" {
+		qualifiedSpec = env
+	}
+	qualified, err := server.ParseVRAMZeroingQualified(qualifiedSpec)
+	if err != nil {
+		slog.Error("Invalid --vram-zeroing-qualified", "value", qualifiedSpec, "error", err)
+		os.Exit(1)
+	}
 
 	depMode := *deploymentMode
 	if envDepMode := os.Getenv("DEPLOYMENT_MODE"); envDepMode != "" {
@@ -84,6 +160,21 @@ func main() {
 	featureGates, err := features.Parse(gatesSpec)
 	if err != nil {
 		slog.Error("Invalid feature gates", "value", gatesSpec, "error", err)
+		os.Exit(1)
+	}
+
+	// SCRUB_POLICY, SCRUB and VRAM_ZEROING_QUALIFIED override the flags, mirroring
+	// DEPLOYMENT_MODE: the Helm chart configures the agent through env vars.
+	for env, value := range map[string]*string{
+		"SCRUB_POLICY": scrubFlags.policy, "SCRUB": scrubFlags.mode, "VRAM_ZEROING_QUALIFIED": scrubFlags.qualified,
+	} {
+		if envValue, ok := os.LookupEnv(env); ok {
+			*value = envValue
+		}
+	}
+	scrubCfg, err := scrubFlags.parse()
+	if err != nil {
+		slog.Error("Invalid VRAM scrub configuration", "error", err)
 		os.Exit(1)
 	}
 
@@ -132,6 +223,8 @@ func main() {
 		utils.GetPodPIDs = tpu.GetPodPIDs
 		utils.HasGPUProcesses = tpu.HasProcesses
 		slog.InfoContext(ctx, "Using TPU process discovery", "acceleratorType", accelType)
+	} else {
+		logScrubPolicy(ctx, scrubCfg)
 	}
 
 	// GPU-CR housekeeping runs only when the shared checkpoint dir is
@@ -157,9 +250,22 @@ func main() {
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String())
+		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed,
+		"vramZeroingQualified", qualifiedSpec,
+		"higherEpoch", *higherEpoch,
+		"unknownJobSuspend", *unknownJobSuspend,
+		"epochZero", *epochZero,
+		"epochOnRefusal", *epochOnRefusal,
+		"preconditionRefusal", *preconditionRefusal)
 	err = server.StartServer(
-		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates)
+		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
+		server.GuestConfig{VRAMZeroingQualified: qualified},
+		statemachine.WithReportResumedOutcome(*reportResumed),
+		statemachine.WithHigherEpoch(*higherEpoch),
+		statemachine.WithUnknownJobSuspend(*unknownJobSuspend),
+		statemachine.WithEpochZero(*epochZero),
+		statemachine.WithEpochOnRefusal(*epochOnRefusal),
+		statemachine.WithPreconditionRefusal(*preconditionRefusal))
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)

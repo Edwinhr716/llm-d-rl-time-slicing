@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -59,6 +60,11 @@ type Config struct {
 	// is rejected (OutOfcpu/OutOfmemory) on a full trainer node. Zero means "do not cap".
 	CPUHeadroom    resource.Quantity
 	MemoryHeadroom resource.Quantity
+	// RealRequests (--guest-budget=computed, PENDING LEAD DECISION D-NS-9) gives each mirror
+	// container the guest's requests unchanged and ignores the headroom caps: the VK Node then
+	// advertises only what the host can hold, so the real kubelet's fit check passes. False is
+	// today's behaviour (--guest-budget=static): requests capped at the headroom.
+	RealRequests bool
 	// GPUClaim is the ResourceClaim (in the guest's namespace) that replaces nvidia.com/gpu.
 	// Empty means guests asking for a GPU are refused.
 	GPUClaim string
@@ -72,11 +78,34 @@ type Config struct {
 	// the virtual Node is deleted) and a guest re-created with the same name re-adopts it.
 	OwnerRef bool
 	// Group is the time-slice group of the real node. Empty means the orchestrator loop is off:
-	// the mirror gets no contract labels and keeps the guest's restartPolicy.
+	// the mirror gets no group or role label and keeps the guest's restartPolicy unless
+	// AgentJob is set.
 	Group string
+	// AgentJob makes the mirror a snapshot-agent job (M4): it gets LabelJobID and
+	// restartPolicy Never. Group implies it.
+	AgentJob bool
 	// Attempt counts the mirrors created for one guest; it makes the job id unique per
-	// incarnation. Used only when Group is set.
+	// incarnation. Used only when Group or AgentJob is set.
 	Attempt int
+	// DeviceMemoryReserve is added to the memory limit of every mirror container that asks for
+	// the GPU. On Suspend the snapshot agent copies the device memory into the container's
+	// memory cgroup, so memory.max must fit the process plus the device bytes. Build it with
+	// DeviceReserve (device memory x factor, default x1.1). Zero means "add nothing".
+	DeviceMemoryReserve resource.Quantity
+}
+
+// DeviceReserve is ceil(deviceMemory x factor), rounded up to a whole MiB: the memory the
+// snapshot agent needs in the mirror's cgroup to hold one GPU's memory on Suspend.
+func DeviceReserve(deviceMemory resource.Quantity, factor float64) (resource.Quantity, error) {
+	if factor < 1 {
+		return resource.Quantity{}, fmt.Errorf("device memory factor %v is below 1", factor)
+	}
+	if deviceMemory.Sign() < 0 {
+		return resource.Quantity{}, fmt.Errorf("device memory %s is negative", deviceMemory.String())
+	}
+	const mi = 1 << 20
+	b := math.Ceil(float64(deviceMemory.Value()) * factor)
+	return *resource.NewQuantity(int64(math.Ceil(b/mi))*mi, resource.BinarySI), nil
 }
 
 // Name returns the mirror's name for a guest.
@@ -158,7 +187,7 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 	for i := range spec.Containers {
 		c := &spec.Containers[i]
 		c.LivenessProbe, c.ReadinessProbe, c.StartupProbe = nil, nil, nil
-		c.Resources = mirrorResources(c.Resources, cfg, gpu)
+		c.Resources = mirrorResources(c.Resources, cfg, gpu, containerRequestsGPU(c))
 		c.Env = rewriteDownwardEnv(c.Env, guest)
 	}
 	if gpu {
@@ -190,6 +219,10 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 		pod.Labels[LabelGroup] = cfg.Group
 		pod.Labels[LabelJobID] = JobID(guest, cfg.Attempt)
 		pod.Labels[LabelRole] = RoleBackground
+		pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+	} else if cfg.AgentJob {
+		// The snapshot agent finds the job by this label (M4 without the orchestrator loop).
+		pod.Labels[LabelJobID] = JobID(guest, cfg.Attempt)
 		pod.Spec.RestartPolicy = corev1.RestartPolicyNever
 	}
 	if cfg.OwnerRef {
@@ -233,10 +266,21 @@ func tolerated(tols []corev1.Toleration, want corev1.Toleration) bool {
 	return false
 }
 
-// mirrorResources caps requests at the headroom and swaps the GPU for the claim. Limits are
-// kept (a memory limit is what protects the trainer from the guest), except that a capped
-// request never exceeds its limit.
-func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev1.ResourceRequirements {
+// containerRequestsGPU reports whether one container asks for nvidia.com/gpu.
+func containerRequestsGPU(c *corev1.Container) bool {
+	_, req := c.Resources.Requests[GPUResource]
+	_, lim := c.Resources.Limits[GPUResource]
+	return req || lim
+}
+
+// mirrorResources caps requests at the headroom (static mode; computed mode keeps the guest's
+// requests) and swaps the GPU for the claim. Limits are kept (a memory limit is what protects
+// the trainer from the guest), except that a capped request never exceeds its limit. A
+// container that asks for the GPU gets the device reserve on top of its memory limit
+// (contract: limit = container limit + device reserve). With no limit, the base is its memory
+// request; with neither, the limit is the reserve alone, so the mirror never has an unlimited
+// memory.max (the agent refuses Suspend then).
+func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu, ownsGPU bool) corev1.ResourceRequirements {
 	out := *in.DeepCopy()
 	delete(out.Requests, GPUResource)
 	delete(out.Limits, GPUResource)
@@ -253,8 +297,26 @@ func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev
 			out.Requests[name] = lim.DeepCopy()
 		}
 	}
-	capAt(out.Requests, corev1.ResourceCPU, cfg.CPUHeadroom)
-	capAt(out.Requests, corev1.ResourceMemory, cfg.MemoryHeadroom)
+	if !cfg.RealRequests {
+		// --guest-budget=static
+		capAt(out.Requests, corev1.ResourceCPU, cfg.CPUHeadroom)
+	}
+	if ownsGPU && cfg.DeviceMemoryReserve.Sign() > 0 {
+		base := resource.Quantity{}
+		if lim, ok := out.Limits[corev1.ResourceMemory]; ok {
+			base = lim.DeepCopy()
+		} else if req, ok := out.Requests[corev1.ResourceMemory]; ok {
+			base = req.DeepCopy()
+		}
+		base.Add(cfg.DeviceMemoryReserve)
+		if out.Limits == nil {
+			out.Limits = corev1.ResourceList{}
+		}
+		out.Limits[corev1.ResourceMemory] = base
+	}
+	if !cfg.RealRequests {
+		capAt(out.Requests, corev1.ResourceMemory, cfg.MemoryHeadroom)
+	}
 	if gpu {
 		out.Claims = append(out.Claims, corev1.ResourceClaim{Name: ClaimRefName})
 	}
@@ -302,4 +364,37 @@ func rewriteDownwardEnv(env []corev1.EnvVar, guest *corev1.Pod) []corev1.EnvVar 
 		env[i].Value, env[i].ValueFrom = val, nil
 	}
 	return env
+}
+
+// Resources is what the "mirror resources" log line reports for one mirror.
+type Resources struct {
+	ReqCPU, ReqMemory, LimMemory resource.Quantity
+	// Capped is true when any container's request is below the guest's (its request, or its
+	// limit when it has none): the static-mode cap applied.
+	Capped bool
+}
+
+// ResourceSummary sums the mirror's container requests and memory limits.
+func ResourceSummary(guest, mirrorPod *corev1.Pod) *Resources {
+	out := &Resources{}
+	for i := range mirrorPod.Spec.Containers {
+		got := mirrorPod.Spec.Containers[i].Resources
+		out.ReqCPU.Add(got.Requests[corev1.ResourceCPU])
+		out.ReqMemory.Add(got.Requests[corev1.ResourceMemory])
+		out.LimMemory.Add(got.Limits[corev1.ResourceMemory])
+		if i >= len(guest.Spec.Containers) {
+			continue
+		}
+		in := guest.Spec.Containers[i].Resources
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			want, ok := in.Requests[name]
+			if !ok {
+				want, ok = in.Limits[name]
+			}
+			if req := got.Requests[name]; ok && req.Cmp(want) < 0 {
+				out.Capped = true
+			}
+		}
+	}
+	return out
 }

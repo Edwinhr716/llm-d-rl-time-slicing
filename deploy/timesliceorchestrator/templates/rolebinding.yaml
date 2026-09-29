@@ -3,7 +3,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "timesliceorchestrator.fullname" . }}-configmap
-  namespace: timeslice-system
+  namespace: {{ include "timesliceorchestrator.lockNamespace" . }}
   labels:
     {{- include "timesliceorchestrator.labels" . | nindent 4 }}
 roleRef:
@@ -13,5 +13,5 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ include "timesliceorchestrator.serviceAccountName" . }}
-    namespace: timeslice-system
+    namespace: {{ include "timesliceorchestrator.namespace" . }}
 {{- end }}

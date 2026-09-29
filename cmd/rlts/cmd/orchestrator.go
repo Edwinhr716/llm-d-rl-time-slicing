@@ -22,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 )
@@ -38,7 +39,12 @@ func init() {
 	orchestratorCmd.AddCommand(statusCmd)
 	orchestratorCmd.AddCommand(acquireCmd)
 	orchestratorCmd.AddCommand(yieldCmd)
+	yieldCmd.Flags().DurationVar(&yieldExpectedIdle, "expected-idle", 0,
+		"expected_idle hint sent with the Yield (0 sends none)")
 }
+
+// yieldExpectedIdle is the yield command's --expected-idle.
+var yieldExpectedIdle time.Duration
 
 func getClient() (pb.TimeSliceOrchestratorServiceClient, *grpc.ClientConn, error) {
 	conn, err := grpc.NewClient(orchestratorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -167,7 +173,11 @@ var yieldCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		resp, err := client.Yield(ctx, &pb.YieldRequest{GroupId: groupID, JobId: jobID})
+		req := &pb.YieldRequest{GroupId: groupID, JobId: jobID}
+		if yieldExpectedIdle > 0 {
+			req.ExpectedIdle = durationpb.New(yieldExpectedIdle)
+		}
+		resp, err := client.Yield(ctx, req)
 		if err != nil {
 			return fmt.Errorf("failed to yield: %w", err)
 		}

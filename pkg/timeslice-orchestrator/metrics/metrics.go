@@ -101,6 +101,49 @@ var (
 			Help: "Number of dispatch budget evaluations that computed 1 but were not written, because the rising edge is published externally.",
 		},
 	)
+
+	// KillUnconfirmedTotal counts guest Kills that reached the agent but were
+	// not confirmed, once per guest and node, when first seen (decision
+	// D-NS-6, every --unconfirmed-kill value). Under "grant" each one ends in
+	// a foreground grant with AcquireResponse.vram_unconfirmed = true.
+	KillUnconfirmedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "timeslice_kill_unconfirmed_total",
+			Help: "Number of guest kills that reached the agent but were not confirmed.",
+		},
+	)
+
+	// GrantBlocked is 1 while the foreground of a group waits past the
+	// notice window on a node whose guest kill is not confirmed
+	// (--unconfirmed-kill=block or escalate), and 0 once it is released.
+	GrantBlocked = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "timeslice_grant_blocked",
+			Help: "1 while a foreground grant is held on a node whose guest kill is not confirmed.",
+		},
+		[]string{"group", "node"},
+	)
+
+	// UnconfirmedEscalationsTotal counts escalation steps taken after an
+	// unconfirmed guest kill (--unconfirmed-kill=escalate): step 1 deletes the
+	// mirror pod gracefully, step 2 marks the node not lendable.
+	UnconfirmedEscalationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "timeslice_unconfirmed_escalations_total",
+			Help: "Number of escalation steps taken after an unconfirmed guest kill.",
+		},
+		[]string{"step"},
+	)
+
+	// NodeFailed is 1 while a node is marked not lendable after an
+	// unconfirmed guest kill (escalation step 2), and 0 once it is released.
+	NodeFailed = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "timeslice_node_failed",
+			Help: "1 while a node is not lendable because a guest kill on it is not confirmed.",
+		},
+		[]string{"node"},
+	)
 )
 
 // CleanupGroup removes gauge series labeled with the given group so stale
@@ -123,5 +166,9 @@ func Register() {
 		DispatchBudgetWritesTotal,
 		DispatchBudgetHeldTotal,
 		DispatchBudgetRisingEdgeSkippedTotal,
+		KillUnconfirmedTotal,
+		GrantBlocked,
+		UnconfirmedEscalationsTotal,
+		NodeFailed,
 	)
 }
