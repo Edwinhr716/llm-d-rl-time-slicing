@@ -83,7 +83,34 @@ func (b *Backend) Start(ctx context.Context) error {
 	if !cache.WaitForCacheSync(ctx.Done(), b.synced) {
 		return fmt.Errorf("mirror informer did not sync")
 	}
+	if err := b.logAdopted(ctx); err != nil {
+		return err
+	}
 	go b.orphanLoop(ctx)
+	return nil
+}
+
+// logAdopted runs once at startup. It changes nothing: the informer already holds every
+// mirror, so the first GetPod for each guest finds its mirror and the library never creates a
+// second one. It only records which mirrors this process took over, with their job id.
+func (b *Backend) logAdopted(ctx context.Context) error {
+	ms, err := b.mirrors.List(labels.Everything())
+	if err != nil {
+		return err
+	}
+	for _, m := range ms {
+		if m.DeletionTimestamp != nil || m.Status.Phase == corev1.PodSucceeded || m.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		g, err := b.client.CoreV1().Pods(m.Namespace).Get(ctx, m.Annotations[AnnotationGuestName], metav1.GetOptions{})
+		if err != nil || string(g.UID) != m.Labels[LabelMirrorOf] {
+			continue // no live guest: orphanLoop reports it
+		}
+		log.G(ctx).WithField("guest", g.Namespace+"/"+g.Name).WithField("mirror", m.Name).
+			WithField("mirrorUID", m.UID).WithField("jobID", m.Labels[LabelJobID]).
+			WithField("podIP", m.Status.PodIP).WithField("cause", "vk-restart").
+			Warn("re-adopted orphaned mirror")
+	}
 	return nil
 }
 
@@ -221,12 +248,15 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}
+	// Attempt 1: a guest's mirror is never re-created under the same guest UID, since a restart
+	// keeps the mirror and an adopted orphan keeps its own job id.
+	want.Labels[LabelJobID] = JobID(guest.UID, 1)
 	logger := log.G(ctx).WithField("guest", guest.Namespace+"/"+guest.Name).WithField("mirror", want.Name)
 
 	m, err := b.client.CoreV1().Pods(guest.Namespace).Create(ctx, want, metav1.CreateOptions{})
 	switch {
 	case err == nil:
-		logger.WithField("mirrorUID", m.UID).Info("mirror created")
+		logger.WithField("mirrorUID", m.UID).WithField("jobID", m.Labels[LabelJobID]).Info("mirror created")
 	case apierrors.IsAlreadyExists(err):
 		if m, err = b.adoptOrReplace(ctx, guest, want); err != nil {
 			return err
@@ -271,7 +301,9 @@ func (b *Backend) adoptOrReplace(ctx context.Context, guest, want *corev1.Pod) (
 		b.mu.Lock()
 		delete(b.orphanSince, cur.UID)
 		b.mu.Unlock()
-		logger.WithField("mirrorUID", adopted.UID).WithField("podIP", adopted.Status.PodIP).Warn("re-adopted orphaned mirror")
+		logger.WithField("mirrorUID", adopted.UID).WithField("podIP", adopted.Status.PodIP).
+			WithField("jobID", adopted.Labels[LabelJobID]).WithField("cause", "guest-recreated").
+			Warn("re-adopted orphaned mirror")
 		return adopted, nil
 	}
 	// Not adoptable (different containers, not ours, or finished): remove it and let the

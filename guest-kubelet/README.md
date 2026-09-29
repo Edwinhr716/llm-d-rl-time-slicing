@@ -23,6 +23,9 @@ kubelet for the guest pods scheduled onto it.
   soon as the mirror has stopped.
 - Leader election (`--leader-elect`, Lease `guest-kubelet-<vnode>`) runs 2 replicas. On restart
   or failover, existing mirrors are found again and nothing is re-created.
+- Every mirror carries `timeslice.io/job-id=<guest UID>-<attempt>` (attempts start at 1). A
+  restarted guest kubelet keeps the mirrors it finds: the process keeps running and the job id
+  stays the same. An adopted orphan (below) keeps its own job id.
 - `--mirror-owner-ref=false` lets mirrors outlive guests that were force-deleted after a Node
   deletion. A guest re-created with the same name and the same containers re-adopts the mirror
   (same UID and IP). Orphans are deleted after `--orphan-grace`.

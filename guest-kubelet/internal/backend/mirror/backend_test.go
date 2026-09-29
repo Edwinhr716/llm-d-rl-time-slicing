@@ -264,3 +264,87 @@ func TestGuestRemovedWhenMirrorStops(t *testing.T) {
 		t.Error("guest should be deleted once its mirror is gone")
 	}
 }
+
+func readyGuest(uid string) *corev1.Pod {
+	g := cpuGuest(uid)
+	g.Status.Phase = corev1.PodRunning
+	g.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	return g
+}
+
+// liveMirror is the running mirror a previous guest kubelet process created for g.
+func liveMirror(t *testing.T, g *corev1.Pod, cfg *Config, uid types.UID, attempt int) *corev1.Pod {
+	t.Helper()
+	m, err := Build(g, *cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.UID = uid
+	m.Labels[LabelJobID] = JobID(g.UID, attempt)
+	m.Status.Phase = corev1.PodRunning
+	return m
+}
+
+func TestJobID(t *testing.T) {
+	if got := JobID(types.UID("0f1e-2d3c"), 2); got != "0f1e-2d3c-2" {
+		t.Errorf("JobID: %s", got)
+	}
+}
+
+func TestCreateSetsJobID(t *testing.T) {
+	h := newHarness(t, testOptions())
+	g := cpuGuest("g1")
+	h.addGuest(g)
+	if err := h.b.Create(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mirror("vllm-m"); m.Labels[LabelJobID] != "g1-1" {
+		t.Errorf("job-id %q, want g1-1", m.Labels[LabelJobID])
+	}
+}
+
+func TestRestartKeepsMirrorAndJobID(t *testing.T) {
+	g := readyGuest("g1")
+	opts := testOptions()
+	m := liveMirror(t, g, &opts.Config, "mirror-uid", 1)
+	h := newHarness(t, opts, g, m)
+	h.addGuest(g)
+
+	for _, a := range h.client.Actions() {
+		if d, ok := a.(k8stesting.DeleteAction); ok && d.GetName() == "vllm-m" {
+			t.Fatalf("a restart must not delete the mirror: %v", d)
+		}
+	}
+	if got, err := h.b.Get("ns", "vllm"); err != nil || got.UID != "g1" {
+		t.Fatalf("Get after restart: %v %v", got, err)
+	}
+	// The library calls CreatePod only when Get fails; a racing call is still a no-op.
+	if err := h.b.Create(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	cur := h.mirror("vllm-m")
+	if cur.UID != "mirror-uid" || cur.Labels[LabelJobID] != "g1-1" {
+		t.Errorf("want same mirror and job id, got uid=%s jobID=%s", cur.UID, cur.Labels[LabelJobID])
+	}
+}
+
+func TestReadoptOrphanKeepsJobIDAndSetsOwner(t *testing.T) {
+	opts := testOptions()
+	opts.OwnerRef = true
+	orphan := liveMirror(t, cpuGuest("old-uid"), &opts.Config, "mirror-uid", 1)
+	h := newHarness(t, opts, orphan)
+
+	g := cpuGuest("new-uid")
+	h.addGuest(g)
+	if err := h.b.Create(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	m := h.mirror("vllm-m")
+	if m.UID != "mirror-uid" || m.Labels[LabelMirrorOf] != "new-uid" || m.Labels[LabelJobID] != "old-uid-1" {
+		t.Errorf("want the orphan adopted with its job id, got uid=%s of=%s jobID=%s",
+			m.UID, m.Labels[LabelMirrorOf], m.Labels[LabelJobID])
+	}
+	if len(m.OwnerReferences) != 1 || m.OwnerReferences[0].UID != "new-uid" {
+		t.Errorf("ownerRefs: %v", m.OwnerReferences)
+	}
+}
