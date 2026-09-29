@@ -103,9 +103,9 @@ func future() time.Time {
 }
 
 // newGuestSM returns a StateManager with guestJob registered in state.
-func newGuestSM(t *testing.T, state pb.JobState, opts ...statemachine.Option) *statemachine.StateManager {
+func newGuestSM(t *testing.T, state pb.JobState) *statemachine.StateManager {
 	t.Helper()
-	sm := statemachine.NewStateManager(opts...)
+	sm := statemachine.NewStateManager()
 	setJob(t, sm, state, pb.Outcome_OUTCOME_UNSPECIFIED)
 	return sm
 }
@@ -251,7 +251,7 @@ func TestGuestOp_StaleEpochRejected(t *testing.T) {
 
 	// The next real call, with a higher epoch, goes through.
 	resumeID := startGuest(t, sm, statemachine.OpTypeResume, 7, instant(statemachine.GuestResult{}, nil))
-	checkComplete(t, waitForOperation(t, sm, resumeID), pb.Outcome_OUTCOME_RESUMED)
+	checkComplete(t, waitForOperation(t, sm, resumeID), pb.Outcome_OUTCOME_UNSPECIFIED)
 	checkJobState(t, sm, guestJob, pb.JobState_JOB_STATE_RUNNING)
 }
 
@@ -377,10 +377,10 @@ func TestGuestOp_HigherEpochAbortsRunningOperation(t *testing.T) {
 	checkFailed(t, getOp(t, sm, suspendID), pb.ErrorReason_STALE_EPOCH)
 
 	close(resumeStub.release)
-	checkComplete(t, waitForOperation(t, sm, resumeID), pb.Outcome_OUTCOME_RESUMED)
+	checkComplete(t, waitForOperation(t, sm, resumeID), pb.Outcome_OUTCOME_UNSPECIFIED)
 	st := jobStatus(t, sm)
-	if st.GetState() != pb.JobState_JOB_STATE_RUNNING || st.GetLastOutcome() != pb.Outcome_OUTCOME_RESUMED {
-		t.Errorf("expected RUNNING/RESUMED, got %s/%s", st.GetState(), st.GetLastOutcome())
+	if st.GetState() != pb.JobState_JOB_STATE_RUNNING || st.GetLastOutcome() != pb.Outcome_OUTCOME_UNSPECIFIED {
+		t.Errorf("expected RUNNING with no outcome, got %s/%s", st.GetState(), st.GetLastOutcome())
 	}
 	if st.GetEpoch() != 4 {
 		t.Errorf("expected epoch 4, got %d", st.GetEpoch())
@@ -401,7 +401,7 @@ func TestSeedEpoch(t *testing.T) {
 
 	// The call that the annotation announced carries the same epoch.
 	resumeID := startGuest(t, sm, statemachine.OpTypeResume, 10, instant(statemachine.GuestResult{}, nil))
-	checkComplete(t, waitForOperation(t, sm, resumeID), pb.Outcome_OUTCOME_RESUMED)
+	checkComplete(t, waitForOperation(t, sm, resumeID), pb.Outcome_OUTCOME_UNSPECIFIED)
 
 	// SeedEpoch never aborts a running operation.
 	stub := newGuestStub(suspendedResult)
@@ -474,15 +474,15 @@ func TestGuestOp_StateTable(t *testing.T) {
 		},
 		{
 			"resume RUNNING", pb.JobState_JOB_STATE_RUNNING, 0, statemachine.OpTypeResume, completedAtOnce,
-			pb.Outcome_OUTCOME_RESUMED, pb.JobState_JOB_STATE_RUNNING,
+			pb.Outcome_OUTCOME_UNSPECIFIED, pb.JobState_JOB_STATE_RUNNING,
 		},
 		{
 			"resume SAVED", pb.JobState_JOB_STATE_SAVED, 0, statemachine.OpTypeResume, ranWorker,
-			pb.Outcome_OUTCOME_RESUMED, pb.JobState_JOB_STATE_RUNNING,
+			pb.Outcome_OUTCOME_UNSPECIFIED, pb.JobState_JOB_STATE_RUNNING,
 		},
 		{
 			"resume SUSPENDED", pb.JobState_JOB_STATE_SUSPENDED, 0, statemachine.OpTypeResume, ranWorker,
-			pb.Outcome_OUTCOME_RESUMED, pb.JobState_JOB_STATE_RUNNING,
+			pb.Outcome_OUTCOME_UNSPECIFIED, pb.JobState_JOB_STATE_RUNNING,
 		},
 		{
 			"resume IDLE", pb.JobState_JOB_STATE_IDLE, 0, statemachine.OpTypeResume, refused,
@@ -573,36 +573,18 @@ func TestGuestOp_JobStatusFields(t *testing.T) {
 	}
 }
 
-func TestGuestOp_ReportResumedOutcome(t *testing.T) {
-	tests := []struct {
-		name string
-		opts []statemachine.Option
-		want pb.Outcome
-	}{
-		{name: "default keeps RESUMED", want: pb.Outcome_OUTCOME_RESUMED},
-		{
-			name: "explicit true",
-			opts: []statemachine.Option{statemachine.WithReportResumedOutcome(true)},
-			want: pb.Outcome_OUTCOME_RESUMED,
-		},
-		{
-			name: "false reports no outcome",
-			opts: []statemachine.Option{statemachine.WithReportResumedOutcome(false)},
-			want: pb.Outcome_OUTCOME_UNSPECIFIED,
-		},
+func TestGuestOp_ResumeReportsNoOutcome(t *testing.T) {
+	sm := newGuestSM(t, pb.JobState_JOB_STATE_SUSPENDED)
+	opID := startGuest(t, sm, statemachine.OpTypeResume, 1, instant(statemachine.GuestResult{}, nil))
+	checkComplete(t, waitForOperation(t, sm, opID), pb.Outcome_OUTCOME_UNSPECIFIED)
+	checkJobState(t, sm, guestJob, pb.JobState_JOB_STATE_RUNNING)
+	if got := jobStatus(t, sm).GetLastOutcome(); got != pb.Outcome_OUTCOME_UNSPECIFIED {
+		t.Errorf("expected no last outcome after a resume, got %s", got)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sm := newGuestSM(t, pb.JobState_JOB_STATE_SUSPENDED, tt.opts...)
-			opID := startGuest(t, sm, statemachine.OpTypeResume, 1, instant(statemachine.GuestResult{}, nil))
-			checkComplete(t, waitForOperation(t, sm, opID), tt.want)
-			checkJobState(t, sm, guestJob, pb.JobState_JOB_STATE_RUNNING)
 
-			// A Resume of a RUNNING job completes at once with the same outcome.
-			opID = startGuest(t, sm, statemachine.OpTypeResume, 2, mustNotRun(t))
-			checkComplete(t, waitForOperation(t, sm, opID), tt.want)
-		})
-	}
+	// A Resume of a RUNNING job completes at once, also with no outcome.
+	opID = startGuest(t, sm, statemachine.OpTypeResume, 2, mustNotRun(t))
+	checkComplete(t, waitForOperation(t, sm, opID), pb.Outcome_OUTCOME_UNSPECIFIED)
 }
 
 func TestGuestOp_Deadlines(t *testing.T) {
@@ -727,7 +709,7 @@ func TestGuestOp_WorkerFailures(t *testing.T) {
 		{
 			name:   "suspend without a suspend outcome",
 			intent: statemachine.OpTypeSuspend,
-			res:    statemachine.GuestResult{Outcome: pb.Outcome_OUTCOME_RESUMED},
+			res:    statemachine.GuestResult{Outcome: pb.Outcome_OUTCOME_KILLED},
 			want:   pb.ErrorReason_BACKEND_ERROR,
 		},
 	}

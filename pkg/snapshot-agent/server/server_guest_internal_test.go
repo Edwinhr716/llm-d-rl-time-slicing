@@ -77,20 +77,4 @@ func TestServer_GuestOperationFields(t *testing.T) {
 			t.Errorf("unexpected response: %v", resp)
 		}
 	})
-
-	t.Run("state options reach the state manager", func(t *testing.T) {
-		srv := NewServer(nil, backends.BackendNoop, "standalone", backends.NewChannelRegistry(), nil,
-			sm.WithReportResumedOutcome(false))
-		srv.state.RegisterJob(jobID, "group-1")
-		if err := srv.state.TransitionToRunning(jobID, []int{1}); err != nil {
-			t.Fatal(err)
-		}
-		opID, err := srv.state.StartGuestOp(jobID, sm.OpTypeResume, 1, time.Now().Add(time.Minute), suspended)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp := waitGuestOp(t, srv, opID); resp.GetOutcome() != pb.Outcome_OUTCOME_UNSPECIFIED {
-			t.Errorf("expected no outcome with the flag off, got %s", resp.GetOutcome())
-		}
-	})
 }

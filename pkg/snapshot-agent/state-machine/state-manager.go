@@ -113,32 +113,17 @@ type StateManager struct {
 
 	// now is the clock; replaced in tests.
 	now func() time.Time
-	// reportResumed selects the outcome of a successful Resume:
-	// OUTCOME_RESUMED when true, OUTCOME_UNSPECIFIED when false.
-	reportResumed bool
 }
 
 // Option configures a StateManager.
 type Option func(*StateManager)
 
-// WithReportResumedOutcome selects whether a successful Resume completes
-// with OUTCOME_RESUMED (true, the default) or with no outcome (false).
-//
-// PENDING LEAD DECISION ("drop RESUMED" scope): the default keeps
-// OUTCOME_RESUMED; false is the wider "drop RESUMED" reading.
-func WithReportResumedOutcome(report bool) Option {
-	return func(sm *StateManager) {
-		sm.reportResumed = report
-	}
-}
-
 // NewStateManager creates a new StateManager instance.
 func NewStateManager(opts ...Option) *StateManager {
 	sm := &StateManager{
-		jobs:          make(map[string]*Job),
-		operations:    make(map[string]*Operation),
-		now:           time.Now,
-		reportResumed: true,
+		jobs:       make(map[string]*Job),
+		operations: make(map[string]*Operation),
+		now:        time.Now,
 	}
 	for _, opt := range opts {
 		opt(sm)
