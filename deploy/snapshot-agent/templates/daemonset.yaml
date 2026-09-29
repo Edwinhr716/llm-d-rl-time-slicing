@@ -77,6 +77,10 @@ spec:
             - name: nvidia-devices
               mountPath: {{ .Values.nvidia.devices.mountPath }}
             {{- end }}
+            {{- if .Values.cgroup.enabled }}
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+            {{- end }}
       volumes:
         {{- if .Values.nvidia.driver.enabled }}
         - name: nvidia-driver
@@ -88,6 +92,12 @@ spec:
         - name: nvidia-devices
           hostPath:
             path: {{ .Values.nvidia.devices.hostPath }}
+            type: Directory
+        {{- end }}
+        {{- if .Values.cgroup.enabled }}
+        - name: cgroup
+          hostPath:
+            path: {{ .Values.cgroup.hostPath }}
             type: Directory
         {{- end }}
       {{- with .Values.nodeSelector }}

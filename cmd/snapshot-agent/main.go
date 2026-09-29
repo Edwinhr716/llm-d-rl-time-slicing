@@ -188,6 +188,9 @@ func main() {
 		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed)
 	err = server.StartServer(
 		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
+		server.KillConfig{Scrub: server.ScrubConfig{
+			Policy: scrubCfg.policy, Mode: scrubCfg.mode, Allowlist: scrubCfg.allowlist,
+		}},
 		statemachine.WithReportResumedOutcome(*reportResumed))
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)

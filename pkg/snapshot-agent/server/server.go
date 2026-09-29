@@ -30,6 +30,7 @@ type Server struct {
 	deploymentMode  string
 	channelRegistry *backends.ChannelRegistry
 	featureGates    features.Gates
+	killer          *killer
 }
 
 // NewServer creates a new Server instance. channelRegistry is shared with
@@ -53,6 +54,7 @@ func NewServer(
 		deploymentMode:  deploymentMode,
 		channelRegistry: channelRegistry,
 		featureGates:    featureGates,
+		killer:          newKiller(),
 	}
 }
 
@@ -548,8 +550,8 @@ func (h *HealthServer) Watch(req *grpc_health_v1.HealthCheckRequest, stream grpc
 }
 
 // StartServer starts the gRPC server on the specified port. featureGates
-// may be nil, which leaves every gate at its default. stateOpts configure
-// the StateManager.
+// may be nil, which leaves every gate at its default. killCfg configures
+// the Kill pipeline. stateOpts configure the StateManager.
 func StartServer(
 	ctx context.Context,
 	port int,
@@ -558,6 +560,7 @@ func StartServer(
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
 	featureGates features.Gates,
+	killCfg KillConfig,
 	stateOpts ...sm.Option,
 ) error {
 	lc := net.ListenConfig{}
@@ -583,6 +586,9 @@ func StartServer(
 	// SuspendAll and ResumeAll find their targets in the watcher's
 	// node-scoped pod cache. Set before the server serves any call.
 	sm.WithTargetLister(watcher.LabelledJobs)(srv.state)
+	// Kill finds the job's pods in the watcher's cache.
+	srv.killer.pods = watcher
+	srv.killer.configure(killCfg)
 	watcher.Start(ctx)
 
 	s := grpc.NewServer()
