@@ -45,7 +45,8 @@ type hostCommandWiring struct {
 	readyOnce sync.Once
 }
 
-func newHostCommandWiring(opts *options) (*hostCommandWiring, error) {
+// faults, when not nil, plays armed /debug/fault faults on the freezer=agent client.
+func newHostCommandWiring(opts *options, faults *hostcmd.FaultInjector) (*hostCommandWiring, error) {
 	wiring := &hostCommandWiring{o: opts, readyCh: make(chan struct{})}
 	if opts.hostCommandPort == 0 {
 		return wiring, nil
@@ -61,11 +62,15 @@ func newHostCommandWiring(opts *options) (*hostCommandWiring, error) {
 	switch opts.freezer {
 	case freezerDelete, freezerFake:
 	case freezerAgent:
-		addr := opts.agentAddr
+		addr := opts.hcAgentAddr
 		if addr == "" {
-			addr = net.JoinHostPort(opts.hostIP, strconv.Itoa(opts.agentPort))
+			addr = net.JoinHostPort(opts.hostIP, strconv.Itoa(opts.hcAgentPort))
 		}
-		if wiring.agent, err = hostcmd.DialAgent(addr); err != nil {
+		var dialOpts []grpc.DialOption
+		if faults != nil {
+			dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(faults.Interceptor()))
+		}
+		if wiring.agent, err = hostcmd.DialAgent(addr, dialOpts...); err != nil {
 			return nil, err
 		}
 	default:

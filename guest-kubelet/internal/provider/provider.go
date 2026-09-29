@@ -29,6 +29,12 @@ type Backend interface {
 	SetStatusCallback(func(*corev1.Pod))
 }
 
+// Gate decides whether a guest may get a mirror. The era (D-NS-13) closes it at era end: a
+// refused guest gets no mirror, and the gate is responsible for its status.
+type Gate interface {
+	Admit(ctx context.Context, pod *corev1.Pod) bool
+}
+
 // CreateOwner takes over mirror creation. In host-command mode mirrors may be created only
 // while the orchestrator has lent the node (after a Resume, before the next Vacate), so the host
 // command server creates them and CreatePod only tells it that a guest is waiting.
@@ -43,6 +49,7 @@ type Provider struct {
 	admission *Admission
 	hook      func(*corev1.Pod)
 	creator   CreateOwner // nil: CreatePod creates the mirror itself (M1)
+	gate      Gate        // nil: every guest is admitted (D-NS-13 era gate)
 	// logged holds "<uid>/<message>" for the once-per-pod guest verdict lines.
 	logged sync.Map
 
@@ -74,6 +81,12 @@ func (p *Provider) WithAdmission(a *Admission) *Provider {
 		a.Rejected = NewRejectedSet()
 	}
 	p.admission = a
+	return p
+}
+
+// WithGate sets the admission gate (nil: every guest is admitted) and returns p.
+func (p *Provider) WithGate(g Gate) *Provider {
+	p.gate = g
 	return p
 }
 
@@ -146,6 +159,10 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if p.creator != nil {
 		log.G(ctx).WithField("pod", key(pod)).Debug("guest waits for the host command server to create its mirror")
 		p.creator.GuestWaiting(pod)
+		return nil
+	}
+	if p.gate != nil && !p.gate.Admit(ctx, pod) {
+		log.G(ctx).WithField("pod", key(pod)).Info("guest refused: the era has ended")
 		return nil
 	}
 	return p.backend.Create(ctx, pod)

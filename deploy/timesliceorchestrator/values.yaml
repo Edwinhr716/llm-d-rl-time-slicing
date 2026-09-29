@@ -1,5 +1,43 @@
 replicaCount: 1
 
+# Namespace for the Deployment, Service, ServiceAccount and bindings. Keep the
+# default unless you run a second, independent orchestrator install.
+namespace: timeslice-system
+
+# Recreate stops the old pod before the new one starts, so two orchestrator
+# replicas never run at once and never both act on the lock ConfigMap during
+# an upgrade. A RollingUpdate would briefly run two.
+strategy:
+  type: Recreate
+
+# Where group lock holders are persisted. Each orchestrator install in a
+# cluster needs its own ConfigMap; two installs sharing one fight over the same
+# groups. namespace "" = the chart namespace above. configMap "" = the
+# orchestrator's default name (timeslice-orchestrator-locks). The chart grants
+# ConfigMap access in the lock namespace.
+lock:
+  namespace: ""
+  configMap: ""
+
+# What this orchestrator watches. Defaults watch everything, as before.
+#   watchNamespaces: pods are watched only in these namespaces; pods elsewhere
+#     join no group. [] = all namespaces.
+#   nodeSelector: label selector (kubectl syntax, e.g. "pool=demo") limiting the
+#     nodes this orchestrator sees; nodes outside it contribute to no group and
+#     pods bound to them are ignored. Group membership still comes from the
+#     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
+#     with the pod-scheduling nodeSelector further down.
+#     The selector must select every real host that carries the group label;
+#     mirrors are bound there. See examples/ for the two label layouts.
+#   nodeSelectorExemptBackground: keep pods labelled timeslice.io/role=background
+#     in their group even when they are bound to a node outside nodeSelector.
+#     Only pods are exempt: such a node still contributes to no group. false =
+#     they are dropped like any other pod. No effect without nodeSelector.
+scope:
+  watchNamespaces: []
+  nodeSelector: ""
+  nodeSelectorExemptBackground: false
+
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator
   pullPolicy: Always
@@ -64,6 +102,47 @@ dispatchBudget:
   openDelay: "0s"
   externalRisingEdge: false
 
+# Alert threshold on a guest's off-window, the time it stays suspended while
+# the RL job runs (flag --max-serving-offwindow). Past it the orchestrator logs
+# a warning and counts timeslice_guest_offwindow_exceeded_total; it never cuts
+# the RL job short. Requests held on a frozen guest start failing once the
+# off-window passes the request timeout of whatever holds them. "" = the
+# orchestrator default (4m); "0s" turns the alert off.
+maxServingOffwindow: ""
+
+# Extra orchestrator flags, passed as is after the ones above, e.g.
+#   extraArgs: ["--background-role=true", "--min-bubble=30s"]
+extraArgs: []
+
+# Prometheus scraping and alerting through Google Cloud Managed Service for
+# Prometheus (monitoring.googleapis.com/v1 CRDs). Both are off by default.
+#   podMonitoring: a PodMonitoring that scrapes the metrics port.
+#   rules: a Rules object with the TimesliceGuestOffwindowExceeded alert, which
+#     fires while a guest's off-window is over --max-serving-offwindow
+#     (timeslice_max_serving_offwindow_seconds), and
+#     TimesliceAgentUnreachable, which fires while a grant waits on an
+#     unreachable snapshot agent.
+monitoring:
+  podMonitoring:
+    enabled: false
+    interval: 15s
+  rules:
+    enabled: false
+    agentUnreachableFor: 1m
+# What happens when a guest's Kill is not confirmed by T + K (PENDING LEAD
+# DECISION D-NS-6).
+#   action: grant (default, previous behaviour) grants the foreground with
+#     vram_unconfirmed = true; block never grants until the Kill is confirmed
+#     or the guest is otherwise vacated, retrying the Kill and alerting;
+#     escalate blocks and escalates.
+#   escalateAfter: "<E1>,<E2>" after T + K, used only by escalate: at E1 the
+#     guest's mirror pod is deleted gracefully (never grace period 0), at E2
+#     the node is marked not lendable (Warning event on the Node,
+#     timeslice_node_failed). The chart grants pod delete only for escalate.
+unconfirmedKill:
+  action: grant
+  escalateAfter: "10s,40s"
+
 resources: {}
   # limits:
   #   cpu: 100m
@@ -72,6 +151,7 @@ resources: {}
   #   cpu: 100m
   #   memory: 128Mi
 
+# Scheduling of the orchestrator pod itself.
 nodeSelector: {}
 tolerations: []
 affinity: {}

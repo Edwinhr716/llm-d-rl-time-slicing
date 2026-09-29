@@ -29,7 +29,7 @@ func evalGuestNodeController(
 		GuestNodeLabel: guestNodeLabel,
 	})
 	leases := cs.CoordinationV1().Leases(corev1.NamespaceNodeLease)
-	nc, err := node.NewNodeController(NodeProvider{}, &spec, cs.CoreV1().Nodes(),
+	nc, err := node.NewNodeController(NewNodeProvider(&spec), &spec, cs.CoreV1().Nodes(),
 		node.WithNodeEnableLeaseV1WithRenewInterval(leases, node.DefaultLeaseDuration, time.Second),
 		node.WithNodeStatusUpdateInterval(time.Second),
 		node.WithNodePingInterval(time.Second),

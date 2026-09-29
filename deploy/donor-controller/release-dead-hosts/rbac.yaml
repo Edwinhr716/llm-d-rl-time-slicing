@@ -1,0 +1,27 @@
+# Extra RBAC for --release-dead-hosts (H11): delete a virtual Node whose host Node is gone or
+# was recreated. Removing the finalizer uses the base nodes/patch. Placeholder: __NS__.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: __NS__-donor-controller-release
+  labels:
+    app.kubernetes.io/name: donor-controller
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: __NS__-donor-controller-release
+  labels:
+    app.kubernetes.io/name: donor-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: __NS__-donor-controller-release
+subjects:
+  - kind: ServiceAccount
+    name: donor-controller
+    namespace: __NS__

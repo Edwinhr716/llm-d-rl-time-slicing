@@ -13,7 +13,11 @@ Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*
 ## Deployment with Helm
 
 > [!IMPORTANT]
-> The TimeSlice Orchestrator is hardcoded to manage its locks (stored as a ConfigMap) in the `timeslice-system` namespace. Consequently, the Helm chart creates namespace-scoped RBAC resources (`Role` and `RoleBinding`) specifically in the `timeslice-system` namespace.
+> By default the orchestrator keeps its locks (a ConfigMap named
+> `timeslice-orchestrator-locks`) in the `timeslice-system` namespace, and the
+> Helm chart creates the namespace-scoped RBAC resources (`Role` and
+> `RoleBinding`) there. See
+> [Scoping and second installs](#scoping-and-second-installs) to change this.
 >
 > It is highly recommended to deploy the orchestrator itself into the `timeslice-system` namespace.
 
@@ -93,4 +97,133 @@ And then run:
 helm upgrade --install timesliceorchestrator ./timesliceorchestrator \
   --namespace timeslice-system \
   --create-namespace
+```
+
+## Scoping and second installs
+
+By default the orchestrator watches pods in every namespace and every node,
+and keeps its locks in `timeslice-system/timeslice-orchestrator-locks`. These
+chart values (and the flags they set) narrow that down:
+
+* `namespace` (default `timeslice-system`): namespace for the Deployment,
+  Service, ServiceAccount and bindings.
+* `lock.namespace`, flag `--lock-namespace` (default `""`, the chart
+  namespace): namespace of the lock ConfigMap. The chart's `Role` is created
+  there.
+* `lock.configMap`, flag `--lock-configmap` (default `""`, which means
+  `timeslice-orchestrator-locks`): name of the lock ConfigMap.
+* `scope.watchNamespaces`, flag `--watch-namespaces` (default `[]`, all
+  namespaces): pods are watched only in these namespaces, one informer each.
+  Pods elsewhere join no group.
+* `scope.nodeSelector`, flag `--node-selector` (default `""`, all nodes):
+  label selector limiting the nodes the orchestrator sees. Nodes outside it
+  contribute to no group, and pods bound to them are ignored. Group
+  membership still comes from the `group.timeslice.io/<group>` node label.
+  See [Choosing a node selector](#choosing-a-node-selector).
+* `scope.nodeSelectorExemptBackground`, flag
+  `--node-selector-exempt-background` (default `false`): keep pods labelled
+  `timeslice.io/role=background` in their group even when they are bound to a
+  node outside the node selector. Only pods are exempt: such a node still
+  contributes to no group, so the orchestrator never commands it. No effect
+  without a node selector.
+* `strategy` (default `type: Recreate`): the old pod stops before the new one
+  starts, so two replicas never act on the lock ConfigMap at once.
+
+Flags are only passed when they differ from the defaults, so an image without
+them keeps working with the default values.
+
+Two orchestrators in one cluster must use different lock ConfigMaps and
+should watch disjoint namespaces and nodes. For example, a second install
+that manages only the `rl-demo` namespace and the nodes labelled
+`timeslice.io/pool=demo`:
+
+```bash
+helm upgrade --install demo-orchestrator ./timesliceorchestrator \
+  --namespace rl-demo-system --create-namespace \
+  --set namespace=rl-demo-system \
+  --set lock.configMap=demo-orchestrator-locks \
+  --set 'scope.watchNamespaces={rl-demo}' \
+  --set scope.nodeSelector=timeslice.io/pool=demo
+```
+
+The chart still grants read access to pods and nodes cluster-wide through a
+`ClusterRole`.
+
+## Guest metrics, off-window alert and dashboard
+
+With the background protocol on, the orchestrator exports the guest
+time-slicing metrics on the metrics port (8080, `/metrics`):
+
+* `timeslice_notice_seconds{group_id}` (histogram): notice start until every
+  guest of the group is vacated.
+* `timeslice_guest_kills_total{reason,node}` (counter): guests killed through
+  their snapshot agent, once per guest per notice. `reason` is `deadline`
+  (not clear at T), `faulted` (agent reported FAULTED) or `disconnected`
+  (host unseen for the background liveness).
+* `timeslice_kill_unconfirmed_total` (counter): kills the agent did not
+  confirm within the kill budget.
+* `timeslice_agent_unreachable{node}` (gauge): 1 while a grant is blocked on
+  the node's unreachable snapshot agent, 0 once it answers.
+* `timeslice_foreground_wait_seconds{group_id}` (histogram): wait of each
+  granted foreground Acquire, notice included.
+* `timeslice_guest_offwindow_seconds{group_id,job_id,node}` (gauge): how long
+  the guest has been suspended, from its agent's state. The series goes when
+  the guest runs again or is gone.
+* `timeslice_max_serving_offwindow_seconds` (gauge): `--max-serving-offwindow`
+  in seconds, 0 when the alert is off.
+* `timeslice_guest_offwindow_exceeded_total{group_id}` (counter): off-windows
+  that passed `--max-serving-offwindow`.
+* `timeslice_background_participants{node}` (gauge): 1 while the node's host
+  command endpoint answers, 0 while its commands fail.
+* `timeslice_host_vacate_seconds{node,how}` (histogram): Vacate sent to a host
+  until the host is clear. `how` is `ack`, `kill`, `unconfirmed-kill` or
+  `no-live-guest`.
+* `timeslice_host_resume_seconds{node}` (histogram): Resume sent to a host
+  until it acked.
+
+
+The host metrics need `--host-command-port`.
+
+`--max-serving-offwindow` (value `maxServingOffwindow`, default 4m) is an
+alert threshold, not a limit: past it the orchestrator logs
+`Guest off-window over the limit` once per off-window and counts
+`timeslice_guest_offwindow_exceeded_total`. The RL job is never cut short.
+Read it next to the dispatcher's own exceeded-deadline counter.
+
+On GKE with Managed Service for Prometheus, `monitoring.podMonitoring.enabled`
+scrapes the orchestrator and `monitoring.rules.enabled` adds the
+`TimesliceGuestOffwindowExceeded` and `TimesliceAgentUnreachable` alerts. A
+Cloud Monitoring dashboard over these metrics is in
+`dashboards/timeslice-guest.json`:
+
+```bash
+cd deploy/timesliceorchestrator
+gcloud monitoring dashboards create --project=<project> \
+  --config-from-file=dashboards/timeslice-guest.json
+```
+
+### Choosing a node selector
+
+The selector must select every real host that carries the group label;
+mirrors are bound there. The virtual kubelet runs each guest as a mirror pod
+on the real host, and the mirror pod is how the orchestrator counts the guest,
+so a host outside the selector hides its guests and never joins the group.
+The virtual node itself carries no group label and need not be selected.
+
+A label selector cannot match a key prefix, so pick one of the layouts in
+[`examples/`](examples/):
+
+* [`node-selector-prefix.yaml`](examples/node-selector-prefix.yaml): hosts
+  carry `group.timeslice.io/<group>=true`. The selector names one group, so
+  use one orchestrator install per group.
+* [`node-selector-ns.yaml`](examples/node-selector-ns.yaml): every donor host
+  carries `timeslice.io/donor=true`, so one selector covers every group.
+
+For example, for group `my-group` with the first layout:
+
+```bash
+helm upgrade --install my-group-orchestrator ./timesliceorchestrator \
+  -f ./timesliceorchestrator/examples/node-selector-prefix.yaml \
+  --set lock.configMap=my-group-orchestrator-locks \
+  --set 'scope.nodeSelector=group.timeslice.io/my-group=true'
 ```

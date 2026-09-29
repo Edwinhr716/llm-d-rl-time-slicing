@@ -69,6 +69,8 @@ class TimeSliceOrchestratorServiceServicer:
         If the group is idle and the job's context is already RUNNING on the accelerator,
         it returns immediately. Otherwise, it queues the job and waits for the current
         locking_job to yield, then drives the snapshot/restore cycle.
+        With ROLE_BACKGROUND it never queues: it blocks until the node is lent to
+        the background participant and no notice is running.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

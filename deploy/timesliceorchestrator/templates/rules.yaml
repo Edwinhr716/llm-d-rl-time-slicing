@@ -1,0 +1,41 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+# {{- if .Values.monitoring.rules.enabled }}
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: '{{ include "timesliceorchestrator.fullname" . }}'
+  namespace: '{{ include "timesliceorchestrator.namespace" . }}'
+  labels:
+    app.kubernetes.io/name: '{{ include "timesliceorchestrator.name" . }}'
+    app.kubernetes.io/instance: '{{ .Release.Name }}'
+spec:
+  groups:
+    - name: timeslice-guest
+      interval: 30s
+      rules:
+        # A guest has been suspended longer than --max-serving-offwindow.
+        # Requests held on it may fail with a deadline error; pair it with the
+        # dispatcher's exceeded-deadline counter. The RL job is not cut short.
+        - alert: TimesliceGuestOffwindowExceeded
+          expr: >-
+            max by (group_id, job_id, node) (timeslice_guest_offwindow_seconds)
+            > on () group_left ()
+            max (timeslice_max_serving_offwindow_seconds > 0)
+          labels:
+            severity: warning
+          annotations:
+            summary: >-
+              Guest {{`{{ $labels.job_id }}`}} on {{`{{ $labels.node }}`}} has been
+              suspended for {{`{{ $value | humanizeDuration }}`}}, over --max-serving-offwindow.
+        # A grant is blocked because the node's snapshot agent cannot be
+        # reached (fail closed: the RL job waits).
+        - alert: TimesliceAgentUnreachable
+          expr: max by (node) (timeslice_agent_unreachable) == 1
+          for: '{{ .Values.monitoring.rules.agentUnreachableFor }}'
+          labels:
+            severity: critical
+          annotations:
+            summary: >-
+              Snapshot agent on {{`{{ $labels.node }}`}} is unreachable while a grant waits on it.
+# {{- end }}

@@ -1,0 +1,13 @@
+# Scope an orchestrator install to the hosts of one group, with hosts labelled
+# group.timeslice.io/<group>=true.
+#
+# The selector must select every real host that carries the group label;
+# mirrors are bound there.
+#
+# A label selector cannot match a key prefix, so this names one group: use one
+# install per group. Replace <group> with the group ID, and give each install
+# its own lock ConfigMap.
+lock:
+  configMap: <group>-orchestrator-locks
+scope:
+  nodeSelector: group.timeslice.io/<group>=true

@@ -3,20 +3,32 @@ PROJECT ?= YOUR_PROJECT
 REGION  ?= YOUR_REGION
 TAG     ?= $(shell git rev-parse --short HEAD)
 IMAGE   := $(REGION)-docker.pkg.dev/$(PROJECT)/guest-kubelet/guest-kubelet:$(TAG)
+PLUGIN_IMAGE ?= $(subst /guest-kubelet:,/gpu-shadow-plugin:,$(IMAGE))
 CONTEXT ?= YOUR_KUBE_CONTEXT
 KUBECTL := kubectl --context $(CONTEXT)
 HOST    ?= YOUR_GPU_NODE
 VNODE   ?= vk-$(lastword $(subst -, ,$(HOST)))
-SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|'
+SUBST   := sed -e 's|__IMAGE__|$(IMAGE)|' -e 's|__HOST__|$(HOST)|' -e 's|__VNODE__|$(VNODE)|' \
+	-e 's|__PLUGIN_IMAGE__|$(PLUGIN_IMAGE)|'
 
-.PHONY: build deploy test-guest gpu-guest m2-deploy q5-force q5-toggle status undeploy
+.PHONY: build build-gpu-shadow deploy deploy-ds deploy-deviceplugin test-guest gpu-guest m2-deploy q5-force q5-toggle status undeploy
 
 build: ## vet, test, build and push the image remotely
 	gcloud builds submit --project=$(PROJECT) --config cloudbuild.yaml --substitutions=_TAG=$(TAG) .
 
+build-gpu-shadow: ## the GPU shadow device plugin image, for --gpu-mode=deviceplugin
+	gcloud builds submit --project=$(PROJECT) --config cloudbuild-gpu-shadow.yaml \
+		--substitutions=_REGISTRY=$(patsubst %/,%,$(dir $(PLUGIN_IMAGE))),_TAG=$(TAG) .
+
 deploy: ## namespace, RBAC, Deployment (image tag = TAG)
 	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
 	$(SUBST) deploy/deployment.yaml | $(KUBECTL) apply -f -
+
+deploy-ds: ## D-NS-11 ns-ds: namespace, RBAC, DaemonSet on nodes labelled timeslice.io/donor=true
+	$(KUBECTL) apply -f deploy/namespace.yaml -f deploy/rbac.yaml
+	$(SUBST) deploy/daemonset.yaml | $(KUBECTL) apply -f -
+deploy-deviceplugin: ## --gpu-mode=deviceplugin: shadow plugin and admission policy (the Deployment still needs the flag)
+	$(SUBST) deploy/opt-deviceplugin/*.yaml | $(KUBECTL) apply -f -
 
 test-guest: ## step one: CPU-only guest and a Service selecting it
 	$(SUBST) deploy/test-guest.yaml | $(KUBECTL) apply -f -
@@ -50,3 +62,5 @@ undeploy: ## namespace first (guests, then mirrors via ownerRef), then cluster-s
 	-$(KUBECTL) -n kube-node-lease delete role,rolebinding guest-kubelet-proto
 	-$(KUBECTL) delete clusterrole q5-epp-auth-reviewer
 	-$(KUBECTL) delete clusterrolebinding q5-epp-auth-reviewer-binding
+	-$(SUBST) deploy/opt-deviceplugin/*.yaml | $(KUBECTL) delete --ignore-not-found -f -
+	-$(KUBECTL) taint node $(HOST) timeslice.io/gpu-fence-

@@ -139,17 +139,21 @@ type Reconciled struct {
 }
 
 // ReconcileSuspend makes each mirror's recorded suspend state agree with the freezer after a
-// restart (M5, M3 path): the host wins. A frozen mirror is Suspended whatever was recorded (a
+// restart (M5, per-guest agent path): the host wins. A frozen mirror is Suspended whatever was recorded (a
 // crash between the freeze and the write left Suspending; a crash before the thaw left
 // Resuming). A running mirror recorded Suspending or Resuming was never frozen or already thawed:
 // its state is cleared and its Ready follows the readiness probe again. A running mirror
-// recorded Suspended (thawed behind our back) is cleared too. Mirrors without a cgroup (not
-// started, or gone) are left alone. Call it after Start, before the pod controller runs, and
+// recorded Suspended (thawed behind our back) is cleared too. Mirrors whose job the agent does not
+// list (not started, or gone) are left alone. Call it after Start, before the pod controller runs, and
 // only when this process owns suspend (not in host-command mode, whose freezer is elsewhere).
 func (b *Backend) ReconcileSuspend(ctx context.Context) ([]Reconciled, error) {
-	fz := b.opts.Suspend.Freezer
-	if fz == nil {
+	ag := b.opts.Suspend.Agent
+	if ag == nil {
 		return nil, nil
+	}
+	jobs, err := ag.Jobs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("agent jobs: %w", err)
 	}
 	ms, err := b.mirrors.List(labels.Everything())
 	if err != nil {
@@ -162,13 +166,11 @@ func (b *Backend) ReconcileSuspend(ctx context.Context) ([]Reconciled, error) {
 			continue
 		}
 		recorded, _ := SuspendState(mp)
-		frozen, ferr := fz.Frozen(mp)
-		if ferr != nil {
-			if !errors.Is(ferr, freeze.ErrNoCgroup) {
-				errs = append(errs, fmt.Errorf("mirror %s/%s: %w", mp.Namespace, mp.Name, ferr))
-			}
-			continue
+		job, ok := jobs[mp.Labels[LabelJobID]]
+		if !ok {
+			continue // the agent does not know the job (not started, or gone)
 		}
+		frozen := job.State == freeze.JobSuspended
 		want := ""
 		if frozen {
 			want = StateSuspended
@@ -187,14 +189,6 @@ func (b *Backend) ReconcileSuspend(ctx context.Context) ([]Reconciled, error) {
 	}
 	return out, errors.Join(errs...)
 }
-
-// Kill sequence annotations (M4, Q6). The kill sequence writes AnnotationKilling (its cause)
-// before the agent's Kill and AnnotationKilled (the message) before it deletes the mirror.
-// Relist reads them to finish a kill sequence a restart interrupted (FinishKills).
-const (
-	AnnotationKilling = "timeslice.io/killing"
-	AnnotationKilled  = "timeslice.io/killed"
-)
 
 // KillFunc asks the snapshot agent to kill one job, bounded by ctx.
 type KillFunc func(ctx context.Context, jobID, reason string) error

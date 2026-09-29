@@ -8,6 +8,7 @@ substitutions:
   _TAG: dev
   _ALLOW_TIDY: "false"
   _ALLOW_REGEN: "false"
+queueTtl: 14400s
 options:
   logging: GCS_ONLY
   machineType: E2_HIGHCPU_8

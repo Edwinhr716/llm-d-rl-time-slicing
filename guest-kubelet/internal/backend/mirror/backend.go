@@ -12,12 +12,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
@@ -51,6 +53,23 @@ type Options struct {
 	Prober Prober
 	// Suspend configures suspend and resume (M3). Its zero value disables them.
 	Suspend SuspendOptions
+	// ClaimMode is where a GPU mirror's claim comes from (D-NS-18 M3, donorclaim.go). The
+	// zero value is ClaimModeStatic: Config.GPUClaim, today's behaviour.
+	ClaimMode ClaimMode
+	// DonorSelector selects the donor pods in ClaimModeDonor. Nil means DefaultDonorSelector.
+	DonorSelector labels.Selector
+
+	// GPUMode is how guests' nvidia.com/gpu is attached (--gpu-mode). Empty means claim.
+	// The fields below are for GPUModeDevicePlugin only.
+	GPUMode GPUMode
+	// GPUDonorSelector selects donor pods on the host (label selector, --gpu-donor-selector).
+	GPUDonorSelector string
+	// Holders reads which pod holds which GPU on the host (the shadow plugin).
+	Holders HoldersSource
+	// Recorder records GPUUnavailable and DonorGone on guests. Optional.
+	Recorder record.EventRecorder
+	// FenceInterval is how often the fence is re-checked besides donor and mirror events.
+	FenceInterval time.Duration
 }
 
 // Prober is the readiness prober the backend drives (internal/probe implements it).
@@ -76,11 +95,55 @@ type Backend struct {
 	mirrors corev1listers.PodLister
 	synced  cache.InformerSynced
 
+	// deviceplugin mode only: donor pods on the host, and the fence (fence.go).
+	donorFactory informers.SharedInformerFactory
+	donors       corev1listers.PodLister
+	donorsSynced cache.InformerSynced
+	fenceKick    chan struct{}
+	// attachMu serializes GPU choice and mirror create, so two guests never pick one GPU.
+	// assigned covers the gap until the mirror informer has a just-created mirror.
+	attachMu sync.Mutex
+	assigned map[corev1.ResourceName]assignment
+
 	mu          sync.Mutex
 	onStatus    func(*corev1.Pod) // the library's notify callback, wrapped by the provider
 	orphanSince map[types.UID]time.Time
 	gate        gateState  // host-command mode only; guarded by mu
-	locks       guestLocks // one suspend or resume per guest at a time
+	locks       guestLocks // one suspend, resume or agent call per guest at a time
+	// resumeMu resumes one guest at a time (Q6); hostMu runs one host-level call at a time.
+	resumeMu, hostMu sync.Mutex
+	// Guarded by mu: kill messages of guests whose mirror the kill sequence is removing, the
+	// mirrors created per guest (the job id attempt, M4 mode), the last host epoch and the agent Status.
+	killed    map[types.UID]string
+	killing   map[types.UID]string // causes of kill sequences that have not recorded the kill yet
+	attempts  map[types.UID]int
+	hostEpoch int64
+	agent     agentView
+
+	deletedReason func() string // overrides ReasonMirrorDeleted when it returns non-empty
+	fenceKnown    bool          // fenceState is what the node's fence taint was last seen or written as
+	fenceState    bool
+}
+
+// SetDeletedReason installs fn, asked for the guest's status reason when its mirror is deleted
+// by someone other than the guest's own deletion. An empty answer keeps ReasonMirrorDeleted.
+// The era (D-NS-13) answers EraEnded while it expires guests.
+func (b *Backend) SetDeletedReason(fn func() string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deletedReason = fn
+}
+
+func (b *Backend) mirrorDeletedReason() string {
+	b.mu.Lock()
+	fn := b.deletedReason
+	b.mu.Unlock()
+	if fn != nil {
+		if r := fn(); r != "" {
+			return r
+		}
+	}
+	return ReasonMirrorDeleted
 }
 
 // New builds the backend. guests must list the pods bound to the virtual node.
@@ -88,6 +151,12 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, options *O
 	opts := *options
 	if opts.Resync == 0 {
 		opts.Resync = 30 * time.Second
+	}
+	if opts.GPUMode == "" {
+		opts.GPUMode = GPUModeClaim
+	}
+	if opts.FenceInterval == 0 {
+		opts.FenceInterval = 2 * time.Second
 	}
 	// Like an LWS controller's Owns() watch, but filtered by label, not ownerRef: mirrors
 	// must still be found when they have no owner (OwnerRef=false, or the guest is gone).
@@ -101,13 +170,44 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, options *O
 		mirrors: inf.Lister(), synced: inf.Informer().HasSynced,
 		orphanSince: map[types.UID]time.Time{},
 		gate:        newGateState(),
+		killed:      map[types.UID]string{},
+		killing:     map[types.UID]string{},
+		attempts:    map[types.UID]int{},
+		assigned:    map[corev1.ResourceName]assignment{},
 	}
 	_, _ = inf.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { b.mirrorChanged(obj) },
 		UpdateFunc: func(_, obj any) { b.mirrorChanged(obj) },
 		DeleteFunc: b.mirrorDeleted,
 	})
+	if opts.GPUMode == GPUModeDevicePlugin {
+		b.watchDonors(inf.Informer())
+	}
 	return b
+}
+
+// watchDonors sets up the deviceplugin-mode donor informer (pods on the host that match the
+// selector, in every namespace) and kicks the fence on every donor or mirror change.
+func (b *Backend) watchDonors(mirrors cache.SharedIndexInformer) {
+	opts := &b.opts
+	df := informers.NewSharedInformerFactoryWithOptions(b.client, opts.Resync,
+		informers.WithTweakListOptions(func(lo *metav1.ListOptions) {
+			lo.LabelSelector = opts.GPUDonorSelector
+			lo.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", opts.HostNode).String()
+		}))
+	dinf := df.Core().V1().Pods()
+	b.donorFactory, b.donors, b.donorsSynced = df, dinf.Lister(), dinf.Informer().HasSynced
+	b.fenceKick = make(chan struct{}, 1)
+	kick := cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { b.pokeFence() },
+		UpdateFunc: func(any, any) { b.pokeFence() },
+		DeleteFunc: func(any) { b.pokeFence() },
+	}
+	for _, informer := range []cache.SharedIndexInformer{dinf.Informer(), mirrors} {
+		if _, err := informer.AddEventHandler(kick); err != nil {
+			log.L.WithError(err).Warn("fence: could not watch pods; the fence runs on its interval only")
+		}
+	}
 }
 
 // Start runs the informer and blocks until it has synced. Call it before the pod controller
@@ -118,7 +218,19 @@ func (b *Backend) Start(ctx context.Context) error {
 	if !cache.WaitForCacheSync(ctx.Done(), b.synced) {
 		return fmt.Errorf("mirror informer did not sync")
 	}
+	if b.donorFactory != nil {
+		// The fence must not run before the donor cache is full: an empty cache would make
+		// every donor look gone and stop every mirror.
+		b.donorFactory.Start(ctx.Done())
+		if !cache.WaitForCacheSync(ctx.Done(), b.donorsSynced) {
+			return fmt.Errorf("donor informer did not sync")
+		}
+		go b.fenceLoop(ctx)
+	}
 	go b.orphanLoop(ctx)
+	if b.opts.Suspend.Agent != nil && b.opts.Suspend.AgentStatusPoll > 0 {
+		go b.agentStatusLoop(ctx)
+	}
 	return nil
 }
 
@@ -162,8 +274,12 @@ func (b *Backend) mirrorChanged(obj any) {
 	b.emit(b.translate(g, m))
 }
 
-// translateProbed is TranslateStatusWith the configured prober, if any.
+// translateProbed is TranslateStatusWith the configured prober, if any. A guest whose mirror the
+// kill sequence removes is Failed from the kill on (M4), in either mode.
 func (b *Backend) translateProbed(guest, m *corev1.Pod) *corev1.Pod {
+	if st := b.killedStatus(guest, m); st != nil {
+		return st // Failed from the kill on, while the mirror still terminates
+	}
 	if b.opts.Prober == nil {
 		return TranslateStatus(guest, m)
 	}
@@ -196,7 +312,12 @@ func (b *Backend) mirrorDeleted(obj any) {
 	b.forgetProbes(mirrorPod)
 	g := b.guestFor(mirrorPod)
 	if g == nil {
+		b.forgetKilled(types.UID(mirrorPod.Labels[LabelMirrorOf]))
 		return
+	}
+	if st := b.killedStatus(g, mirrorPod); st != nil && g.DeletionTimestamp == nil {
+		b.emit(st)
+		return // the kill record stays: the guest must keep showing Failed
 	}
 	// The annotation covers a restart between the delete and this event (M5).
 	if vacated := b.takeVacated(g.UID); vacated || mirrorPod.Annotations[AnnotationVacated] == "true" {
@@ -204,9 +325,10 @@ func (b *Backend) mirrorDeleted(obj any) {
 		return
 	}
 	if g.DeletionTimestamp == nil {
-		b.emit(TerminalStatus(g, mirrorPod, ReasonMirrorDeleted))
+		b.emit(TerminalStatus(g, mirrorPod, b.mirrorDeletedReason()))
 		return
 	}
+	b.forgetKilled(g.UID)
 	b.emit(TerminalStatus(g, mirrorPod, ReasonGuestDeleted))
 	go b.finishGuestDeletion(context.Background(), g)
 }
@@ -292,7 +414,10 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 // Create builds and creates the mirror. It is idempotent: an existing mirror for this guest is
 // fine; an orphaned mirror with the same name and the same containers is adopted.
 func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
-	cfg := b.buildConfig(guest)
+	cfg, err := b.claimConfig(ctx, guest)
+	if err != nil {
+		return err
+	}
 	if b.opts.Group != nil {
 		res := b.opts.Group()
 		g, ok := res.Group()
@@ -305,31 +430,87 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 		}
 		cfg.Group = g
 	}
-	want, err := Build(guest, &cfg)
+	if b.opts.Suspend.Agent != nil {
+		// Q6: admit a guest only while one restore plus the sum of checkpoints fits N - K.
+		if _, exists := b.mirrorOf(guest); !exists {
+			if err := b.admit(guest); err != nil {
+				return err
+			}
+		}
+		if !b.opts.Gated {
+			// M4 without host commands: the job id attempt is counted here (host-command
+			// mode counts it in buildConfig).
+			cfg.Background = true
+			b.mu.Lock()
+			cfg.Attempt = b.attempts[guest.UID]
+			b.mu.Unlock()
+		}
+	}
+	var att *GPUAttachment
+	if b.opts.GPUMode == GPUModeDevicePlugin && RequestsGPU(guest) {
+		// D-NS-10: the donor's own GPU through its shadow resource.
+		b.attachMu.Lock()
+		defer b.attachMu.Unlock()
+		if m, ok := b.mirrorOf(guest); ok {
+			b.emit(b.translate(guest, m)) // already attached (a retry, or a restart)
+			return nil
+		}
+		if att, err = b.attachGPU(ctx, guest); err != nil {
+			return err // fail closed: no mirror; the library retries the create
+		}
+	}
+	want, err := BuildWithGPU(guest, &cfg, att)
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}
 	logger := log.G(ctx).WithField("guest", guest.Namespace+"/"+guest.Name).WithField("mirror", want.Name)
 
-	m, err := b.client.CoreV1().Pods(guest.Namespace).Create(ctx, want, metav1.CreateOptions{})
+	mirrorPod, err := b.client.CoreV1().Pods(guest.Namespace).Create(ctx, want, metav1.CreateOptions{})
 	switch {
 	case err == nil:
-		logger.WithField("mirrorUID", m.UID).Info("mirror created")
+		if cfg.Background && !b.opts.Gated {
+			b.mu.Lock()
+			b.attempts[guest.UID]++ // a mirror created again for this guest gets a new job id
+			b.mu.Unlock()
+		}
+		logger.WithField("mirrorUID", mirrorPod.UID).WithField("job", mirrorPod.Labels[LabelJobID]).Info("mirror created")
+		logResources(logger, ResourceSummary(guest, mirrorPod))
 	case apierrors.IsAlreadyExists(err):
-		if m, err = b.adoptOrReplace(ctx, guest, want); err != nil {
+		if mirrorPod, err = b.adoptOrReplace(ctx, guest, want); err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("create mirror: %w", err)
 	}
+	if att != nil {
+		b.attached(ctx, guest, want, att)
+	}
 
 	if RequestsGPU(guest) && b.opts.ReserveClaim {
-		if err := b.reserveClaim(ctx, guest.Namespace, b.opts.GPUClaim, m); err != nil {
+		if err := b.reserveClaim(ctx, guest.Namespace, cfg.GPUClaim, mirrorPod); err != nil {
 			return err
 		}
 	}
-	b.emit(b.translate(guest, m))
+	b.emit(b.translate(guest, mirrorPod))
 	return nil
+}
+
+// logResources is the "mirror resources" line: what the mirror requests and whether the
+// static-mode cap applied.
+func logResources(logger log.Logger, res *Resources) {
+	logger.WithField("req_cpu", res.ReqCPU.String()).WithField("req_memory", res.ReqMemory.String()).
+		WithField("lim_memory", res.LimMemory.String()).WithField("capped", res.Capped).
+		Info("mirror resources")
+}
+
+// attached logs a GPU attach and remembers it until the mirror informer has the mirror.
+// The caller holds attachMu.
+func (b *Backend) attached(ctx context.Context, guest, mirror *corev1.Pod, att *GPUAttachment) {
+	name := mirror.Namespace + "/" + mirror.Name
+	log.G(ctx).WithField("mirror", name).WithField("mode", string(GPUModeDevicePlugin)).
+		WithField("uuid", att.UUID).WithField("attach", AttachShadowDevicePlugin).
+		WithField("resource", string(att.Resource)).WithField("donor", att.Donor).Info("mirror gpu attached")
+	b.assigned[att.Resource] = assignment{guest: guest.UID, mirror: name, at: time.Now()}
 }
 
 // adoptOrReplace handles a name clash with an existing mirror.
@@ -387,7 +568,7 @@ func (b *Backend) Delete(ctx context.Context, guest *corev1.Pod) error {
 		go b.finishGuestDeletion(context.Background(), guest)
 		return errdefs.NotFoundf("no mirror for guest %s/%s", guest.Namespace, guest.Name)
 	}
-	b.thawBeforeDelete(ctx, mirrorPod)
+	b.killBeforeDelete(ctx, mirrorPod)
 	uid := mirrorPod.UID
 	opts := metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}
 	if guest.DeletionGracePeriodSeconds != nil {
@@ -457,19 +638,4 @@ func (b *Backend) collectOrphans(ctx context.Context, now time.Time) {
 		}
 	}
 	b.mu.Unlock()
-}
-
-// thawBeforeDelete thaws a suspended mirror before it is deleted: a frozen process cannot act
-// on SIGTERM, so it would sit out the whole grace period and then be killed. Best effort.
-func (b *Backend) thawBeforeDelete(ctx context.Context, m *corev1.Pod) {
-	fz := b.opts.Suspend.Freezer
-	state, epoch := SuspendState(m)
-	if fz == nil || state == "" {
-		return
-	}
-	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := fz.Resume(tctx, m, epoch); err != nil {
-		log.G(ctx).WithError(err).WithField("mirror", m.Namespace+"/"+m.Name).Warn("could not thaw the mirror before deleting it")
-	}
 }

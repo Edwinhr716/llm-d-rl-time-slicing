@@ -1,8 +1,6 @@
 package provider
 
 import (
-	"context"
-
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -62,6 +60,7 @@ func HostOwnerRef(name string, uid types.UID) metav1.OwnerReference {
 
 // NewNodeSpec builds the Node object that the library registers once at startup.
 // After that the library only patches nodes/status; it never rewrites spec or labels.
+// Status changes after registration go through NodeProvider (node_status.go).
 func NewNodeSpec(cfg NodeConfig) corev1.Node {
 	capacity := corev1.ResourceList{
 		corev1.ResourceCPU:    cfg.CPU,
@@ -142,13 +141,3 @@ func nodeLabels(name string, guestNodeLabel bool) map[string]string {
 	}
 	return labels
 }
-
-// NodeProvider is the node half of the provider. The library calls Ping every 10s and
-// only writes node status if Ping succeeds. M0 has no backend to check, so it is always healthy.
-type NodeProvider struct{}
-
-// Ping reports the node as healthy while the process is alive.
-func (NodeProvider) Ping(ctx context.Context) error { return ctx.Err() }
-
-// NotifyNodeStatus would push status changes (capacity, cordon) to the library. M0 has none.
-func (NodeProvider) NotifyNodeStatus(context.Context, func(*corev1.Node)) {}

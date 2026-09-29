@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"k8s.io/client-go/util/workqueue"
@@ -46,7 +47,7 @@ func (t *TrackQueue) getAddRateLimitedCount() int {
 type pendingOp struct {
 	node        string
 	job         string
-	opType      string // "snapshot" or "restore"
+	opType      string // "snapshot", "restore" or "kill"
 	targetState agentpb.JobState
 }
 
@@ -164,6 +165,28 @@ func (f *FakeSnapshotAgentStore) Restore(ctx context.Context, nodeName, jobID, g
 	}
 
 	return &agentpb.RestoreResponse{OperationId: opID}, nil
+}
+
+// Kill starts a kill operation. It completes on the next GetOperation, and
+// the job goes IDLE.
+func (f *FakeSnapshotAgentStore) Kill(
+	ctx context.Context, nodeName, jobID, reason string, deadline time.Time,
+) (*agentpb.KillResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.opCounter++
+	opID := fmt.Sprintf("op-kill-%d", f.opCounter)
+	f.pendingOperations[opID] = pendingOp{
+		node:        nodeName,
+		job:         jobID,
+		opType:      "kill",
+		targetState: agentpb.JobState_JOB_STATE_IDLE,
+	}
+	if _, ok := f.jobStates[nodeName]; !ok {
+		f.jobStates[nodeName] = make(map[string]agentpb.JobState)
+	}
+	return &agentpb.KillResponse{OperationId: opID}, nil
 }
 
 func (f *FakeSnapshotAgentStore) GetOperation(

@@ -26,6 +26,9 @@ type AdmissionPolicy struct {
 	// HostGPUModel is the host Node's GPU model, normalized. Empty (no model label) refuses
 	// every GPU guest: fail closed.
 	HostGPUModel string
+	// Probes is the probe rule (lead decision D-VK-5, --guest-probe-policy). Empty means
+	// ProbePolicyA, today's default.
+	Probes ProbePolicy
 }
 
 // Rejection says which rule refused a guest and why, in words for the event.
@@ -68,7 +71,7 @@ func HostGPUModel(n *corev1.Node) string {
 // Admit returns why a guest must be refused, or nil. It is a pure function of the pod and
 // the policy.
 func Admit(pod *corev1.Pod, pol AdmissionPolicy) *Rejection {
-	if r := checkProbesOptionA(pod); r != nil {
+	if r := checkProbes(pod, pol.Probes); r != nil {
 		return r
 	}
 	return checkGPU(pod, pol)

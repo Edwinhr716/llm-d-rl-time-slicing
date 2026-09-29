@@ -1,0 +1,57 @@
+# The donor controller. Placeholders: __IMAGE__, __NS__, __ORCH_ADDR__ (orchestrator host:port)
+# and __ARGS__ (extra flags, space-separated; an unrendered placeholder adds none). Command-line
+# flags win over __ARGS__. One replica: the controller keeps its era state in node annotations
+# and must not run twice at once (Recreate).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: donor-controller
+  namespace: __NS__
+  labels:
+    app.kubernetes.io/name: donor-controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: donor-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: donor-controller
+        timeslice.io/eval-role: donor-standin
+    spec:
+      serviceAccountName: donor-controller
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-accelerator
+                    operator: DoesNotExist
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: donor-controller
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args:
+            - --orchestrator-addr=__ORCH_ADDR__
+          env:
+            - name: DONOR_CONTROLLER_ARGS
+              value: '__ARGS__'
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

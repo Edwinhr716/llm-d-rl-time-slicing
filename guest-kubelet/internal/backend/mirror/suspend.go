@@ -25,7 +25,7 @@ const (
 	// AnnotationSuspendState is Suspending, Suspended or Resuming.
 	AnnotationSuspendState = "timeslice.io/suspend-state"
 	// AnnotationSuspendStateSince is when the current suspend state began (RFC 3339). For
-	// Suspended it is the time the freeze completed.
+	// Suspended it is the time the agent reported the job suspended.
 	AnnotationSuspendStateSince = "timeslice.io/suspend-state-since"
 
 	StateSuspending = "Suspending"
@@ -41,27 +41,39 @@ const (
 	EventResumed       = "Resumed"
 	EventSuspendFailed = "SuspendFailed"
 	EventResumeFailed  = "ResumeFailed"
+	EventKilled        = "Killed"
 )
 
-// SuspendOptions configures suspend and resume. Freezer nil disables both.
+// SuspendOptions configures suspend and resume through the snapshot agent (M4). Agent nil
+// disables both.
 type SuspendOptions struct {
-	// Freezer stops and restarts the mirror's processes: the cgroup freezer in M3, the
-	// snapshot agent in M4.
-	Freezer freeze.Backend
+	// Agent is the node's snapshot agent. The guest kubelet never freezes a process itself.
+	Agent freeze.Agent
 	// NotReadyTimeout bounds the wait for the guest's Ready=False to be visible in the API
-	// before the freeze.
+	// before the agent is called.
 	NotReadyTimeout time.Duration
-	// FreezeTimeout bounds each freeze and thaw.
-	FreezeTimeout time.Duration
-	// ReadyCheck confirms, after the thaw, that the engine serves again; ReadyTimeout bounds it.
+	// NoticeWindow (N) and KillBudget (K) come from the demo config (pending lead decision;
+	// defaults 30 s and 3 s). A suspend or resume the caller gives no deadline gets
+	// now + N - K; the kill sequence gives the agent K to confirm its Kill.
+	NoticeWindow time.Duration
+	KillBudget   time.Duration
+	// CheckpointEstimate and RestoreEstimate are one guest's suspend and resume times on this
+	// GPU. A new mirror is admitted only while one restore plus the checkpoints of every mirror
+	// (the new one included) fit N - K (Q6). Zero turns the check off.
+	CheckpointEstimate time.Duration
+	RestoreEstimate    time.Duration
+	// AgentStatusPoll is how often the agent's Status is read to keep the hold (and the
+	// Suspended state of each guest) in line with the agent. Zero turns it off.
+	AgentStatusPoll time.Duration
+	// ReadyCheck confirms, after the resume, that the engine serves again; ReadyTimeout bounds it.
 	ReadyCheck   ReadyCheck
 	ReadyTimeout time.Duration
-	// Recorder records Suspended/Resumed events on the guest. Optional.
+	// Recorder records Suspended/Resumed/Killed events on the guest. Optional.
 	Recorder record.EventRecorder
 	// OnHoldChange, if set, is called when a guest turns Suspending (before NotReady is
-	// confirmed), when a suspend is rolled back, and when a resume starts: the answer of Hold
-	// may have changed. It must not block (the ns-cordon option of --cordon-while-held pokes
-	// its loop).
+	// confirmed), when a suspend is rolled back, when a resume starts, when a guest is killed
+	// and when the agent's Status changes the hold: the answer of Hold may have changed. It
+	// must not block (the ns-cordon option of --cordon-while-held pokes its loop).
 	OnHoldChange func()
 }
 
@@ -69,24 +81,32 @@ type SuspendOptions struct {
 type Result struct {
 	State string `json:"state"`
 	Epoch int64  `json:"epoch"`
-	// Suspend: time to confirm NotReady, then to freeze. Resume: time to thaw, then to pass
-	// the ready check.
+	// Deadline is the absolute deadline given to the agent.
+	Deadline time.Time `json:"deadline,omitzero"`
+	// NotReady is the time to confirm NotReady (suspend). Agent is the agent call, from the
+	// first send to the end of its operation. ReadyCheck is the engine check (resume).
 	NotReady   time.Duration `json:"notReady,omitempty"`
-	Freeze     time.Duration `json:"freeze,omitempty"`
-	Thaw       time.Duration `json:"thaw,omitempty"`
+	Agent      time.Duration `json:"agent,omitempty"`
 	ReadyCheck time.Duration `json:"readyCheck,omitempty"`
 	Total      time.Duration `json:"total"`
+	// Outcome is the agent's outcome (SUSPENDED, RELEASED, RESUMED).
+	Outcome string `json:"outcome,omitempty"`
 	// Noop is true when the guest was already in the requested state.
 	Noop bool `json:"noop,omitempty"`
+	// Killed is set when the call ended in the kill sequence (or, for a guest with no
+	// accelerator context, a plain delete); the guest is then Failed.
+	Killed string `json:"killed,omitempty"`
 }
 
 // ErrBusy means another suspend or resume of the same guest is running.
 var ErrBusy = errors.New("another suspend or resume of this guest is in flight")
 
-// guestLocks allows one suspend or resume per guest at a time.
+// guestLocks allows one agent call per guest at a time. seq counts the unlocks, so the agent
+// status loop can tell that an operation finished while it read the agent.
 type guestLocks struct {
 	mu    sync.Mutex
 	inUse map[types.UID]bool
+	seq   uint64
 }
 
 func (l *guestLocks) tryLock(uid types.UID) bool {
@@ -106,6 +126,13 @@ func (l *guestLocks) unlock(uid types.UID) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.inUse, uid)
+	l.seq++
+}
+
+func (l *guestLocks) unlocks() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.seq
 }
 
 // SuspendState returns the suspend state and epoch recorded on a mirror. "" means Running.
@@ -119,18 +146,41 @@ func SuspendState(m *corev1.Pod) (string, int64) {
 	return m.Annotations[AnnotationSuspendState], epoch
 }
 
-// Suspend takes a running guest out of service and freezes it. The order is fixed:
-//  1. raise the epoch and record Suspending on the mirror (the guest turns NotReady);
+// deadlineOr is the given agent deadline, or now + N - K.
+func (so *SuspendOptions) deadlineOr(deadline time.Time) time.Time {
+	if !deadline.IsZero() {
+		return deadline
+	}
+	return time.Now().Add(so.NoticeWindow - so.KillBudget)
+}
+
+// waitCtx bounds the wait for an agent operation: its deadline plus the RPC time for the
+// agent's FAILED answer to arrive. Past it the guest kubelet stops waiting (a deadline miss).
+func waitCtx(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	return context.WithDeadline(ctx, deadline.Add(agentAnswerGrace))
+}
+
+// agentAnswerGrace is how long past its deadline the guest kubelet waits for the agent's
+// answer. The agent fails the operation at the deadline itself.
+const agentAnswerGrace = time.Second
+
+// Suspend takes a running guest out of service and has the snapshot agent suspend it (Q6):
+//  1. raise the epoch by compare-and-swap and record Suspending on the mirror (the guest turns
+//     NotReady);
 //  2. wait until the API shows the guest NotReady, so its endpoint is withdrawn;
-//  3. freeze;
-//  4. record Suspended (the guest shows container state Waiting, reason Suspended).
+//  3. read the agent's Status: a job it does not list has no accelerator context yet, so the
+//     mirror is deleted instead (normal grace) and the guest ends Failed;
+//  4. agent Suspend with the epoch and the deadline (zero: now + N - K), then GetOperation
+//     until it ends;
+//  5. record Suspended (the guest shows container state Waiting, reason Suspended).
 //
-// There is no drain: freezing without one lost no requests in Q3, and requests that reach a
-// frozen engine are served after the thaw. If step 2 or 3 fails, the guest is thawed and put
-// back to Running; if the thaw also fails it is left Suspending, which keeps it NotReady.
-func (b *Backend) Suspend(ctx context.Context, namespace, name string) (Result, error) {
+// If step 2 fails nothing was frozen: the guest is put back to Running. From step 3 on, any
+// agent failure, deadline miss or Unimplemented runs the kill sequence (agent Kill, delete the
+// mirror with normal grace, the guest Failed); a guest is never left running on a process the
+// agent may have half frozen.
+func (b *Backend) Suspend(ctx context.Context, namespace, name string, deadline time.Time) (Result, error) {
 	start := time.Now()
-	so := b.opts.Suspend
+	so := &b.opts.Suspend
 	guest, mirrorPod, err := b.lockGuest(namespace, name)
 	if err != nil {
 		return Result{}, err
@@ -144,41 +194,58 @@ func (b *Backend) Suspend(ctx context.Context, namespace, name string) (Result, 
 	default:
 		return Result{}, errdefs.InvalidInputf("guest %s/%s is %s; resume it first", namespace, name, state)
 	}
-	logger := log.G(ctx).WithField("guest", namespace+"/"+name)
+	job := mirrorPod.Labels[LabelJobID]
+	if job == "" {
+		return Result{}, errdefs.InvalidInputf("mirror of %s/%s has no %s label", namespace, name, LabelJobID)
+	}
+	deadline = so.deadlineOr(deadline)
+	logger := log.G(ctx).WithField("guest", namespace+"/"+name).WithField("job", job)
 
-	if mirrorPod, err = b.setSuspendState(ctx, guest, StateSuspending, true); err != nil {
+	if mirrorPod, err = b.setSuspendState(ctx, guest, StateSuspending, bumpEpoch); err != nil {
 		return Result{}, err
 	}
 	_, epoch = SuspendState(mirrorPod)
 	b.emit(b.translate(guest, mirrorPod))
-	res := Result{State: StateSuspending, Epoch: epoch}
+	res := Result{State: StateSuspending, Epoch: epoch, Deadline: deadline}
 
 	stepStart := time.Now()
 	// The informer must hold the Suspending mirror first, or a late event for the previous
 	// mirror version could re-emit Ready after the check below has passed.
 	if err := b.waitInformerState(ctx, guest, StateSuspending, so.NotReadyTimeout); err != nil {
-		return res, b.abortSuspend(ctx, guest, mirrorPod, epoch, err)
+		return res, b.abortSuspend(ctx, guest, err)
 	}
 	if so.OnHoldChange != nil {
-		so.OnHoldChange() // the informer already shows Suspending: cordon before the freeze
+		so.OnHoldChange() // the informer already shows Suspending: cordon before the agent call
 	}
 	if err := b.WaitNotReady(ctx, guest, so.NotReadyTimeout); err != nil {
-		return res, b.abortSuspend(ctx, guest, mirrorPod, epoch, fmt.Errorf("confirm NotReady: %w", err))
+		return res, b.abortSuspend(ctx, guest, fmt.Errorf("confirm NotReady: %w", err))
 	}
 	res.NotReady = time.Since(stepStart)
 
 	stepStart = time.Now()
-	fctx, cancel := context.WithTimeout(ctx, so.FreezeTimeout)
-	err = so.Freezer.Suspend(fctx, mirrorPod, epoch)
-	cancel()
+	wctx, cancel := waitCtx(ctx, deadline)
+	defer cancel()
+	jobs, err := so.Agent.Jobs(wctx)
 	if err != nil {
-		return res, b.abortSuspend(ctx, guest, mirrorPod, epoch, fmt.Errorf("freeze: %w", err))
+		res.Killed = b.killGuest(ctx, guest, mirrorPod, "agent Status failed before Suspend: "+err.Error())
+		return res, fmt.Errorf("agent status: %w", err)
 	}
-	res.Freeze = time.Since(stepStart)
+	if _, listed := jobs[job]; !listed {
+		res.Killed = b.deleteNoContext(ctx, guest, mirrorPod)
+		return res, nil
+	}
+	outcome, err := so.Agent.Suspend(wctx, job, epoch, deadline)
+	res.Agent = time.Since(stepStart)
+	if err != nil {
+		res.Killed = b.killGuest(ctx, guest, mirrorPod, "agent Suspend failed: "+err.Error())
+		return res, fmt.Errorf("agent suspend: %w", err)
+	}
+	res.Outcome = outcome
 
-	if mirrorPod, err = b.setSuspendState(ctx, guest, StateSuspended, false); err != nil {
-		// Frozen, but not recorded. The guest stays NotReady (Suspending); a retry finishes it.
-		return res, fmt.Errorf("frozen, but recording Suspended failed: %w", err)
+	if mirrorPod, err = b.setSuspendState(ctx, guest, StateSuspended, keepEpoch); err != nil {
+		// Suspended, but not recorded. The guest stays NotReady (Suspending) and held; a retry
+		// (same state, next epoch) finishes it.
+		return res, fmt.Errorf("suspended, but recording Suspended failed: %w", err)
 	}
 	b.emit(b.translate(guest, mirrorPod))
 	// A resume right after this call reads the state from the informer: wait (bounded) until it
@@ -188,39 +255,36 @@ func (b *Backend) Suspend(ctx context.Context, namespace, name string) (Result, 
 	}
 	res.State, res.Total = StateSuspended, time.Since(start)
 	b.event(guest, corev1.EventTypeNormal, EventSuspended,
-		fmt.Sprintf("frozen (epoch %d): NotReady confirmed in %s, freeze %s", epoch, res.NotReady, res.Freeze))
-	logger.WithField("epoch", epoch).WithField("notReadyMs", res.NotReady.Milliseconds()).
-		WithField("freezeMs", res.Freeze.Milliseconds()).WithField("totalMs", res.Total.Milliseconds()).Info("guest suspended")
+		fmt.Sprintf("suspended by the snapshot agent (epoch %d, %s): NotReady confirmed in %s, agent %s",
+			epoch, outcome, res.NotReady, res.Agent))
+	logger.WithField("epoch", epoch).WithField("outcome", outcome).WithField("notReadyMs", res.NotReady.Milliseconds()).
+		WithField("agentMs", res.Agent.Milliseconds()).WithField("totalMs", res.Total.Milliseconds()).Info("guest suspended")
 	return res, nil
 }
 
-// abortSuspend undoes a failed suspend: thaw (in case the freeze got partway), then Running.
-func (b *Backend) abortSuspend(ctx context.Context, guest, m *corev1.Pod, epoch int64, cause error) error {
+// abortSuspend undoes a suspend that failed before the agent was called: back to Running.
+func (b *Backend) abortSuspend(ctx context.Context, guest *corev1.Pod, cause error) error {
 	b.event(guest, corev1.EventTypeWarning, EventSuspendFailed, cause.Error())
-	tctx, cancel := context.WithTimeout(ctx, b.opts.Suspend.FreezeTimeout)
-	defer cancel()
-	if err := b.opts.Suspend.Freezer.Resume(tctx, m, epoch); err != nil && !errors.Is(err, freeze.ErrNoCgroup) {
-		return fmt.Errorf("%w; thaw after the failure also failed, guest left %s: %w", cause, StateSuspending, err)
-	}
-	if m2, err := b.setSuspendState(ctx, guest, "", false); err == nil {
-		b.emit(b.translate(guest, m2))
-		b.holdChanged(ctx, guest, "")
-	} else {
+	m2, err := b.setSuspendState(ctx, guest, "", keepEpoch)
+	if err != nil {
 		return fmt.Errorf("%w; could not clear %s: %w", cause, StateSuspending, err)
 	}
+	b.emit(b.translate(guest, m2))
+	b.holdChanged(ctx, guest, "")
 	return cause
 }
 
-// Resume thaws a suspended guest and returns it to service:
-//  1. raise the epoch and record Resuming (the guest stays NotReady);
-//  2. thaw;
+// Resume has the snapshot agent resume a suspended guest and returns it to service (Q6):
+//  1. raise the epoch by compare-and-swap and record Resuming (the guest stays NotReady);
+//  2. agent Resume with the epoch and the deadline (zero: now + N - K), one guest at a time;
 //  3. run the ready check (the engine answers its readiness probe);
 //  4. clear the suspend state (the guest turns Ready again).
 //
-// Any failure leaves the guest Resuming, so it is never Ready on a process that did not come back.
-func (b *Backend) Resume(ctx context.Context, namespace, name string) (Result, error) {
+// A failure in step 2 or 3 runs the kill sequence: the guest is never Ready on a process that
+// did not come back.
+func (b *Backend) Resume(ctx context.Context, namespace, name string, deadline time.Time) (Result, error) {
 	start := time.Now()
-	so := b.opts.Suspend
+	so := &b.opts.Suspend
 	guest, mirrorPod, err := b.lockGuest(namespace, name)
 	if err != nil {
 		return Result{}, err
@@ -234,40 +298,42 @@ func (b *Backend) Resume(ctx context.Context, namespace, name string) (Result, e
 	default:
 		return Result{}, errdefs.InvalidInputf("guest %s/%s is %s; suspend it first", namespace, name, state)
 	}
-	logger := log.G(ctx).WithField("guest", namespace+"/"+name)
+	job := mirrorPod.Labels[LabelJobID]
+	if job == "" {
+		return Result{}, errdefs.InvalidInputf("mirror of %s/%s has no %s label", namespace, name, LabelJobID)
+	}
+	// Resume one at a time (Q6): the restore budget in N - K counts one restore.
+	b.resumeMu.Lock()
+	defer b.resumeMu.Unlock()
+	deadline = so.deadlineOr(deadline)
+	logger := log.G(ctx).WithField("guest", namespace+"/"+name).WithField("job", job)
 
-	if mirrorPod, err = b.setSuspendState(ctx, guest, StateResuming, true); err != nil {
+	if mirrorPod, err = b.setSuspendState(ctx, guest, StateResuming, bumpEpoch); err != nil {
 		return Result{}, err
 	}
 	_, epoch = SuspendState(mirrorPod)
 	b.emit(b.translate(guest, mirrorPod))
 	b.holdChanged(ctx, guest, StateResuming)
-	res := Result{State: StateResuming, Epoch: epoch}
+	res := Result{State: StateResuming, Epoch: epoch, Deadline: deadline}
 
 	stepStart := time.Now()
-	fctx, cancel := context.WithTimeout(ctx, so.FreezeTimeout)
-	err = so.Freezer.Resume(fctx, mirrorPod, epoch)
+	wctx, cancel := waitCtx(ctx, deadline)
+	err = so.Agent.Resume(wctx, job, epoch, deadline)
 	cancel()
+	res.Agent = time.Since(stepStart)
 	if err != nil {
-		b.event(guest, corev1.EventTypeWarning, EventResumeFailed, "thaw: "+err.Error())
-		return res, fmt.Errorf("thaw: %w", err)
+		res.Killed = b.killGuest(ctx, guest, mirrorPod, "agent Resume failed: "+err.Error())
+		return res, fmt.Errorf("agent resume: %w", err)
 	}
-	res.Thaw = time.Since(stepStart)
+	res.Outcome = freeze.OutcomeResumed
 
-	stepStart = time.Now()
-	if so.ReadyCheck != nil {
-		rctx, rcancel := context.WithTimeout(ctx, so.ReadyTimeout)
-		err = so.ReadyCheck(rctx, guest, mirrorPod)
-		rcancel()
-		if err != nil {
-			b.event(guest, corev1.EventTypeWarning, EventResumeFailed, "ready check: "+err.Error())
-			return res, fmt.Errorf("ready check: %w", err)
-		}
+	if err := b.readyCheck(ctx, guest, mirrorPod, &res); err != nil {
+		res.Killed = b.killGuest(ctx, guest, mirrorPod, "engine did not serve after the resume: "+err.Error())
+		return res, fmt.Errorf("ready check: %w", err)
 	}
-	res.ReadyCheck = time.Since(stepStart)
 
-	if mirrorPod, err = b.setSuspendState(ctx, guest, "", false); err != nil {
-		return res, fmt.Errorf("thawed, but clearing %s failed: %w", StateResuming, err)
+	if mirrorPod, err = b.setSuspendState(ctx, guest, "", keepEpoch); err != nil {
+		return res, fmt.Errorf("resumed, but clearing %s failed: %w", StateResuming, err)
 	}
 	b.emit(b.translate(guest, mirrorPod))
 	// Same for a suspend right after this call.
@@ -276,18 +342,31 @@ func (b *Backend) Resume(ctx context.Context, namespace, name string) (Result, e
 	}
 	res.State, res.Total = "Running", time.Since(start)
 	b.event(guest, corev1.EventTypeNormal, EventResumed,
-		fmt.Sprintf("thawed (epoch %d): thaw %s, ready check %s", epoch, res.Thaw, res.ReadyCheck))
-	logger.WithField("epoch", epoch).WithField("thawMs", res.Thaw.Milliseconds()).
+		fmt.Sprintf("resumed by the snapshot agent (epoch %d): agent %s, ready check %s", epoch, res.Agent, res.ReadyCheck))
+	logger.WithField("epoch", epoch).WithField("agentMs", res.Agent.Milliseconds()).
 		WithField("readyCheckMs", res.ReadyCheck.Milliseconds()).WithField("totalMs", res.Total.Milliseconds()).Info("guest resumed")
 	return res, nil
+}
+
+func (b *Backend) readyCheck(ctx context.Context, guest, mirrorPod *corev1.Pod, res *Result) error {
+	so := &b.opts.Suspend
+	if so.ReadyCheck == nil {
+		return nil
+	}
+	stepStart := time.Now()
+	rctx, cancel := context.WithTimeout(ctx, so.ReadyTimeout)
+	defer cancel()
+	err := so.ReadyCheck(rctx, guest, mirrorPod)
+	res.ReadyCheck = time.Since(stepStart)
+	return err
 }
 
 // lockGuest finds the guest and its mirror and takes the guest's operation lock.
 //
 //nolint:gocritic // unnamedResult: nonamedreturns forbids naming them
 func (b *Backend) lockGuest(namespace, name string) (*corev1.Pod, *corev1.Pod, error) {
-	if b.opts.Suspend.Freezer == nil {
-		return nil, nil, errdefs.InvalidInput("suspend is not configured (no freeze backend)")
+	if b.opts.Suspend.Agent == nil {
+		return nil, nil, errdefs.InvalidInput("suspend is not configured (no snapshot agent)")
 	}
 	guest, err := b.guests.Pods(namespace).Get(name)
 	if err != nil {
@@ -297,15 +376,49 @@ func (b *Backend) lockGuest(namespace, name string) (*corev1.Pod, *corev1.Pod, e
 	if !ok {
 		return nil, nil, errdefs.NotFoundf("guest %s/%s has no mirror", namespace, name)
 	}
+	if killStarted(m) || m.DeletionTimestamp != nil {
+		return nil, nil, errdefs.InvalidInputf("guest %s/%s is being killed or deleted", namespace, name)
+	}
 	if !b.locks.tryLock(guest.UID) {
 		return nil, nil, ErrBusy
 	}
 	return guest, m, nil
 }
 
-// setSuspendState writes the suspend state (and, with bump, epoch+1) on the guest's mirror by
-// compare-and-swap on its resourceVersion, retrying on conflicts. state "" clears it.
-func (b *Backend) setSuspendState(ctx context.Context, guest *corev1.Pod, state string, bump bool) (*corev1.Pod, error) {
+// How setSuspendState moves the epoch.
+const (
+	keepEpoch int64 = 0
+	bumpEpoch int64 = -1
+)
+
+// setSuspendState writes the suspend state on the guest's mirror by compare-and-swap on its
+// resourceVersion, retrying on conflicts. state "" clears it. epoch is keepEpoch, bumpEpoch
+// (epoch+1) or a value to write (a host-level call's epoch).
+func (b *Backend) setSuspendState(ctx context.Context, guest *corev1.Pod, state string, epoch int64) (*corev1.Pod, error) {
+	return b.mutateMirror(ctx, guest, func(cur *corev1.Pod, a map[string]string) {
+		switch epoch {
+		case keepEpoch:
+		case bumpEpoch:
+			_, e := SuspendState(cur)
+			a[AnnotationGuestEpoch] = strconv.FormatInt(e+1, 10)
+		default:
+			a[AnnotationGuestEpoch] = strconv.FormatInt(epoch, 10)
+		}
+		if state == "" {
+			delete(a, AnnotationSuspendState)
+			delete(a, AnnotationSuspendStateSince)
+		} else {
+			a[AnnotationSuspendState] = state
+			a[AnnotationSuspendStateSince] = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+	})
+}
+
+// mutateMirror applies fn to the annotations of the guest's current mirror and writes them by
+// compare-and-swap on its resourceVersion, retrying on conflicts.
+func (b *Backend) mutateMirror(
+	ctx context.Context, guest *corev1.Pod, fn func(cur *corev1.Pod, a map[string]string),
+) (*corev1.Pod, error) {
 	pods := b.client.CoreV1().Pods(guest.Namespace)
 	var lastErr error
 	for range 5 {
@@ -320,17 +433,7 @@ func (b *Backend) setSuspendState(ctx context.Context, guest *corev1.Pod, state 
 		if upd.Annotations == nil {
 			upd.Annotations = map[string]string{}
 		}
-		if bump {
-			_, epoch := SuspendState(cur)
-			upd.Annotations[AnnotationGuestEpoch] = strconv.FormatInt(epoch+1, 10)
-		}
-		if state == "" {
-			delete(upd.Annotations, AnnotationSuspendState)
-			delete(upd.Annotations, AnnotationSuspendStateSince)
-		} else {
-			upd.Annotations[AnnotationSuspendState] = state
-			upd.Annotations[AnnotationSuspendStateSince] = time.Now().UTC().Format(time.RFC3339Nano)
-		}
+		fn(cur, upd.Annotations)
 		out, err := pods.Update(ctx, upd, metav1.UpdateOptions{}) // upd carries cur's resourceVersion
 		if err == nil {
 			return out, nil
@@ -378,7 +481,7 @@ func applySuspendState(st *corev1.PodStatus, guest, m *corev1.Pod) {
 				continue
 			}
 			cs.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
-				Reason: StateSuspended, Message: "frozen by guest-kubelet since " + since.UTC().Format(time.RFC3339),
+				Reason: StateSuspended, Message: "suspended by the snapshot agent since " + since.UTC().Format(time.RFC3339),
 			}}
 			cs.Started = new(false)
 		}

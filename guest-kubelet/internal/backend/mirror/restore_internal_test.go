@@ -4,24 +4,19 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	corev1 "k8s.io/api/core/v1"
 )
 
-// reportingFreezer is a fakeFreezer whose Frozen answers what the test set.
-type reportingFreezer struct {
-	*fakeFreezer
-	frozen bool
-}
-
-func (f *reportingFreezer) Frozen(*corev1.Pod) (bool, error) { return f.frozen, nil }
-
-// reconcileRig is a suspend harness whose mirror has the recorded state and whose freezer
-// reports frozen, as the M3 path finds them after a restart.
+// reconcileRig is a suspend harness whose mirror has the recorded state and whose agent
+// lists the job frozen or running, as the agent path finds them after a restart.
 func reconcileRig(t *testing.T, recorded string, frozen bool) *harness {
 	t.Helper()
-	h, ff := suspendHarness(t)
-	h.b.opts.Suspend.Freezer = &reportingFreezer{fakeFreezer: ff, frozen: frozen}
+	h, fa := suspendHarness(t)
+	job := h.mirror("vllm" + Suffix).Labels[LabelJobID]
+	if frozen {
+		fa.setJob(job, "SUSPENDED")
+	} else {
+		fa.setJob(job, "RUNNING")
+	}
 	if recorded != "" {
 		m, err := h.b.mirrors.Pods("ns").Get("vllm-m")
 		if err != nil {

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,12 +15,11 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/budget"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/controller"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/hostcmd"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/infrastructure"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -42,7 +42,9 @@ func run() error {
 	port := flag.Int("port", 50051, "The server port")
 	metricsPort := flag.Int("metrics-port", 8080, "The metrics server port")
 	kubeconfig := flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	controllerWorkers := flag.Int("controller-workers", 1, "The number of workers for the controller")
+	controllerWorkers := flag.Int("controller-workers", controller.DefaultWorkers,
+		"The number of workers for the controller. More than one lets other groups and the resync proceed "+
+			"while one group waits on a slow agent.")
 	snapshotAgentPort := flag.Int("snapshot-agent-port", 9001, "The default port for snapshot agents")
 	resyncPeriod := flag.Duration("resync-period", 30*time.Second, "The period for periodic resync of agent states")
 	servingQuantum := flag.Duration("serving-quantum", envDuration("TIMESLICE_SERVING_QUANTUM", 0),
@@ -77,7 +79,153 @@ func run() error {
 			"timeslice_orchestrator_dispatch_budget_rising_edge_skipped_total to see the orchestrator "+
 			"declining to open it. Supersedes --dispatch-budget-open-delay. "+
 			"Overridable with the TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE environment variable.")
+	foregroundWait := flag.String("foreground-wait", controller.ForegroundWaitBlocking,
+		"How reconcile waits on a foreground snapshot or restore. \"blocking\" (option A, the default and the "+
+			"only mode implemented) blocks on the agent operation, bounded by --foreground-op-timeout. "+
+			"PENDING LEAD DECISION: option B (\"async\") is refused until decided.")
+	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
+		"Upper bound on each blocking wait for a foreground snapshot or restore operation. What happens on "+
+			"expiry is set by --foreground-op-timeout-action. 0 means unbounded.")
+	foregroundOpTimeoutAction := flag.String("foreground-op-timeout-action", controller.ForegroundOpTimeoutActionRetry,
+		"What happens when a foreground snapshot or restore passes --foreground-op-timeout. \"retry\" (the "+
+			"default) returns an error and the group is retried with the --retry-base-delay backoff, waiting on the "+
+			"same operation and never starting a new one while it is pending. \"faulted\" marks the job FAULTED on "+
+			"that node, so the group is faulted until the job's pods are replaced. \"bounded\" retries up to "+
+			"--foreground-op-timeout-retries more timeouts of the same operation, then marks the job FAULTED. "+
+			"PENDING LEAD DECISION (D-ORCH-3).")
+	foregroundOpTimeoutRetries := flag.Int("foreground-op-timeout-retries", controller.DefaultForegroundOpTimeoutRetries,
+		"With --foreground-op-timeout-action=bounded: how many more timed-out waits on the same operation are "+
+			"retried before the job is marked FAULTED.")
+	backgroundRole := flag.Bool("background-role", false,
+		"Enable the background participant protocol: Acquire/Yield with ROLE_BACKGROUND, participant_id "+
+			"heartbeats and GroupStatus.background_protocol = 1. Off (the default) reports "+
+			"background_protocol = 0 and refuses ROLE_BACKGROUND; foreground callers are unaffected.")
+	lendPolicy := flag.String("lend-policy", envString(server.EnvLendPolicy, server.LendPolicyHint),
+		"When a foreground Yield records a lend hint. \"hint\" (the default) only when the Yield carries "+
+			"expected_idle >= --min-bubble. \"always\" on every foreground Yield, with or without expected_idle; "+
+			"--min-bubble is ignored. PENDING LEAD DECISION (D-NS-17). "+
+			"Overridable with the TIMESLICE_LEND_POLICY environment variable.")
+	minBubble := flag.Duration("min-bubble", 0,
+		"Smallest Yield expected_idle that records a lend hint under --lend-policy=hint. 0 (the default) never "+
+			"lends: the group goes IDLE_YIELDED as before. PENDING LEAD DECISION: suggested demo value 30s.")
+	noticeWindow := flag.Duration("notice-window", server.DefaultNoticeWindow,
+		"Notice window N: time from a foreground Acquire to the foreground getting the accelerator back while "+
+			"background guests hold it. PENDING LEAD DECISION.")
+	killBudget := flag.Duration("kill-budget", server.DefaultKillBudget,
+		"Kill budget K reserved at the end of the notice window; guests must vacate by T = notice + N - K. "+
+			"PENDING LEAD DECISION.")
+	hostCommandPort := flag.Int("host-command-port", 0,
+		"Port of the per-host command endpoint (D-NS-4 ns-push-vk). When set, a foreground Acquire commands "+
+			"every host of the group at <node InternalIP>:<port> to vacate by T = notice + N - K and is granted only "+
+			"after every host acked; a lend (Yield with --min-bubble) commands the hosts to resume. 0 (the default) "+
+			"disables host commands.")
+	backgroundLiveness := flag.Duration("background-liveness", controller.DefaultBackgroundLiveness,
+		"Background liveness L: with host commands on, a host whose commands have failed this long during a "+
+			"vacate counts as unseen and its guests are killed through their snapshot agent.")
+	unconfirmedKill := flag.String("unconfirmed-kill", controller.UnconfirmedKillGrant,
+		"What happens when a guest's Kill is not confirmed by T + K (D-NS-6). \"grant\" (the default, today's "+
+			"behaviour) grants the foreground with vram_unconfirmed = true. \"block\" never grants until the Kill "+
+			"is confirmed or the guest is otherwise vacated, retrying the Kill and alerting. \"escalate\" blocks "+
+			"and escalates on --unconfirmed-escalate-after. PENDING LEAD DECISION.")
+	unconfirmedEscalateAfter := flag.String("unconfirmed-escalate-after", controller.DefaultUnconfirmedEscalateAfter,
+		"<E1>,<E2> after the unconfirmed-kill decision (T + K) for --unconfirmed-kill=escalate: at E1 the guest's "+
+			"mirror pod is deleted gracefully, at E2 the node is marked not lendable. Used only by escalate.")
+	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
+	// are proposals awaiting the lead's sign-off.
+	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
+		"Bound on every call to a snapshot agent, including each status and operation poll. 0 disables it. "+
+			"PENDING LEAD DECISION.")
+	retryBaseDelay := flag.Duration("retry-base-delay", 1*time.Second,
+		"First retry delay after a failed reconcile of a group; it doubles on each further failure. "+
+			"PENDING LEAD DECISION.")
+	retryMaxDelay := flag.Duration("retry-max-delay", 30*time.Second,
+		"Cap on the retry delay after failed reconciles of a group. PENDING LEAD DECISION.")
+	holderWaitRequeue := flag.Duration("holder-wait-requeue", 1*time.Second,
+		"Re-reconcile a group this long after a pass that ends with the lock holder not yet loaded, so an "+
+			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
+	killPollInterval := flag.Duration("kill-poll-interval", controller.DefaultKillPollInterval,
+		"How often a kill operation is polled. PENDING LEAD DECISION.")
+	maxServingOffwindow := flag.Duration("max-serving-offwindow", controller.DefaultMaxServingOffwindow,
+		"Alert threshold on a guest's off-window (how long it stays suspended). Past it the orchestrator "+
+			"logs a warning and counts timeslice_guest_offwindow_exceeded_total; it never cuts the foreground "+
+			"short. 0 disables the alert; timeslice_guest_offwindow_seconds is exported either way.")
+	lockNamespace := flag.String("lock-namespace", store.Namespace,
+		"Namespace of the ConfigMap that persists group lock holders. Give each orchestrator install in a "+
+			"cluster its own lock ConfigMap; two installs sharing one fight over the same groups.")
+	lockConfigMap := flag.String("lock-configmap", store.ConfigMapName,
+		"Name of the ConfigMap that persists group lock holders.")
+	watchNamespaces := flag.String("watch-namespaces", "",
+		"Comma-separated namespaces whose pods are watched. Pods elsewhere are invisible to this "+
+			"orchestrator and join no group. Empty (the default) watches all namespaces.")
+	nodeSelector := flag.String("node-selector", "",
+		"Label selector (kubectl syntax, e.g. pool=demo) limiting the nodes this orchestrator sees. "+
+			"Nodes outside it contribute to no group, and pods bound to them are ignored. Group membership "+
+			"still comes from the group.timeslice.io/<group> node label. Empty (the default) watches all nodes.")
+	nodeGroupLabels := flag.String("node-group-labels", infrastructure.NodeGroupLabelsPrefix,
+		"Which node labels put a node in a group. \"prefix\" (the default) reads group.timeslice.io/<group>=true; "+
+			"pair it with an empty --node-selector. \"ns\" reads timeslice.io/donor=true plus "+
+			"timeslice.io/group=<namespace>.<job-id>.<group> (the value the donor pods carry); pair it with "+
+			"--node-selector=timeslice.io/donor=true. \"either\" accepts both forms (a node whose two forms name "+
+			"different groups is in none); pair it with an empty --node-selector. In every mode a node naming "+
+			"more than one group, or a half-written label, is in no group. PENDING LEAD DECISION D-NS-1.")
+	nodeSelectorExemptBackground := flag.Bool("node-selector-exempt-background", false,
+		"Keep pods labelled timeslice.io/role=background in their group even when they are bound to a node "+
+			"outside --node-selector. Only pods are exempt: such a node still contributes to no group. "+
+			"False (the default) drops them like any other pod. No effect without --node-selector.")
 	flag.Parse()
+
+	if err := infrastructure.ValidateNodeGroupLabels(*nodeGroupLabels); err != nil {
+		return fmt.Errorf("--node-group-labels: %w", err)
+	}
+
+	if err := controller.ValidateForegroundWait(*foregroundWait); err != nil {
+		return fmt.Errorf("--foreground-wait: %w", err)
+	}
+	if *foregroundOpTimeout < 0 {
+		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", *foregroundOpTimeout)
+	}
+	if err := controller.ValidateForegroundOpTimeoutAction(*foregroundOpTimeoutAction); err != nil {
+		return fmt.Errorf("--foreground-op-timeout-action: %w", err)
+	}
+	if *foregroundOpTimeoutRetries < 0 {
+		return fmt.Errorf("--foreground-op-timeout-retries must not be negative, got %d", *foregroundOpTimeoutRetries)
+	}
+	if *minBubble < 0 {
+		return fmt.Errorf("--min-bubble must not be negative, got %v", *minBubble)
+	}
+	if err := server.ValidateLendPolicy(*lendPolicy); err != nil {
+		return fmt.Errorf("--lend-policy: %w", err)
+	}
+	if *lendPolicy == server.LendPolicyAlways && *minBubble > 0 {
+		slog.Warn("--min-bubble is ignored when --lend-policy=always", "minBubble", *minBubble)
+	}
+	if *noticeWindow <= 0 || *killBudget <= 0 || *killBudget >= *noticeWindow {
+		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
+			*killBudget, *noticeWindow)
+	}
+
+	if err := controller.ValidateUnconfirmedKill(*unconfirmedKill); err != nil {
+		return fmt.Errorf("--unconfirmed-kill: %w", err)
+	}
+	escalateAfter, err := controller.ParseUnconfirmedEscalateAfter(*unconfirmedEscalateAfter)
+	if err != nil {
+		return fmt.Errorf("--unconfirmed-escalate-after: %w", err)
+	}
+
+	if *hostCommandPort < 0 || *hostCommandPort > 65535 {
+		return fmt.Errorf("--host-command-port must be 0 or a port number, got %d", *hostCommandPort)
+	}
+	if *backgroundLiveness <= 0 {
+		return fmt.Errorf("--background-liveness must be positive, got %v", *backgroundLiveness)
+	}
+	if *maxServingOffwindow < 0 {
+		return fmt.Errorf("--max-serving-offwindow must not be negative, got %v", *maxServingOffwindow)
+	}
+
+	scope, err := infrastructure.ParseScope(*watchNamespaces, *nodeSelector)
+	if err != nil {
+		return err
+	}
 
 	if *budgetRedisAddr != "" && *budgetJob == "" {
 		// Defaulting here would silently publish "0" forever and stall the
@@ -108,31 +256,42 @@ func run() error {
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	nodeInformerFactory := informers.NewSharedInformerFactory(clientset, time.Minute*30)
-	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Minute*30,
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = "timeslice.io/group"
-		}),
-	)
+	informerFactories := scope.NewInformerFactories(clientset, time.Minute*30)
 
-	lockStore := store.NewConfigMapLockStore(clientset)
+	lockStore := store.NewConfigMapLockStore(clientset, store.WithConfigMap(*lockNamespace, *lockConfigMap))
 	groupStore := store.NewGroupStore(lockStore)
 	jobStore := store.NewJobStore()
-	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, *snapshotAgentPort)
+	snapshotAgentStore := store.NewGRPCSnapshotAgentStore(0, *snapshotAgentPort).WithRPCTimeout(*agentRPCTimeout)
 	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
-		workqueue.DefaultTypedControllerRateLimiter[string](),
+		controller.NewRateLimiter(*retryBaseDelay, *retryMaxDelay),
 		workqueue.TypedRateLimitingQueueConfig[string]{
 			Name: "groups",
 		},
 	)
 
+	infraOpts := make([]infrastructure.Option, 0, len(informerFactories.Pods))
+	for _, f := range informerFactories.Pods[1:] {
+		infraOpts = append(infraOpts, infrastructure.WithPodInformers(f.Core().V1().Pods()))
+	}
+	if !scope.AllNodes() {
+		infraOpts = append(infraOpts, infrastructure.WithNodeScopedPods())
+		if *nodeSelectorExemptBackground {
+			infraOpts = append(infraOpts, infrastructure.WithNodeSelectorExemptBackground())
+		}
+	} else if *nodeSelectorExemptBackground {
+		slog.Warn("--node-selector-exempt-background has no effect without --node-selector")
+	}
 	infraOrch := infrastructure.NewKubernetesOrchestrator(
-		nodeInformerFactory.Core().V1().Nodes(),
-		podInformerFactory.Core().V1().Pods(),
+		informerFactories.Nodes.Core().V1().Nodes(),
+		informerFactories.Pods[0].Core().V1().Pods(),
 		groupStore,
 		jobStore,
 		snapshotAgentStore,
+		infraOpts...,
 	)
+	if err := infraOrch.SetNodeGroupLabels(*nodeGroupLabels); err != nil {
+		return fmt.Errorf("--node-group-labels: %w", err)
+	}
 	if err := infraOrch.Start(ctx, queue); err != nil {
 		return fmt.Errorf("failed to start infrastructure orchestrator: %w", err)
 	}
@@ -145,12 +304,44 @@ func run() error {
 		snapshotAgentStore,
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
+	ctrl.HolderWaitRequeue = *holderWaitRequeue
+	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
+	ctrl.ForegroundOpTimeoutAction = *foregroundOpTimeoutAction
+	ctrl.ForegroundOpTimeoutRetries = *foregroundOpTimeoutRetries
+	ctrl.KillPollInterval = *killPollInterval
+	ctrl.BackgroundLiveness = *backgroundLiveness
+	ctrl.MaxServingOffwindow = *maxServingOffwindow
+	ctrl.UnconfirmedKill = *unconfirmedKill
+	ctrl.UnconfirmedEscalateAfter = escalateAfter
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, infraOrch)
 
 	// Start informers
-	nodeInformerFactory.Start(ctx.Done())
-	podInformerFactory.Start(ctx.Done())
+	informerFactories.Nodes.Start(ctx.Done())
+	for _, f := range informerFactories.Pods {
+		f.Start(ctx.Done())
+	}
 
-	opts := []server.Option{server.WithServingQuantum(*servingQuantum)}
+	opts := []server.Option{
+		server.WithServingQuantum(*servingQuantum),
+		server.WithBackgroundRole(*backgroundRole),
+		server.WithLendPolicy(*lendPolicy),
+		server.WithMinBubble(*minBubble),
+		server.WithNoticeTiming(*noticeWindow, *killBudget),
+	}
+	if *hostCommandPort > 0 {
+		hosts := hostcmd.New(ctx, hostcmd.Config{
+			Resolve:      hostResolver(infraOrch, *hostCommandPort),
+			NoticeWindow: *noticeWindow,
+			KillBudget:   *killBudget,
+			Enqueue:      ctrl.EnqueueWork,
+		})
+		defer func() {
+			stop() // Close waits for the command goroutines, which stop with ctx.
+			hosts.Close()
+		}()
+		ctrl.Hosts = hosts
+		opts = append(opts, server.WithHostCommander(hosts))
+	}
 	if *budgetRedisAddr != "" {
 		publisher := budget.NewPublisher(budget.NewRedisWriter(*budgetRedisAddr), *budgetKey, *budgetJob).
 			WithOpenDelay(*budgetOpenDelay).
@@ -170,8 +361,46 @@ func run() error {
 		"dispatchBudgetJob", *budgetJob,
 		"dispatchBudgetOpenDelay", *budgetOpenDelay,
 		"dispatchBudgetExternalRisingEdge", *budgetExternalRisingEdge,
+		"foregroundWait", *foregroundWait,
+		"foregroundOpTimeout", *foregroundOpTimeout,
+		"foregroundOpTimeoutAction", *foregroundOpTimeoutAction,
+		"foregroundOpTimeoutRetries", *foregroundOpTimeoutRetries,
+		"backgroundRole", *backgroundRole,
+		"lendPolicy", *lendPolicy,
+		"minBubble", *minBubble,
+		"noticeWindow", *noticeWindow,
+		"killBudget", *killBudget,
+		"hostCommandPort", *hostCommandPort,
+		"backgroundLiveness", *backgroundLiveness,
+		"unconfirmedKill", *unconfirmedKill,
+		"unconfirmedEscalateAfter", *unconfirmedEscalateAfter,
+		"controllerWorkers", *controllerWorkers,
+		"agentRPCTimeout", *agentRPCTimeout,
+		"retryBaseDelay", *retryBaseDelay,
+		"retryMaxDelay", *retryMaxDelay,
+		"holderWaitRequeue", *holderWaitRequeue,
+		"killPollInterval", *killPollInterval,
+		"maxServingOffwindow", *maxServingOffwindow,
+		"lockConfigMap", lockStore.ConfigMapRef(),
+		"watchNamespaces", scope.Namespaces,
+		"nodeSelector", scope.NodeSelector,
+		"nodeGroupLabels", *nodeGroupLabels,
+		"recommendedNodeSelector", infrastructure.RecommendedNodeSelector(*nodeGroupLabels),
+		"nodeSelectorExemptBackground", *nodeSelectorExemptBackground,
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
+}
+
+// hostResolver returns the address of the command endpoint of a node:
+// <node InternalIP>:<port>.
+func hostResolver(infraOrch *infrastructure.KubernetesOrchestrator, port int) func(string) (string, error) {
+	return func(node string) (string, error) {
+		addr, err := infraOrch.NodeAddress(node)
+		if err != nil {
+			return "", err
+		}
+		return net.JoinHostPort(addr, strconv.Itoa(port)), nil
+	}
 }
 
 // envString returns the value of the named environment variable, or def if it

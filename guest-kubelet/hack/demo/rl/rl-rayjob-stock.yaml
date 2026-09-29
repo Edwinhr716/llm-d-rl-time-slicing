@@ -1,0 +1,200 @@
+# Stock reference for rl-rayjob.yaml (hook K2): the same RayJob as a verl user
+# would write it without time-slicing. No timeslice labels, no Ray resource
+# pins, no timeslice command settings, no TIMESLICE_* env, no shared claim, no
+# group-host placement. Used only as the baseline of the manifest diff.
+# Placeholders as in rl-rayjob.yaml.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: __JOB__
+  namespace: __NS__
+spec:
+  jobId: __JOB__
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 600
+  # The head has num-cpus 0, so the driver runs on a prepped worker.
+  entrypointNumCpus: 1
+  # One line after folding. Values that need quoting are quoted for two shell
+  # parses (the submitter's bash, then the job supervisor's sh).
+  entrypoint: >-
+    timeout --signal=INT --kill-after=120 10800
+    python3 -m verl.experimental.fully_async_policy.fully_async_main
+    data.train_files=/workspace/data/eurus_code/train.parquet
+    data.val_files=/workspace/data/eurus_code/val.parquet
+    data.prompt_key=prompt
+    data.truncation=left
+    data.max_prompt_length=2048
+    data.max_response_length=6144
+    data.train_batch_size=0
+    data.gen_batch_size=1
+    data.return_raw_chat=True
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct
+    actor_rollout_ref.model.use_remove_padding=True
+    actor_rollout_ref.model.enable_gradient_checkpointing=True
+    actor_rollout_ref.hybrid_engine=False
+    actor_rollout_ref.actor.strategy=fsdp
+    actor_rollout_ref.actor.ppo_mini_batch_size=4
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+    actor_rollout_ref.actor.use_kl_loss=False
+    actor_rollout_ref.actor.kl_loss_coef=0.0
+    actor_rollout_ref.actor.entropy_coeff=0
+    actor_rollout_ref.actor.grad_clip=1.0
+    actor_rollout_ref.actor.loss_agg_mode=token-mean
+    actor_rollout_ref.actor.use_dynamic_bsz=True
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192
+    actor_rollout_ref.actor.optim.lr=1e-6
+    actor_rollout_ref.actor.optim.lr_warmup_steps=-1
+    actor_rollout_ref.actor.fsdp_config.param_offload=True
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192
+    actor_rollout_ref.rollout.name=vllm
+    actor_rollout_ref.rollout.mode=async
+    actor_rollout_ref.rollout.n=4
+    actor_rollout_ref.rollout.calculate_log_probs=True
+    actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=True
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.55
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1
+    actor_rollout_ref.rollout.max_model_len=8192
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192
+    actor_rollout_ref.rollout.enable_chunked_prefill=True
+    actor_rollout_ref.rollout.temperature=1.0
+    actor_rollout_ref.rollout.top_p=1.0
+    actor_rollout_ref.rollout.top_k=-1
+    algorithm.adv_estimator=grpo
+    algorithm.use_kl_in_reward=False
+    algorithm.kl_ctrl.kl_coef=0.0
+    'trainer.logger=[console]'
+    trainer.val_before_train=False
+    trainer.save_freq=-1
+    trainer.resume_mode=disable
+    trainer.nnodes=1
+    trainer.n_gpus_per_node=1
+    trainer.total_epochs=10
+    trainer.test_freq=-1
+    trainer.project_name=timeslice-demo
+    trainer.experiment_name=rl-batch-code-l4
+    trainer.default_local_dir=/workspace/results/ckpts
+    rollout.nnodes=1
+    rollout.n_gpus_per_node=1
+    rollout.total_rollout_steps=65536
+    async_training.staleness_threshold=8
+    async_training.trigger_parameter_sync_step=1
+    async_training.use_dynamic_resource_scheduling=False
+    async_training.use_trainer_do_validate=False
+  rayClusterSpec:
+    headGroupSpec:
+      rayStartParams:
+        num-cpus: "0"
+        dashboard-host: "0.0.0.0"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: __REGISTRY__/rl-trainer:v0.1.6
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "8Gi"
+                limits:
+                  memory: "8Gi"
+    workerGroupSpecs:
+      - groupName: trainers
+        replicas: __TRAINER_REPLICAS__
+        rayStartParams:
+          num-gpus: "1"
+          num-cpus: "24"
+        template:
+          spec:
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: ray-worker
+                image: __REGISTRY__/rl-trainer:v0.1.6
+                env:
+                  - name: VLLM_USE_V1
+                    value: "1"
+                  - name: HF_HOME
+                    value: "/workspace/hf"
+                  - name: NCCL_CUMEM_ENABLE
+                    value: "0"
+                  - name: NCCL_NVLS_ENABLE
+                    value: "0"
+                  - name: PYTORCH_CUDA_ALLOC_CONF
+                    value: "expandable_segments:True"
+                  - name: VERL_REPO
+                    value: "https://github.com/aishukamal/verl.git"
+                  - name: VERL_REF
+                    value: "feat/fully-async-lifecycle-hooks"
+                # Per-node prep; KubeRay appends its Ray start after these args.
+                args:
+                  - >-
+                    set -eo pipefail;
+                    mkdir -p /workspace/results;
+                    export RESULTS_DIR=/workspace/results;
+                    source /opt/timeslice-demo/install_common.sh;
+                    cd /workspace;
+                    python3 /opt/timeslice-demo/data_prep.py --out_dir /workspace/data/eurus_code
+                    --tokenizer Qwen/Qwen2.5-0.5B-Instruct --train_size 512 --val_size 64
+                # The prep takes ~20 min; KubeRay's default liveness probe would
+                # restart the pod before the raylet exists.
+                livenessProbe:
+                  exec:
+                    command: ["true"]
+                resources:
+                  requests:
+                    cpu: "8"
+                    memory: "40Gi"
+                  limits:
+                    memory: "64Gi"
+                    nvidia.com/gpu: "1"
+      - groupName: samplers
+        replicas: 1
+        rayStartParams:
+          num-gpus: "1"
+          num-cpus: "24"
+        template:
+          spec:
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: ray-worker
+                image: __REGISTRY__/rl-trainer:v0.1.6
+                env:
+                  - name: VLLM_USE_V1
+                    value: "1"
+                  - name: HF_HOME
+                    value: "/workspace/hf"
+                  - name: NCCL_CUMEM_ENABLE
+                    value: "0"
+                  - name: NCCL_NVLS_ENABLE
+                    value: "0"
+                  - name: PYTORCH_CUDA_ALLOC_CONF
+                    value: "expandable_segments:True"
+                  - name: VERL_REPO
+                    value: "https://github.com/aishukamal/verl.git"
+                  - name: VERL_REF
+                    value: "feat/fully-async-lifecycle-hooks"
+                args:
+                  - >-
+                    set -eo pipefail;
+                    mkdir -p /workspace/results;
+                    export RESULTS_DIR=/workspace/results;
+                    source /opt/timeslice-demo/install_common.sh;
+                    cd /workspace;
+                    python3 /opt/timeslice-demo/data_prep.py --out_dir /workspace/data/eurus_code
+                    --tokenizer Qwen/Qwen2.5-0.5B-Instruct --train_size 512 --val_size 64
+                livenessProbe:
+                  exec:
+                    command: ["true"]
+                resources:
+                  requests:
+                    cpu: "12"
+                    memory: "60Gi"
+                  limits:
+                    nvidia.com/gpu: "1"

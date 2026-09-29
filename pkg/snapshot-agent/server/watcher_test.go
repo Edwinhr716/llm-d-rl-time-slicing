@@ -18,6 +18,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -225,4 +226,272 @@ func TestWatcher(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWatcherSeedsGuestEpoch(t *testing.T) {
+	origGetK8sClient := podutils.GetK8sClient
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() {
+		podutils.GetK8sClient = origGetK8sClient
+		podutils.GetPodPIDs = origGetPodPIDs
+	}()
+	t.Setenv("NODE_NAME", "test-node")
+
+	fakeClient := fakek8s.NewSimpleClientset()
+	podutils.GetK8sClient = func() (kubernetes.Interface, error) {
+		return fakeClient, nil
+	}
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) {
+		return nil, nil
+	}
+
+	state := sm.NewStateManager()
+	watcher, err := server.NewWatcher(fakeClient, state)
+	if err != nil {
+		t.Fatalf("Failed to create watcher: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+
+	mirror := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mirror-1",
+			Namespace:   "default",
+			Labels:      map[string]string{podutils.JobIDLabel: "guest-1", podutils.GroupLabel: "group-1"},
+			Annotations: map[string]string{podutils.GuestEpochAnnotation: "7"},
+		},
+		Spec: corev1.PodSpec{NodeName: "test-node"},
+	}
+	if _, err := fakeClient.CoreV1().Pods("default").Create(ctx, mirror, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create pod: %v", err)
+	}
+	waitForEpoch(t, state, 7)
+
+	setEpoch := func(value string) {
+		t.Helper()
+		updated := mirror.DeepCopy()
+		updated.Annotations[podutils.GuestEpochAnnotation] = value
+		if _, err := fakeClient.CoreV1().Pods("default").Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("Failed to update pod: %v", err)
+		}
+	}
+
+	setEpoch("9")
+	waitForEpoch(t, state, 9)
+
+	// Lower and invalid values are ignored (the state-machine tests cover
+	// that the fence never goes down); the watcher keeps going.
+	setEpoch("3")
+	setEpoch("not-a-number")
+	setEpoch("10")
+	waitForEpoch(t, state, 10)
+
+	// A late call below the annotation is refused.
+	_, err = state.StartGuestOp("guest-1", sm.OpTypeResume, 8, time.Now().Add(time.Minute),
+		func(context.Context) (sm.GuestResult, error) {
+			t.Error("worker must not run")
+			return sm.GuestResult{}, nil
+		})
+	if got := sm.ErrorReasonOf(err); got != pb.ErrorReason_STALE_EPOCH {
+		t.Errorf("expected STALE_EPOCH, got %v (%v)", got, err)
+	}
+}
+
+func waitForEpoch(t *testing.T, state *sm.StateManager, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var got int64
+	for time.Now().Before(deadline) {
+		for _, st := range state.GetJobStatus() {
+			if st.GetJobId() == "guest-1" {
+				got = st.GetEpoch()
+			}
+		}
+		if got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected epoch %d, got %d", want, got)
+}
+
+func TestHostOp_WatcherLabelledJobs(t *testing.T) {
+	origGetK8sClient := podutils.GetK8sClient
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() {
+		podutils.GetK8sClient = origGetK8sClient
+		podutils.GetPodPIDs = origGetPodPIDs
+	}()
+	t.Setenv("NODE_NAME", "test-node")
+
+	fakeClient := fakek8s.NewSimpleClientset()
+	podutils.GetK8sClient = func() (kubernetes.Interface, error) {
+		return fakeClient, nil
+	}
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) {
+		return nil, nil
+	}
+
+	watcher, err := server.NewWatcher(fakeClient, sm.NewStateManager())
+	if err != nil {
+		t.Fatalf("Failed to create watcher: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+
+	pod := func(name, node, role, jobID string, phase corev1.PodPhase, deleting bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{}},
+			Spec:       corev1.PodSpec{NodeName: node},
+			Status:     corev1.PodStatus{Phase: phase},
+		}
+		if role != "" {
+			p.Labels[podutils.RoleLabel] = role
+		}
+		if jobID != "" {
+			p.Labels[podutils.JobIDLabel] = jobID
+		}
+		if deleting {
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+			p.Finalizers = []string{"test/hold"}
+		}
+		return p
+	}
+	for _, p := range []*corev1.Pod{
+		pod("trainer", "test-node", "foreground", "trainer-1", corev1.PodRunning, false),
+		pod("mirror-done", "test-node", "background", "guest-done", corev1.PodSucceeded, false),
+		pod("mirror-failed", "test-node", "background", "guest-failed", corev1.PodFailed, false),
+		pod("mirror-other-node", "other-node", "background", "guest-other", corev1.PodRunning, false),
+		pod("mirror-no-job", "test-node", "background", "", corev1.PodRunning, false),
+		pod("mirror-b", "test-node", "background", "guest-b", corev1.PodRunning, false),
+		pod("mirror-a", "test-node", "background", "guest-a", corev1.PodPending, false),
+		pod("mirror-deleting", "test-node", "background", "guest-deleting", corev1.PodRunning, true),
+	} {
+		if _, err := fakeClient.CoreV1().Pods("default").Create(ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create pod %s: %v", p.Name, err)
+		}
+	}
+
+	want := []string{"guest-a", "guest-b", "guest-deleting"}
+	deadline := time.Now().Add(2 * time.Second)
+	var got []string
+	for time.Now().Before(deadline) {
+		got = watcher.LabelledJobs("background")
+		sort.Strings(got)
+		if reflect.DeepEqual(got, want) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("LabelledJobs(background): expected %v, got %v", want, got)
+	}
+	if got := watcher.LabelledJobs("foreground"); !reflect.DeepEqual(got, []string{"trainer-1"}) {
+		t.Errorf("LabelledJobs(foreground): expected [trainer-1], got %v", got)
+	}
+	if got := watcher.LabelledJobs("none"); len(got) != 0 {
+		t.Errorf("LabelledJobs(none): expected nothing, got %v", got)
+	}
+}
+
+func recoveryPod(name, jobID, role, epoch string) *corev1.Pod {
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{}},
+		Spec:       corev1.PodSpec{NodeName: "test-node"},
+	}
+	if jobID != "" {
+		p.Labels[podutils.JobIDLabel] = jobID
+	}
+	if role != "" {
+		p.Labels[podutils.RoleLabel] = role
+	}
+	if epoch != "" {
+		p.Annotations = map[string]string{podutils.GuestEpochAnnotation: epoch}
+	}
+	return p
+}
+
+// TestWatcherLocalJobs checks that restart recovery sees every cached job,
+// registered with its mirror's epoch, as soon as the cache has synced, and
+// the highest epoch of each role for the SuspendAll and ResumeAll fences.
+func TestWatcherLocalJobs(t *testing.T) {
+	t.Setenv("NODE_NAME", "test-node")
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() { podutils.GetPodPIDs = origGetPodPIDs }()
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) { return nil, nil }
+
+	other := recoveryPod("elsewhere", "job-x", "background", "40")
+	other.Spec.NodeName = "other-node"
+	done := recoveryPod("done", "job-d", "background", "50")
+	done.Status.Phase = corev1.PodSucceeded
+	fakeClient := fakek8s.NewSimpleClientset(
+		recoveryPod("b", "job-b", "background", "7"), recoveryPod("a", "guest-1", "background", "12"),
+		recoveryPod("a2", "guest-1", "", ""), recoveryPod("plain", "", "background", "99"),
+		recoveryPod("t", "trainer", "foreground", "3"), recoveryPod("bad", "job-e", "background", "x"),
+		other, done)
+	state := sm.NewStateManager()
+	watcher, err := server.NewWatcher(fakeClient, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+	if !watcher.Synced() {
+		t.Fatal("cache not synced after Start")
+	}
+	if got, want := watcher.LocalJobs(), []string{"guest-1", "job-b", "job-d", "job-e", "trainer"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("LocalJobs %v, want %v", got, want)
+	}
+	// The fake client ignores the informer's spec.nodeName field selector,
+	// so the event handlers also see job-x; only the local jobs count here.
+	epochs := map[string]int64{}
+	for _, st := range state.GetJobStatus() {
+		if st.GetJobId() != "job-x" {
+			epochs[st.GetJobId()] = st.GetEpoch()
+		}
+	}
+	if want := map[string]int64{"guest-1": 12, "job-b": 7, "job-d": 50, "job-e": 0, "trainer": 3}; !reflect.DeepEqual(epochs, want) {
+		t.Errorf("registered jobs %v, want %v", epochs, want)
+	}
+	if got, want := watcher.RoleEpochs(), map[string]int64{"background": 12, "foreground": 3}; !reflect.DeepEqual(got, want) {
+		t.Errorf("RoleEpochs %v, want %v", got, want)
+	}
+}
+
+// TestWatcherHoldDetection checks that a held detection loop promotes no
+// IDLE job until it is released, so restart recovery sets states first.
+func TestWatcherHoldDetection(t *testing.T) {
+	t.Setenv("NODE_NAME", "test-node")
+	origGetPodPIDs := podutils.GetPodPIDs
+	defer func() { podutils.GetPodPIDs = origGetPodPIDs }()
+	podutils.GetPodPIDs = func(context.Context, string, string) ([]int, error) { return []int{42}, nil }
+
+	state := sm.NewStateManager()
+	watcher, err := server.NewWatcher(fakek8s.NewSimpleClientset(recoveryPod("a", "job-a", "", "")), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.HoldDetection()
+	watcher.Start(ctx)
+	watcher.LocalJobs()
+	time.Sleep(1500 * time.Millisecond) // past the first detection tick
+	if st := state.GetJobStatus(); len(st) != 1 || st[0].GetState() != pb.JobState_JOB_STATE_IDLE {
+		t.Fatalf("held detection changed the job: %v", st)
+	}
+	watcher.ReleaseDetection()
+	watcher.ReleaseDetection() // idempotent
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := state.GetJobStatus(); len(st) == 1 && st[0].GetState() == pb.JobState_JOB_STATE_RUNNING {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("job not promoted after ReleaseDetection: %v", state.GetJobStatus())
 }

@@ -1,0 +1,44 @@
+---
+# --gpu-mode=deviceplugin only: nobody but the guest kubelet may ask for a GPU shadow resource
+# on the host. Without this, any pod could request timeslice.io/gpu-shadow-<minor> and get a GPU
+# that another pod already holds through nvidia.com/gpu. Pods bound to another node are left to
+# that node's policy. Placeholder: __HOST__.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: guest-kubelet-proto-gpu-shadow
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: prefix
+      expression: "'timeslice.io/gpu-shadow-'"
+    - name: asksShadow
+      expression: >-
+        object.spec.containers.exists(c, has(c.resources) &&
+        ((has(c.resources.limits) && c.resources.limits.exists(r, r.startsWith(variables.prefix))) ||
+        (has(c.resources.requests) && c.resources.requests.exists(r, r.startsWith(variables.prefix))))) ||
+        (has(object.spec.initContainers) && object.spec.initContainers.exists(c, has(c.resources) &&
+        ((has(c.resources.limits) && c.resources.limits.exists(r, r.startsWith(variables.prefix))) ||
+        (has(c.resources.requests) && c.resources.requests.exists(r, r.startsWith(variables.prefix))))))
+    - name: otherNode
+      expression: >-
+        has(object.spec.nodeName) && object.spec.nodeName != '' && object.spec.nodeName != '__HOST__'
+  validations:
+    - expression: >-
+        !variables.asksShadow || variables.otherNode ||
+        request.userInfo.username == 'system:serviceaccount:guest-kubelet-proto:guest-kubelet'
+      message: "timeslice.io/gpu-shadow-* is reserved for the guest kubelet's mirror pods"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: guest-kubelet-proto-gpu-shadow
+spec:
+  policyName: guest-kubelet-proto-gpu-shadow
+  validationActions: [Deny]
