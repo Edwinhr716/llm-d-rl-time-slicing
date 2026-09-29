@@ -1,0 +1,15 @@
+# Node labels that put a node in a time-slicing group, as a merge patch.
+#
+# Replace __GROUP__ with the group's value: the same value the group's pods carry in their
+# timeslice.io/group label, normally <namespace>.<job-id>.<worker group>. It is used as written
+# and must be a valid label value (at most 63 characters). Then:
+#
+#   kubectl patch node <node> --type=merge --patch-file=host-labels.yaml
+#
+# The orchestrator also still accepts the older form group.timeslice.io/<group>=true. A node
+# whose labels name more than one group, or whose timeslice.io/donor and timeslice.io/group
+# labels are half-written, is in no group.
+metadata:
+  labels:
+    timeslice.io/donor: "true"
+    timeslice.io/group: "__GROUP__"

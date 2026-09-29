@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/infrastructure"
 	"github.com/spf13/cobra"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -220,7 +221,6 @@ func verifyNodeLabels(ctx context.Context, clientset kubernetes.Interface) (bool
 		return false, []string{fmt.Sprintf("Error listing nodes: %v", err)}
 	}
 
-	const nodeLabelPrefix = "group.timeslice.io/"
 	type LabeledNodeInfo struct {
 		Name  string
 		Group string
@@ -229,22 +229,20 @@ func verifyNodeLabels(ctx context.Context, clientset kubernetes.Interface) (bool
 
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
-		for k, v := range node.Labels {
-			if strings.HasPrefix(k, nodeLabelPrefix) && v == "true" {
-				group := strings.TrimPrefix(k, nodeLabelPrefix)
-				labeledNodes = append(labeledNodes, LabeledNodeInfo{
-					Name:  node.Name,
-					Group: group,
-				})
-				break
-			}
+		// The same membership rule as the orchestrator: either label form, exactly one group.
+		for _, group := range infrastructure.GroupsFromNodeLabels(node.Labels) {
+			labeledNodes = append(labeledNodes, LabeledNodeInfo{
+				Name:  node.Name,
+				Group: group,
+			})
 		}
 	}
 
 	if len(labeledNodes) == 0 {
 		return false, []string{
 			"Status: Found 0 labeled nodes",
-			"No nodes found with timeslice group label (group.timeslice.io/<group>=true)",
+			"No nodes found with timeslice group labels " +
+				"(timeslice.io/donor=true plus timeslice.io/group=<group>, or group.timeslice.io/<group>=true)",
 		}
 	}
 

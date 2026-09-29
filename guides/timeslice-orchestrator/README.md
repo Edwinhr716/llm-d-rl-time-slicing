@@ -73,7 +73,7 @@ To enable time-slicing, the cluster must be configured with:
 - **At least one GPU node with:**
   - **NVIDIA Driver:** 565 or later (required for DRA Driver).
   - **Labels & Taints:** `timeslice.io/enabled=true` and tainted with `timeslice.io/shared=true:NoSchedule` to isolate time-slicing workloads.
-  - **Group Labels:** `group.timeslice.io/<group-id>=true` (e.g., `group.timeslice.io/group-ab-sampler=true`) to schedule grouped pods together.
+  - **Group Labels:** `timeslice.io/donor=true` plus `timeslice.io/group=<group-id>` (e.g., `timeslice.io/group=group-ab-sampler`), the same key and value the group's pods carry. [host-labels.yaml](host-labels.yaml) applies them as a patch. The older form `group.timeslice.io/<group-id>=true` is still accepted. A node whose labels name more than one group, or carry only one of the two `timeslice.io/donor` and `timeslice.io/group` labels, is in no group.
 - **Deployment Ordering:** Nodes for a group must be active and labeled **before** workloads attempt to acquire the lock. The orchestrator uses these labels for topology discovery; for now, empty groups cannot be managed.
 
 ### Installation via Helm
@@ -136,7 +136,7 @@ Work pods must target nodes that are enabled for time-slicing and belong to thei
 ```yaml
 spec:
   nodeSelector:
-    group.timeslice.io/group-ab-sampler: "true" # Matches the node Group label
+    timeslice.io/group: "group-ab-sampler" # Matches the node Group label
 ```
 
 ##### Tolerations
@@ -174,7 +174,7 @@ spec:
   - name: accelerator
     resourceClaimName: group-ab-sampler-claim # References an external ResourceClaim
   nodeSelector:
-    group.timeslice.io/group-ab-sampler: "true" # Matches the node Group label
+    timeslice.io/group: "group-ab-sampler" # Matches the node Group label
   tolerations:
   - key: "timeslice.io/shared"
     operator: "Equal"
