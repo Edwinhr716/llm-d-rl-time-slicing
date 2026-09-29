@@ -1,0 +1,12 @@
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /gpu-shadow-plugin ./cmd/gpu-shadow-plugin
+
+# The image's default user (root) is kept: the kubelet's device-plugin and pod-resources
+# sockets are root-only. deploy/opt-deviceplugin/gpu-shadow.yaml drops every capability.
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /gpu-shadow-plugin /gpu-shadow-plugin
+ENTRYPOINT ["/gpu-shadow-plugin"]

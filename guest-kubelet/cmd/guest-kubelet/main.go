@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"github.com/edwinhr716/guest-kubelet/internal/backend/mirror"
+	"github.com/edwinhr716/guest-kubelet/internal/gpushadow/api"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
 
@@ -51,6 +53,11 @@ type options struct {
 	reserveClaim             bool
 	mirrorOwnerRef           bool
 	orphanGrace              time.Duration
+
+	// D-NS-10: how nvidia.com/gpu reaches the mirror
+	gpuMode, donorSelector, holdersURL string
+
+	logFormat string
 
 	// M1: surviving an outage
 	providerIDFromHost bool
@@ -81,6 +88,14 @@ func main() {
 	flag.BoolVar(&o.reserveClaim, "reserve-claim", false, "add GPU mirrors to the claim's status.reservedFor (kube-controller-manager also does it)")
 	flag.BoolVar(&o.mirrorOwnerRef, "mirror-owner-ref", true, "make the guest the mirror's owner (false: mirrors survive guest force-deletion and can be re-adopted)")
 	flag.DurationVar(&o.orphanGrace, "orphan-grace", 10*time.Minute, "how long a mirror without a guest is kept for re-adoption")
+	flag.StringVar(&o.gpuMode, "gpu-mode", string(mirror.GPUModeClaim),
+		"how a guest's nvidia.com/gpu reaches the mirror: claim (the shared --gpu-claim, DRA) or "+
+			"deviceplugin (the donor's own GPU through the shadow device plugin, no DRA)")
+	flag.StringVar(&o.donorSelector, "donor-selector", mirror.DefaultDonorSelector,
+		"deviceplugin mode: label selector of donor pods on the host whose GPU mirrors share")
+	flag.StringVar(&o.holdersURL, "gpu-holders-url", "http://"+api.DefaultHoldersAddr+api.HoldersPath,
+		"deviceplugin mode: the shadow plugin's endpoint saying which pod holds which GPU")
+	flag.StringVar(&o.logFormat, "log-format", "json", "log format: json or text")
 
 	// Off by default: GKE's ValidatingAdmissionPolicy validate-node-providerid denies a Node
 	// whose providerID does not end in "/<node name>", so on GKE this flag makes the Node
@@ -91,7 +106,11 @@ func main() {
 	flag.StringVar(&o.podName, "pod-name", os.Getenv("POD_NAME"), "leader-election identity (env POD_NAME)")
 	flag.Parse()
 
-	log.L = vkslog.FromSlog(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+	var handler slog.Handler = slog.NewJSONHandler(os.Stderr, nil)
+	if o.logFormat == "text" {
+		handler = slog.NewTextHandler(os.Stderr, nil)
+	}
+	log.L = vkslog.FromSlog(slog.New(handler))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -108,6 +127,9 @@ func run(ctx context.Context, o options) error {
 	if o.nodeName == "" {
 		o.nodeName = "vk-" + o.hostNode[strings.LastIndex(o.hostNode, "-")+1:]
 	}
+	if err := checkGPUMode(ctx, &o); err != nil {
+		return err
+	}
 	client, err := nodeutil.ClientsetFromEnv(o.kubeconfig)
 	if err != nil {
 		return err
@@ -116,6 +138,38 @@ func run(ctx context.Context, o options) error {
 		return runKubelet(ctx, client, o)
 	}
 	return runWithLeaderElection(ctx, client, o)
+}
+
+// checkGPUMode validates --gpu-mode and the flags that go with it. In deviceplugin mode the
+// guest kubelet makes no resource.k8s.io call, so the claim flags are dropped or refused.
+func checkGPUMode(ctx context.Context, opts *options) error {
+	if opts.logFormat != "json" && opts.logFormat != "text" {
+		return fmt.Errorf("--log-format must be json or text, got %q", opts.logFormat)
+	}
+	mode, err := mirror.ParseGPUMode(opts.gpuMode)
+	if err != nil {
+		return fmt.Errorf("--gpu-mode: %w", err)
+	}
+	if mode != mirror.GPUModeDevicePlugin {
+		return nil
+	}
+	if opts.reserveClaim {
+		return fmt.Errorf("--reserve-claim needs --gpu-mode=claim")
+	}
+	if opts.gpuClaim != "" {
+		log.G(ctx).WithField("gpuClaim", opts.gpuClaim).Warn("--gpu-claim is ignored with --gpu-mode=deviceplugin")
+		opts.gpuClaim = ""
+	}
+	if opts.donorSelector == "" {
+		return fmt.Errorf("--donor-selector must be a non-empty label selector")
+	}
+	if _, err := labels.Parse(opts.donorSelector); err != nil {
+		return fmt.Errorf("--donor-selector %q: %w", opts.donorSelector, err)
+	}
+	if opts.holdersURL == "" {
+		return fmt.Errorf("--gpu-holders-url is required with --gpu-mode=deviceplugin")
+	}
+	return nil
 }
 
 // runWithLeaderElection is LWS's (or any controller-runtime manager's) leader election, but
@@ -195,7 +249,11 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			HostNode: o.hostNode, VirtualNode: o.nodeName, GPUClaim: o.gpuClaim,
 			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey, OwnerRef: o.mirrorOwnerRef,
 		},
-		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
+		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace, GPUMode: mirror.GPUMode(o.gpuMode),
+	}
+	if mopts.GPUMode == mirror.GPUModeDevicePlugin {
+		mopts.DonorSelector = o.donorSelector
+		mopts.Holders = mirror.HTTPHolders{URL: o.holdersURL}
 	}
 	if mopts.CPUHeadroom, err = resource.ParseQuantity(o.cpuHeadroom); err != nil {
 		return fmt.Errorf("--mirror-cpu-headroom: %w", err)
@@ -217,6 +275,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	recorder := provider.GuestOnlyRecorder{
 		EventRecorder: eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(o.nodeName, "pod-controller")}),
 	}
+	mopts.Recorder = recorder
 
 	var backend *mirror.Backend
 	n, err := nodeutil.NewNode(o.nodeName,

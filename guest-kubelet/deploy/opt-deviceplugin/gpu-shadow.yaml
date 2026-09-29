@@ -1,0 +1,67 @@
+---
+# --gpu-mode=deviceplugin only: the GPU shadow device plugin on the host node (cmd/gpu-shadow-plugin).
+# It advertises each physical GPU a second time as timeslice.io/gpu-shadow-<minor> (one device
+# each) and serves, on the host loopback, which pod holds which nvidia.com/gpu. The guest kubelet
+# asks for the shadow resource of the donor's GPU, so the real kubelet attaches exactly that GPU
+# to the mirror and sets its device cgroup: the mirror needs no privilege and no hostPath.
+#
+# The plugin runs as root, because the kubelet's device-plugin and pod-resources sockets are
+# root-only, but it is not privileged: every capability is dropped, the root filesystem is
+# read-only, and only the device-plugin directory is mounted writable. It has no API token.
+# Placeholders: __HOST__ (the GPU node) and __PLUGIN_IMAGE__ (cloudbuild-gpu-shadow.yaml).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-shadow
+  namespace: guest-kubelet-proto
+spec:
+  selector:
+    matchLabels: {app: gpu-shadow}
+  template:
+    metadata:
+      labels: {app: gpu-shadow}
+    spec:
+      automountServiceAccountToken: false
+      # The guest kubelet reads the holders endpoint at 127.0.0.1:10262 from the host network.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        kubernetes.io/hostname: __HOST__
+      tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+        - {key: timeslice.io/gpu-fence, operator: Exists, effect: NoSchedule}
+      securityContext:
+        runAsUser: 0
+        runAsNonRoot: false
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: plugin
+          image: __PLUGIN_IMAGE__
+          args:
+            - --gpu-resource=nvidia.com/gpu
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: device-plugins, mountPath: /var/lib/kubelet/device-plugins}
+            - {name: pod-resources, mountPath: /var/lib/kubelet/pod-resources, readOnly: true}
+            - {name: dev, mountPath: /host/dev, readOnly: true}
+            - {name: proc-driver, mountPath: /host/proc/driver/nvidia, readOnly: true}
+      volumes:
+        - name: device-plugins
+          hostPath: {path: /var/lib/kubelet/device-plugins, type: Directory}
+        - name: pod-resources
+          hostPath: {path: /var/lib/kubelet/pod-resources, type: Directory}
+        # Read only to check which /dev/nvidiaN exist; the kubelet hands the nodes to the mirror.
+        - name: dev
+          hostPath: {path: /dev, type: Directory}
+        # gpus/<pci>/information: each GPU's device minor and UUID.
+        - name: proc-driver
+          hostPath: {path: /proc/driver/nvidia, type: Directory}

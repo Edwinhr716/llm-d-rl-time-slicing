@@ -98,15 +98,29 @@ func RequestsGPU(pod *corev1.Pod) bool {
 	return false
 }
 
-// Build returns the mirror pod for a guest. The guest is not modified.
+// Build returns the mirror pod for a guest, attaching a GPU through cfg.GPUClaim
+// (--gpu-mode=claim). The guest is not modified.
 func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
+	return BuildWithGPU(guest, &cfg, nil)
+}
+
+// BuildWithGPU is Build with the GPU attach chosen by the caller: nil means the shared claim
+// (claim mode, exactly what Build does); non-nil means the donor's own device through its
+// shadow resource (--gpu-mode=deviceplugin, see gpu_attach.go).
+func BuildWithGPU(guest *corev1.Pod, cfg *Config, att *GPUAttachment) (*corev1.Pod, error) {
 	if cfg.HostNode == "" {
 		return nil, fmt.Errorf("mirror: HostNode is required")
 	}
 	gpu := RequestsGPU(guest)
-	if gpu && cfg.GPUClaim == "" {
+	if gpu && att == nil && cfg.GPUClaim == "" {
 		return nil, fmt.Errorf("guest %s/%s requests %s but no GPU claim is configured", guest.Namespace, guest.Name, GPUResource)
 	}
+	if gpu && att != nil {
+		if err := CheckDevicePluginGuest(guest); err != nil {
+			return nil, err
+		}
+	}
+	useClaim := gpu && att == nil
 
 	spec := *guest.Spec.DeepCopy()
 
@@ -118,7 +132,7 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 	spec.Affinity = nil
 	spec.TopologySpreadConstraints = nil
 	spec.SchedulingGates = nil
-	spec.Tolerations = mirrorTolerations(guest.Spec.Tolerations, cfg)
+	spec.Tolerations = mirrorTolerations(guest.Spec.Tolerations, *cfg)
 	// Admission fills these from the PriorityClass/RuntimeClass; copying the values makes it
 	// reject the create ("must not be set"), so let admission fill them again.
 	spec.Priority = nil
@@ -136,16 +150,20 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 	for i := range spec.Containers {
 		c := &spec.Containers[i]
 		c.LivenessProbe, c.ReadinessProbe, c.StartupProbe = nil, nil, nil
-		c.Resources = mirrorResources(c.Resources, cfg, gpu)
+		c.Resources = mirrorResources(c.Resources, *cfg, useClaim)
+		if att != nil && containerRequestsGPU(&guest.Spec.Containers[i]) {
+			attachShadow(&c.Resources, att)
+		}
 		c.Env = rewriteDownwardEnv(c.Env, guest)
 	}
-	if gpu {
+	if useClaim {
+		claim := cfg.GPUClaim
 		spec.ResourceClaims = append(spec.ResourceClaims, corev1.PodResourceClaim{
-			Name: ClaimRefName, ResourceClaimName: &cfg.GPUClaim,
+			Name: ClaimRefName, ResourceClaimName: &claim,
 		})
 	}
 
-	m := &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      Name(guest.Name),
 			Namespace: guest.Namespace,
@@ -162,10 +180,14 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 		},
 		Spec: spec,
 	}
-	if cfg.OwnerRef {
-		m.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
+	if gpu && att != nil {
+		pod.Annotations[AnnotationGPUUUID] = att.UUID
+		pod.Annotations[AnnotationGPUDonorUID] = string(att.DonorUID)
 	}
-	return m, nil
+	if cfg.OwnerRef {
+		pod.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
+	}
+	return pod, nil
 }
 
 // OwnerRef is the reference from a mirror to its guest. blockOwnerDeletion is left unset: it

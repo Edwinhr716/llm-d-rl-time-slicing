@@ -27,6 +27,9 @@ spec:
       tolerations:
         - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
         - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        # --gpu-mode=deviceplugin: the fence taint this guest kubelet puts on the host while a
+        # mirror still runs on a departed donor's GPU must not block a restart of the kubelet itself.
+        - {key: timeslice.io/gpu-fence, operator: Exists, effect: NoSchedule}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
