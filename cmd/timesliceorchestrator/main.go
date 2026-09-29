@@ -85,7 +85,12 @@ func run() error {
 			"PENDING LEAD DECISION: option B (\"async\") is refused until decided.")
 	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
 		"Upper bound on each blocking wait for a foreground snapshot or restore operation. On expiry the "+
-			"reconcile is retried. 0 means unbounded.")
+			"reconcile is retried and waits on the same operation, never starting a new one while it is "+
+			"pending, until --foreground-op-timeout-retries more timeouts have passed; then the job is marked "+
+			"FAULTED on that node until its pods are replaced. 0 means unbounded.")
+	foregroundOpTimeoutRetries := flag.Int("foreground-op-timeout-retries", controller.DefaultForegroundOpTimeoutRetries,
+		"How many more timed-out waits on the same foreground snapshot or restore are retried before the job "+
+			"is marked FAULTED. 0 marks it FAULTED at the first timeout.")
 	backgroundRole := flag.Bool("background-role", false,
 		"Enable the background participant protocol: Acquire/Yield with ROLE_BACKGROUND, participant_id "+
 			"heartbeats and GroupStatus.background_protocol = 1. Off (the default) reports "+
@@ -141,6 +146,9 @@ func run() error {
 	}
 	if *foregroundOpTimeout < 0 {
 		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", *foregroundOpTimeout)
+	}
+	if *foregroundOpTimeoutRetries < 0 {
+		return fmt.Errorf("--foreground-op-timeout-retries must not be negative, got %d", *foregroundOpTimeoutRetries)
 	}
 	if *minBubble < 0 {
 		return fmt.Errorf("--min-bubble must not be negative, got %v", *minBubble)
@@ -233,6 +241,7 @@ func run() error {
 	ctrl.ResyncPeriod = *resyncPeriod
 	ctrl.HolderWaitRequeue = *holderWaitRequeue
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
+	ctrl.ForegroundOpTimeoutRetries = *foregroundOpTimeoutRetries
 	ctrl.KillPollInterval = *killPollInterval
 	ctrl.BackgroundLiveness = *backgroundLiveness
 
@@ -283,6 +292,7 @@ func run() error {
 		"dispatchBudgetExternalRisingEdge", *budgetExternalRisingEdge,
 		"foregroundWait", *foregroundWait,
 		"foregroundOpTimeout", *foregroundOpTimeout,
+		"foregroundOpTimeoutRetries", *foregroundOpTimeoutRetries,
 		"backgroundRole", *backgroundRole,
 		"minBubble", *minBubble,
 		"noticeWindow", *noticeWindow,

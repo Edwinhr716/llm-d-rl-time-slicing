@@ -105,6 +105,8 @@ type flagValues struct {
 	lockConfigMap            string
 	watchNamespaces          string
 	nodeSelector             string
+
+	foregroundOpTimeoutRetries int
 }
 
 // newFlagSet declares the flags of cmd/timesliceorchestrator/main.go with the
@@ -134,6 +136,8 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 		"How reconcile waits on a foreground snapshot or restore")
 	fs.DurationVar(&fv.foregroundOpTimeout, "foreground-op-timeout", 10*time.Minute,
 		"Upper bound on each blocking wait for a foreground operation; 0 means unbounded")
+	fs.IntVar(&fv.foregroundOpTimeoutRetries, "foreground-op-timeout-retries", controller.DefaultForegroundOpTimeoutRetries,
+		"Timed-out waits on the same foreground operation retried before the job is marked FAULTED")
 	fs.BoolVar(&fv.backgroundRole, "background-role", false, "Enable the background participant protocol")
 	fs.DurationVar(&fv.minBubble, "min-bubble", 0, "Smallest Yield expected_idle that records a lend hint")
 	fs.DurationVar(&fv.noticeWindow, "notice-window", server.DefaultNoticeWindow, "Notice window N")
@@ -160,6 +164,9 @@ func (fv *flagValues) validate() error {
 	}
 	if fv.foregroundOpTimeout < 0 {
 		return fmt.Errorf("--foreground-op-timeout must not be negative, got %v", fv.foregroundOpTimeout)
+	}
+	if fv.foregroundOpTimeoutRetries < 0 {
+		return fmt.Errorf("--foreground-op-timeout-retries must not be negative, got %d", fv.foregroundOpTimeoutRetries)
 	}
 	if fv.minBubble < 0 {
 		return fmt.Errorf("--min-bubble must not be negative, got %v", fv.minBubble)
@@ -267,6 +274,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.ResyncPeriod = fv.resyncPeriod
 	ctrl.HolderWaitRequeue = fv.holderWaitRequeue
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
+	ctrl.ForegroundOpTimeoutRetries = fv.foregroundOpTimeoutRetries
 	ctrl.KillPollInterval = fv.killPollInterval
 	ctrl.BackgroundLiveness = fv.backgroundLiveness
 
@@ -305,6 +313,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"metricsPort", metricsPort,
 		"foregroundWait", fv.foregroundWait,
 		"foregroundOpTimeout", fv.foregroundOpTimeout,
+		"foregroundOpTimeoutRetries", fv.foregroundOpTimeoutRetries,
 		"controllerWorkers", fv.controllerWorkers,
 		"backgroundRole", fv.backgroundRole,
 		"minBubble", fv.minBubble,
