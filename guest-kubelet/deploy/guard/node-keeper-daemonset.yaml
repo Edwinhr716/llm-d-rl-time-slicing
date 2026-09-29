@@ -1,0 +1,52 @@
+# Pending lead decision D-NS-11, option ns-ds: the VK-A7 outage guard (node-keeper.yaml) as a
+# DaemonSet on the same nodes as the guest kubelet DaemonSet (deploy/daemonset.yaml), those
+# labelled timeslice.io/donor=true. The keeper finds its virtual Node from NODE_NAME, as the guest
+# kubelet does. Removing the label stops both, so the guard does not hold the Node of an unbound
+# host. `make deploy-ds` replaces __IMAGE__.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: guest-kubelet-node-keeper
+  namespace: guest-kubelet-proto
+spec:
+  updateStrategy:
+    # The Deployment's Recreate, per node: at most one keeper per Node, the old one stops before
+    # the new one starts. It holds no state (the Lease annotations do).
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: guest-kubelet-node-keeper}
+  template:
+    metadata:
+      labels: {app: guest-kubelet-node-keeper}
+    spec:
+      serviceAccountName: guest-kubelet
+      # On the host: if the host dies the keeper dies with it, and the normal NotReady/delete
+      # path cleans up the virtual Node.
+      nodeSelector:
+        timeslice.io/donor: "true"
+      tolerations:
+        - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: node-keeper
+          image: __IMAGE__
+          args:
+            - --node-keeper=true
+            - --keeper-stale-after=15s
+            - --keeper-outage-grace=15m
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 50m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
