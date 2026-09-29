@@ -40,17 +40,20 @@ import (
 type options struct {
 	nodeName, hostNode, hostIP, kubeletVersion string
 	kubeletPort                                int
-	cpu, memory, pods                          string
+	pods                                       string
 	gpus                                       int64
 	kubeconfig                                 string
 	workers                                    int
 
+	// Guest CPU/RAM budget
+	budgetMarginCPU, budgetMarginMem string
+	budgetRefresh                    time.Duration
+
 	// M1: mirror backend
-	cpuHeadroom, memHeadroom string
-	gpuClaim                 string
-	reserveClaim             bool
-	mirrorOwnerRef           bool
-	orphanGrace              time.Duration
+	gpuClaim       string
+	reserveClaim   bool
+	mirrorOwnerRef bool
+	orphanGrace    time.Duration
 
 	// M1: surviving an outage
 	providerIDFromHost bool
@@ -66,15 +69,16 @@ func main() {
 	flag.StringVar(&o.hostIP, "host-ip", os.Getenv("HOST_IP"), "real host IP, advertised as the Node's InternalIP (env HOST_IP)")
 	flag.IntVar(&o.kubeletPort, "kubelet-port", 10260, "port advertised in status.daemonEndpoints (the real kubelet holds 10250)")
 	flag.StringVar(&o.kubeletVersion, "kubelet-version", "v1.35.8-guest-kubelet-m1", "reported in status.nodeInfo.kubeletVersion")
-	flag.StringVar(&o.cpu, "cpu", "8", "advertised cpu capacity")
-	flag.StringVar(&o.memory, "memory", "32Gi", "advertised memory capacity")
 	flag.StringVar(&o.pods, "pods", "20", "advertised pod capacity")
 	flag.Int64Var(&o.gpus, "gpus", 1, "advertised nvidia.com/gpu capacity")
+	// cpu and memory are not flags: the VK Node advertises the host's allocatable minus the
+	// resident pods' requests minus the margin, and mirrors carry the guest's real requests.
+	flag.StringVar(&o.budgetMarginCPU, "budget-margin-cpu", "250m", "guest budget: cpu kept free on the host")
+	flag.StringVar(&o.budgetMarginMem, "budget-margin-memory", "1Gi", "guest budget: memory kept free on the host")
+	flag.DurationVar(&o.budgetRefresh, "budget-refresh", 30*time.Second, "guest budget: recompute interval (0 = once at start)")
 	flag.StringVar(&o.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "kubeconfig path; empty means in-cluster")
 	flag.IntVar(&o.workers, "workers", 4, "pod sync workers")
 
-	flag.StringVar(&o.cpuHeadroom, "mirror-cpu-headroom", "1", "cap on each mirror container's cpu request (0 = no cap)")
-	flag.StringVar(&o.memHeadroom, "mirror-memory-headroom", "4Gi", "cap on each mirror container's memory request (0 = no cap)")
 	flag.StringVar(&o.gpuClaim, "gpu-claim", "", "ResourceClaim (in the guest's namespace) that replaces nvidia.com/gpu on the mirror")
 	// Off by default: measured in M1, kube-controller-manager's resourceclaim controller adds a
 	// pod that already has spec.nodeName to the claim's reservedFor about 1 s after creation.
@@ -182,13 +186,8 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if o.providerIDFromHost {
 		cfg.ProviderID = host.Spec.ProviderID
 	}
-	for _, q := range []struct {
-		in  string
-		dst *resource.Quantity
-	}{{o.cpu, &cfg.CPU}, {o.memory, &cfg.Memory}, {o.pods, &cfg.Pods}} {
-		if *q.dst, err = resource.ParseQuantity(q.in); err != nil {
-			return fmt.Errorf("capacity %q: %w", q.in, err)
-		}
+	if cfg.Pods, err = resource.ParseQuantity(o.pods); err != nil {
+		return fmt.Errorf("--pods: %w", err)
 	}
 	mopts := mirror.Options{
 		Config: mirror.Config{
@@ -197,14 +196,19 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		},
 		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
 	}
-	if mopts.CPUHeadroom, err = resource.ParseQuantity(o.cpuHeadroom); err != nil {
-		return fmt.Errorf("--mirror-cpu-headroom: %w", err)
+	bo := provider.BudgetOptions{Refresh: o.budgetRefresh}
+	if bo.MarginCPU, err = resource.ParseQuantity(o.budgetMarginCPU); err != nil {
+		return fmt.Errorf("--budget-margin-cpu: %w", err)
 	}
-	if mopts.MemoryHeadroom, err = resource.ParseQuantity(o.memHeadroom); err != nil {
-		return fmt.Errorf("--mirror-memory-headroom: %w", err)
+	if bo.MarginMemory, err = resource.ParseQuantity(o.budgetMarginMem); err != nil {
+		return fmt.Errorf("--budget-margin-memory: %w", err)
 	}
 
-	nodeSpec := provider.NewNodeSpec(cfg)
+	nodeProvider, err := provider.SetupNode(ctx, client, o.hostNode, &cfg, &bo)
+	if err != nil {
+		return err
+	}
+	nodeSpec := *nodeProvider.Node()
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
 		return err
 	}
@@ -223,7 +227,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, mopts)
-			return provider.New(backend), provider.NodeProvider{}, nil
+			return provider.New(backend), nodeProvider, nil
 		},
 		nodeutil.WithClient(client),
 		func(c *nodeutil.NodeConfig) error {
@@ -235,7 +239,7 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 			// the mirror, so the guest kubelet never needs it.
 			c.SkipDownwardAPIResolution = true
 			c.HTTPListenAddr = fmt.Sprintf(":%d", o.kubeletPort) // no TLS config, so no server starts yet
-			c.NodeStatusUpdateErrorHandler = reRegisterOnNotFound(client, &nodeSpec)
+			c.NodeStatusUpdateErrorHandler = reRegisterOnNotFound(client, nodeProvider.Node)
 			return nil
 		},
 	)
@@ -285,13 +289,13 @@ func ensureProviderID(ctx context.Context, client kubernetes.Interface, name, id
 
 // reRegisterOnNotFound recreates the Node if someone deleted it (for example the cloud
 // node lifecycle controller). The loud log line is how we record that it happened.
-func reRegisterOnNotFound(client kubernetes.Interface, spec *corev1.Node) node.ErrorHandler {
+func reRegisterOnNotFound(client kubernetes.Interface, current func() *corev1.Node) node.ErrorHandler {
 	return func(ctx context.Context, err error) error {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
-		log.G(ctx).WithField("node", spec.Name).Warn("Node object was deleted by someone else; re-registering")
-		fresh := spec.DeepCopy()
+		fresh := current() // the template, with the current budget
+		log.G(ctx).WithField("node", fresh.Name).Warn("Node object was deleted by someone else; re-registering")
 		fresh.ResourceVersion = ""
 		_, err = client.CoreV1().Nodes().Create(ctx, fresh, metav1.CreateOptions{})
 		return err

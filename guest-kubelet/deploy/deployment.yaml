@@ -37,8 +37,9 @@ spec:
           args:
             - --leader-elect=true
             - --gpu-claim=shared-m1-gpu-claim
-            - --mirror-cpu-headroom=1
-            - --mirror-memory-headroom=4Gi
+            - --budget-margin-cpu=250m
+            - --budget-margin-memory=1Gi
+            - --budget-refresh=30s
             - --mirror-owner-ref=true
           env:
             - name: HOST_IP

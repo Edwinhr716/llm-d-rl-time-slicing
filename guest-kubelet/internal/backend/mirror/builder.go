@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -41,11 +40,6 @@ const (
 type Config struct {
 	HostNode    string // real node the mirror is pinned to (spec.nodeName)
 	VirtualNode string // our virtual node; stored in LabelMirrorNode
-	// Headroom caps each container's requests on the real node. The kubelet re-runs the fit
-	// check on pods that skip the scheduler, so a mirror asking for the guest's full requests
-	// is rejected (OutOfcpu/OutOfmemory) on a full trainer node. Zero means "do not cap".
-	CPUHeadroom    resource.Quantity
-	MemoryHeadroom resource.Quantity
 	// GPUClaim is the ResourceClaim (in the guest's namespace) that replaces nvidia.com/gpu.
 	// Empty means guests asking for a GPU are refused.
 	GPUClaim string
@@ -124,7 +118,7 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 	spec.Priority = nil
 	spec.PreemptionPolicy = nil
 	spec.Overhead = nil
-	spec.Resources = nil // pod-level resources would bypass the per-container headroom cap
+	spec.Resources = nil // the mirror carries the per-container requests and limits only
 	// The guest kubelet owns readiness (plan option c1). The real kubelet must not probe the
 	// mirror, and the guest's readiness gates belong to the guest, not the mirror.
 	spec.ReadinessGates = nil
@@ -136,7 +130,7 @@ func Build(guest *corev1.Pod, cfg Config) (*corev1.Pod, error) {
 	for i := range spec.Containers {
 		c := &spec.Containers[i]
 		c.LivenessProbe, c.ReadinessProbe, c.StartupProbe = nil, nil, nil
-		c.Resources = mirrorResources(c.Resources, cfg, gpu)
+		c.Resources = mirrorResources(c.Resources, gpu)
 		c.Env = rewriteDownwardEnv(c.Env, guest)
 	}
 	if gpu {
@@ -203,15 +197,15 @@ func tolerated(tols []corev1.Toleration, want corev1.Toleration) bool {
 	return false
 }
 
-// mirrorResources caps requests at the headroom and swaps the GPU for the claim. Limits are
-// kept (a memory limit is what protects the trainer from the guest), except that a capped
-// request never exceeds its limit.
-func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev1.ResourceRequirements {
+// mirrorResources keeps the guest's requests and limits (the VK Node's budget already booked
+// the requests on the host; a memory limit is what protects the trainer from the guest) and
+// swaps the GPU for the claim.
+func mirrorResources(in corev1.ResourceRequirements, gpu bool) corev1.ResourceRequirements {
 	out := *in.DeepCopy()
 	delete(out.Requests, GPUResource)
 	delete(out.Limits, GPUResource)
-	// A container with a limit but no request gets request=limit from API defaulting, which
-	// would dodge the cap. Make the request explicit so the cap applies.
+	// A container with a limit but no request gets request=limit from API defaulting. Make the
+	// request explicit so the mirror's spec shows what it books on the host.
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 		if _, hasReq := out.Requests[name]; hasReq {
 			continue
@@ -223,8 +217,6 @@ func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev
 			out.Requests[name] = lim.DeepCopy()
 		}
 	}
-	capAt(out.Requests, corev1.ResourceCPU, cfg.CPUHeadroom)
-	capAt(out.Requests, corev1.ResourceMemory, cfg.MemoryHeadroom)
 	if gpu {
 		out.Claims = append(out.Claims, corev1.ResourceClaim{Name: ClaimRefName})
 	}
@@ -235,15 +227,6 @@ func mirrorResources(in corev1.ResourceRequirements, cfg Config, gpu bool) corev
 		out.Limits = nil
 	}
 	return out
-}
-
-func capAt(list corev1.ResourceList, name corev1.ResourceName, headroom resource.Quantity) {
-	if headroom.IsZero() || list == nil {
-		return
-	}
-	if q, ok := list[name]; ok && q.Cmp(headroom) > 0 {
-		list[name] = headroom.DeepCopy()
-	}
 }
 
 // rewriteDownwardEnv replaces downward-API env vars that would otherwise describe the mirror

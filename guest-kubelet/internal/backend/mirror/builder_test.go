@@ -12,7 +12,6 @@ import (
 func testConfig() Config {
 	return Config{
 		HostNode: "real-node", VirtualNode: "vk-x",
-		CPUHeadroom: resource.MustParse("1"), MemoryHeadroom: resource.MustParse("4Gi"),
 		GPUClaim:      "shared-gpu",
 		HostTaints:    []corev1.Taint{{Key: "nvidia.com/gpu", Value: "present", Effect: corev1.TaintEffectNoSchedule}},
 		GuestTaintKey: "timeslice.io/guest",
@@ -91,11 +90,11 @@ func TestBuildMirror(t *testing.T) {
 	if _, ok := c.Resources.Limits[GPUResource]; ok {
 		t.Error("nvidia.com/gpu limit must be removed")
 	}
-	if q := c.Resources.Requests[corev1.ResourceCPU]; q.Cmp(resource.MustParse("1")) != 0 {
-		t.Errorf("cpu request not capped: %s", q.String())
+	if q := c.Resources.Requests[corev1.ResourceCPU]; q.Cmp(resource.MustParse("6")) != 0 {
+		t.Errorf("cpu request must be the guest's: %s", q.String())
 	}
-	if q := c.Resources.Requests[corev1.ResourceMemory]; q.Cmp(resource.MustParse("4Gi")) != 0 {
-		t.Errorf("memory request not capped: %s", q.String())
+	if q := c.Resources.Requests[corev1.ResourceMemory]; q.Cmp(resource.MustParse("24Gi")) != 0 {
+		t.Errorf("memory request must be the guest's: %s", q.String())
 	}
 	if q := c.Resources.Limits[corev1.ResourceMemory]; q.Cmp(resource.MustParse("30Gi")) != 0 {
 		t.Errorf("memory limit must be kept: %s", q.String())
@@ -151,24 +150,15 @@ func TestBuildRefusesGPUWithoutClaim(t *testing.T) {
 	}
 }
 
-func TestLimitOnlyIsCapped(t *testing.T) {
+func TestLimitOnlyGetsRequestEqualLimit(t *testing.T) {
 	g := testGuest()
 	g.Spec.Containers[0].Resources = corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("7")},
 	}
 	m, _ := Build(g, testConfig())
 	r := m.Spec.Containers[0].Resources
-	if q := r.Requests[corev1.ResourceCPU]; q.Cmp(resource.MustParse("1")) != 0 {
-		t.Errorf("limit-only cpu should get an explicit capped request, got %v", r.Requests)
-	}
-}
-
-func TestNoCapWhenHeadroomZero(t *testing.T) {
-	cfg := testConfig()
-	cfg.CPUHeadroom = resource.Quantity{}
-	m, _ := Build(testGuest(), cfg)
-	if q := m.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU]; q.Cmp(resource.MustParse("6")) != 0 {
-		t.Errorf("cpu must not be capped: %s", q.String())
+	if q := r.Requests[corev1.ResourceCPU]; q.Cmp(resource.MustParse("7")) != 0 {
+		t.Errorf("limit-only cpu should get an explicit request equal to its limit, got %v", r.Requests)
 	}
 }
 

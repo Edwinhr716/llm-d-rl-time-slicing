@@ -10,11 +10,16 @@ kubelet for the guest pods scheduled onto it.
   `timeslice.io/virtual-node=true`, taint `timeslice.io/guest=true:NoSchedule`, capacity
   `cpu`/`memory`/`pods`/`nvidia.com/gpu: 1`, and the host's IP as `InternalIP`. No
   `kubernetes.io/os` label, which keeps GKE's system DaemonSets off it.
+- Guest budget: the Node's `cpu` and `memory` are the host's allocatable minus
+  the requests of the pods resident on the host (this VK's own mirrors
+  excluded) minus a margin (`--budget-margin-cpu`, `--budget-margin-memory`),
+  clamped at 0. It is computed before the Node registers and every
+  `--budget-refresh` after that; a smaller budget only affects new binds.
 - A guest is a pod bound to the node that tolerates `timeslice.io/guest` by key. For each one the
   VK creates a mirror pod `<guest>-m` pinned to the host (`internal/backend/mirror`):
   - scheduling fields, probes, readiness gates and guest labels are removed;
   - labels `timeslice.io/mirror-of=<guest UID>` and `timeslice.io/mirror-node=<vnode>` are added;
-  - requests are capped at `--mirror-cpu-headroom` / `--mirror-memory-headroom`;
+  - requests and limits are the guest's (the budget booked them on the host);
   - `nvidia.com/gpu` is replaced by the ResourceClaim `--gpu-claim`, which must already be
     allocated on the host (by the trainer).
 - A label-filtered informer copies the mirror's status to the guest: phase, IPs, start time,
@@ -33,7 +38,9 @@ kubelet for the guest pods scheduled onto it.
 
 ```
 cmd/guest-kubelet/main.go            flags; leader election; nodeutil.NewNode wiring; own event recorder
-internal/provider/node.go            the Node spec (labels, taint, capacity, conditions); NodeProvider
+internal/provider/node.go            the Node spec (labels, taint, capacity)
+internal/provider/node_status.go     NodeProvider: Node template, status updates
+internal/provider/budget.go          the guest budget and its refresh
 internal/provider/provider.go        the pod provider: guest filter, hands guests to the backend
 internal/provider/events.go          drops events about non-guest pods
 internal/backend/mirror/builder.go   guest -> mirror pod (pure function)
