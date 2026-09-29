@@ -20,6 +20,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: donor-controller
+        app: donor-controller
         timeslice.io/eval-role: donor-standin
     spec:
       serviceAccountName: donor-controller
