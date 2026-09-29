@@ -37,6 +37,14 @@ func (h *harness) emittedPods() []*corev1.Pod {
 
 func newHarness(t *testing.T, opts Options, objs ...runtime.Object) *harness {
 	t.Helper()
+	h := buildHarness(t, &opts, objs...)
+	h.start()
+	return h
+}
+
+// buildHarness is newHarness without Start, so a test can put guests in the lister first.
+func buildHarness(t *testing.T, opts *Options, objs ...runtime.Object) *harness {
+	t.Helper()
 	client := fake.NewClientset(objs...)
 	// The API server sets UIDs; the fake does not.
 	client.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
@@ -48,18 +56,32 @@ func newHarness(t *testing.T, opts Options, objs ...runtime.Object) *harness {
 	})
 	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	h := &harness{t: t, client: client, guests: idx}
-	h.b = New(client, corev1listers.NewPodLister(idx), opts)
+	h.b = New(client, corev1listers.NewPodLister(idx), *opts)
 	h.b.SetStatusCallback(func(p *corev1.Pod) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		h.emitted = append(h.emitted, p)
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	if err := h.b.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
 	return h
+}
+
+func (h *harness) start() {
+	h.t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	h.t.Cleanup(cancel)
+	if err := h.b.Start(ctx); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// addOrphan creates, after Start, a mirror whose guest is gone (a mirror found at Start
+// belongs to the previous incarnation and is retired at once).
+func (h *harness) addOrphan(orphan *corev1.Pod) {
+	h.t.Helper()
+	if _, err := h.client.CoreV1().Pods("ns").Create(context.Background(), orphan, metav1.CreateOptions{}); err != nil {
+		h.t.Fatal(err)
+	}
+	h.waitInformer(orphan.Labels[LabelMirrorOf])
 }
 
 func testOptions() Options {
@@ -131,31 +153,13 @@ func TestCreateThenGet(t *testing.T) {
 	}
 }
 
-func TestReadoptOrphanWithSameSpec(t *testing.T) {
-	old := cpuGuest("old-uid")
-	orphan, _ := Build(old, testOptions().Config)
-	orphan.UID = "mirror-uid"
-	orphan.Status.PodIP = "10.9.9.9"
-	orphan.Status.Phase = corev1.PodRunning
-	h := newHarness(t, testOptions(), orphan)
-
-	g := cpuGuest("new-uid") // same name and containers, new UID (StatefulSet re-creation)
-	h.addGuest(g)
-	if err := h.b.Create(context.Background(), g); err != nil {
-		t.Fatal(err)
-	}
-	m := h.mirror("vllm-m")
-	if m.UID != "mirror-uid" || m.Labels[LabelMirrorOf] != "new-uid" || m.Status.PodIP != "10.9.9.9" {
-		t.Errorf("want the same mirror re-adopted, got uid=%s of=%s ip=%s", m.UID, m.Labels[LabelMirrorOf], m.Status.PodIP)
-	}
-}
-
 func TestReplaceOrphanWithDifferentSpec(t *testing.T) {
 	old := cpuGuest("old-uid")
 	old.Spec.Containers[0].Image = "other:1"
 	orphan, _ := Build(old, testOptions().Config)
 	orphan.UID = "mirror-uid"
-	h := newHarness(t, testOptions(), orphan)
+	h := newHarness(t, testOptions())
+	h.addOrphan(orphan)
 
 	g := cpuGuest("new-uid")
 	h.addGuest(g)
@@ -236,8 +240,8 @@ func TestDeleteWithoutMirrorReportsTerminated(t *testing.T) {
 func TestOrphanCollectedAfterGrace(t *testing.T) {
 	orphan, _ := Build(cpuGuest("gone"), testOptions().Config)
 	orphan.UID = "mirror-uid"
-	h := newHarness(t, testOptions(), orphan)
-	h.waitInformer("gone")
+	h := newHarness(t, testOptions())
+	h.addOrphan(orphan)
 	now := time.Now()
 	h.b.collectOrphans(context.Background(), now)
 	if h.mirror("vllm-m") == nil {

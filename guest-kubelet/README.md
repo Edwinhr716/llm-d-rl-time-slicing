@@ -21,11 +21,15 @@ kubelet for the guest pods scheduled onto it.
   conditions and container states.
 - Deleting the guest deletes the mirror with the guest's grace period. The guest is removed as
   soon as the mirror has stopped.
-- Leader election (`--leader-elect`, Lease `guest-kubelet-<vnode>`) runs 2 replicas. On restart
-  or failover, existing mirrors are found again and nothing is re-created.
+- Leader election (`--leader-elect`, Lease `guest-kubelet-<vnode>`) runs 2 replicas.
+- Every mirror carries `timeslice.io/job-id=<guest UID>-<attempt>` (attempts start at 1). Each
+  start of the guest kubelet (restart or failover) is a new incarnation: before the pod
+  controller runs, it marks each running guest NotReady (reason `MirrorReplaced`), deletes its
+  mirror with normal grace, waits until it is gone, and then creates a new mirror with the next
+  attempt. The guest's process restarts; mirrors are never re-adopted.
 - `--mirror-owner-ref=false` lets mirrors outlive guests that were force-deleted after a Node
-  deletion. A guest re-created with the same name and the same containers re-adopts the mirror
-  (same UID and IP). Orphans are deleted after `--orphan-grace`.
+  deletion. A guest re-created with the same name replaces the orphan with a new mirror.
+  Orphans are deleted after `--orphan-grace`.
 - Not yet: probes (a guest is Ready when its container starts), logs/exec (use `kubectl logs
   <guest>-m`), stats.
 

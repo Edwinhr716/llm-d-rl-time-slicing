@@ -26,12 +26,15 @@ type Options struct {
 	// this for pods it binds; a mirror skips the scheduler, and the kubelet refuses to prepare a
 	// claim for a pod that is not in reservedFor.
 	ReserveClaim bool
-	// OrphanGrace is how long a mirror whose guest is gone is kept for a guest re-created with
-	// the same name (StatefulSet, LWS, a re-applied bare pod) to re-adopt. Only matters without
-	// OwnerRef; with it, the garbage collector deletes orphans first.
+	// OrphanGrace is how long a mirror whose guest is gone is kept before it is deleted. Orphans
+	// are never re-adopted: a guest re-created with the same name replaces the orphan at once.
+	// Only matters without OwnerRef; with it, the garbage collector deletes orphans first.
 	OrphanGrace time.Duration
 	// Resync is the mirror informer's resync period.
 	Resync time.Duration
+	// ReplaceWait caps how long a start waits for the previous incarnation's mirrors to be
+	// gone. Zero means their longest termination grace period plus 30 s.
+	ReplaceWait time.Duration
 }
 
 // Backend creates, watches and deletes mirror pods. It keeps no state of its own that matters
@@ -48,6 +51,12 @@ type Backend struct {
 	mu          sync.Mutex
 	onStatus    func(*corev1.Pod) // the library's notify callback, wrapped by the provider
 	orphanSince map[types.UID]time.Time
+	// attempts is the highest job-id attempt retired per guest UID; the next mirror gets +1.
+	attempts map[types.UID]int
+	// retired maps mirrors of a previous incarnation (mirror UID) to their guest UID, and
+	// replacedFor maps a guest UID to its retired mirror, until the new mirror is created.
+	retired     map[types.UID]types.UID
+	replacedFor map[types.UID]types.UID
 }
 
 // New builds the backend. guests must list the pods bound to the virtual node.
@@ -66,6 +75,9 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, opts Optio
 		client: client, opts: opts, guests: guests, factory: f,
 		mirrors: inf.Lister(), synced: inf.Informer().HasSynced,
 		orphanSince: map[types.UID]time.Time{},
+		attempts:    map[types.UID]int{},
+		retired:     map[types.UID]types.UID{},
+		replacedFor: map[types.UID]types.UID{},
 	}
 	_, _ = inf.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { b.mirrorChanged(obj) },
@@ -75,13 +87,16 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, opts Optio
 	return b
 }
 
-// Start runs the informer and blocks until it has synced. Call it before the pod controller
-// starts, so the first GetPod after a restart already sees every existing mirror: that is
-// what stops the library from calling CreatePod again for a guest that already runs.
+// Start runs the informer, blocks until it has synced, and retires the mirrors of the previous
+// incarnation (retirePrevious). Call it before the pod controller starts, so the first GetPod
+// after a restart finds no mirror and the library creates each guest's new mirror.
 func (b *Backend) Start(ctx context.Context) error {
 	b.factory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), b.synced) {
 		return fmt.Errorf("mirror informer did not sync")
+	}
+	if err := b.retirePrevious(ctx); err != nil {
+		return err
 	}
 	go b.orphanLoop(ctx)
 	return nil
@@ -114,7 +129,7 @@ func (b *Backend) guestFor(m *corev1.Pod) *corev1.Pod {
 
 func (b *Backend) mirrorChanged(obj any) {
 	m, ok := obj.(*corev1.Pod)
-	if !ok {
+	if !ok || b.isRetired(m.UID) {
 		return
 	}
 	if g := b.guestFor(m); g != nil {
@@ -123,25 +138,28 @@ func (b *Backend) mirrorChanged(obj any) {
 }
 
 func (b *Backend) mirrorDeleted(obj any) {
-	m, ok := obj.(*corev1.Pod)
+	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		tomb, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			return
 		}
-		if m, ok = tomb.Obj.(*corev1.Pod); !ok {
+		if pod, ok = tomb.Obj.(*corev1.Pod); !ok {
 			return
 		}
 	}
-	g := b.guestFor(m)
+	if b.forgetRetired(pod.UID) {
+		return // replaced on purpose: the guest keeps running on the new mirror
+	}
+	g := b.guestFor(pod)
 	if g == nil {
 		return
 	}
 	if g.DeletionTimestamp == nil {
-		b.emit(TerminalStatus(g, m, ReasonMirrorDeleted))
+		b.emit(TerminalStatus(g, pod, ReasonMirrorDeleted))
 		return
 	}
-	b.emit(TerminalStatus(g, m, ReasonGuestDeleted))
+	b.emit(TerminalStatus(g, pod, ReasonGuestDeleted))
 	go b.finishGuestDeletion(context.Background(), g)
 }
 
@@ -177,15 +195,15 @@ func (b *Backend) finishGuestDeletion(ctx context.Context, g *corev1.Pod) {
 // mirrorOf returns the mirror currently serving this guest (same name, same guest UID).
 func (b *Backend) mirrorOf(guest *corev1.Pod) (*corev1.Pod, bool) {
 	m, err := b.mirrors.Pods(guest.Namespace).Get(Name(guest.Name))
-	if err != nil || m.Labels[LabelMirrorOf] != string(guest.UID) {
+	if err != nil || m.Labels[LabelMirrorOf] != string(guest.UID) || b.isRetired(m.UID) {
 		return nil, false
 	}
 	return m, true
 }
 
 // Get returns the guest with its translated status, or errdefs.NotFound when no mirror serves
-// it. The library calls this before every create/update; after a restart it is the re-adoption
-// point: an existing mirror means "already running", so there is no second CreatePod.
+// it. The library calls this before every create/update: an existing mirror of this
+// incarnation means "already running", so there is no second CreatePod.
 func (b *Backend) Get(namespace, name string) (*corev1.Pod, error) {
 	g, err := b.guests.Pods(namespace).Get(name)
 	if err != nil {
@@ -207,6 +225,9 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 	}
 	var out []*corev1.Pod
 	for _, m := range ms {
+		if b.isRetired(m.UID) {
+			continue
+		}
 		if g := b.guestFor(m); g != nil {
 			out = append(out, TranslateStatus(g, m))
 		}
@@ -215,20 +236,22 @@ func (b *Backend) List() ([]*corev1.Pod, error) {
 }
 
 // Create builds and creates the mirror. It is idempotent: an existing mirror for this guest is
-// fine; an orphaned mirror with the same name and the same containers is adopted.
+// fine; any other mirror with the same name is deleted first.
 func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	want, err := Build(guest, b.opts.Config)
 	if err != nil {
 		return errdefs.AsInvalidInput(err)
 	}
+	want.Labels[LabelJobID] = JobID(guest.UID, b.nextAttempt(guest.UID))
 	logger := log.G(ctx).WithField("guest", guest.Namespace+"/"+guest.Name).WithField("mirror", want.Name)
 
 	m, err := b.client.CoreV1().Pods(guest.Namespace).Create(ctx, want, metav1.CreateOptions{})
 	switch {
 	case err == nil:
-		logger.WithField("mirrorUID", m.UID).Info("mirror created")
+		logger.WithField("mirrorUID", m.UID).WithField("jobID", m.Labels[LabelJobID]).Info("mirror created")
+		b.logReplaced(ctx, guest, m)
 	case apierrors.IsAlreadyExists(err):
-		if m, err = b.adoptOrReplace(ctx, guest, want); err != nil {
+		if m, err = b.replaceStale(ctx, guest, want); err != nil {
 			return err
 		}
 	default:
@@ -244,38 +267,17 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 	return nil
 }
 
-// adoptOrReplace handles a name clash with an existing mirror.
-func (b *Backend) adoptOrReplace(ctx context.Context, guest, want *corev1.Pod) (*corev1.Pod, error) {
-	logger := log.G(ctx).WithField("guest", guest.Namespace+"/"+guest.Name)
+// replaceStale handles a name clash with an existing mirror.
+func (b *Backend) replaceStale(ctx context.Context, guest, want *corev1.Pod) (*corev1.Pod, error) {
 	cur, err := b.client.CoreV1().Pods(guest.Namespace).Get(ctx, want.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("get existing mirror: %w", err)
 	}
-	if cur.Labels[LabelMirrorOf] == string(guest.UID) {
-		return cur, nil // ours already (a retry, or a restart that raced the informer)
+	if cur.Labels[LabelMirrorOf] == string(guest.UID) && !b.isRetired(cur.UID) {
+		return cur, nil // ours already (a retry that raced the informer)
 	}
-	oldOwnerGone := cur.Labels[LabelMirrorOf] != "" && cur.Labels[LabelMirrorNode] == b.opts.VirtualNode &&
-		b.guestFor(cur) == nil
-	if oldOwnerGone && cur.DeletionTimestamp == nil && cur.Annotations[AnnotationGuestSpecHash] == SpecHash(guest) &&
-		cur.Status.Phase != corev1.PodFailed && cur.Status.Phase != corev1.PodSucceeded {
-		upd := cur.DeepCopy()
-		upd.Labels[LabelMirrorOf] = string(guest.UID)
-		upd.OwnerReferences = nil
-		if b.opts.OwnerRef {
-			upd.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
-		}
-		adopted, err := b.client.CoreV1().Pods(guest.Namespace).Update(ctx, upd, metav1.UpdateOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("adopt mirror: %w", err)
-		}
-		b.mu.Lock()
-		delete(b.orphanSince, cur.UID)
-		b.mu.Unlock()
-		logger.WithField("mirrorUID", adopted.UID).WithField("podIP", adopted.Status.PodIP).Warn("re-adopted orphaned mirror")
-		return adopted, nil
-	}
-	// Not adoptable (different containers, not ours, or finished): remove it and let the
-	// library retry the create.
+	// A mirror of a previous incarnation, an orphan, or not ours: remove it with normal grace
+	// and let the library retry the create once it is gone.
 	uid := cur.UID
 	if err := b.client.CoreV1().Pods(guest.Namespace).Delete(ctx, cur.Name, metav1.DeleteOptions{
 		Preconditions: &metav1.Preconditions{UID: &uid},
@@ -344,7 +346,7 @@ func (b *Backend) collectOrphans(ctx context.Context, now time.Time) {
 			b.orphanSince[m.UID] = now
 			since = now
 			log.G(ctx).WithField("mirror", m.Namespace+"/"+m.Name).WithField("podIP", m.Status.PodIP).
-				Warn("mirror has no guest; keeping it for re-adoption until the grace period ends")
+				Warn("mirror has no guest; deleting it when the grace period ends")
 		}
 		b.mu.Unlock()
 		if now.Sub(since) < b.opts.OrphanGrace {

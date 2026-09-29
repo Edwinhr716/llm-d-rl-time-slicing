@@ -80,7 +80,7 @@ func main() {
 	// pod that already has spec.nodeName to the claim's reservedFor about 1 s after creation.
 	flag.BoolVar(&o.reserveClaim, "reserve-claim", false, "add GPU mirrors to the claim's status.reservedFor (kube-controller-manager also does it)")
 	flag.BoolVar(&o.mirrorOwnerRef, "mirror-owner-ref", true, "make the guest the mirror's owner (false: mirrors survive guest force-deletion and can be re-adopted)")
-	flag.DurationVar(&o.orphanGrace, "orphan-grace", 10*time.Minute, "how long a mirror without a guest is kept for re-adoption")
+	flag.DurationVar(&o.orphanGrace, "orphan-grace", 10*time.Minute, "how long a mirror without a guest is kept before deletion")
 
 	// Off by default: GKE's ValidatingAdmissionPolicy validate-node-providerid denies a Node
 	// whose providerID does not end in "/<node name>", so on GKE this flag makes the Node
@@ -242,8 +242,8 @@ func runKubelet(ctx context.Context, client kubernetes.Interface, o options) err
 	if err != nil {
 		return err
 	}
-	// Sync the mirror informer before the pod controller starts: after a restart, the first
-	// GetPod for each guest must already find its mirror (re-adoption, no duplicate create).
+	// Sync the mirror informer and retire the previous incarnation's mirrors before the pod
+	// controller starts: the first GetPod finds no mirror, so each guest gets a new one.
 	if err := backend.Start(ctx); err != nil {
 		return err
 	}
