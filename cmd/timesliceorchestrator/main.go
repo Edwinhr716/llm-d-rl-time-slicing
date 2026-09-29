@@ -85,7 +85,8 @@ func run() error {
 			"PENDING LEAD DECISION: option B (\"async\") is refused until decided.")
 	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
 		"Upper bound on each blocking wait for a foreground snapshot or restore operation. On expiry the "+
-			"reconcile is retried. 0 means unbounded.")
+			"reconcile is retried and waits on the same operation, never starting a new one while it is "+
+			"pending. 0 means unbounded.")
 	backgroundRole := flag.Bool("background-role", false,
 		"Enable the background participant protocol: Acquire/Yield with ROLE_BACKGROUND, participant_id "+
 			"heartbeats and GroupStatus.background_protocol = 1. Off (the default) reports "+
