@@ -81,6 +81,9 @@ func TestEvalwire_FlagsMatchMain(t *testing.T) {
 	if fv.foregroundWait != controller.ForegroundWaitBlocking {
 		t.Errorf("--foreground-wait default = %q, want %q", fv.foregroundWait, controller.ForegroundWaitBlocking)
 	}
+	if fv.unconfirmedKill != controller.UnconfirmedKillGrant {
+		t.Errorf("--unconfirmed-kill default = %q, want %q", fv.unconfirmedKill, controller.UnconfirmedKillGrant)
+	}
 }
 
 func TestEvalwire_RejectsBadArgs(t *testing.T) {
@@ -92,6 +95,11 @@ func TestEvalwire_RejectsBadArgs(t *testing.T) {
 		{"--kill-budget=40s", "--notice-window=30s"},
 		{"stray"},
 		{"--host-command-port=-1"},
+		{"--unconfirmed-kill=other"},
+		{"--unconfirmed-kill="},
+		{"--unconfirmed-escalate-after=40s,10s"},
+		{"--unconfirmed-escalate-after=10s"},
+		{"--unconfirmed-escalate-after=0s,10s"},
 	} {
 		if orch, err := Start(context.Background(), Config{Clientset: cs, Args: args}); err == nil {
 			orch.Stop()

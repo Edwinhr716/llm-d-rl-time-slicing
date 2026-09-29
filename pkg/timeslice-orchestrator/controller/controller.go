@@ -180,14 +180,31 @@ type Controller struct {
 	// Zero means DefaultBackgroundLiveness.
 	BackgroundLiveness time.Duration
 
+	// UnconfirmedKill is --unconfirmed-kill (D-NS-6): what happens when a
+	// guest Kill reached the agent but was not confirmed. "" means
+	// UnconfirmedKillGrant.
+	UnconfirmedKill string
+
+	// UnconfirmedEscalateAfter is --unconfirmed-escalate-after: escalation
+	// step 1 and step 2 after the unconfirmed-kill decision, used only by
+	// UnconfirmedKillEscalate. Zero means DefaultUnconfirmedEscalateAfter.
+	UnconfirmedEscalateAfter [2]time.Duration
+
+	// Kube records Warning events and takes the escalation actions of the
+	// unconfirmed-kill paths. Nil skips them (they are still logged).
+	Kube UnconfirmedKube
+
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
 
-	// killMu guards kills, agentSeen and holdLogged (kill path, kill.go).
-	killMu     sync.Mutex
-	kills      map[string]*killRecord
-	agentSeen  map[string]time.Time
-	holdLogged map[string]time.Time
+	// killMu guards kills, agentSeen and holdLogged (kill path, kill.go),
+	// and blocks and notLendable (unconfirmed_kill_block.go).
+	killMu      sync.Mutex
+	kills       map[string]*killRecord
+	agentSeen   map[string]time.Time
+	holdLogged  map[string]time.Time
+	blocks      map[string]*blockState
+	notLendable map[string]string
 }
 
 // settleEntry remembers when a group's active job was first seen holding an

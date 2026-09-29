@@ -37,7 +37,8 @@ type HostCommander interface {
 }
 
 // forgetHostsIfGroupDeleted drops the host registry and the kill path state
-// (kill records and hold log marks, kill.go) of a group that the observe step
+// (kill records and hold log marks, kill.go; unconfirmed-kill blocks,
+// unconfirmed_kill_block.go) of a group that the observe step
 // deleted from the store, so host state, commands and kill state do not
 // outlive the group.
 func (c *Controller) forgetHostsIfGroupDeleted(ctx context.Context, groupID string) {
@@ -45,6 +46,7 @@ func (c *Controller) forgetHostsIfGroupDeleted(ctx context.Context, groupID stri
 		slog.InfoContext(ctx, "Group deleted: forgetting its hosts")
 		c.Hosts.Forget(groupID)
 		c.forgetKills(groupID)
+		c.releaseBlocks(ctx, groupID, func(*blockState) bool { return false })
 	}
 }
 
@@ -78,6 +80,10 @@ func (c *Controller) holdForHosts(ctx context.Context, group *store.Group) bool 
 	return true
 }
 
+// notLendableUnconfirmedKill is the reason a node is not lent while a guest
+// handed back after an unconfirmed Kill is not vacated (D-NS-6 grant).
+const notLendableUnconfirmedKill = "unconfirmed-kill"
+
 // lendWanted reports whether the foreground lent the accelerator and nothing
 // foreground wants it back.
 func lendWanted(spec *store.GroupSpec) bool {
@@ -106,8 +112,16 @@ func (c *Controller) resumeIfLent(ctx context.Context, group *store.Group) error
 	if guest := c.unconfirmedGuestOn(ctx, group); guest.job != "" {
 		// A guest handed back after an unconfirmed Kill may still be on the
 		// node: do not lend it again until the agent says it is gone.
-		slog.WarnContext(ctx, "Not lending: an unconfirmed kill is not vacated yet", "job", guest.job, "node", guest.node)
+		slog.WarnContext(ctx, "Node not lendable", "node", guest.node, "reason", notLendableUnconfirmedKill,
+			"job", guest.job)
 		return nil
+	}
+	for _, node := range group.Status().Nodes() {
+		// Marked by the last escalation step of an unconfirmed Kill (D-NS-6).
+		if reason := c.nodeNotLendable(node); reason != "" {
+			slog.WarnContext(ctx, "Node not lendable", "node", node, "reason", reason)
+			return nil
+		}
 	}
 	busy, err := c.foregroundResident(ctx, group)
 	if err != nil {

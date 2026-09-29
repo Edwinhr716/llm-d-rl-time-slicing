@@ -96,6 +96,8 @@ type flagValues struct {
 	killBudget               time.Duration
 	hostCommandPort          int
 	backgroundLiveness       time.Duration
+	unconfirmedKill          string
+	unconfirmedEscalateAfter string
 	agentRPCTimeout          time.Duration
 	retryBaseDelay           time.Duration
 	retryMaxDelay            time.Duration
@@ -105,6 +107,9 @@ type flagValues struct {
 	lockConfigMap            string
 	watchNamespaces          string
 	nodeSelector             string
+
+	// escalateAfter is unconfirmedEscalateAfter parsed by validate.
+	escalateAfter [2]time.Duration
 }
 
 // newFlagSet declares the flags of cmd/timesliceorchestrator/main.go with the
@@ -141,6 +146,10 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.IntVar(&fv.hostCommandPort, "host-command-port", 0, "Port of the per-host command endpoint; 0 disables host commands")
 	fs.DurationVar(&fv.backgroundLiveness, "background-liveness", controller.DefaultBackgroundLiveness,
 		"Background liveness L: a host whose commands have failed this long during a vacate counts as unseen")
+	fs.StringVar(&fv.unconfirmedKill, "unconfirmed-kill", controller.UnconfirmedKillGrant,
+		"What happens when a guest's Kill is not confirmed by T + K: grant, block or escalate")
+	fs.StringVar(&fv.unconfirmedEscalateAfter, "unconfirmed-escalate-after", controller.DefaultUnconfirmedEscalateAfter,
+		"<E1>,<E2> after T + K for --unconfirmed-kill=escalate: delete the mirror pod, then mark the node not lendable")
 	fs.DurationVar(&fv.agentRPCTimeout, "agent-rpc-timeout", 5*time.Second, "Bound on every call to a snapshot agent")
 	fs.DurationVar(&fv.retryBaseDelay, "retry-base-delay", 1*time.Second, "First retry delay after a failed reconcile")
 	fs.DurationVar(&fv.retryMaxDelay, "retry-max-delay", 30*time.Second, "Cap on the retry delay")
@@ -174,6 +183,14 @@ func (fv *flagValues) validate() error {
 	if fv.backgroundLiveness <= 0 {
 		return fmt.Errorf("--background-liveness must be positive, got %v", fv.backgroundLiveness)
 	}
+	if err := controller.ValidateUnconfirmedKill(fv.unconfirmedKill); err != nil {
+		return fmt.Errorf("--unconfirmed-kill: %w", err)
+	}
+	escalateAfter, err := controller.ParseUnconfirmedEscalateAfter(fv.unconfirmedEscalateAfter)
+	if err != nil {
+		return fmt.Errorf("--unconfirmed-escalate-after: %w", err)
+	}
+	fv.escalateAfter = escalateAfter
 	if fv.budgetRedisAddr != "" && fv.budgetJob == "" {
 		return errors.New("--dispatch-budget-job is required when --dispatch-budget-redis-addr is set")
 	}
@@ -269,6 +286,9 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.ForegroundOpTimeout = fv.foregroundOpTimeout
 	ctrl.KillPollInterval = fv.killPollInterval
 	ctrl.BackgroundLiveness = fv.backgroundLiveness
+	ctrl.UnconfirmedKill = fv.unconfirmedKill
+	ctrl.UnconfirmedEscalateAfter = fv.escalateAfter
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, infraOrch)
 
 	informerFactories.Nodes.Start(ctx.Done())
 	for _, f := range informerFactories.Pods {
@@ -312,6 +332,8 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"killBudget", fv.killBudget,
 		"hostCommandPort", fv.hostCommandPort,
 		"backgroundLiveness", fv.backgroundLiveness,
+		"unconfirmedKill", fv.unconfirmedKill,
+		"unconfirmedEscalateAfter", fv.unconfirmedEscalateAfter,
 		"agentRPCTimeout", fv.agentRPCTimeout,
 		"retryBaseDelay", fv.retryBaseDelay,
 		"retryMaxDelay", fv.retryMaxDelay,

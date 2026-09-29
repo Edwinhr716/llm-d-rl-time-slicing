@@ -107,6 +107,14 @@ func run() error {
 	backgroundLiveness := flag.Duration("background-liveness", controller.DefaultBackgroundLiveness,
 		"Background liveness L: with host commands on, a host whose commands have failed this long during a "+
 			"vacate counts as unseen and its guests are killed through their snapshot agent.")
+	unconfirmedKill := flag.String("unconfirmed-kill", controller.UnconfirmedKillGrant,
+		"What happens when a guest's Kill is not confirmed by T + K (D-NS-6). \"grant\" (the default, today's "+
+			"behaviour) grants the foreground with vram_unconfirmed = true. \"block\" never grants until the Kill "+
+			"is confirmed or the guest is otherwise vacated, retrying the Kill and alerting. \"escalate\" blocks "+
+			"and escalates on --unconfirmed-escalate-after. PENDING LEAD DECISION.")
+	unconfirmedEscalateAfter := flag.String("unconfirmed-escalate-after", controller.DefaultUnconfirmedEscalateAfter,
+		"<E1>,<E2> after the unconfirmed-kill decision (T + K) for --unconfirmed-kill=escalate: at E1 the guest's "+
+			"mirror pod is deleted gracefully, at E2 the node is marked not lendable. Used only by escalate.")
 	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
 	// are proposals awaiting the lead's sign-off.
 	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
@@ -148,6 +156,14 @@ func run() error {
 	if *noticeWindow <= 0 || *killBudget <= 0 || *killBudget >= *noticeWindow {
 		return fmt.Errorf("--kill-budget (%v) and --notice-window (%v) must be positive with kill budget < notice window",
 			*killBudget, *noticeWindow)
+	}
+
+	if err := controller.ValidateUnconfirmedKill(*unconfirmedKill); err != nil {
+		return fmt.Errorf("--unconfirmed-kill: %w", err)
+	}
+	escalateAfter, err := controller.ParseUnconfirmedEscalateAfter(*unconfirmedEscalateAfter)
+	if err != nil {
+		return fmt.Errorf("--unconfirmed-escalate-after: %w", err)
 	}
 
 	if *hostCommandPort < 0 || *hostCommandPort > 65535 {
@@ -235,6 +251,9 @@ func run() error {
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 	ctrl.KillPollInterval = *killPollInterval
 	ctrl.BackgroundLiveness = *backgroundLiveness
+	ctrl.UnconfirmedKill = *unconfirmedKill
+	ctrl.UnconfirmedEscalateAfter = escalateAfter
+	ctrl.Kube = infrastructure.NewKubeActions(clientset, infraOrch)
 
 	// Start informers
 	informerFactories.Nodes.Start(ctx.Done())
@@ -289,6 +308,8 @@ func run() error {
 		"killBudget", *killBudget,
 		"hostCommandPort", *hostCommandPort,
 		"backgroundLiveness", *backgroundLiveness,
+		"unconfirmedKill", *unconfirmedKill,
+		"unconfirmedEscalateAfter", *unconfirmedEscalateAfter,
 		"controllerWorkers", *controllerWorkers,
 		"agentRPCTimeout", *agentRPCTimeout,
 		"retryBaseDelay", *retryBaseDelay,
