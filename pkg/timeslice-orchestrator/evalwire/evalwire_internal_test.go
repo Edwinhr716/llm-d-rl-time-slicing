@@ -310,3 +310,75 @@ func TestEvalwire_GroupJobs(t *testing.T) {
 		})
 	}
 }
+
+// TestNodeSelectorExemptBackground_BackgroundAcquire checks, for both values of
+// --node-selector-exempt-background, whether the orchestrator accepts the
+// virtual kubelet's background Acquire for its host (D-ORCH-4 metric P).
+// node-h is the host of group g1, node-o another node of g1. With a selector
+// that selects node-h (the "match" value for this node label layout,
+// group.timeslice.io/<group>=true), the Acquire is accepted: granted, or still
+// blocked when the client gives up. With a selector that selects only node-o, node-h is
+// not a node of g1 for this orchestrator, and the Acquire is refused whatever
+// the flag says: the exemption covers pods, not nodes.
+func TestNodeSelectorExemptBackground_BackgroundAcquire(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		selector string
+		accepted bool
+	}{
+		{name: "match", selector: infrastructure.NodeLabelPrefix + "g1=true", accepted: true},
+		{name: "host-unselected", selector: "pool=other", accepted: false},
+	} {
+		for _, exempt := range []string{"false", "true"} {
+			t.Run(tc.name+"/exempt="+exempt, func(t *testing.T) {
+				cs := fake.NewClientset(
+					&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+						Name:   "node-h",
+						Labels: map[string]string{infrastructure.NodeLabelPrefix + "g1": "true", "pool": "demo"},
+					}},
+					&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+						Name:   "node-o",
+						Labels: map[string]string{infrastructure.NodeLabelPrefix + "g1": "true", "pool": "other"},
+					}},
+				)
+				orch, err := Start(context.Background(), Config{Clientset: cs, AgentPort: 1, Args: []string{
+					"--background-role=true",
+					"--min-bubble=10s",
+					"--controller-workers=4",
+					"--node-selector=" + tc.selector,
+					"--node-selector-exempt-background=" + exempt,
+				}})
+				if err != nil {
+					t.Fatalf("Start: %v", err)
+				}
+				defer orch.Stop()
+				waitForGroup(t, orch.Addr, "g1")
+
+				conn, err := grpc.NewClient(orch.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				if err != nil {
+					t.Fatalf("dial %s: %v", orch.Addr, err)
+				}
+				defer func() {
+					if err := conn.Close(); err != nil {
+						t.Logf("close conn: %v", err)
+					}
+				}()
+				ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+				defer cancel()
+				_, err = pb.NewTimeSliceOrchestratorServiceClient(conn).Acquire(ctx, &pb.AcquireRequest{
+					JobId:    "vk/node-h",
+					GroupId:  "g1",
+					Role:     pb.Role_ROLE_BACKGROUND,
+					NodeName: "node-h",
+				})
+				code := status.Code(err)
+				if tc.accepted && code != codes.OK && code != codes.DeadlineExceeded {
+					t.Errorf("background Acquire(vk/node-h) = %v, want it granted or still blocked", err)
+				}
+				if !tc.accepted && code != codes.FailedPrecondition {
+					t.Errorf("background Acquire(vk/node-h) = %v, want FailedPrecondition", err)
+				}
+			})
+		}
+	}
+}

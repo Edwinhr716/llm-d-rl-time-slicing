@@ -22,13 +22,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// The contract's role label and its background value, read literally here
-// rather than through a shared constant, so this file stands alone.
-const (
-	exemptRoleLabelKey   = "timeslice.io/role"
-	exemptRoleBackground = "background"
-)
-
 // WithNodeSelectorExemptBackground keeps pods labelled
 // timeslice.io/role=background in their group even when they are bound to a
 // node outside --node-selector. It has an effect only together with
@@ -45,7 +38,7 @@ func WithNodeSelectorExemptBackground() Option {
 // node informer's scope is kept anyway, because the exemption is on and the
 // pod is a background pod. It logs each time it keeps one.
 func (k *KubernetesOrchestrator) keepExemptBackgroundPod(ctx context.Context, pod *corev1.Pod) bool {
-	if !k.exemptBackground || pod.Labels[exemptRoleLabelKey] != exemptRoleBackground {
+	if !k.exemptBackground || pod.Labels[RoleLabelKey] != RoleBackground {
 		return false
 	}
 	slog.InfoContext(ctx, "Keeping background pod bound to a node outside --node-selector",
