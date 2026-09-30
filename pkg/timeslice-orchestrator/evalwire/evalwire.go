@@ -46,6 +46,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
 	corev1 "k8s.io/api/core/v1"
+	corev1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/util/workqueue"
@@ -109,6 +110,7 @@ type flagValues struct {
 	lockConfigMap            string
 	watchNamespaces          string
 	nodeSelector             string
+	rejectUnwatchedJobs      bool
 }
 
 // newFlagSet declares the flags of cmd/timesliceorchestrator/main.go with the
@@ -155,6 +157,8 @@ func newFlagSet() (*flag.FlagSet, *flagValues) {
 	fs.StringVar(&fv.lockConfigMap, "lock-configmap", store.ConfigMapName, "Name of the lock ConfigMap")
 	fs.StringVar(&fv.watchNamespaces, "watch-namespaces", "", "Comma-separated namespaces whose pods are watched; empty watches all")
 	fs.StringVar(&fv.nodeSelector, "node-selector", "", "Label selector limiting the nodes watched; empty watches all")
+	fs.BoolVar(&fv.rejectUnwatchedJobs, "reject-unwatched-jobs", false,
+		"Reject a foreground Acquire for a job with no pod in --watch-namespaces")
 	return fs, fv
 }
 
@@ -276,6 +280,13 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 	ctrl.KillBudget = fv.killBudget
 	ctrl.BackgroundLiveness = fv.backgroundLiveness
 
+	// Created before the factories start, so it shares their pod caches.
+	podInformers := make([]corev1informers.PodInformer, 0, len(informerFactories.Pods))
+	for _, f := range informerFactories.Pods {
+		podInformers = append(podInformers, f.Core().V1().Pods())
+	}
+	watchedJobs := infrastructure.NewWatchedJobs(podInformers...)
+
 	informerFactories.Nodes.Start(ctx.Done())
 	for _, f := range informerFactories.Pods {
 		f.Start(ctx.Done())
@@ -287,6 +298,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		server.WithMinBubble(fv.minBubble),
 		server.WithNoticeTiming(fv.noticeWindow, fv.killBudget),
 	}
+	opts = append(opts, server.RejectUnwatchedJobsOption(fv.rejectUnwatchedJobs, scope.Namespaces, watchedJobs)...)
 	var publisher *budget.Publisher
 	if fv.budgetRedisAddr != "" {
 		publisher = budget.NewPublisher(budget.NewRedisWriter(fv.budgetRedisAddr), fv.budgetKey, fv.budgetJob).
@@ -314,6 +326,7 @@ func Start(ctx context.Context, cfg Config) (*Orch, error) {
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,
+		"rejectUnwatchedJobs", fv.rejectUnwatchedJobs,
 	)
 
 	// serveErr is written before exited is closed and read only after.

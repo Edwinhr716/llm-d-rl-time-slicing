@@ -3,14 +3,18 @@
 package evalwire
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,6 +94,9 @@ func TestEvalwire_FlagsMatchMain(t *testing.T) {
 	if fv.killPollInterval != controller.DefaultKillPollInterval {
 		t.Errorf("--kill-poll-interval default = %v, want %v", fv.killPollInterval, controller.DefaultKillPollInterval)
 	}
+	if fv.rejectUnwatchedJobs {
+		t.Error("--reject-unwatched-jobs default = true, want false")
+	}
 }
 
 func TestEvalwire_RejectsBadArgs(t *testing.T) {
@@ -99,6 +106,7 @@ func TestEvalwire_RejectsBadArgs(t *testing.T) {
 		{"--foreground-wait=other"},
 		{"--background-liveness=0"},
 		{"--watch-namespaces=Bad_NS"},
+		{"--reject-unwatched-jobs=maybe"},
 		{"--no-such-flag"},
 		{"--kill-budget=40s", "--notice-window=30s"},
 		{"stray"},
@@ -196,5 +204,94 @@ func TestEvalwire_StartStopRestart(t *testing.T) {
 		checkMetrics(t, orch.MetricsAddr)
 		orch.Stop()
 		orch.Stop() // idempotent
+	}
+}
+
+// logBuffer is a bytes.Buffer safe for concurrent writers.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func rejectEvalPod(ns, name, job string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      name,
+			Labels:    map[string]string{infrastructure.PodLabelKey: "g1", infrastructure.JobLabelKey: job},
+		},
+	}
+}
+
+// TestEvalwire_RejectUnwatchedJobs checks both values of
+// --reject-unwatched-jobs through the wired binary path: the startup log key,
+// and a foreground Acquire for a job whose only pod is in an unwatched
+// namespace.
+func TestEvalwire_RejectUnwatchedJobs(t *testing.T) {
+	for _, tc := range []struct {
+		reject     string
+		wantReject bool
+	}{
+		// With the check off the Acquire is admitted and then waits (no agent
+		// loads the job) until the short client deadline ends it.
+		{reject: "false", wantReject: false},
+		{reject: "true", wantReject: true},
+	} {
+		t.Run("reject="+tc.reject, func(t *testing.T) {
+			cs := fake.NewClientset(
+				&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+					Name:   "127.0.0.1",
+					Labels: map[string]string{infrastructure.NodeLabelPrefix + "g1": "true"},
+				}},
+				rejectEvalPod("demo", "trainer", "job-trainer"),
+				rejectEvalPod("other", "stranger", "job-stranger"),
+			)
+			logs := &logBuffer{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+			defer slog.SetDefault(prev)
+
+			orch, err := Start(context.Background(), Config{Clientset: cs, AgentPort: 1, Args: []string{
+				"--background-role=true",
+				"--watch-namespaces=demo",
+				"--reject-unwatched-jobs=" + tc.reject,
+			}})
+			if err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer orch.Stop()
+			if want := "rejectUnwatchedJobs=" + tc.reject; !strings.Contains(logs.String(), want) {
+				t.Errorf("startup log lacks %q", want)
+			}
+			waitForGroup(t, orch.Addr, "g1")
+
+			conn, err := grpc.NewClient(orch.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			defer cancel()
+			_, err = pb.NewTimeSliceOrchestratorServiceClient(conn).Acquire(ctx,
+				&pb.AcquireRequest{GroupId: "g1", JobId: "job-stranger"})
+			if rejected := status.Code(err) == codes.PermissionDenied; rejected != tc.wantReject {
+				t.Errorf("Acquire(job-stranger) = %v, want rejected=%v", err, tc.wantReject)
+			}
+			if got := strings.Contains(logs.String(), "Rejected Acquire for unwatched job"); got != tc.wantReject {
+				t.Errorf("rejection logged = %v, want %v", got, tc.wantReject)
+			}
+		})
 	}
 }

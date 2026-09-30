@@ -74,3 +74,14 @@ Namespace of the lock ConfigMap: lock.namespace, else the chart namespace.
 {{- define "timesliceorchestrator.lockNamespace" -}}
 {{- .Values.lock.namespace | default (include "timesliceorchestrator.namespace" .) }}
 {{- end }}
+
+{{/*
+scope.callerGuard, validated: none (default), netpol or reject.
+*/}}
+{{- define "timesliceorchestrator.callerGuard" -}}
+{{- $guard := .Values.scope.callerGuard | default "none" }}
+{{- if not (has $guard (list "none" "netpol" "reject")) }}
+{{- fail (printf "scope.callerGuard must be none, netpol or reject, got %q" $guard) }}
+{{- end }}
+{{- $guard }}
+{{- end }}

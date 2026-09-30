@@ -1,0 +1,11 @@
+{{- $guard := include "timesliceorchestrator.callerGuard" . }}
+{{- if and (ne $guard "none") (not .Values.scope.watchNamespaces) }}
+WARNING: scope.callerGuard={{ $guard }} has no effect because scope.watchNamespaces is empty
+(every namespace is watched). {{ if eq $guard "netpol" }}No NetworkPolicy was rendered.{{ else }}The orchestrator logs a warning and accepts every job.{{ end }}
+{{- end }}
+{{- if and (eq $guard "netpol") .Values.scope.watchNamespaces }}
+scope.callerGuard=netpol: a NetworkPolicy limits the gRPC port to {{ join ", " .Values.scope.watchNamespaces }}
+{{- if .Values.scope.callerGuardExtraFrom }} and scope.callerGuardExtraFrom{{ end }}. It is enforced only if the
+cluster's network plugin enforces NetworkPolicy. A hostNetwork virtual kubelet needs an ipBlock of node IPs
+in scope.callerGuardExtraFrom.
+{{- end }}

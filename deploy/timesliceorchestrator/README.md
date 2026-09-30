@@ -141,3 +141,47 @@ helm upgrade --install demo-orchestrator ./timesliceorchestrator \
 
 The chart still grants read access to pods and nodes cluster-wide through a
 `ClusterRole`.
+
+### Who may call Acquire (`scope.callerGuard`)
+
+`scope.watchNamespaces` limits what the orchestrator watches, not who can
+call it: by default any client that reaches the gRPC port can call Acquire
+for any job ID. `scope.callerGuard` (default `none`) adds one of two guards,
+and matters only when `scope.watchNamespaces` is set; with an empty watch
+list both are no-ops (the chart prints a warning).
+
+* `none`: no restriction, as before.
+* `reject`: the orchestrator runs with `--reject-unwatched-jobs=true`
+  (default `false`). Acquire returns `PermissionDenied` for a job that has
+  no pod labelled `timeslice.io/group=<group>` and
+  `timeslice.io/job-id=<job>` in the watched namespaces, and logs
+  `Rejected Acquire for unwatched job`. The check looks at namespaces only
+  (not `scope.nodeSelector`, not whether the pod is bound), covers Acquire
+  only, and checks the job, not the caller: a client anywhere that sends a
+  watched job's ID is accepted.
+* `netpol`: the chart renders a `NetworkPolicy` that admits the gRPC port
+  only from pods in the watched namespaces and from the peers in
+  `scope.callerGuardExtraFrom` (a list of `NetworkPolicyPeer`, default
+  `[]`). The metrics port stays open to all.
+
+`netpol` has two caveats:
+
+* A virtual kubelet that runs with `hostNetwork: true` connects from its
+  node's IP, which no `namespaceSelector` matches. Admit it with an
+  `ipBlock` of the node IPs (or the node CIDR) in
+  `scope.callerGuardExtraFrom`. That block admits every host-network pod on
+  those nodes, whatever its namespace.
+
+  ```yaml
+  scope:
+    watchNamespaces: [rl-demo]
+    callerGuard: netpol
+    callerGuardExtraFrom:
+      - ipBlock:
+          cidr: 10.0.0.0/24   # your nodes' IP range
+  ```
+
+* The policy is enforced only if the cluster's network plugin enforces
+  NetworkPolicy. On a cluster without an enforcing plugin (for example a
+  GKE cluster on the legacy datapath with the NetworkPolicy add-on
+  disabled) the object is created and has no effect.

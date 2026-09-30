@@ -45,6 +45,9 @@ spec:
             {{- with .Values.scope.nodeSelector }}
             - "--node-selector={{ . }}"
             {{- end }}
+            {{- if eq (include "timesliceorchestrator.callerGuard" .) "reject" }}
+            - "--reject-unwatched-jobs=true"
+            {{- end }}
           ports:
             - name: grpc
               containerPort: 50051

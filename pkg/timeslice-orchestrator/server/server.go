@@ -54,6 +54,9 @@ type Server struct {
 	minBubble      time.Duration
 	noticeWindow   time.Duration
 	killBudget     time.Duration
+
+	// Unwatched-job check (--reject-unwatched-jobs). See WithRejectUnwatchedJobs.
+	watchedJobs WatchedJobs
 }
 
 // BackgroundProtocolVersion is the value of GroupStatus.background_protocol
@@ -173,6 +176,9 @@ func (s *Server) Acquire(ctx context.Context, req *pb.AcquireRequest) (*pb.Acqui
 
 	role, err := effectiveRole(req.GetRole())
 	if err != nil {
+		return nil, err
+	}
+	if err := s.rejectUnwatched(ctx, req, role); err != nil {
 		return nil, err
 	}
 
