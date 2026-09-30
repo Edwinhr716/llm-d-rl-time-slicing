@@ -27,9 +27,24 @@ lock:
 #     pods bound to them are ignored. Group membership still comes from the
 #     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
 #     with the pod-scheduling nodeSelector further down.
+#   callerGuard: who may call Acquire when watchNamespaces is set. One of:
+#     none   (default) no restriction, as before.
+#     netpol a NetworkPolicy admits the gRPC port only from pods in
+#            watchNamespaces plus the peers in callerGuardExtraFrom. The
+#            metrics port stays open. Rendered only when watchNamespaces is
+#            set, and enforced only if the cluster's network plugin enforces
+#            NetworkPolicy. See the README for the host-network virtual kubelet.
+#     reject the orchestrator runs with --reject-unwatched-jobs: Acquire fails
+#            with PermissionDenied for a job that has no pod in watchNamespaces.
+#            It checks the job, not the caller. No effect without watchNamespaces.
+#   callerGuardExtraFrom: extra NetworkPolicyPeer entries admitted to the gRPC
+#     port when callerGuard is netpol, for example an ipBlock of node IPs for a
+#     host-network virtual kubelet.
 scope:
   watchNamespaces: []
   nodeSelector: ""
+  callerGuard: none
+  callerGuardExtraFrom: []
 
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator

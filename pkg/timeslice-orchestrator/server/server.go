@@ -47,6 +47,7 @@ type Server struct {
 	checkAcquire        checkAcquireFunc
 	servingQuantum      time.Duration
 	budget              *budget.Publisher
+	watchedJobs         WatchedJobs
 }
 
 // budgetPublishInterval is how often the dispatch budget is republished when
@@ -105,6 +106,10 @@ func (s *Server) Acquire(ctx context.Context, req *pb.AcquireRequest) (*pb.Acqui
 	ctx = logging.WithJobID(ctx, req.GetJobId())
 	ctx = logging.WithGroupID(ctx, req.GetGroupId())
 	slog.InfoContext(ctx, "Acquire called")
+
+	if err := s.rejectUnwatched(ctx, req); err != nil {
+		return nil, err
+	}
 
 	groupID := req.GetGroupId()
 	jobID := req.GetJobId()

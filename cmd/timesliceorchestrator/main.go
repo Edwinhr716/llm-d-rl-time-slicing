@@ -18,6 +18,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
+	corev1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -87,6 +88,10 @@ func run() error {
 		"Label selector (kubectl syntax, e.g. pool=demo) limiting the nodes this orchestrator sees. "+
 			"Nodes outside it contribute to no group, and pods bound to them are ignored. Group membership "+
 			"still comes from the group.timeslice.io/<group> node label. Empty (the default) watches all nodes.")
+	rejectUnwatchedJobs := flag.Bool("reject-unwatched-jobs", false,
+		"Reject Acquire with PermissionDenied for a job that has no pod (labelled with its group and job ID) "+
+			"in the --watch-namespaces. It checks the job, not the caller. No effect without --watch-namespaces. "+
+			"False (the default) accepts every job.")
 	flag.Parse()
 
 	scope, err := infrastructure.ParseScope(*watchNamespaces, *nodeSelector)
@@ -164,6 +169,13 @@ func run() error {
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
 
+	// Created before the factories start, so it shares their pod caches.
+	podInformers := make([]corev1informers.PodInformer, 0, len(informerFactories.Pods))
+	for _, f := range informerFactories.Pods {
+		podInformers = append(podInformers, f.Core().V1().Pods())
+	}
+	watchedJobs := infrastructure.NewWatchedJobs(podInformers...)
+
 	// Start informers
 	informerFactories.Nodes.Start(ctx.Done())
 	for _, f := range informerFactories.Pods {
@@ -171,6 +183,7 @@ func run() error {
 	}
 
 	opts := []server.Option{server.WithServingQuantum(*servingQuantum)}
+	opts = append(opts, server.RejectUnwatchedJobsOption(*rejectUnwatchedJobs, scope.Namespaces, watchedJobs)...)
 	if *budgetRedisAddr != "" {
 		publisher := budget.NewPublisher(budget.NewRedisWriter(*budgetRedisAddr), *budgetKey, *budgetJob).
 			WithOpenDelay(*budgetOpenDelay).
@@ -193,6 +206,7 @@ func run() error {
 		"lockConfigMap", lockStore.ConfigMapRef(),
 		"watchNamespaces", scope.Namespaces,
 		"nodeSelector", scope.NodeSelector,
+		"rejectUnwatchedJobs", *rejectUnwatchedJobs,
 	)
 	return server.StartServer(ctx, *port, *metricsPort, ctrl, groupStore, jobStore, *controllerWorkers, opts...)
 }
