@@ -431,6 +431,8 @@ enum ErrorReason {
   BACKEND_ERROR = 8;
   VERIFY_FAILED = 9;
   KILL_UNCONFIRMED = 10;
+  // A Kill superseded the running operation before it finished.
+  SUPERSEDED = 11;
 }
 
 message GetOperationRequest {

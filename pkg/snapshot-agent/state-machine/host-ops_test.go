@@ -430,7 +430,10 @@ func TestHostOp_KillSupersedesTarget(t *testing.T) {
 	waitStarted(t, killStub)
 
 	op := waitForOperation(t, sm, opID)
-	checkFailed(t, op, pb.ErrorReason_ERROR_REASON_UNSPECIFIED)
+	// D-AGENT-10 superseded: the target's reason, and so the host operation's, is SUPERSEDED.
+	checkFailed(t, op, pb.ErrorReason_SUPERSEDED)
+	checkTarget(t, op, "job-hung", pb.OperationStatus_OPERATION_STATUS_FAILED,
+		pb.Outcome_OUTCOME_UNSPECIFIED, pb.ErrorReason_SUPERSEDED)
 	r := targetsByJob(op)["job-hung"]
 	if r.Status != pb.OperationStatus_OPERATION_STATUS_FAILED || !strings.Contains(r.Error, "superseded by Kill") {
 		t.Errorf("unexpected result for the killed target: %+v", r)

@@ -143,7 +143,7 @@ func TestHigherEpoch_Aborted_KillStillSupersedes(t *testing.T) {
 
 	killID := startKill(t, sm, func(context.Context) error { return nil })
 	checkComplete(t, waitForOperation(t, sm, killID), pb.Outcome_OUTCOME_KILLED)
-	checkFailed(t, getOp(t, sm, suspendID), pb.ErrorReason_ERROR_REASON_UNSPECIFIED)
+	checkFailed(t, getOp(t, sm, suspendID), pb.ErrorReason_SUPERSEDED)
 	if !errors.Is(suspendCtx.Err(), context.Canceled) {
 		t.Errorf("superseded operation's context: expected Canceled, got %v", suspendCtx.Err())
 	}

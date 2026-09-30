@@ -260,6 +260,8 @@ const (
 	ErrorReason_BACKEND_ERROR            ErrorReason = 8
 	ErrorReason_VERIFY_FAILED            ErrorReason = 9
 	ErrorReason_KILL_UNCONFIRMED         ErrorReason = 10
+	// A Kill superseded the running operation before it finished.
+	ErrorReason_SUPERSEDED ErrorReason = 11
 )
 
 // Enum value maps for ErrorReason.
@@ -276,6 +278,7 @@ var (
 		8:  "BACKEND_ERROR",
 		9:  "VERIFY_FAILED",
 		10: "KILL_UNCONFIRMED",
+		11: "SUPERSEDED",
 	}
 	ErrorReason_value = map[string]int32{
 		"ERROR_REASON_UNSPECIFIED": 0,
@@ -289,6 +292,7 @@ var (
 		"BACKEND_ERROR":            8,
 		"VERIFY_FAILED":            9,
 		"KILL_UNCONFIRMED":         10,
+		"SUPERSEDED":               11,
 	}
 )
 
@@ -2983,7 +2987,7 @@ const file_snapshot_agent_proto_rawDesc = "" +
 	"\x11OUTCOME_SUSPENDED\x10\x01\x12\x14\n" +
 	"\x10OUTCOME_RELEASED\x10\x02\x12\x13\n" +
 	"\x0fOUTCOME_RESUMED\x10\x03\x12\x12\n" +
-	"\x0eOUTCOME_KILLED\x10\x04*\x8d\x02\n" +
+	"\x0eOUTCOME_KILLED\x10\x04*\x9d\x02\n" +
 	"\vErrorReason\x12\x1c\n" +
 	"\x18ERROR_REASON_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13DEADLINE_INFEASIBLE\x10\x01\x12\x15\n" +
@@ -2996,7 +3000,9 @@ const file_snapshot_agent_proto_rawDesc = "" +
 	"\rBACKEND_ERROR\x10\b\x12\x11\n" +
 	"\rVERIFY_FAILED\x10\t\x12\x14\n" +
 	"\x10KILL_UNCONFIRMED\x10\n" +
-	"*\x8d\x01\n" +
+	"\x12\x0e\n" +
+	"\n" +
+	"SUPERSEDED\x10\v*\x8d\x01\n" +
 	"\x0fOperationStatus\x12 \n" +
 	"\x1cOPERATION_STATUS_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18OPERATION_STATUS_PENDING\x10\x01\x12\x1d\n" +
