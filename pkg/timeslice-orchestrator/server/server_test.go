@@ -61,6 +61,32 @@ func TestServer_Acquire(t *testing.T) {
 			expectEnqueue: true,
 		},
 		{
+			// The agent still reports TRANSITIONING, but the controller marked
+			// the job FAULTED after its foreground operation timed out.
+			name: "group faulted by a foreground operation timeout",
+			setupStores: func(t *testing.T, ctx context.Context) (server.GroupStore, server.JobStore) {
+				t.Helper()
+				gs := store.NewGroupStore(store.NewMemLockStore())
+				_, _, err := gs.GetOrCreate(ctx, "group-1")
+				if err != nil {
+					t.Fatalf("failed to create group: %v", err)
+				}
+				js := store.NewJobStore()
+				job := store.NewJob("group-1", "job-1")
+				job.SetPods([]string{"job-1-pod-1"})
+				job.UpdateContextState("node-1", pb.SnapshotAgentJobState_STATE_TRANSITIONING)
+				job.MarkForegroundTimeoutFault("node-1", "restore-1")
+				if err := js.Put(ctx, job); err != nil {
+					t.Fatalf("failed to put job: %v", err)
+				}
+				return gs, js
+			},
+			groupID:       "group-1",
+			jobID:         "job-1",
+			expectedCode:  codes.Unavailable,
+			expectEnqueue: true,
+		},
+		{
 			name: "timeout waiting for load",
 			setupStores: func(t *testing.T, ctx context.Context) (server.GroupStore, server.JobStore) {
 				t.Helper()
