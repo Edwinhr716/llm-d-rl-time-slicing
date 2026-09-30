@@ -1,0 +1,43 @@
+{{- if .Values.tools.enabled }}
+{{- if not .Values.tools.image }}{{ fail "tools.image is required with tools.enabled" }}{{ end }}
+# tools: the rlts client (GetGroupStatus sampler, stand-in Acquire/Yield) and metric scrapes.
+apiVersion: v1
+kind: Pod
+metadata: {name: tools, namespace: {{ include "demo.sys" . }}, labels: {app: demo-tools}}
+spec:
+  {{- include "demo.controlSelector" . | nindent 2 }}
+  terminationGracePeriodSeconds: 1
+  automountServiceAccountToken: false
+  containers:
+    - name: t
+      image: {{ .Values.tools.image }}
+      command: ["sh", "-c", "trap exit TERM; while true; do sleep 3600 & wait; done"]
+      resources: {requests: {cpu: 50m, memory: 64Mi}}
+{{- with .Values.tools.faultNode }}
+---
+# fault: on the fault host, host PID namespace, not privileged, only CAP_KILL (AppArmor
+# unconfined so kill(2) on another container's process is allowed). It SIGSTOPs/SIGCONTs the
+# snapshot agent process there and reaches the guest kubelet's loopback debug address.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fault
+  namespace: {{ include "demo.sys" $ }}
+  labels: {app: demo-fault}
+  annotations: {container.apparmor.security.beta.kubernetes.io/t: unconfined}
+spec:
+  hostNetwork: true
+  hostPID: true
+  nodeSelector: {kubernetes.io/hostname: {{ . }}}
+  tolerations: [{operator: Exists}]
+  terminationGracePeriodSeconds: 1
+  automountServiceAccountToken: false
+  containers:
+    - name: t
+      image: {{ $.Values.tools.image }}
+      command: ["sh", "-c", "trap exit TERM; while true; do sleep 3600 & wait; done"]
+      securityContext:
+        capabilities: {add: [KILL]}
+      resources: {requests: {cpu: 10m, memory: 32Mi}}
+{{- end }}
+{{- end }}

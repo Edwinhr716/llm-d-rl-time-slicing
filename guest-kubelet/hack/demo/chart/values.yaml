@@ -1,0 +1,134 @@
+# Values of the time-slicing demo workloads. Every knob the demo harness turns is here; a
+# harness renders one values file per run and installs this chart once.
+
+# Namespaces. appNamespace holds the donor, the guests and the serving path (the guests must
+# share it with the donor for --gpu-claim-mode=donor); sysNamespace holds the tools, fault and
+# GPU exporter pods. "" = the release namespace.
+appNamespace: ""
+sysNamespace: ""
+
+# The group hosts, one entry per host: slot (the value of slotLabel on the node), node (the
+# node name) and optionally vk (the virtual Node; default vk-<last part of node>).
+hosts: []
+#  - {slot: host-a, node: my-node-abcd}
+#  - {slot: host-b, node: my-node-efgh}
+slotLabel: timeslice.io/eval-slot
+# Label every demo host carries (timeslice.io/stack-run=<runLabel>); the trainers select it.
+runLabel: ""
+
+# Where the control-side pods (tools, Redis, EPP, router, load pod, RayJob head and samplers)
+# run: a node name, or else a nodeSelector.
+controlNode: ""
+controlNodeSelector: {}
+
+# GPU driver installer for a pool created without a GKE-managed driver
+# (gpu-driver-version=disabled): a copy of the COS installer DaemonSet pinned to one pool, so
+# the shared kube-system installer is not edited.
+driverInstaller:
+  enabled: false
+  namespace: ""   # "" = sysNamespace
+  pool: ""
+  installerImage: cos-nvidia-installer:fixed
+  partitionImage: gcr.io/gke-release/nvidia-partition-gpu@sha256:de12f85ebfb4fb6c1893cd30c23aab662a72fa0448f97ef74fccb82d7522ef17
+  pauseImage: gke.gcr.io/pause:3.8@sha256:880e63f94b145e46f1b1082bb71b85e21f16b99b180b9996407d61240ceb9830
+
+# The RL donor. kind: rayjob (a KubeRay RayJob running verl fully-async, one trainer per group
+# host), pod (a stand-in GPU pod per host; the Acquire/Yield calls come from outside) or none.
+donor:
+  kind: rayjob
+  jobId: rl
+  group: trainers
+  orchAddr: ""        # TIMESLICE_ORCH_ADDR for the verl plugin
+  deviceClass: gpu.nvidia.com
+  # Per-pod GPU claims come from this ResourceClaimTemplate (kind rayjob). Kind pod uses one
+  # shared ResourceClaim named claim (the VK's --gpu-claim in static mode).
+  claimTemplate: rl-gpu
+  claim: rl-gpu
+  labels: {app: ev-rl}
+  rayjob:
+    image: ""
+    # Pacing: async_training.staleness_threshold and ppo_mini_batch_size.
+    staleness: 0
+    miniBatch: 16
+    # TIMESLICE_EXPECTED_IDLE for the verl plugin: "off" (no hint), "auto" or seconds. The
+    # orchestrator lends only on a hint >= its --min-bubble under --lend-policy=hint.
+    expectedIdle: "off"
+    totalEpochs: 10
+    timeoutS: 10800
+    # The fork's client and verl plugin, installed over the image's from this ConfigMap
+    # (key client.tgz with client/ and verl/ inside). "" = use the image's.
+    clientOverlayConfigMap: ""
+    verlRepo: https://github.com/aishukamal/verl.git
+    verlRef: feat/fully-async-lifecycle-hooks
+    extraEnv: {}      # extra runtime_env env_vars for every actor
+    trainer:
+      requests: {cpu: "8", memory: 40Gi}
+      limits: {memory: 64Gi}
+    sampler:
+      requests: {cpu: "12", memory: 60Gi}
+      limits: {memory: 80Gi}
+      # verl's bucketed weight transfer inside the sampler pod shares CUDA memory between
+      # processes. With PyTorch expandable segments the importer takes the exporter's file
+      # descriptors with pidfd_getfd, which fails without CAP_SYS_PTRACE; without expandable
+      # segments it uses cudaIpc handles and needs no added capability. Default: expandable
+      # segments off, no SYS_PTRACE. See README.md.
+      expandableSegments: false
+      sysPtrace: false
+  pod:
+    image: vllm/vllm-openai:v0.9.2
+    gb: 4
+
+# The vLLM guest, one Deployment per group host, pinned to that host's virtual Node.
+guests:
+  enabled: true
+  image: vllm/vllm-openai:v0.9.2
+  model: Qwen/Qwen2.5-0.5B-Instruct
+  gpuMemoryUtilization: "0.4"
+  maxModelLen: 4096
+  labels: {app: guest-vllm}
+  resources:
+    requests: {cpu: "2", memory: 8Gi}
+    limits: {memory: 12Gi}
+
+# tools: a CPU pod with the rlts client (status sampler, stand-in Acquire/Yield, metric
+# scrapes). fault: a pod on faultNode (hostPID, CAP_KILL only) that can SIGSTOP/SIGCONT the
+# snapshot agent there and reach the guest kubelet's loopback debug address.
+tools:
+  enabled: true
+  image: ""
+  faultNode: ""
+
+# GPU metrics (SM utilization) on every GPU node of the demo: NVIDIA dcgm-exporter as a
+# DaemonSet. access: dra-admin reaches the GPUs through a DRA ResourceClaimTemplate with
+# adminAccess (monitoring access to devices that are allocated to other pods; the namespace
+# must carry resource.kubernetes.io/admin-access=true); hostpath mounts the host's driver
+# directory and /dev into a privileged container instead.
+dcgm:
+  enabled: false
+  image: nvcr.io/nvidia/k8s/dcgm-exporter:4.5.2-4.8.1-ubuntu22.04
+  access: dra-admin
+  driverHostPath: /home/kubernetes/bin/nvidia
+  nodeSelector: {}
+  collectInterval: 1000
+  podMonitoring: {enabled: false, interval: 10s}
+  counters: |
+    DCGM_FI_DEV_GPU_UTIL,      gauge, GPU utilization (%).
+    DCGM_FI_DEV_FB_USED,       gauge, Framebuffer memory used (MiB).
+    DCGM_FI_DEV_FB_FREE,       gauge, Framebuffer memory free (MiB).
+    DCGM_FI_DEV_POWER_USAGE,   gauge, Power draw (W).
+    DCGM_FI_DEV_SM_CLOCK,      gauge, SM clock frequency (MHz).
+    DCGM_FI_PROF_SM_ACTIVE,    gauge, Ratio of cycles an SM has at least 1 warp assigned.
+    DCGM_FI_PROF_GR_ENGINE_ACTIVE, gauge, Ratio of time the graphics engine is active.
+
+# The serving path in front of the guests: Redis (llm-d-async transport), the load pod, the
+# InferencePool over the guests, the EPP and the llm-d-router Envoy. llm-d-async itself comes
+# from its own chart (point its igwBaseURL at http://q1-router.<appNamespace>:8081).
+serving:
+  enabled: true
+  redisImage: redis:7-alpine
+  loadImage: python:3.12-slim
+  eppImage: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
+  envoyImage: docker.io/envoyproxy/envoy:distroless-v1.33.2
+  routeTimeout: 0s
+  routeIdleTimeout: 240s
+  apPodMonitoring: {enabled: false, interval: 10s}

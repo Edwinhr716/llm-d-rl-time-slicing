@@ -1,0 +1,166 @@
+{{- if .Values.serving.enabled }}
+# Redis (llm-d-async transport), the load pod, the InferencePool over the guests and the EPP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: {{ include "demo.app" . }}
+  labels: {app: redis}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      {{- include "demo.controlSelector" . | nindent 6 }}
+      containers:
+      - name: redis
+        image: {{ .Values.serving.redisImage }}
+        args: ["--save", "", "--appendonly", "no"]
+        ports: [{containerPort: 6379}]
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {memory: 1Gi}
+        readinessProbe:
+          exec: {command: ["redis-cli", "ping"]}
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: {{ include "demo.app" . }}}
+spec:
+  selector: {app: redis}
+  ports: [{port: 6379, targetPort: 6379}]
+---
+# Load pod: runs the driver and the metric samplers (stdlib python only).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qprobe
+  namespace: {{ include "demo.app" . }}
+  labels: {app: qprobe}
+spec:
+  {{- include "demo.controlSelector" . | nindent 2 }}
+  containers:
+  - name: qprobe
+    image: {{ .Values.serving.loadImage }}
+    command: ["sleep", "infinity"]
+    resources:
+      requests: {cpu: 250m, memory: 256Mi}
+---
+# InferencePool + EPP (q1-router.yaml, EPP v0.9.0, no flow control).
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata: {name: guest-pool, namespace: {{ include "demo.app" . }}}
+spec:
+  targetPorts: [{number: 8000}]
+  selector:
+    matchLabels:
+      {{- toYaml .Values.guests.labels | nindent 6 }}
+  endpointPickerRef:
+    name: q1-epp
+    kind: Service
+    port: {number: 9002}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: q1-epp, namespace: {{ include "demo.app" . }}}
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata: {name: q1-epp-pod-read, namespace: {{ include "demo.app" . }}}
+rules:
+- apiGroups: ["inference.networking.x-k8s.io"]
+  resources: ["inferenceobjectives", "inferencemodelrewrites"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["inference.networking.k8s.io"]
+  resources: ["inferencepools"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata: {name: q1-epp-pod-read-binding, namespace: {{ include "demo.app" . }}}
+subjects: [{kind: ServiceAccount, name: q1-epp, namespace: {{ include "demo.app" . }}}]
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: q1-epp-pod-read}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: q1-epp-plugins-config, namespace: {{ include "demo.app" . }}}
+data:
+  default-plugins.yaml: |
+    apiVersion: inference.networking.x-k8s.io/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+    - type: queue-scorer
+    - type: kv-cache-utilization-scorer
+    schedulingProfiles:
+    - name: default
+      plugins:
+      - pluginRef: queue-scorer
+      - pluginRef: kv-cache-utilization-scorer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: q1-epp
+  namespace: {{ include "demo.app" . }}
+  labels: {app: q1-epp}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: q1-epp}}
+  template:
+    metadata: {labels: {app: q1-epp}}
+    spec:
+      {{- include "demo.controlSelector" . | nindent 6 }}
+      serviceAccountName: q1-epp
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: q1-epp
+        image: {{ .Values.serving.eppImage }}
+        imagePullPolicy: IfNotPresent
+        args:
+        - --pool-name
+        - "guest-pool"
+        - --pool-namespace
+        - "{{ include "demo.app" . }}"
+        - --v
+        - "4"
+        - --zap-encoder
+        - "json"
+        - --grpc-port
+        - "9002"
+        - --grpc-health-port
+        - "9003"
+        - --config-file
+        - /config/default-plugins.yaml
+        - --metrics-endpoint-auth=false
+        ports:
+        - containerPort: 9002
+        - containerPort: 9003
+        - {name: metrics, containerPort: 9090}
+        livenessProbe:
+          grpc: {port: 9003, service: inference-extension}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          grpc: {port: 9003, service: inference-extension}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        volumeMounts: [{name: plugins-config-volume, mountPath: "/config"}]
+      volumes:
+      - name: plugins-config-volume
+        configMap: {name: q1-epp-plugins-config}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: q1-epp, namespace: {{ include "demo.app" . }}}
+spec:
+  selector: {app: q1-epp}
+  ports:
+  - {name: grpc, protocol: TCP, port: 9002, targetPort: 9002, appProtocol: http2}
+  - {name: metrics, port: 9090, targetPort: 9090}
+  type: ClusterIP
+{{- end }}

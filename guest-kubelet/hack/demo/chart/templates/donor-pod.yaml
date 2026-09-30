@@ -1,0 +1,49 @@
+{{- if eq .Values.donor.kind "pod" }}
+{{- if gt (len .Values.hosts) 1 }}
+{{- fail "donor.kind=pod shares one ResourceClaim, so it supports one host; use donor.kind=rayjob for a group of several hosts" }}
+{{- end }}
+{{- range .Values.hosts }}
+---
+# Stand-in trainer on {{ .slot }}: one GPU pod holding a CUDA tensor of donor.pod.gb GB, touched
+# every 0.5 s. The Acquire/Yield calls come from outside (the tools pod's rlts).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ev-rl-{{ .slot }}
+  namespace: {{ include "demo.app" $ }}
+  labels:
+    {{- toYaml $.Values.donor.labels | nindent 4 }}
+    timeslice.io/job-id: {{ $.Values.donor.jobId }}
+    timeslice.io/group: {{ $.Values.donor.group }}
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  nodeSelector:
+    kubernetes.io/hostname: {{ .node }}
+  tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+  resourceClaims:
+    - {name: gpu, resourceClaimName: {{ $.Values.donor.claim }}}
+  containers:
+    - name: trainer
+      image: {{ $.Values.donor.pod.image }}
+      command: ["python3", "-u", "-c"]
+      args:
+        - |
+          import time, torch
+          gb = float("{{ $.Values.donor.pod.gb }}")
+          x = torch.ones(int(gb * (1 << 30)) // 4, device="cuda")
+          print("standin holding", gb, "GB on", torch.cuda.get_device_name(0), flush=True)
+          n = 0
+          while True:
+              x[: 1 << 20].mul_(1.0)
+              torch.cuda.synchronize()
+              n += 1
+              if n % 120 == 0:
+                  print("standin alive", n, flush=True)
+              time.sleep(0.5)
+      resources:
+        requests: {cpu: "1", memory: 6Gi}
+        limits: {memory: 14Gi}
+        claims: [{name: gpu}]
+{{- end }}
+{{- end }}

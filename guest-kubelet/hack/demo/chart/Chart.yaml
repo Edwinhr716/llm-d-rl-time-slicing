@@ -1,0 +1,11 @@
+apiVersion: v2
+name: timeslice-demo
+description: >-
+  The workloads of the time-slicing demo around the timeslice charts: the RL donor (a KubeRay RayJob
+  running verl, or a stand-in GPU pod), the vLLM guests on the virtual Nodes, the serving path in front
+  of them (llm-d-router Envoy + EPP, InferencePool, Redis for llm-d-async), a GPU metrics exporter,
+  and the demo's tools and fault pods. Install the orchestrator, snapshot-agent and guest-kubelet
+  charts first, and llm-d-async from its own chart.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

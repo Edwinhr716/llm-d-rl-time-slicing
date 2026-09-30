@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: {{ include "snapshot-agent.fullname" . }}
-  namespace: timeslice-system
+  namespace: {{ .Values.namespace | default "timeslice-system" }}
   labels:
     {{- include "snapshot-agent.labels" . | nindent 4 }}
 spec:
@@ -17,6 +17,9 @@ spec:
       {{- end }}
       labels:
         {{- include "snapshot-agent.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -25,17 +28,32 @@ spec:
       serviceAccountName: {{ include "snapshot-agent.serviceAccountName" . }}
       hostNetwork: true
       hostPID: true
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- $args := list }}
+          {{- range $name, $value := .Values.flags }}
+          {{- if not (or (kindIs "invalid" $value) (eq (toString $value) "")) }}
+          {{- $args = append $args (printf "--%s=%v" $name $value) }}
+          {{- end }}
+          {{- end }}
+          {{- with $args }}
+          args:
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- end }}
           env:
             - name: DEPLOYMENT_MODE
               value: "k8s"
             - name: PATH
-              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              value: {{ .Values.path | default "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" | quote }}
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
@@ -65,6 +83,9 @@ spec:
               value: "all"
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: "compute,utility"
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.port }}

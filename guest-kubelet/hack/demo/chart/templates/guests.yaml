@@ -1,0 +1,54 @@
+{{- if .Values.guests.enabled }}
+{{- range .Values.hosts }}
+---
+# vLLM guest for {{ .slot }}: a Deployment (a guest the guest kubelet kills ends Failed and its
+# ReplicaSet brings a new one up on the next lend) pinned to that host's virtual Node, with the
+# guest toleration and plain nvidia.com/gpu (the mirror, never the guest, holds the claim).
+# httpGet readiness only; the guest kubelet runs it. Small footprint so a Suspend stays short.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guest-{{ .slot }}
+  namespace: {{ include "demo.app" $ }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- toYaml $.Values.guests.labels | nindent 6 }}
+      demo-slot: {{ .slot }}
+  template:
+    metadata:
+      labels:
+        {{- toYaml $.Values.guests.labels | nindent 8 }}
+        demo-slot: {{ .slot }}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: {{ include "demo.vk" . }}, timeslice.io/virtual-node: "true"}
+      tolerations:
+        - {key: timeslice.io/guest, operator: Exists, effect: NoSchedule}
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: vllm
+          image: {{ $.Values.guests.image }}
+          args:
+            - --model={{ $.Values.guests.model }}
+            - --port=8000
+            - --gpu-memory-utilization={{ $.Values.guests.gpuMemoryUtilization }}
+            - --max-model-len={{ $.Values.guests.maxModelLen }}
+            - --enforce-eager
+            - --disable-log-requests
+          env:
+            - {name: HF_HOME, value: /tmp/hf}
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests:
+              {{- toYaml $.Values.guests.resources.requests | nindent 14 }}
+              nvidia.com/gpu: "1"
+            limits:
+              {{- toYaml $.Values.guests.resources.limits | nindent 14 }}
+              nvidia.com/gpu: "1"
+{{- end }}
+{{- end }}

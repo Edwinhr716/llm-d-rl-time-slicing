@@ -1,0 +1,82 @@
+{{- if .Values.rbac.create }}
+# What the virtual-kubelet library, the mirror backend and the donor-claim lookup call.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "guest-kubelet.fullname" . }}
+  labels:
+    {{- include "guest-kubelet.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update", "patch"]
+  # Only used with --guest-probe-policy=c: exec probes run inside the mirror through the API server.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "services"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "guest-kubelet.fullname" . }}
+  labels:
+    {{- include "guest-kubelet.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "guest-kubelet.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "guest-kubelet.serviceAccountName" . }}
+    namespace: {{ include "guest-kubelet.namespace" . }}
+---
+# Node heartbeat Leases live in kube-node-lease.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "guest-kubelet.fullname" . }}
+  namespace: kube-node-lease
+  labels:
+    {{- include "guest-kubelet.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "guest-kubelet.fullname" . }}
+  namespace: kube-node-lease
+  labels:
+    {{- include "guest-kubelet.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "guest-kubelet.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "guest-kubelet.serviceAccountName" . }}
+    namespace: {{ include "guest-kubelet.namespace" . }}
+{{- end }}

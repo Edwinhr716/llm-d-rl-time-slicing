@@ -1,0 +1,9 @@
+{{- if .Values.serving.apPodMonitoring.enabled }}
+# Managed Service for Prometheus scrape of llm-d-async's metrics port.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: {name: llm-d-async, namespace: {{ include "demo.app" . }}}
+spec:
+  selector: {matchLabels: {app.kubernetes.io/name: llm-d-async}}
+  endpoints: [{port: 9090, interval: {{ .Values.serving.apPodMonitoring.interval }}}]
+{{- end }}

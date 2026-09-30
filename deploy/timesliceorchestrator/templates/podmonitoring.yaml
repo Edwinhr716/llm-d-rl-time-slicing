@@ -1,0 +1,16 @@
+{{- if .Values.podMonitoring.enabled }}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ include "timesliceorchestrator.fullname" . }}
+  namespace: {{ include "timesliceorchestrator.namespace" . }}
+  labels:
+    {{- include "timesliceorchestrator.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "timesliceorchestrator.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.podMonitoring.interval }}
+{{- end }}

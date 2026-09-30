@@ -1,0 +1,98 @@
+{{- if .Values.dcgm.enabled }}
+{{- $d := .Values.dcgm }}
+# GPU metrics exporter (NVIDIA dcgm-exporter) on every GPU node of the demo, port 9400.
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: {{ .Release.Name }}-dcgm-counters, namespace: {{ include "demo.sys" . }}}
+data:
+  counters.csv: |
+    {{- $d.counters | nindent 4 }}
+{{- if eq $d.access "dra-admin" }}
+---
+# Monitoring access to every GPU of the node, including GPUs allocated to other pods. Needs the
+# DRAAdminAccess feature and the namespace label resource.kubernetes.io/admin-access=true.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata: {name: {{ .Release.Name }}-dcgm-gpus, namespace: {{ include "demo.sys" . }}}
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpus
+          exactly: {deviceClassName: {{ .Values.donor.deviceClass }}, allocationMode: All, adminAccess: true}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: {{ .Release.Name }}-dcgm-exporter, namespace: {{ include "demo.sys" . }}}
+spec:
+  selector:
+    matchLabels: {app: demo-dcgm-exporter}
+  template:
+    metadata:
+      labels: {app: demo-dcgm-exporter}
+    spec:
+      {{- with $d.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      automountServiceAccountToken: false
+      {{- if eq $d.access "dra-admin" }}
+      resourceClaims:
+        - name: gpus
+          resourceClaimTemplateName: {{ .Release.Name }}-dcgm-gpus
+      {{- end }}
+      containers:
+        - name: exporter
+          image: {{ $d.image }}
+          args:
+            - -f
+            - /etc/dcgm-exporter/demo/counters.csv
+            - -c
+            - {{ $d.collectInterval | quote }}
+          env:
+            - name: DCGM_EXPORTER_KUBERNETES
+              value: "false"
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            {{- if eq $d.access "hostpath" }}
+            - {name: LD_LIBRARY_PATH, value: /usr/local/nvidia/lib64}
+            - {name: NVIDIA_VISIBLE_DEVICES, value: all}
+            {{- end }}
+          ports: [{name: metrics, containerPort: 9400}]
+          readinessProbe:
+            httpGet: {path: /health, port: 9400}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+            {{- if eq $d.access "dra-admin" }}
+            claims: [{name: gpus}]
+            {{- end }}
+          {{- if eq $d.access "hostpath" }}
+          securityContext: {privileged: true}
+          {{- end }}
+          volumeMounts:
+            - {name: counters, mountPath: /etc/dcgm-exporter/demo, readOnly: true}
+            {{- if eq $d.access "hostpath" }}
+            - {name: nvidia, mountPath: /usr/local/nvidia, readOnly: true}
+            - {name: dev, mountPath: /dev}
+            {{- end }}
+      volumes:
+        - name: counters
+          configMap: {name: {{ .Release.Name }}-dcgm-counters}
+        {{- if eq $d.access "hostpath" }}
+        - {name: nvidia, hostPath: {path: {{ $d.driverHostPath }}, type: Directory}}
+        - {name: dev, hostPath: {path: /dev, type: Directory}}
+        {{- end }}
+{{- if $d.podMonitoring.enabled }}
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: {name: {{ .Release.Name }}-dcgm-exporter, namespace: {{ include "demo.sys" . }}}
+spec:
+  selector: {matchLabels: {app: demo-dcgm-exporter}}
+  endpoints: [{port: metrics, interval: {{ $d.podMonitoring.interval }}}]
+{{- end }}
+{{- end }}

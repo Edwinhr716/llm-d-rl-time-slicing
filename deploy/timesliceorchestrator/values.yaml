@@ -117,6 +117,29 @@ unconfirmedKill:
   mode: grant
   escalateAfter: "10s,40s"
 
+# Any orchestrator flag not covered above, as flag name (without "--") -> value.
+# Each entry renders one "--<name>=<value>" argument, in key order, after the
+# arguments above (a flag given twice takes the later value). An empty string or
+# null skips the entry, so a values file can switch a flag back to the binary
+# default. Nothing is set by default. Example (the TODAY demo stack):
+#   flags:
+#     background-role: true
+#     min-bubble: 30s
+#     notice-window: 30s
+#     kill-budget: 3s
+#     background-liveness: 3s
+flags: {}
+
+# Extra labels on the orchestrator pod (for example a stable selector for a
+# PodMonitoring or a log query).
+podLabels: {}
+
+# Managed Service for Prometheus scrape of the metrics port (needs the
+# monitoring.googleapis.com PodMonitoring CRD). Off by default.
+podMonitoring:
+  enabled: false
+  interval: 10s
+
 resources: {}
   # limits:
   #   cpu: 100m

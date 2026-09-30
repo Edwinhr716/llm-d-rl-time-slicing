@@ -1,0 +1,78 @@
+# Default values for guest-kubelet: one guest kubelet per selected host, each
+# registering the virtual Node vk-<last dash-separated part of the host name>
+# (unless flags.node-name is set).
+
+# Namespace of the DaemonSet and its ServiceAccount.
+namespace: timeslice-system
+
+image:
+  repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/guest-kubelet
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Every guest kubelet flag, as flag name (without "--") -> value. Each entry
+# renders one "--<name>=<value>" argument, in key order; an empty string or null
+# skips it, so the binary default applies. Nothing is set by default: the chart
+# runs the binary's defaults. Example (the TODAY demo stack with a RayJob donor):
+#   flags:
+#     kubelet-port: 10260
+#     gpu-claim-mode: donor
+#     orchestrator-addr: timesliceorchestrator.timeslice-system.svc:50051
+#     freezer: agent
+#     agent-addr: 127.0.0.1:9001
+#     background-liveness: 3s
+#     hold-group: trainers
+#     debug-addr: 127.0.0.1:10261
+flags: {}
+
+# Extra container environment variables (a list of EnvVar objects). HOST_IP,
+# NODE_NAME, POD_NAME and POD_NAMESPACE are always set from the downward API.
+extraEnv: []
+
+podLabels: {}
+podAnnotations: {}
+
+# The guest kubelet serves its kubelet port on the host network.
+hostNetwork: true
+terminationGracePeriodSeconds: 10
+
+# Hosts that get a guest kubelet. Select only the hosts whose accelerator is
+# lent to guests.
+nodeSelector: {}
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+affinity: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""

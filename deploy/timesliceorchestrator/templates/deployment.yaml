@@ -18,6 +18,9 @@ spec:
     metadata:
       labels:
         {{- include "timesliceorchestrator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "timesliceorchestrator.serviceAccountName" . }}
       containers:
@@ -49,6 +52,11 @@ spec:
             {{- end }}
             {{- if .Values.scope.nodeSelectorExemptBackground }}
             - "--node-selector-exempt-background=true"
+            {{- end }}
+            {{- range $name, $value := .Values.flags }}
+            {{- if not (or (kindIs "invalid" $value) (eq (toString $value) "")) }}
+            - {{ printf "--%s=%v" $name $value | quote }}
+            {{- end }}
             {{- end }}
           ports:
             - name: grpc

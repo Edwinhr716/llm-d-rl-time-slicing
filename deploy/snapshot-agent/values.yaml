@@ -5,6 +5,11 @@ image:
   tag: "latest"
 
 imagePullSecrets: []
+
+# Namespace of the DaemonSet and its ServiceAccount (and the ClusterRoleBinding
+# subject). Keep the default unless you run a second, independent agent next
+# to the shared one (then also give it its own port).
+namespace: timeslice-system
 nameOverride: ""
 fullnameOverride: ""
 
@@ -32,6 +37,28 @@ tolerations:
 affinity: {}
 
 port: 9001
+
+# Pod DNS policy. The agent runs on the host network, so it resolves cluster
+# Service names only with ClusterFirstWithHostNet. "" keeps the Kubernetes
+# default (ClusterFirst, which on the host network falls back to the node's
+# resolver).
+dnsPolicy: ""
+
+# Extra labels on the agent pods.
+podLabels: {}
+
+# PATH inside the agent container. Add the mounted driver's bin directory
+# (nvidia.driver.mountPath + /bin) when the agent must find the driver tools
+# there.
+path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Any agent flag, as flag name (without "--") -> value. Each entry renders one
+# "--<name>=<value>" argument, in key order; an empty string or null skips it.
+# Nothing is set by default. Example: flags: {higher-epoch: abort}
+flags: {}
+
+# Extra container environment variables (a list of EnvVar objects).
+extraEnv: []
 
 securityContext:
   privileged: true
