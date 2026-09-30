@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gpu-metrics
+description: DCGM exporter DaemonSet for GPU utilization (SM active, occupancy) on GPU hosts
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

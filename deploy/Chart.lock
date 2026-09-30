@@ -8,8 +8,20 @@ dependencies:
 - name: node-supervisor
   repository: file://./node-supervisor
   version: 0.1.0
+- name: guest-kubelet
+  repository: file://./guest-kubelet
+  version: 0.1.0
+- name: timeslice-webhook
+  repository: file://./timeslice-webhook
+  version: 0.1.0
+- name: donor-controller
+  repository: file://./donor-controller
+  version: 0.1.0
+- name: gpu-metrics
+  repository: file://./gpu-metrics
+  version: 0.1.0
 - name: nvidia-dra-driver-gpu
   repository: https://helm.ngc.nvidia.com/nvidia
   version: 25.8.0
-digest: sha256:205658731089ce8cf586feb3dfacae850b41e470c8f19b3ec16833a4b4ef8777
-generated: "2026-09-22T20:49:25.590009-07:00"
+digest: sha256:4d9837443b2ac75913ab1a604c5679c4e359d97ead1974c45e9632d8bf9dd8d0
+generated: "2026-09-30T00:24:02.408375369Z"

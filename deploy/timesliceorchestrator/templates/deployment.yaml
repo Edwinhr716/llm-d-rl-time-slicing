@@ -59,6 +59,35 @@ spec:
             {{- with .Values.settleTimeout }}
             - "--settle-timeout={{ . }}"
             {{- end }}
+            {{- with .Values.guest }}
+            {{- if ne (toString .backgroundRole) "" }}
+            - "--background-role={{ .backgroundRole }}"
+            {{- end }}
+            {{- with .lendPolicy }}
+            - "--lend-policy={{ . }}"
+            {{- end }}
+            {{- with .minBubble }}
+            - "--min-bubble={{ . }}"
+            {{- end }}
+            {{- with .noticeWindow }}
+            - "--notice-window={{ . }}"
+            {{- end }}
+            {{- with .killBudget }}
+            - "--kill-budget={{ . }}"
+            {{- end }}
+            {{- with .backgroundLiveness }}
+            - "--background-liveness={{ . }}"
+            {{- end }}
+            {{- with .nodeGroupLabels }}
+            - "--node-group-labels={{ . }}"
+            {{- end }}
+            {{- end }}
+            {{- with .Values.controllerWorkers }}
+            - "--controller-workers={{ . }}"
+            {{- end }}
+            {{- with .Values.resyncPeriod }}
+            - "--resync-period={{ . }}"
+            {{- end }}
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}

@@ -4,6 +4,10 @@ image:
   pullPolicy: Always
   tag: "latest"
 
+# Namespace for the DaemonSet and ServiceAccount. Keep the default unless you
+# run a second, independent install next to its own orchestrator.
+namespace: timeslice-system
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -32,6 +36,13 @@ tolerations:
 affinity: {}
 
 port: 9001
+
+# Pod DNS policy. The agent runs with hostNetwork; "ClusterFirstWithHostNet"
+# lets it resolve cluster Services. "" keeps the Kubernetes default.
+dnsPolicy: ""
+
+# Extra container env entries (a list of EnvVar), after the ones above.
+extraEnv: []
 
 securityContext:
   privileged: true

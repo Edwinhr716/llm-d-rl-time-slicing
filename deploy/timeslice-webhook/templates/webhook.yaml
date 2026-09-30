@@ -1,0 +1,146 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same. The Secret, the
+# Deployment and the webhook configuration share one generated CA, so they
+# live in one file.
+# {{- $ns := include "timeslice-webhook.namespace" . }}
+# {{- $name := include "timeslice-webhook.fullname" . }}
+# {{- $secret := .Values.tls.secretName | default (printf "%s-tls" $name) }}
+# {{- $caBundle := .Values.tls.caBundle }}
+# {{- if .Values.tls.generate }}
+# {{- $dns := list (printf "%s.%s.svc" $name $ns) (printf "%s.%s.svc.cluster.local" $name $ns) }}
+# {{- $ca := genCA (printf "%s-ca" $name) (int .Values.tls.validityDays) }}
+# {{- $cert := genSignedCert (first $dns) nil $dns (int .Values.tls.validityDays) $ca }}
+# {{- $caBundle = $ca.Cert | b64enc }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: '{{ $secret }}'
+  namespace: '{{ $ns }}'
+  labels:
+    # {{- include "timeslice-webhook.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: '{{ $cert.Cert | b64enc }}'
+  tls.key: '{{ $cert.Key | b64enc }}'
+---
+# {{- else if not $caBundle }}
+# {{- fail "timeslice-webhook: tls.caBundle is required when tls.generate is false" }}
+# {{- end }}
+# No ServiceAccount token, no RBAC: the webhook never calls the API server.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: '{{ $name }}'
+  namespace: '{{ $ns }}'
+  labels:
+    # {{- include "timeslice-webhook.labels" . | nindent 4 }}
+spec:
+  # {{- printf "replicas: %d" (int .Values.replicaCount) | nindent 2 }}
+  selector:
+    matchLabels:
+      # {{- include "timeslice-webhook.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        # {{- include "timeslice-webhook.selectorLabels" . | nindent 8 }}
+      annotations:
+        # A new certificate restarts the pods.
+        timeslice.io/ca-checksum: '{{ $caBundle | sha256sum | trunc 16 }}'
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      nodeSelector:
+        # {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        # {{- toYaml .Values.tolerations | nindent 8 }}
+      affinity:
+        # {{- if .Values.affinity }}{{ toYaml .Values.affinity | nindent 8 }}{{ else }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    # {{- include "timeslice-webhook.selectorLabels" . | nindent 20 }}
+        # {{- end }}
+      containers:
+        - name: webhook
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}'
+          imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+          command:
+            - /timeslice-webhook
+            - '--port={{ .Values.port }}'
+            - --cert-dir=/etc/timeslice-webhook/certs
+          args:
+            # {{- include "timeslice-webhook.flags" .Values.flags | trim | nindent 12 }}
+            # {{- range .Values.extraArgs }}
+            - '{{ . }}'
+            # {{- end }}
+          ports:
+            # {{- printf "- {name: https, containerPort: %d}" (int .Values.port) | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: https, scheme: HTTPS}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: https, scheme: HTTPS}
+            periodSeconds: 10
+          resources:
+            # {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: certs, mountPath: /etc/timeslice-webhook/certs, readOnly: true}
+      volumes:
+        - name: certs
+          secret: {secretName: '{{ $secret }}'}
+---
+# The API server calls the webhook on 443; the Service forwards to the named
+# container port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: '{{ $name }}'
+  namespace: '{{ $ns }}'
+  labels:
+    # {{- include "timeslice-webhook.labels" . | nindent 4 }}
+spec:
+  selector:
+    # {{- include "timeslice-webhook.selectorLabels" . | nindent 4 }}
+  ports:
+    - {name: https, port: 443, targetPort: https}
+---
+# One entry per label, CREATE only. Pods with neither label never reach the
+# webhook. Cluster-scoped, so the name carries the namespace.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: '{{ $name }}-{{ $ns }}'
+  labels:
+    # {{- include "timeslice-webhook.labels" . | nindent 4 }}
+webhooks:
+  # {{- range $entry := list "donor" "guest" }}
+  - name: '{{ $entry }}.timeslice.io'
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service: {name: '{{ $name }}', namespace: '{{ $ns }}', path: /mutate, port: 443}
+      caBundle: '{{ $caBundle }}'
+    rules:
+      - {apiGroups: [""], apiVersions: ["v1"], operations: ["CREATE"], resources: ["pods"], scope: Namespaced}
+    objectSelector:
+      matchLabels:
+        'timeslice.io/{{ $entry }}': "true"
+    namespaceSelector:
+      # {{- include "timeslice-webhook.namespaceSelector" $ | nindent 6 }}
+    matchPolicy: Equivalent
+    failurePolicy: '{{ index $.Values.failurePolicy $entry }}'
+    sideEffects: None
+    timeoutSeconds: 3
+    reinvocationPolicy: IfNeeded
+  # {{- end }}

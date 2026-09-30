@@ -1,0 +1,76 @@
+# Timeslice admission webhook (cmd/timeslice-webhook): the Deployment, its
+# Service, its TLS Secret, the MutatingWebhookConfiguration (donor and guest
+# entries) and the CEL ValidatingAdmissionPolicy for the pods it does not see.
+# Off by default in the parent chart. The raw manifests under manifests/ are
+# the same objects for a install without Helm.
+
+# Namespace for the Deployment, Service and Secret.
+namespace: timeslice-system
+
+image:
+  repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timeslice-webhook
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+# HTTPS port in the container. Use 10250 on a private GKE control plane
+# without a firewall rule for other ports; the Service always listens on 443.
+port: 8443
+
+# TLS for the webhook Service name <fullname>.<namespace>.svc.
+#   generate: true makes a CA and a serving certificate at every install or
+#     upgrade (the pods restart with them) and sets the caBundle.
+#   generate: false uses the kubernetes.io/tls Secret secretName, signed by
+#     the CA in caBundle (base64 PEM).
+tls:
+  generate: true
+  validityDays: 3650
+  secretName: ""
+  caBundle: ""
+
+# Namespaces whose pods the webhook entries and the CEL policy check.
+# {} = every namespace except kube-system and the webhook's own.
+namespaceSelector: {}
+
+# failurePolicy per entry: a donor admitted without its job-id and group is
+# invisible to the orchestrator, so donors fail closed; a guest admitted as
+# written only loses its steering, so guests fail open.
+failurePolicy:
+  donor: Fail
+  guest: Ignore
+
+# The CEL ValidatingAdmissionPolicy (W10, W6, W9, W2) and its binding.
+policy:
+  enabled: true
+
+# Webhook flags (pkg/webhook/config.go), one "--<key>=<value>" each, in key
+# order. "" = not rendered (the webhook default). --port and --cert-dir come
+# from the values above.
+flags:
+  # required | preferred: how a guest is steered to virtual Nodes.
+  guest-steering: ""
+  # <namespace>:<name> of the guest kubelet's ServiceAccount (W7); the CEL
+  # policy exempts the same identity. Required when policy.enabled.
+  vk-service-account: ""
+  # How donors learn their job-id, group and orchestrator address.
+  donor-client-wiring: ""
+  # host:port of the orchestrator, injected into donors.
+  orchestrator-addr: ""
+  virtual-node-label: ""
+  group-format: ""
+  podinfo-path: ""
+
+extraArgs: []
+
+resources:
+  requests: {cpu: 10m, memory: 32Mi}
+  limits: {memory: 128Mi}
+
+nodeSelector: {}
+tolerations: []
+# {} = spread the replicas over nodes (preferred anti-affinity).
+affinity: {}

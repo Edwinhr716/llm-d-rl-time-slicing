@@ -96,6 +96,8 @@ type options struct {
 	readinessProbes bool
 	// Pending lead decision D-NS-2: false = keep (today), true = ns-label.
 	guestNodeLabel bool
+	nodeLabels     string
+	nodeTaints     string
 
 	// VK-A7: admission and mirror memory
 	gpuAllowlist       string
@@ -269,6 +271,11 @@ func main() {
 			"empty disables them")
 	flag.BoolVar(&o.guestNodeLabel, "guest-node-label", false,
 		"also label the virtual Node timeslice.io/guest=true, for guests with a preferred node affinity (virtual-node=true stays)")
+	flag.StringVar(&o.nodeLabels, "node-labels", "",
+		"extra labels on the virtual Node, k=v,k2=v2 (keys the guest kubelet sets itself are refused); empty adds none")
+	flag.StringVar(&o.nodeTaints, "node-taints", "",
+		"extra taints on the virtual Node, k=v:Effect,k2:Effect, next to timeslice.io/guest; set at registration, so "+
+			"only guests that tolerate them ever bind; empty adds none")
 
 	flag.StringVar(&o.gpuAllowlist, "gpu-allowlist", "nvidia-l4",
 		"comma-separated GPU models guests may use; a GPU guest is rejected unless the host Node's model label "+
@@ -321,7 +328,7 @@ func run(ctx context.Context, opts *options) error {
 	if !group.ValidSource(opts.groupSource) {
 		return fmt.Errorf("--group-source=%q: want one of %s", opts.groupSource, strings.Join(group.Sources, ", "))
 	}
-	if err := errors.Join(opts.checkDebug(), opts.checkProbePolicy()); err != nil {
+	if err := errors.Join(opts.checkDebug(), opts.checkProbePolicy(), opts.checkNodeExtras()); err != nil {
 		return err
 	}
 	if err := checkGPUMode(ctx, opts); err != nil {
@@ -338,6 +345,13 @@ func run(ctx context.Context, opts *options) error {
 		return runKubelet(ctx, client, opts)
 	}
 	return runWithLeaderElection(ctx, client, opts)
+}
+
+// checkNodeExtras refuses a bad --node-labels or --node-taints before anything starts.
+func (o *options) checkNodeExtras() error {
+	_, errL := provider.ParseNodeLabels(o.nodeLabels)
+	_, errT := provider.ParseNodeTaints(o.nodeTaints)
+	return errors.Join(errL, errT)
 }
 
 func defaultNodeName(hostNode string) string {
@@ -574,6 +588,12 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 		Name: o.nodeName, InternalIP: o.hostIP, KubeletPort: int32(o.kubeletPort),
 		KubeletVersion: o.kubeletVersion, GPUs: o.gpus, GuestNodeLabel: o.guestNodeLabel,
 		HostName: host.Name, HostUID: host.UID,
+	}
+	if cfg.ExtraLabels, err = provider.ParseNodeLabels(o.nodeLabels); err != nil {
+		return err
+	}
+	if cfg.ExtraTaints, err = provider.ParseNodeTaints(o.nodeTaints); err != nil {
+		return err
 	}
 	if o.providerIDFromHost {
 		cfg.ProviderID = host.Spec.ProviderID

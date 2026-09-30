@@ -11,6 +11,11 @@ Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*
 *   `timesliceorchestrator/`: Subchart for the TimeSlice Orchestrator.
 *   `snapshot-agent/`: Subchart for the Snapshot Agent DaemonSet.
 
+The guest time-slicing subcharts `guest-kubelet/`, `timeslice-webhook/` and
+`donor-controller/`, and `gpu-metrics/` (a DCGM exporter for SM utilization),
+are off by default. Each chart's `values.yaml` documents its values. Set
+`createNamespace: false` to install into a namespace that already exists.
+
 ## Prerequisites
 
 *   Helm v3 installed.

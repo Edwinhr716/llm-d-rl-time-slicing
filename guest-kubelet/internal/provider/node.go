@@ -49,6 +49,10 @@ type NodeConfig struct {
 	HostUID  types.UID
 	// GuestNodeLabel adds the label GuestNodeLabel=true next to VirtualNodeLabel (D-NS-2).
 	GuestNodeLabel bool
+	// ExtraLabels and ExtraTaints (--node-labels, --node-taints) are added to the registered
+	// Node. ParseNodeLabels and ParseNodeTaints refuse the keys the VK sets itself.
+	ExtraLabels map[string]string
+	ExtraTaints []corev1.Taint
 }
 
 // HostOwnerRef is the ownerReference from the virtual Node to the real Node it runs on.
@@ -93,11 +97,12 @@ func NewNodeSpec(cfg NodeConfig) corev1.Node {
 			// No kubernetes.io/os label either: every GKE system DaemonSet that landed on the
 			// M0 node (collector, fluentbit-gke, gcsfusecsi-node, gke-metrics-agent, pdcsi-node)
 			// requires kubernetes.io/os=linux, so without it none of them is scheduled here.
-			Labels: nodeLabels(cfg.Name, cfg.GuestNodeLabel),
+			Labels: withExtraLabels(nodeLabels(cfg.Name, cfg.GuestNodeLabel), cfg.ExtraLabels),
 		},
 		Spec: corev1.NodeSpec{
 			ProviderID: cfg.ProviderID,
-			Taints:     []corev1.Taint{{Key: GuestTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule}},
+			Taints: append([]corev1.Taint{{Key: GuestTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule}},
+				cfg.ExtraTaints...),
 		},
 		Status: corev1.NodeStatus{
 			Phase:       corev1.NodeRunning,
@@ -125,6 +130,16 @@ func NewNodeSpec(cfg NodeConfig) corev1.Node {
 			},
 		},
 	}
+}
+
+// withExtraLabels adds extra to labels; a key already in labels keeps its value.
+func withExtraLabels(labels, extra map[string]string) map[string]string {
+	for k, v := range extra {
+		if _, set := labels[k]; !set {
+			labels[k] = v
+		}
+	}
+	return labels
 }
 
 func nodeLabels(name string, guestNodeLabel bool) map[string]string {

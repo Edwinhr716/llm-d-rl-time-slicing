@@ -1,0 +1,82 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+# CEL rules for the pods the webhook does not see, so they never depend on the
+# webhook being up:
+#   W10  timeslice.io/role is set only by the virtual kubelet
+#   W6   a pod with timeslice.io/group also carries timeslice.io/job-id
+#   W9   a guest carries no group, job-id or role label
+#   W2   a guest requests no resource claims
+# Requests of the guest kubelet itself are not checked (W7). On UPDATE a rule is
+# checked only when the labels change.
+# {{- if .Values.policy.enabled }}
+# {{- $name := printf "%s-pods-%s" (include "timeslice-webhook.fullname" .) (include "timeslice-webhook.namespace" .) }}
+# {{- $vk := include "timeslice-webhook.vkUsername" . }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: '{{ $name }}'
+  labels:
+    # {{- include "timeslice-webhook.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: not-the-virtual-kubelet
+      expression: "request.userInfo.username != '{{ $vk }}'"
+  variables:
+    - name: checked
+      expression: >-
+        request.operation == 'CREATE' ||
+        has(object.metadata.labels) != has(oldObject.metadata.labels) ||
+        (has(object.metadata.labels) && object.metadata.labels != oldObject.metadata.labels)
+    - name: guest
+      expression: >-
+        has(object.metadata.labels) && 'timeslice.io/guest' in object.metadata.labels &&
+        object.metadata.labels['timeslice.io/guest'] == 'true'
+  validations:
+    - expression: >-
+        !variables.checked || !has(object.metadata.labels) ||
+        !('timeslice.io/role' in object.metadata.labels)
+      message: "[W10] timeslice.io/role is set only by the virtual kubelet on mirror pods; remove it"
+      reason: Forbidden
+    - expression: >-
+        !variables.checked || !has(object.metadata.labels) ||
+        !('timeslice.io/group' in object.metadata.labels) || 'timeslice.io/job-id' in object.metadata.labels
+      message: >-
+        [W6] a pod with timeslice.io/group needs timeslice.io/job-id; label it timeslice.io/donor=true
+        to have both derived, or set both
+      reason: Forbidden
+    - expression: >-
+        !variables.checked || !variables.guest ||
+        !['timeslice.io/group', 'timeslice.io/job-id', 'timeslice.io/role'].exists(k, k in object.metadata.labels)
+      message: >-
+        [W9] a guest pod must not carry timeslice.io/group, timeslice.io/job-id or timeslice.io/role:
+        they are set by the virtual kubelet on the mirror pod
+      reason: Forbidden
+    - expression: >-
+        !variables.checked || !variables.guest ||
+        ((!has(object.spec.resourceClaims) || size(object.spec.resourceClaims) == 0) &&
+        !object.spec.containers.exists(c, has(c.resources) && has(c.resources.claims) && size(c.resources.claims) > 0))
+      message: >-
+        [W2] a guest pod must not request resource claims: the mirror pod runs on the donor's GPU
+        through the virtual kubelet
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: '{{ $name }}'
+  labels:
+    # {{- include "timeslice-webhook.labels" . | nindent 4 }}
+spec:
+  policyName: '{{ $name }}'
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      # {{- include "timeslice-webhook.namespaceSelector" . | nindent 6 }}
+# {{- end }}

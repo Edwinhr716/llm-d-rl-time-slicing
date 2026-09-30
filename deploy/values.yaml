@@ -2,6 +2,11 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
+# Create the timeslice-system Namespace. Set false when the release installs
+# into a namespace that already exists (for example a second, independent
+# install whose subcharts set their own namespace).
+createNamespace: true
+
 # Override values for the timesliceorchestrator subchart
 timesliceorchestrator:
   enabled: true
@@ -46,6 +51,21 @@ node-supervisor:
       operator: "Equal"
       value: "true"
       effect: "NoSchedule"
+
+# Guest time-slicing components (see each chart's values.yaml). All off by
+# default; a guest-serving install enables the first three and sets their
+# flags, and the guest kubelet's ServiceAccount (<namespace>:<name>) in
+# timeslice-webhook.flags.vk-service-account.
+guest-kubelet:
+  enabled: false
+timeslice-webhook:
+  enabled: false
+donor-controller:
+  enabled: false
+
+# DCGM exporter on GPU hosts (SM active, SM occupancy, GPU utilization).
+gpu-metrics:
+  enabled: false
 
 # Override values for the nvidia-dra-driver-gpu subchart
 nvidia-dra-driver-gpu:

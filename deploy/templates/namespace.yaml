@@ -1,4 +1,7 @@
+# Template directives sit in comments so the file stays valid YAML for linters.
+# {{- if .Values.createNamespace }}
 apiVersion: v1
 kind: Namespace
 metadata:
   name: timeslice-system
+# {{- end }}

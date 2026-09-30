@@ -1,0 +1,88 @@
+# Guest kubelet (the virtual kubelet): a DaemonSet with one pod per donor host.
+# Each pod registers the virtual Node vk-<last part of the host name> and runs
+# guests as mirror pods on its host. Off by default in the parent chart.
+
+# Namespace for the DaemonSet, ServiceAccount and leader-election Role.
+namespace: timeslice-system
+
+image:
+  repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/guest-kubelet
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # "" = the chart fullname. The webhook's --vk-service-account and its CEL
+  # policy name this account as <namespace>:<name>.
+  name: ""
+
+rbac:
+  create: true
+
+# Hosts that get a guest kubelet. Labelling a node timeslice.io/donor=true is
+# what schedules one there (late bound); add a second key to keep a second
+# install off the first one's hosts.
+nodeSelector:
+  timeslice.io/donor: "true"
+
+tolerations:
+  - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+  # The fence taint a guest kubelet puts on its host while a mirror still runs
+  # on a departed donor's GPU must not block a restart of the kubelet itself.
+  - {key: timeslice.io/gpu-fence, operator: Exists, effect: NoSchedule}
+
+# Guaranteed-style sizing: the last thing evicted under node pressure.
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: 500m, memory: 256Mi}
+
+# Extra labels and taints on the virtual Node (--node-labels, --node-taints).
+# They are set when the Node registers, so a guest of another install or test
+# run never binds in the window before a later `kubectl label`. Guests then need
+# a matching toleration and nodeSelector. Empty adds none.
+#   nodeLabels:  {example.com/run: r1}
+#   nodeTaints:  [{key: example.com/run, value: r1, effect: NoSchedule}]
+nodeLabels: {}
+nodeTaints: []
+
+# Guest kubelet flags, one "--<key>=<value>" each, in key order. A key set to
+# "" (or removed) is not rendered and the binary default applies; see
+# guest-kubelet/cmd/guest-kubelet/main.go for every flag. The keys below are
+# the ones a donor-mode install sets.
+flags:
+  leader-elect: true
+  # Port of the virtual Node's kubelet API (logs, exec) on the host network.
+  kubelet-port: 10260
+  mirror-cpu-headroom: "1"
+  mirror-memory-headroom: 4Gi
+  mirror-owner-ref: true
+  # Where the mirror's GPU comes from: donor = the donor pod's DRA claim.
+  gpu-claim-mode: ""
+  guest-budget: ""
+  # Where the guest kubelet reads a host's group (label layout).
+  group-source: ""
+  # Host commands from the orchestrator (its --host-command-port) and the
+  # allow-list of orchestrator pod IPs or CIDRs ("" allows every caller).
+  host-command-port: ""
+  host-command-allow: ""
+  # agent = suspend and resume through the node's snapshot agent.
+  freezer: ""
+  snapshot-agent-port: ""
+  agent-addr: ""
+  vacate-margin: ""
+  # K and N: keep equal to the orchestrator's values.
+  kill-budget: ""
+  notice-window: ""
+  cordon-while-held: ""
+  guest-probe-policy: ""
+  guest-node-label: ""
+  # Test hooks, loopback only: the debug endpoint and agent fault injection.
+  debug-addr: ""
+  agent-fault-injection: ""
+
+# Flags passed as is after the ones above.
+extraArgs: []

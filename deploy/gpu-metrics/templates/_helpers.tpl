@@ -1,7 +1,7 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "snapshot-agent.name" -}}
+{{- define "gpu-metrics.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
@@ -10,7 +10,7 @@ Create a default fully qualified app name.
 We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
 If release name contains chart name it will be used as a full name.
 */}}
-{{- define "snapshot-agent.fullname" -}}
+{{- define "gpu-metrics.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -26,16 +26,16 @@ If release name contains chart name it will be used as a full name.
 {{/*
 Create chart name and version as used by the chart label.
 */}}
-{{- define "snapshot-agent.chart" -}}
+{{- define "gpu-metrics.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels
 */}}
-{{- define "snapshot-agent.labels" -}}
-helm.sh/chart: {{ include "snapshot-agent.chart" . }}
-{{ include "snapshot-agent.selectorLabels" . }}
+{{- define "gpu-metrics.labels" -}}
+helm.sh/chart: {{ include "gpu-metrics.chart" . }}
+{{ include "gpu-metrics.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -45,25 +45,26 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/*
 Selector labels
 */}}
-{{- define "snapshot-agent.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "snapshot-agent.name" . }}
+{{- define "gpu-metrics.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "gpu-metrics.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
-{{- end }}
-
-{{/*
-Create the name of the service account to use
-*/}}
-{{- define "snapshot-agent.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create }}
-{{- default (include "snapshot-agent.fullname" .) .Values.serviceAccount.name }}
-{{- else }}
-{{- default "default" .Values.serviceAccount.name }}
-{{- end }}
 {{- end }}
 
 {{/*
 Namespace every namespaced resource of this chart is created in.
 */}}
-{{- define "snapshot-agent.namespace" -}}
+{{- define "gpu-metrics.namespace" -}}
 {{- .Values.namespace | default "timeslice-system" }}
+{{- end }}
+
+{{/*
+Command-line flags from a map of flag name to value, one "--name=value" list item each, in key
+order. A key whose value is "" or null renders nothing, so the binary default applies.
+*/}}
+{{- define "gpu-metrics.flags" -}}
+{{- range $k, $v := . }}
+{{- if and (not (kindIs "invalid" $v)) (ne (toString $v) "") }}
+- {{ printf "--%s=%v" $k $v | quote }}
+{{- end }}
+{{- end }}
 {{- end }}

@@ -124,6 +124,32 @@ hostCommand:
 # --settle-timeout. "" = the orchestrator default (30s).
 settleTimeout: ""
 
+# Guest time-slicing (background role) flags. Each is rendered only when set, so
+# the defaults leave the orchestrator's own defaults in place.
+#   backgroundRole: --background-role, accept ROLE_BACKGROUND participants
+#     (guest kubelets). "" = not rendered (orchestrator default: off).
+#   lendPolicy: --lend-policy, when an idle group is lent to its background
+#     participant (for example "always").
+#   minBubble: --min-bubble, the shortest expected idle a Yield must announce
+#     for the group to be lent.
+#   noticeWindow / killBudget / backgroundLiveness: N, K and L
+#     (--notice-window, --kill-budget, --background-liveness).
+#   nodeGroupLabels: --node-group-labels, which node label layout names a
+#     group (see examples/).
+guest:
+  backgroundRole: ""
+  lendPolicy: ""
+  minBubble: ""
+  noticeWindow: ""
+  killBudget: ""
+  backgroundLiveness: ""
+  nodeGroupLabels: ""
+
+# Controller tuning: --controller-workers and --resync-period. "" / 0 = not
+# rendered (orchestrator defaults).
+controllerWorkers: 0
+resyncPeriod: ""
+
 # Extra orchestrator flags, passed as is after the ones above, e.g.
 #   extraArgs: ["--background-role=true", "--min-bubble=30s"]
 extraArgs: []
