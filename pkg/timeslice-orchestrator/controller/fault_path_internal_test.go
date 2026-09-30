@@ -131,13 +131,15 @@ func operationDoneAfter(d time.Duration) func(context.Context, string, string) (
 	}
 }
 
-// TestWaitForKillOperation_PollsAtKillInterval: a kill that finishes at 250 ms
-// is seen within one 100 ms poll, where the 1 s snapshot poll would take 1 s.
+// TestWaitForKillOperation_PollsAtKillInterval: the kill poll defaults to the
+// 1 s snapshot poll; set to 100 ms, a kill that finishes at 250 ms is seen
+// within one 100 ms poll, where the 1 s snapshot poll would take 1 s.
 func TestWaitForKillOperation_PollsAtKillInterval(t *testing.T) {
 	ctrl := NewController(nil, nil, nil, nil, &MockSnapshotAgentStore{OperationFunc: operationDoneAfter(250 * time.Millisecond)})
-	if ctrl.KillPollInterval != 100*time.Millisecond {
-		t.Fatalf("default KillPollInterval = %v, want 100ms", ctrl.KillPollInterval)
+	if ctrl.KillPollInterval != time.Second {
+		t.Fatalf("default KillPollInterval = %v, want 1s", ctrl.KillPollInterval)
 	}
+	ctrl.KillPollInterval = 100 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

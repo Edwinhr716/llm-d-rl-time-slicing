@@ -12,9 +12,9 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
-// TestNewRateLimiter is Q13 scenario S1b: client-go's default limiter starts at
-// 5 ms, which retried a failing group nine times in 0.7 s, and caps at 1000 s.
-// The proposed limiter starts at 1 s and caps at 30 s.
+// TestNewRateLimiter: the per-group delay starts at the base, doubles on each
+// failure and stops at the cap (here 1 s and 30 s, as --retry-base-delay and
+// --retry-max-delay can set).
 func TestNewRateLimiter(t *testing.T) {
 	limiter := controller.NewRateLimiter(time.Second, 30*time.Second)
 	want := []time.Duration{
@@ -36,6 +36,24 @@ func TestNewRateLimiter(t *testing.T) {
 	}
 	if got := limiter.When("g"); got != time.Second {
 		t.Errorf("When() after Forget = %v, want 1s", got)
+	}
+}
+
+// TestNewRateLimiter_Defaults: the default flags give client-go's default
+// backoff, 5 ms doubling to 1000 s.
+func TestNewRateLimiter_Defaults(t *testing.T) {
+	limiter := controller.NewRateLimiter(controller.DefaultRetryBaseDelay, controller.DefaultRetryMaxDelay)
+	want := []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond}
+	for i, wantDelay := range want {
+		if got := limiter.When("g"); got != wantDelay {
+			t.Errorf("failure %d: When() = %v, want %v", i+1, got, wantDelay)
+		}
+	}
+	for i := len(want); i < 40; i++ {
+		limiter.When("g")
+	}
+	if got := limiter.When("g"); got != 1000*time.Second {
+		t.Errorf("capped When() = %v, want 1000s", got)
 	}
 }
 

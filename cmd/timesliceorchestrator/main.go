@@ -79,23 +79,23 @@ func run() error {
 			"timeslice_orchestrator_dispatch_budget_rising_edge_skipped_total to see the orchestrator "+
 			"declining to open it. Supersedes --dispatch-budget-open-delay. "+
 			"Overridable with the TIMESLICE_DISPATCH_BUDGET_EXTERNAL_RISING_EDGE environment variable.")
-	// Fault-path timeouts and retries (Q13). The defaults marked PENDING LEAD DECISION
-	// are proposals awaiting the lead's sign-off.
-	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 5*time.Second,
-		"Bound on every call to a snapshot agent, including each status and operation poll. 0 disables it. "+
-			"PENDING LEAD DECISION.")
+	// Fault-path timeouts and retries. The defaults keep the controller's
+	// earlier behaviour; each can be tightened per deployment.
+	agentRPCTimeout := flag.Duration("agent-rpc-timeout", 0,
+		"Bound on every call to a snapshot agent, including each status and operation poll. 0 (the default) "+
+			"disables it.")
 	foregroundOpTimeout := flag.Duration("foreground-op-timeout", 10*time.Minute,
 		"Bound on waiting for one snapshot or restore operation to finish. 0 disables it.")
-	retryBaseDelay := flag.Duration("retry-base-delay", 1*time.Second,
-		"First retry delay after a failed reconcile of a group; it doubles on each further failure. "+
-			"PENDING LEAD DECISION.")
-	retryMaxDelay := flag.Duration("retry-max-delay", 30*time.Second,
-		"Cap on the retry delay after failed reconciles of a group. PENDING LEAD DECISION.")
-	holderWaitRequeue := flag.Duration("holder-wait-requeue", 1*time.Second,
+	retryBaseDelay := flag.Duration("retry-base-delay", controller.DefaultRetryBaseDelay,
+		"First retry delay after a failed reconcile of a group; it doubles on each further failure.")
+	retryMaxDelay := flag.Duration("retry-max-delay", controller.DefaultRetryMaxDelay,
+		"Cap on the retry delay after failed reconciles of a group.")
+	holderWaitRequeue := flag.Duration("holder-wait-requeue", 0,
 		"Re-reconcile a group this long after a pass that ends with the lock holder not yet loaded, so an "+
-			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
+			"agent state change reaches the waiting Acquire before the next retry or resync. 0 (the default) "+
+			"disables it.")
 	killPollInterval := flag.Duration("kill-poll-interval", controller.DefaultKillPollInterval,
-		"How often a kill operation is polled. PENDING LEAD DECISION.")
+		"How often a kill operation is polled.")
 	flag.Parse()
 
 	if *budgetRedisAddr != "" && *budgetJob == "" {

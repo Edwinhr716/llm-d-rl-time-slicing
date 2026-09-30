@@ -26,8 +26,13 @@ const (
 	DefaultWorkers = 4
 
 	// DefaultKillPollInterval is how often WaitForKillOperation polls a kill
-	// operation. PENDING LEAD DECISION (Q13).
-	DefaultKillPollInterval = 100 * time.Millisecond
+	// operation. It matches the snapshot and restore poll.
+	DefaultKillPollInterval = operationPollInterval
+
+	// DefaultRetryBaseDelay and DefaultRetryMaxDelay are client-go's default
+	// per-item controller backoff: 5 ms doubling to 1000 s.
+	DefaultRetryBaseDelay = 5 * time.Millisecond
+	DefaultRetryMaxDelay  = 1000 * time.Second
 
 	// rateLimiterQPS and rateLimiterBurst are the overall bucket that
 	// client-go's default controller rate limiter also applies.
@@ -37,9 +42,8 @@ const (
 
 // NewRateLimiter returns the controller's retry limiter: per group, the first
 // retry waits baseDelay and each further failure doubles it up to maxDelay, and
-// an overall 10 qps bucket applies on top. client-go's default is 5 ms to
-// 1000 s, which retries a failing group nine times in under a second and then
-// backs off far past any useful wait.
+// an overall 10 qps bucket applies on top. With DefaultRetryBaseDelay and
+// DefaultRetryMaxDelay it is client-go's default controller rate limiter.
 func NewRateLimiter(baseDelay, maxDelay time.Duration) workqueue.TypedRateLimiter[string] {
 	return workqueue.NewTypedMaxOfRateLimiter(
 		workqueue.NewTypedItemExponentialFailureRateLimiter[string](baseDelay, maxDelay),
@@ -748,8 +752,9 @@ func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeN
 }
 
 // WaitForKillOperation blocks until the given kill operation on the node
-// completes or fails. It polls every KillPollInterval rather than every second,
-// because the lock handoff waits on it. The caller bounds it with ctx.
+// completes or fails. It polls every KillPollInterval, which can be set shorter
+// than the snapshot poll because the lock handoff waits on it. The caller bounds
+// it with ctx.
 func (c *Controller) WaitForKillOperation(ctx context.Context, groupID, jobID, nodeName, operationID string) error {
 	interval := c.KillPollInterval
 	if interval <= 0 {
