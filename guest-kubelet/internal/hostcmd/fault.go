@@ -140,7 +140,7 @@ func (f *FaultInjector) Interceptor() grpc.UnaryClientInterceptor {
 		case FaultUnimplemented:
 			return status.Error(codes.Unimplemented, "injected fault: not implemented")
 		case FaultRefuse:
-			return status.Error(codes.FailedPrecondition, "BACKEND_ERROR: injected fault")
+			return refusal(codes.FailedPrecondition, sapb.ErrorReason_BACKEND_ERROR.String(), "injected fault")
 		default:
 			return invoker(ctx, method, req, reply, cc, opts...)
 		}

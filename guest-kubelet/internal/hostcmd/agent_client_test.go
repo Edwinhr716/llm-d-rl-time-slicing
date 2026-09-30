@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -197,10 +198,21 @@ func TestClient_LostOperationIsStartedAgain(t *testing.T) {
 	wantRequests(t, s, "Resume j1 4", "Resume j1 4")
 }
 
-func TestClient_RefusalPrefixIsDecodedAndNotRetried(t *testing.T) {
-	// Pending lead decision D-AGENT-2, option prefix: the reason starts the status message.
+// errorInfoStatus is a refusal as the agent sends it under D-AGENT-2, option errorinfo.
+func errorInfoStatus(t *testing.T, code codes.Code, msg, reason, domain string) error {
+	t.Helper()
+	st, err := status.New(code, msg).WithDetails(&errdetails.ErrorInfo{Reason: reason, Domain: domain})
+	if err != nil {
+		t.Fatalf("WithDetails: %v", err)
+	}
+	return st.Err()
+}
+
+func TestClient_RefusalErrorInfoIsDecodedAndNotRetried(t *testing.T) {
+	// Lead decision D-AGENT-2, option errorinfo: the reason is an ErrorInfo detail.
 	s := newScripted()
-	s.errs["Suspend"] = []error{status.Error(codes.FailedPrecondition, "STALE_EPOCH: epoch 3 is lower than the last epoch 7")}
+	s.errs["Suspend"] = []error{errorInfoStatus(t, codes.FailedPrecondition,
+		"epoch 3 is lower than the last epoch 7", "STALE_EPOCH", hostcmd.ErrorInfoDomain)}
 	_, err := (&hostcmd.AgentBackend{Client: dialScripted(t, s)}).Suspend(context.Background(), "j1", 3, time.Now().Add(time.Second))
 	if hostcmd.ReasonOf(err) != "STALE_EPOCH" {
 		t.Fatalf("reason of %v = %q", err, hostcmd.ReasonOf(err))
@@ -209,6 +221,25 @@ func TestClient_RefusalPrefixIsDecodedAndNotRetried(t *testing.T) {
 		t.Fatalf("last epoch = %d %t", last, ok)
 	}
 	wantRequests(t, s, "Suspend j1 3")
+}
+
+func TestClient_RefusalReasonNeedsErrorInfo(t *testing.T) {
+	for name, err := range map[string]error{
+		"prefix only":  status.Error(codes.FailedPrecondition, "STALE_EPOCH: epoch 3 is lower than the last epoch 7"),
+		"other domain": errorInfoStatus(t, codes.FailedPrecondition, "x", "STALE_EPOCH", "example.com"),
+		"unspecified":  errorInfoStatus(t, codes.FailedPrecondition, "x", "ERROR_REASON_UNSPECIFIED", hostcmd.ErrorInfoDomain),
+	} {
+		s := newScripted()
+		s.errs["Suspend"] = []error{err}
+		ab := &hostcmd.AgentBackend{Client: dialScripted(t, s)}
+		_, got := ab.Suspend(context.Background(), "j1", 3, time.Now().Add(time.Second))
+		if r := hostcmd.ReasonOf(got); r != "" {
+			t.Errorf("%s: reason of %v = %q, want none", name, got, r)
+		}
+		if _, ok := freeze.LastEpoch(got); ok {
+			t.Errorf("%s: a status without the ErrorInfo detail is not a STALE_EPOCH refusal", name)
+		}
+	}
 }
 
 func TestClient_FailedOperationCarriesItsReason(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -15,9 +16,14 @@ import (
 	"github.com/edwinhr716/guest-kubelet/internal/freeze"
 )
 
+// ErrorInfoDomain is the domain of the google.rpc.ErrorInfo detail the snapshot agent puts on a
+// refusal (lead decision D-AGENT-2, option errorinfo).
+const ErrorInfoDomain = "snapshot-agent.llm-d-rl-time-slicing"
+
 // AgentError is a refusal or a failed operation from the snapshot agent. Reason is the
-// ErrorReason name, read from the start of the gRPC status message ("STALE_EPOCH: ...", pending
-// lead decision D-AGENT-2, option prefix), or "" when the message has no known prefix.
+// ErrorReason name, read from the ErrorInfo detail in ErrorInfoDomain on the gRPC status
+// (D-AGENT-2, option errorinfo), or "" when the status has no such detail. Msg is the status
+// message as sent; it is never parsed for a reason.
 type AgentError struct {
 	Code   codes.Code
 	Reason string
@@ -62,13 +68,37 @@ func decodeError(err error) error {
 	if !ok {
 		return err
 	}
-	out := &AgentError{Code: st.Code(), Msg: st.Message()}
-	if name, rest, found := strings.Cut(st.Message(), ": "); found {
-		if v, known := sapb.ErrorReason_value[name]; known && v != 0 {
-			out.Reason, out.Msg = name, rest
+	return &AgentError{Code: st.Code(), Reason: statusReason(st), Msg: st.Message()}
+}
+
+// statusReason returns the Reason of the first ErrorInfo detail in ErrorInfoDomain on st, or
+// "" when there is none or it names ERROR_REASON_UNSPECIFIED.
+func statusReason(st *status.Status) string {
+	for _, detail := range st.Details() {
+		info, ok := detail.(*errdetails.ErrorInfo)
+		if !ok || info.GetDomain() != ErrorInfoDomain {
+			continue
 		}
+		if v, known := sapb.ErrorReason_value[info.GetReason()]; known && v == 0 {
+			return ""
+		}
+		return info.GetReason()
 	}
-	return out
+	return ""
+}
+
+// refusal builds a refusal status error the way the snapshot agent sends it: message msg and,
+// when reason is set, one ErrorInfo detail in ErrorInfoDomain.
+func refusal(code codes.Code, reason, msg string) error {
+	st := status.New(code, msg)
+	if reason == "" {
+		return st.Err()
+	}
+	withInfo, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason, Domain: ErrorInfoDomain})
+	if err != nil {
+		return st.Err()
+	}
+	return withInfo.Err()
 }
 
 // retryable: the call may not have reached the agent, or its answer was lost. Sending it

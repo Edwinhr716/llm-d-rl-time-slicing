@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -55,9 +56,14 @@ func (e *OpError) Unwrap() error {
 	return e.Err
 }
 
+// ErrorInfoDomain is the domain of the ErrorInfo detail a refusal carries.
+const ErrorInfoDomain = "snapshot-agent.llm-d-rl-time-slicing"
+
 // RefusalError is returned when a Suspend, Resume or Kill call is refused
-// before any operation starts. It converts to a gRPC status with Code, and
-// the status message starts with the ErrorReason name when Reason is set.
+// before any operation starts. It converts to a gRPC status with Code and
+// message Msg. When Reason is set, the status also carries one
+// google.rpc.ErrorInfo detail whose Reason is the ErrorReason name and whose
+// Domain is ErrorInfoDomain. Error, used in logs, starts with the name.
 type RefusalError struct {
 	Code   codes.Code
 	Reason pb.ErrorReason
@@ -73,7 +79,16 @@ func (e *RefusalError) Error() string {
 
 // GRPCStatus lets status.FromError and status.Code read the refusal.
 func (e *RefusalError) GRPCStatus() *status.Status {
-	return status.New(e.Code, e.Error())
+	st := status.New(e.Code, e.Msg)
+	if e.Reason == pb.ErrorReason_ERROR_REASON_UNSPECIFIED {
+		return st
+	}
+	withInfo, err := st.WithDetails(&errdetails.ErrorInfo{Reason: e.Reason.String(), Domain: ErrorInfoDomain})
+	if err != nil {
+		// Only an OK code makes WithDetails fail here; a refusal is never OK.
+		return st
+	}
+	return withInfo
 }
 
 func refuse(code codes.Code, reason pb.ErrorReason, format string, args ...any) error {
