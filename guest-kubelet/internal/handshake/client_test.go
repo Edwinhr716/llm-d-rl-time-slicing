@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -331,10 +332,25 @@ func TestResume_FaultedAfterRestartIsRefused(t *testing.T) {
 	}
 }
 
-func TestSuspend_RefusalWithReasonPrefix(t *testing.T) {
+// refusalStatus is a FailedPrecondition refusal as the agent sends it under D-AGENT-2
+// errorinfo: a plain message and, when reason is set, one google.rpc.ErrorInfo detail in domain.
+func refusalStatus(t *testing.T, msg, reason, domain string) *status.Status {
+	t.Helper()
+	st := status.New(codes.FailedPrecondition, msg)
+	if reason == "" {
+		return st
+	}
+	withInfo, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason, Domain: domain})
+	if err != nil {
+		t.Fatalf("WithDetails: %v", err)
+	}
+	return withInfo
+}
+
+func TestSuspend_RefusalWithErrorInfo(t *testing.T) {
 	f := newFake()
 	f.start = func(string, int) error {
-		return status.Error(codes.FailedPrecondition, "STALE_EPOCH: epoch 2 is lower than 3")
+		return refusalStatus(t, "epoch 2 is lower than 3", "STALE_EPOCH", handshake.ErrorInfoDomain).Err()
 	}
 	c := handshake.New(f, fastOpts)
 	err := c.Suspend(withDeadline(t, time.Second), mirrorPod(), 2)
@@ -347,15 +363,21 @@ func TestSuspend_RefusalWithReasonPrefix(t *testing.T) {
 	}
 }
 
-func TestParseReason(t *testing.T) {
-	for _, tc := range []struct{ in, reason, rest string }{
-		{"PRECONDITION_MEMORY: no room", "PRECONDITION_MEMORY", "no room"},
-		{"ERROR_REASON_UNSPECIFIED: x", "", "ERROR_REASON_UNSPECIFIED: x"},
-		{"NOT_A_REASON: x", "", "NOT_A_REASON: x"},
-		{"plain message", "", "plain message"},
+func TestStatusReason(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		st   *status.Status
+		want string
+	}{
+		{"errorinfo", refusalStatus(t, "no room", "PRECONDITION_MEMORY", handshake.ErrorInfoDomain), "PRECONDITION_MEMORY"},
+		{"other domain", refusalStatus(t, "x", "STALE_EPOCH", "example.com"), ""},
+		{"no detail, message starts with a name", status.New(codes.FailedPrecondition, "STALE_EPOCH: x"), ""},
+		{"message names a reason", refusalStatus(t, "STALE_EPOCH: x", "BACKEND_ERROR", handshake.ErrorInfoDomain), "BACKEND_ERROR"},
+		{"plain message", status.New(codes.Aborted, "plain message"), ""},
+		{"nil", nil, ""},
 	} {
-		if r, rest := handshake.ParseReason(tc.in); r != tc.reason || rest != tc.rest {
-			t.Errorf("handshake.ParseReason(%q) = %q, %q", tc.in, r, rest)
+		if got := handshake.StatusReason(tc.st); got != tc.want {
+			t.Errorf("%s: handshake.StatusReason = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }

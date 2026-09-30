@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
@@ -127,8 +128,8 @@ type Error struct {
 	Op    string // Suspend, Resume, Kill or Status
 	JobID string
 	Kind  Kind
-	// Reason is the agent's ErrorReason name when it gave one: from a refusal's message
-	// prefix (D-AGENT-2, for example "STALE_EPOCH: ...") or from the failed operation.
+	// Reason is the agent's ErrorReason name when it gave one: from a refusal's
+	// google.rpc.ErrorInfo detail (D-AGENT-2 errorinfo) or from the failed operation.
 	Reason string
 	Code   codes.Code // gRPC code of a refusal
 	Msg    string
@@ -155,20 +156,22 @@ func ReasonOf(err error) string {
 	return ""
 }
 
-// ParseReason splits a refusal message into the ErrorReason name it starts with (the agent's
-// D-AGENT-2 prefix encoding, "STALE_EPOCH: epoch 3 is lower ...") and the rest. A message
-// without a known prefix returns "" and the whole message.
-//
-//nolint:gocritic // unnamedResult: nonamedreturns forbids naming them
-func ParseReason(msg string) (string, string) {
-	name, rest, ok := strings.Cut(msg, ": ")
-	if !ok {
-		return "", msg
+// ErrorInfoDomain is the google.rpc.ErrorInfo domain of snapshot-agent refusals.
+const ErrorInfoDomain = "snapshot-agent.llm-d-rl-time-slicing"
+
+// StatusReason returns the ErrorReason name a refusal carries: the Reason of the status's
+// google.rpc.ErrorInfo detail with domain ErrorInfoDomain (the agent's D-AGENT-2 errorinfo
+// encoding), or "" when it has none. The status message is plain text and is never parsed.
+func StatusReason(st *status.Status) string {
+	if st == nil {
+		return ""
 	}
-	if v, known := pb.ErrorReason_value[name]; !known || v == int32(pb.ErrorReason_ERROR_REASON_UNSPECIFIED) {
-		return "", msg
+	for _, detail := range st.Details() {
+		if info, ok := detail.(*errdetails.ErrorInfo); ok && info.GetDomain() == ErrorInfoDomain {
+			return info.GetReason()
+		}
 	}
-	return name, rest
+	return ""
 }
 
 // JobID returns the mirror's agent job id.
@@ -392,12 +395,11 @@ func transient(err error) bool {
 
 func refusal(op, jobID string, err error) *Error {
 	st := status.Convert(err)
-	reason, msg := ParseReason(st.Message())
 	kind := KindRefused
 	if st.Code() == codes.Unimplemented {
 		kind = KindUnimplemented
 	}
-	return &Error{Op: op, JobID: jobID, Kind: kind, Reason: reason, Code: st.Code(), Msg: msg}
+	return &Error{Op: op, JobID: jobID, Kind: kind, Reason: StatusReason(st), Code: st.Code(), Msg: st.Message()}
 }
 
 func deadlineErr(op, jobID string, last error) *Error {
