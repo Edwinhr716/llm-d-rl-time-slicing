@@ -199,8 +199,8 @@ func (c *Client) Suspend(ctx context.Context, mirror *corev1.Pod, epoch int64) e
 }
 
 // Resume asks the agent to restore and thaw the mirror's job. A completed Resume reports
-// RESUMED, or no outcome when the agent runs with --report-resumed-outcome=false (D-AGENT-7);
-// both are accepted.
+// RESUMED, or no outcome when the agent is built with reportResumedOutcome = false (D-AGENT-1
+// drop; D-AGENT-7 removed the flag); both are accepted.
 func (c *Client) Resume(ctx context.Context, mirror *corev1.Pod, epoch int64) error {
 	jobID, deadline, err := c.prepare(ctx, "Resume", mirror)
 	if err != nil {

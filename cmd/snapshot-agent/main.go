@@ -50,10 +50,6 @@ func main() {
 	defaultBackend := flag.String("default-backend", string(backends.BackendCuda),
 		"Backend used when a request carries no backend_config (the orchestrator never sends one, "+
 			"so this selects the backend for orchestrator-driven snapshots/restores)")
-	// PENDING LEAD DECISION ("drop RESUMED" scope): the default keeps
-	// OUTCOME_RESUMED; false reports no outcome for a successful Resume.
-	reportResumed := flag.Bool("report-resumed-outcome", true,
-		"Report OUTCOME_RESUMED for a successful Resume; false reports no outcome (pending decision)")
 	// PENDING LEAD DECISION D-AGENT-3: the default aborts a running guest
 	// operation when a higher epoch arrives; "aborted" refuses the new call.
 	higherEpoch := flag.String("higher-epoch", statemachine.HigherEpochAbort,
@@ -250,7 +246,7 @@ func main() {
 
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String(), "reportResumedOutcome", *reportResumed,
+		"featureGates", featureGates.String(), "reportResumedOutcome", reportResumedOutcome,
 		"vramZeroingQualified", qualifiedSpec,
 		"higherEpoch", *higherEpoch,
 		"unknownJobSuspend", *unknownJobSuspend,
@@ -260,14 +256,27 @@ func main() {
 	err = server.StartServer(
 		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates,
 		server.GuestConfig{VRAMZeroingQualified: qualified},
-		statemachine.WithReportResumedOutcome(*reportResumed),
-		statemachine.WithHigherEpoch(*higherEpoch),
-		statemachine.WithUnknownJobSuspend(*unknownJobSuspend),
-		statemachine.WithEpochZero(*epochZero),
-		statemachine.WithEpochOnRefusal(*epochOnRefusal),
-		statemachine.WithPreconditionRefusal(*preconditionRefusal))
+		append(stateMachineOptions(),
+			statemachine.WithHigherEpoch(*higherEpoch),
+			statemachine.WithUnknownJobSuspend(*unknownJobSuspend),
+			statemachine.WithEpochZero(*epochZero),
+			statemachine.WithEpochOnRefusal(*epochOnRefusal),
+			statemachine.WithPreconditionRefusal(*preconditionRefusal))...)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)
 	}
+}
+
+// reportResumedOutcome is the outcome of a successful Resume, fixed at build
+// time: true reports OUTCOME_RESUMED, false reports no outcome. It replaces
+// the former -report-resumed-outcome flag.
+//
+// PENDING LEAD DECISION ("drop RESUMED" scope): holds the default, keep
+// OUTCOME_RESUMED, until that decision is made.
+const reportResumedOutcome = true
+
+// stateMachineOptions returns the StateManager options the agent ships with.
+func stateMachineOptions() []statemachine.Option {
+	return []statemachine.Option{statemachine.WithReportResumedOutcome(reportResumedOutcome)}
 }

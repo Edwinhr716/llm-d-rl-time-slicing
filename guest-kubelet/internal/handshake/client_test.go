@@ -445,8 +445,8 @@ func TestSuspend_ReleasedIsUnexpected(t *testing.T) {
 }
 
 func TestResume_UnspecifiedOutcomeAccepted(t *testing.T) {
-	// D-AGENT-7: an agent with --report-resumed-outcome=false completes a Resume without an
-	// outcome.
+	// D-AGENT-1 drop: an agent built with reportResumedOutcome = false completes a Resume
+	// without an outcome.
 	f := newFake()
 	f.getOp = func(string, int) (*pb.GetOperationResponse, error) {
 		return &pb.GetOperationResponse{Status: pb.OperationStatus_OPERATION_STATUS_COMPLETE}, nil
