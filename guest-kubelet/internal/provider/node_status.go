@@ -106,3 +106,21 @@ func (p *NodeProvider) SetCPUMemory(cpu, memory resource.Quantity) bool {
 	})
 	return changed
 }
+
+// SetGPUs sets the Node's nvidia.com/gpu capacity and allocatable to n and reports whether
+// they changed (pooled mode: the virtual node advertises what the host's pooled shadow
+// resource has allocatable).
+func (p *NodeProvider) SetGPUs(n int64) bool {
+	changed := false
+	want := *resource.NewQuantity(n, resource.DecimalSI)
+	p.Update(func(node *corev1.Node) bool {
+		for _, list := range []corev1.ResourceList{node.Status.Capacity, node.Status.Allocatable} {
+			if cur, ok := list[GPUResource]; !ok || cur.Cmp(want) != 0 {
+				list[GPUResource] = want.DeepCopy()
+				changed = true
+			}
+		}
+		return changed
+	})
+	return changed
+}

@@ -187,15 +187,23 @@ func TestDevicePluginRefusals(t *testing.T) {
 			guest := testGuest()
 			hn.addGuest(guest)
 			err := hn.b.Create(context.Background(), guest)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("want refusal containing %q, got %v", tc.want, err)
+			var r *refusalError
+			if !errors.As(err, &r) || !strings.Contains(r.reason, tc.want) {
+				t.Fatalf("want refusal whose logged reason contains %q, got %v", tc.want, err)
+			}
+			// Guard rail 3: what reaches the guest (status.message, events) names no donor,
+			// selector or other mirror.
+			for _, leak := range []string{"donor", "other-m", "ns/", tc.want} {
+				if strings.Contains(err.Error(), leak) {
+					t.Errorf("guest-visible error %q contains %q", err.Error(), leak)
+				}
 			}
 			if hn.mirror("vllm-m") != nil {
 				t.Error("fail closed: no mirror when no donor GPU is found")
 			}
 			select {
 			case event := <-rec.Events:
-				if !strings.Contains(event, EventGPUUnavailable) {
+				if !strings.Contains(event, EventGPUUnavailable) || strings.Contains(event, "donor") || strings.Contains(event, tc.want) {
 					t.Errorf("event %q", event)
 				}
 			default:

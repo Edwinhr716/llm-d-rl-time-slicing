@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/edwinhr716/guest-kubelet/internal/gpushadow/api"
 	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
@@ -83,6 +84,9 @@ type Config struct {
 	// Group is the group the real node yields to (internal/group). When set, the mirror
 	// carries it as LabelGroup. The backend sets it per create from the host node's labels.
 	Group string
+	// GroupToken writes group.Token(Group) in LabelGroup instead of the name, so a mirror in
+	// the guest's namespace does not reveal the owner's namespace (--mirror-group-label=token).
+	GroupToken bool
 	// Background turns on host-command mode (D-NS-4 ns-push-vk) or the per-guest agent path
 	// (M4): the mirror also gets LabelJobID and LabelRole and restartPolicy Never.
 	Background bool
@@ -169,7 +173,11 @@ func BuildWithGPU(guest *corev1.Pod, cfg *Config, att *GPUAttachment) (*corev1.P
 		return nil, fmt.Errorf("guest %s/%s requests %s but no GPU claim is configured", guest.Namespace, guest.Name, GPUResource)
 	}
 	if gpu && att != nil {
-		if err := CheckDevicePluginGuest(guest); err != nil {
+		check := CheckDevicePluginGuest
+		if att.Pooled {
+			check = func(g *corev1.Pod) error { _, err := CheckPooledGuest(g); return err }
+		}
+		if err := check(guest); err != nil {
 			return nil, err
 		}
 	}
@@ -204,10 +212,18 @@ func BuildWithGPU(guest *corev1.Pod, cfg *Config, att *GPUAttachment) (*corev1.P
 		c := &spec.Containers[i]
 		c.LivenessProbe, c.ReadinessProbe, c.StartupProbe = nil, nil, nil
 		c.Resources = mirrorResources(c.Resources, cfg, useClaim, containerRequestsGPU(c))
-		if att != nil && containerRequestsGPU(&guest.Spec.Containers[i]) {
-			attachShadow(&c.Resources, att)
+		if gc := &guest.Spec.Containers[i]; att != nil && containerRequestsGPU(gc) {
+			if att.Pooled {
+				attachShadowQty(&c.Resources, api.PooledResource, containerGPUQty(gc))
+			} else {
+				attachShadow(&c.Resources, att)
+			}
 		}
 		c.Env = rewriteDownwardEnv(c.Env, guest)
+		dropMknod(c)
+	}
+	for i := range spec.InitContainers {
+		dropMknod(&spec.InitContainers[i])
 	}
 	if useClaim {
 		claim := cfg.GPUClaim
@@ -235,6 +251,9 @@ func BuildWithGPU(guest *corev1.Pod, cfg *Config, att *GPUAttachment) (*corev1.P
 	}
 	if cfg.Group != "" {
 		pod.Labels[LabelGroup] = cfg.Group
+		if cfg.GroupToken {
+			pod.Labels[LabelGroup] = group.Token(cfg.Group)
+		}
 	}
 	if cfg.Background {
 		// The orchestrator finds background guests by these labels. A kubelet restart of a
@@ -244,8 +263,12 @@ func BuildWithGPU(guest *corev1.Pod, cfg *Config, att *GPUAttachment) (*corev1.P
 		pod.Spec.RestartPolicy = corev1.RestartPolicyNever
 	}
 	if gpu && att != nil {
-		pod.Annotations[AnnotationGPUUUID] = att.UUID
-		pod.Annotations[AnnotationGPUDonorUID] = string(att.DonorUID)
+		if att.UUID != "" {
+			pod.Annotations[AnnotationGPUUUID] = att.UUID
+		}
+		if att.DonorUID != "" {
+			pod.Annotations[AnnotationGPUDonorUID] = string(att.DonorUID)
+		}
 	}
 	if cfg.OwnerRef {
 		pod.OwnerReferences = []metav1.OwnerReference{OwnerRef(guest)}
@@ -306,6 +329,15 @@ func mirrorResources(in corev1.ResourceRequirements, cfg *Config, gpu, ownsGPU b
 	out := *in.DeepCopy()
 	delete(out.Requests, GPUResource)
 	delete(out.Limits, GPUResource)
+	// Second guard: never copy a guest's shadow resource onto the mirror; only
+	// attachShadow (the GPU the guest kubelet picked) may add one.
+	for _, list := range []corev1.ResourceList{out.Requests, out.Limits} {
+		for name := range list {
+			if api.IsShadowResource(name) {
+				delete(list, name)
+			}
+		}
+	}
 	// A container with a limit but no request gets request=limit from API defaulting, which
 	// would dodge the cap. Make the request explicit so the cap applies.
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
@@ -418,4 +450,46 @@ func ResourceSummary(guest, mirrorPod *corev1.Pod) *Resources {
 		}
 	}
 	return out
+}
+
+// CapMknod is the capability every mirror container loses. A
+// mirror's cgroup device allowlist admits only its own GPU, but containerd's default
+// capability set includes MKNOD, so a process could create /dev/nvidiaN nodes for the other
+// GPUs; dropping it closes that path whatever the guest asked for.
+const CapMknod corev1.Capability = "MKNOD"
+
+// dropMknod removes MKNOD from the container's added capabilities and adds it to the dropped
+// ones, keeping everything else the guest set. A drop of ALL already covers it.
+func dropMknod(c *corev1.Container) {
+	if c.SecurityContext == nil {
+		c.SecurityContext = &corev1.SecurityContext{}
+	}
+	if c.SecurityContext.Capabilities == nil {
+		c.SecurityContext.Capabilities = &corev1.Capabilities{}
+	}
+	caps := c.SecurityContext.Capabilities
+	add := caps.Add[:0:0]
+	for _, a := range caps.Add {
+		if !capIs(a, CapMknod) { // an added ALL stays: the runtime applies drops after adds
+			add = append(add, a)
+		}
+	}
+	caps.Add = add
+	if len(caps.Add) == 0 {
+		caps.Add = nil
+	}
+	for _, d := range caps.Drop {
+		if capIs(d, CapMknod) || capIs(d, "ALL") {
+			return
+		}
+	}
+	caps.Drop = append(caps.Drop, CapMknod)
+}
+
+// capIs compares capability names the way the runtime does: case-insensitive, CAP_ optional.
+func capIs(c, want corev1.Capability) bool {
+	norm := func(x corev1.Capability) string {
+		return strings.TrimPrefix(strings.ToUpper(string(x)), "CAP_")
+	}
+	return norm(c) == norm(want)
 }

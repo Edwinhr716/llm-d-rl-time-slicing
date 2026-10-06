@@ -102,8 +102,12 @@ func (b *Backend) reconcileFence(ctx context.Context) {
 		log.G(ctx).WithField("mirror", mir.Namespace+"/"+mir.Name).WithField("uuid", mir.Annotations[AnnotationGPUUUID]).
 			WithField("donorUID", mir.Annotations[AnnotationGPUDonorUID]).Warn("donor gone; GPU fenced and mirror stopped")
 		if g := b.guestFor(mir); g != nil && b.opts.Recorder != nil {
+			what := "this guest's GPUs" // pooled mirrors carry no UUID annotation
+			if u := mir.Annotations[AnnotationGPUUUID]; u != "" {
+				what = "GPU " + u
+			}
 			b.opts.Recorder.Event(g, corev1.EventTypeWarning, EventDonorGone,
-				"the donor pod holding GPU "+mir.Annotations[AnnotationGPUUUID]+" is gone; the mirror was stopped")
+				"the donor pod holding "+what+" is gone; the mirror was stopped")
 		}
 	}
 }

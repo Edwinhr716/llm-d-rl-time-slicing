@@ -29,15 +29,23 @@ const (
 	HoldersPath = "/holders"
 )
 
+// PooledResource is the one resource of the plugin's --mode=pooled:
+// its devices are the GPUs the node's single nvidia.com/gpu holder (the donor) holds.
+const PooledResource corev1.ResourceName = "timeslice.io/gpu-shadow"
+
+// PooledUUIDsEnv is set by the pooled plugin's Allocate to the chosen GPUs' UUIDs, comma
+// separated, in the order of the devices.
+const PooledUUIDsEnv = "TIMESLICE_GPU_UUIDS"
+
 // ShadowResource is the resource name that stands for the GPU with this device minor
 // (/dev/nvidia<minor>).
 func ShadowResource(minor int) corev1.ResourceName {
 	return corev1.ResourceName(ShadowResourcePrefix + strconv.Itoa(minor))
 }
 
-// IsShadowResource reports whether name is a shadow resource.
+// IsShadowResource reports whether name is a shadow resource, per-GPU or pooled.
 func IsShadowResource(name corev1.ResourceName) bool {
-	return strings.HasPrefix(string(name), ShadowResourcePrefix)
+	return name == PooledResource || strings.HasPrefix(string(name), ShadowResourcePrefix)
 }
 
 // GPU is one physical GPU on the host.
@@ -46,6 +54,10 @@ type GPU struct {
 	UUID     string              `json:"uuid"`     // GPU-..., empty if the driver did not report it
 	Device   string              `json:"device"`   // "nvidiaN"
 	Resource corev1.ResourceName `json:"resource"` // shadow resource name for this GPU
+	// PCI is the GPU's PCI address (the /proc/driver/nvidia/gpus directory name), lower case.
+	PCI string `json:"pci,omitempty"`
+	// NUMA is the GPU's NUMA node from sysfs; -1 when unknown.
+	NUMA int `json:"numa"`
 }
 
 // Holder is one container that holds devices of the normal GPU resource, as the real kubelet's

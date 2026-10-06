@@ -72,6 +72,7 @@ type options struct {
 	donorSelector            string
 	reserveClaim             bool
 	mirrorOwnerRef           bool
+	mirrorGroupLabel         string
 	orphanGrace              time.Duration
 
 	// D-NS-10: how nvidia.com/gpu reaches the mirror
@@ -88,7 +89,8 @@ type options struct {
 	// D-VK-3 option b: where the real node's group is read (internal/group)
 	groupSource string
 	// D-VK-2 option c: one-shot deregistration (end of an era).
-	deregister bool
+	deregister  bool
+	stopCleanup bool
 	// VK-A7 on D-VK-2 c: replace a Node held Terminating by the finalizer when the VK returns.
 	reclaimNode bool
 
@@ -189,11 +191,13 @@ func main() {
 	// Off by default: measured in M1, kube-controller-manager's resourceclaim controller adds a
 	// pod that already has spec.nodeName to the claim's reservedFor about 1 s after creation.
 	flag.BoolVar(&o.reserveClaim, "reserve-claim", false, "add GPU mirrors to the claim's status.reservedFor (kube-controller-manager also does it)")
+	flag.StringVar(&o.mirrorGroupLabel, "mirror-group-label", "plain", "what mirrors carry in timeslice.io/group: plain (the group name, which embeds the owner namespace) or token (an opaque hash; needs an orchestrator that matches tokens)")
 	flag.BoolVar(&o.mirrorOwnerRef, "mirror-owner-ref", true, "make the guest the mirror's owner (false: mirrors survive guest force-deletion and can be re-adopted)")
 	flag.DurationVar(&o.orphanGrace, "orphan-grace", 10*time.Minute, "how long a mirror without a guest is kept for re-adoption")
 	flag.StringVar(&o.gpuMode, "gpu-mode", string(mirror.GPUModeClaim),
 		"how a guest's nvidia.com/gpu reaches the mirror: claim (the shared --gpu-claim, DRA) or "+
-			"deviceplugin (the donor's own GPU through the shadow device plugin, no DRA)")
+			"deviceplugin (the donor's own GPU through the shadow device plugin, no DRA) or "+
+			"pooled (one pooled shadow resource for all the donor's GPUs; the real kubelet picks)")
 	flag.StringVar(&o.gpuDonorSelector, "gpu-donor-selector", mirror.DevicePluginDonorSelector,
 		"deviceplugin mode: label selector of donor pods on the host whose GPU mirrors share")
 	flag.StringVar(&o.holdersURL, "gpu-holders-url", "http://"+api.DefaultHoldersAddr+api.HoldersPath,
@@ -230,6 +234,8 @@ func main() {
 	flag.DurationVar(&o.fakeSuspendDelay, "fake-freezer-suspend-delay", 12500*time.Millisecond,
 		"--freezer=fake: time a Suspend takes")
 	flag.DurationVar(&o.fakeResumeDelay, "fake-freezer-resume-delay", 6*time.Second, "--freezer=fake: time a Resume takes")
+	flag.BoolVar(&o.stopCleanup, "stop-cleanup", true,
+		"on SIGTERM, delete the virtual Node if the VK's controller is gone (uninstall), else cordon it and mark it NotReady until a VK serves it again")
 	flag.BoolVar(&o.deregister, "deregister", false,
 		"one-shot: delete the virtual Node, remove its finalizer and exit (end of an era; stop the serving VK first)")
 	flag.BoolVar(&o.reclaimNode, "reclaim-terminating-node", true,
@@ -341,6 +347,12 @@ func run(ctx context.Context, opts *options) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		// Guard rail 4: on a signal, the process that served the Node cleans it up.
+		if ctx.Err() != nil && roleRan.Load() && opts.stopCleanup {
+			stopCleanup(ctx, client, opts)
+		}
+	}()
 	if !opts.leaderElect {
 		return runKubelet(ctx, client, opts)
 	}
@@ -392,6 +404,9 @@ func (o *options) checkDebug() error {
 	return nil
 }
 
+// pooledCapacityPoll is how often pooled mode re-reads the host's gpu-shadow allocatable.
+const pooledCapacityPoll = 3 * time.Second
+
 // checkGPUMode validates --gpu-mode and the flags that go with it. In deviceplugin mode the
 // guest kubelet makes no resource.k8s.io call, so the claim flags are dropped or refused.
 func checkGPUMode(ctx context.Context, opts *options) error {
@@ -402,7 +417,7 @@ func checkGPUMode(ctx context.Context, opts *options) error {
 	if err != nil {
 		return fmt.Errorf("--gpu-mode: %w", err)
 	}
-	if mode != mirror.GPUModeDevicePlugin {
+	if !mode.SharesDonorGPU() {
 		return nil
 	}
 	if opts.reserveClaim {
@@ -417,6 +432,11 @@ func checkGPUMode(ctx context.Context, opts *options) error {
 	}
 	if _, err := labels.Parse(opts.gpuDonorSelector); err != nil {
 		return fmt.Errorf("--gpu-donor-selector %q: %w", opts.gpuDonorSelector, err)
+	}
+	if mode == mirror.GPUModePooled {
+		// Pooled mode picks no GPU, so it reads no holders endpoint.
+		opts.holdersURL = ""
+		return nil
 	}
 	if opts.holdersURL == "" {
 		return fmt.Errorf("--gpu-holders-url is required with --gpu-mode=deviceplugin")
@@ -589,6 +609,12 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 		KubeletVersion: o.kubeletVersion, GPUs: o.gpus, GuestNodeLabel: o.guestNodeLabel,
 		HostName: host.Name, HostUID: host.UID,
 	}
+	pooled := mirror.GPUMode(o.gpuMode) == mirror.GPUModePooled
+	if pooled {
+		// Virtual node GPU capacity = the host's gpu-shadow allocatable, kept
+		// current below; --gpus is ignored.
+		cfg.GPUs = provider.HostAllocatable(host, api.PooledResource)
+	}
 	if cfg.ExtraLabels, err = provider.ParseNodeLabels(o.nodeLabels); err != nil {
 		return err
 	}
@@ -610,10 +636,14 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 		Config: mirror.Config{
 			HostNode: o.hostNode, VirtualNode: o.nodeName, GPUClaim: o.gpuClaim,
 			HostTaints: host.Spec.Taints, GuestTaintKey: provider.GuestTaintKey, OwnerRef: o.mirrorOwnerRef,
+			GroupToken: o.mirrorGroupLabel == "token",
 		},
 		ReserveClaim: o.reserveClaim, OrphanGrace: o.orphanGrace,
 		GPUMode: mirror.GPUMode(o.gpuMode),
 		Gated:   o.hostCommandPort > 0,
+	}
+	if o.mirrorGroupLabel != "plain" && o.mirrorGroupLabel != "token" {
+		return fmt.Errorf("--mirror-group-label: want plain or token, got %q", o.mirrorGroupLabel)
 	}
 	if mopts.ClaimMode, err = mirror.ParseClaimMode(o.gpuClaimMode); err != nil {
 		return fmt.Errorf("--gpu-claim-mode: %w", err)
@@ -621,8 +651,10 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 	if mopts.DonorSelector, err = labels.Parse(o.donorSelector); err != nil {
 		return fmt.Errorf("--donor-selector: %w", err)
 	}
-	if mopts.GPUMode == mirror.GPUModeDevicePlugin {
+	if mopts.GPUMode.SharesDonorGPU() {
 		mopts.GPUDonorSelector = o.gpuDonorSelector
+	}
+	if mopts.GPUMode == mirror.GPUModeDevicePlugin {
 		mopts.Holders = mirror.HTTPHolders{URL: o.holdersURL}
 	}
 	if mopts.CPUHeadroom, err = resource.ParseQuantity(o.cpuHeadroom); err != nil {
@@ -663,6 +695,11 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 	if err != nil {
 		return err
 	}
+	if pooled {
+		nodeProvider.OnStart(func(ctx context.Context) {
+			provider.FollowHostGPUs(ctx, client, o.hostNode, api.PooledResource, pooledCapacityPoll, nodeProvider)
+		})
+	}
 	nodeSpec := *nodeProvider.Node()
 	if err := ensureProviderID(ctx, client, o.nodeName, cfg.ProviderID); err != nil {
 		return err
@@ -672,6 +709,10 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 	action, err := provider.EnsureNodeGuard(ctx, client, &nodeSpec)
 	if err != nil {
 		return err
+	}
+	roleRan.Store(true)
+	if o.stopCleanup {
+		go provider.KeepClearingStopped(ctx, client.CoreV1().Nodes(), o.nodeName, selfID, clearStoppedInterval)
 	}
 	// VK-A7: a Terminating Node cannot be un-deleted. On a live host (we run on it), swap it for
 	// a fresh one before the library starts, so the outage leaves no trace on the Node.

@@ -73,8 +73,8 @@ func TestDiscover(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []api.GPU{
-		{Minor: 0, UUID: "GPU-aaa", Device: "nvidia0", Resource: "timeslice.io/gpu-shadow-0"},
-		{Minor: 1, UUID: "GPU-bbb", Device: "nvidia1", Resource: "timeslice.io/gpu-shadow-1"},
+		{Minor: 0, UUID: "GPU-aaa", Device: "nvidia0", Resource: "timeslice.io/gpu-shadow-0", PCI: "0000:00:03.0", NUMA: -1},
+		{Minor: 1, UUID: "GPU-bbb", Device: "nvidia1", Resource: "timeslice.io/gpu-shadow-1", PCI: "0000:00:04.0", NUMA: -1},
 	}
 	if len(gpus) != len(want) {
 		t.Fatalf("Discover = %+v, want %+v", gpus, want)

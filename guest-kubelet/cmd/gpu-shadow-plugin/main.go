@@ -31,6 +31,10 @@ type options struct {
 	listen       string
 	resource     string
 	tools        string
+	minors       string
+	mode         string
+	poll         time.Duration
+	sysRoot      string
 }
 
 func main() {
@@ -54,6 +58,12 @@ func main() {
 	flag.StringVar(&opts.listen, "listen", api.DefaultHoldersAddr,
 		"address of the holders endpoint (host network; keep it on loopback)")
 	flag.StringVar(&opts.resource, "gpu-resource", "nvidia.com/gpu", "the normal GPU resource whose holders are reported")
+	flag.StringVar(&opts.minors, "shadow-minors", "",
+		"comma-separated device minors to advertise on the shadow ledger (empty: every GPU); the others stay trainer-only")
+	flag.StringVar(&opts.mode, "mode", "per-gpu",
+		"per-gpu: one resource per GPU (timeslice.io/gpu-shadow-<minor>); pooled: one resource timeslice.io/gpu-shadow whose devices are the GPUs the node's one nvidia.com/gpu holder holds")
+	flag.DurationVar(&opts.poll, "poll", gpushadow.DefaultPollInterval, "pooled mode: how often pod-resources is re-read")
+	flag.StringVar(&opts.sysRoot, "sys-root", "/host/sys", "the host's /sys as mounted in this container (pooled mode: GPU NUMA nodes; empty: none)")
 	flag.Parse()
 	opts.cfg.Tools = strings.FieldsFunc(opts.tools, func(r rune) bool { return r == ',' || r == ' ' })
 
@@ -76,6 +86,27 @@ func run(ctx context.Context, opts *options) error {
 	}
 	for i := range gpus {
 		logger.Info("gpu found", "device", gpus[i].Device, "uuid", gpus[i].UUID, "resource", gpus[i].Resource)
+	}
+
+	if opts.mode != "per-gpu" && opts.mode != "pooled" {
+		return fmt.Errorf("--mode: want per-gpu or pooled, got %q", opts.mode)
+	}
+	if opts.mode == "pooled" && opts.minors != "" {
+		return fmt.Errorf("--shadow-minors is per-gpu only")
+	}
+	gpushadow.AddNUMA(gpus, opts.sysRoot)
+	for i := range gpus {
+		logger.Info("gpu topology", "device", gpus[i].Device, "pci", gpus[i].PCI, "numa", gpus[i].NUMA)
+	}
+	shadowGPUs, err := gpushadow.FilterMinors(gpus, opts.minors)
+	if err != nil {
+		return err
+	}
+	for i := range shadowGPUs {
+		if opts.mode == "pooled" {
+			break // pooled mode advertises the GPUs on one resource, as RunPooled logs
+		}
+		logger.Info("gpu advertised on shadow ledger", "device", shadowGPUs[i].Device, "resource", shadowGPUs[i].Resource)
 	}
 
 	lister, closeLister, err := gpushadow.DialPodResources(opts.podResources)
@@ -115,5 +146,8 @@ func run(ctx context.Context, opts *options) error {
 		}
 	}()
 
-	return gpushadow.Run(ctx, gpus, &opts.cfg)
+	if opts.mode == "pooled" {
+		return gpushadow.RunPooled(ctx, gpus, lister, opts.resource, opts.poll, &opts.cfg)
+	}
+	return gpushadow.Run(ctx, shadowGPUs, &opts.cfg)
 }

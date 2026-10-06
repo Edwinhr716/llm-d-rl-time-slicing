@@ -48,7 +48,6 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/server"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/util/workqueue"
@@ -486,7 +485,7 @@ func groupJobs(ctx context.Context, jobStore *store.JobStore, podListers []corev
 		return nil
 	}
 	background := map[string]bool{}
-	selector := labels.SelectorFromSet(labels.Set{infrastructure.PodLabelKey: group})
+	selector := infrastructure.GroupSelector(group, nil)
 	for _, lister := range podListers {
 		pods, err := lister.List(selector)
 		if err != nil {

@@ -7,6 +7,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/edwinhr716/guest-kubelet/internal/gpushadow/api"
 )
 
 // ReasonGuestRejected is the event reason and the pod status reason of a guest that admission
@@ -125,7 +127,9 @@ func checkProbesOptionA(pod *corev1.Pod) *Rejection {
 // amd.com/gpu, anything named */gpu).
 func isGPUResource(n corev1.ResourceName) bool {
 	s := string(n)
-	return strings.HasPrefix(s, "nvidia.com/") || strings.HasSuffix(s, "/gpu")
+	// A shadow resource (timeslice.io/gpu-shadow-<minor>) names one physical GPU; only the
+	// guest kubelet may put it on a mirror, so a guest that lists one is refused.
+	return strings.HasPrefix(s, "nvidia.com/") || strings.HasSuffix(s, "/gpu") || api.IsShadowResource(n)
 }
 
 // checkGPU refuses a GPU guest the host cannot give: a GPU resource other than plain

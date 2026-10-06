@@ -79,8 +79,11 @@ func TestGPUModeDevicePlugin_AttachesShadowResource(t *testing.T) {
 	if ShadowResourceOf(mir) != "timeslice.io/gpu-shadow-1" {
 		t.Errorf("ShadowResourceOf = %q", ShadowResourceOf(mir))
 	}
-	// Unprivileged: the builder adds no securityContext, volume or host access.
-	if ctr.SecurityContext != nil || len(mir.Spec.Volumes) != len(guest.Spec.Volumes) || mir.Spec.HostPID || mir.Spec.HostIPC {
+	// Unprivileged: the builder adds no privilege, volume or host access; its only
+	// securityContext change is the MKNOD drop.
+	sc := ctr.SecurityContext
+	if sc == nil || sc.Privileged != nil || sc.Capabilities == nil || len(sc.Capabilities.Add) != 0 ||
+		!reflect.DeepEqual(sc.Capabilities.Drop, []corev1.Capability{CapMknod}) || len(mir.Spec.Volumes) != len(guest.Spec.Volumes) || mir.Spec.HostPID || mir.Spec.HostIPC {
 		t.Errorf("mirror must not gain privilege: sc=%v volumes=%v", ctr.SecurityContext, mir.Spec.Volumes)
 	}
 	if _, ok := guest.Spec.Containers[0].Resources.Limits["timeslice.io/gpu-shadow-1"]; ok {

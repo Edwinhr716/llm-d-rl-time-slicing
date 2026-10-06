@@ -194,7 +194,7 @@ func (k *KubernetesOrchestrator) getNodesForGroup(groupID string) ([]string, err
 
 // getPodsForGroup returns the pods that are tied to the given group.
 func (k *KubernetesOrchestrator) getPodsForGroup(ctx context.Context, groupID string) ([]PodInfo, error) {
-	selector := labels.SelectorFromSet(labels.Set{PodLabelKey: groupID})
+	selector := GroupSelector(groupID, nil)
 	pods := make([]*corev1.Pod, 0)
 	for _, lister := range k.podListers {
 		listed, err := lister.List(selector)
@@ -515,6 +515,9 @@ func (k *KubernetesOrchestrator) enqueuePod(ctx context.Context, obj interface{}
 func (k *KubernetesOrchestrator) getGroupFromPod(pod *corev1.Pod) string {
 	if pod.Labels == nil {
 		return ""
+	}
+	if v := pod.Labels[PodLabelKey]; IsGroupToken(v) {
+		return k.groupOfToken(pod, v)
 	}
 	return pod.Labels[PodLabelKey]
 }

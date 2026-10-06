@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	corev1 "k8s.io/api/core/v1"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
 	"github.com/edwinhr716/guest-kubelet/internal/gpushadow/api"
@@ -81,7 +82,7 @@ func newShadow(gpu *api.GPU, cfg *Config) *shadow {
 }
 
 func (s *shadow) health() string {
-	if _, err := os.Stat(filepath.Join(s.cfg.DevRoot, s.gpu.Device)); err != nil {
+	if !devExists(s.cfg, s.gpu.Device) {
 		return pluginapi.Unhealthy
 	}
 	return pluginapi.Healthy
@@ -136,44 +137,62 @@ func (s *shadow) Allocate(_ context.Context, req *pluginapi.AllocateRequest) (*p
 	return out, nil
 }
 
-func (s *shadow) exists(name string) bool {
-	_, err := os.Stat(filepath.Join(s.cfg.DevRoot, name))
+func (s *shadow) containerResponse() (*pluginapi.ContainerAllocateResponse, error) {
+	return containerResponse(s.cfg, []api.GPU{s.gpu}, false)
+}
+
+func devExists(cfg *Config, name string) bool {
+	_, err := os.Stat(filepath.Join(cfg.DevRoot, name))
 	return err == nil
 }
 
-func (s *shadow) deviceSpec(name string) *pluginapi.DeviceSpec {
+func deviceSpec(cfg *Config, name string) *pluginapi.DeviceSpec {
 	return &pluginapi.DeviceSpec{
-		HostPath: filepath.Join(s.cfg.HostDevRoot, name), ContainerPath: "/dev/" + name, Permissions: "mrw",
+		HostPath: filepath.Join(cfg.HostDevRoot, name), ContainerPath: "/dev/" + name, Permissions: "mrw",
 	}
 }
 
-func (s *shadow) containerResponse() (*pluginapi.ContainerAllocateResponse, error) {
-	if !s.exists(s.gpu.Device) {
-		return nil, fmt.Errorf("device %s is gone", s.gpu.Device)
+// containerResponse is one container's Allocate answer for these GPUs: their device nodes,
+// the control devices, the driver mount and LD_LIBRARY_PATH, and with uuidEnv the
+// PooledUUIDsEnv variable.
+func containerResponse(cfg *Config, gpus []api.GPU, uuidEnv bool) (*pluginapi.ContainerAllocateResponse, error) {
+	devices := make([]*pluginapi.DeviceSpec, 0, len(gpus)+4)
+	uuids := make([]string, 0, len(gpus))
+	for _, g := range gpus {
+		if !devExists(cfg, g.Device) {
+			return nil, fmt.Errorf("device %s is gone", g.Device)
+		}
+		devices = append(devices, deviceSpec(cfg, g.Device))
+		uuids = append(uuids, g.UUID)
 	}
-	devices := []*pluginapi.DeviceSpec{s.deviceSpec(s.gpu.Device)}
 	for _, name := range requiredControlDevices {
-		if !s.exists(name) {
+		if !devExists(cfg, name) {
 			return nil, fmt.Errorf("control device %s is missing (is the NVIDIA driver loaded?)", name)
 		}
-		devices = append(devices, s.deviceSpec(name))
+		devices = append(devices, deviceSpec(cfg, name))
 	}
 	for _, name := range optionalControlDevices {
-		if s.exists(name) {
-			devices = append(devices, s.deviceSpec(name))
+		if devExists(cfg, name) {
+			devices = append(devices, deviceSpec(cfg, name))
 		}
 	}
-	resp := &pluginapi.ContainerAllocateResponse{Devices: devices}
-	if s.cfg.HostDriverRoot != "" {
-		resp.Mounts = []*pluginapi.Mount{{HostPath: s.cfg.HostDriverRoot, ContainerPath: s.cfg.ContainerDriverRoot, ReadOnly: true}}
-		for _, tool := range s.cfg.Tools {
+	resp := &pluginapi.ContainerAllocateResponse{Devices: devices, Envs: map[string]string{}}
+	if cfg.HostDriverRoot != "" {
+		resp.Mounts = []*pluginapi.Mount{{HostPath: cfg.HostDriverRoot, ContainerPath: cfg.ContainerDriverRoot, ReadOnly: true}}
+		for _, tool := range cfg.Tools {
 			resp.Mounts = append(resp.Mounts, &pluginapi.Mount{
-				HostPath: filepath.Join(s.cfg.HostDriverRoot, "bin", tool), ContainerPath: "/usr/bin/" + tool, ReadOnly: true,
+				HostPath: filepath.Join(cfg.HostDriverRoot, "bin", tool), ContainerPath: "/usr/bin/" + tool, ReadOnly: true,
 			})
 		}
 	}
-	if s.cfg.LibraryPath != "" {
-		resp.Envs = map[string]string{"LD_LIBRARY_PATH": s.cfg.LibraryPath}
+	if cfg.LibraryPath != "" {
+		resp.Envs["LD_LIBRARY_PATH"] = cfg.LibraryPath
+	}
+	if uuidEnv {
+		resp.Envs[api.PooledUUIDsEnv] = strings.Join(uuids, ",")
+	}
+	if len(resp.Envs) == 0 {
+		resp.Envs = nil
 	}
 	return resp, nil
 }
@@ -224,18 +243,22 @@ func (s *shadow) stop() {
 
 // register tells the kubelet about this plugin's socket and resource.
 func (s *shadow) register(ctx context.Context) error {
-	conn, err := grpc.NewClient("unix://"+filepath.Join(s.cfg.PluginDir, filepath.Base(pluginapi.KubeletSocket)),
+	return registerResource(ctx, s.cfg, s.socket, s.gpu.Resource)
+}
+
+func registerResource(ctx context.Context, cfg *Config, socket string, resource corev1.ResourceName) error {
+	conn, err := grpc.NewClient("unix://"+filepath.Join(cfg.PluginDir, filepath.Base(pluginapi.KubeletSocket)),
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
 	}
-	defer closeLogged(s.cfg.Log, "kubelet registration connection", conn.Close)
+	defer closeLogged(cfg.Log, "kubelet registration connection", conn.Close)
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	_, err = pluginapi.NewRegistrationClient(conn).Register(ctx, &pluginapi.RegisterRequest{
 		Version:      pluginapi.Version,
-		Endpoint:     filepath.Base(s.socket),
-		ResourceName: string(s.gpu.Resource),
+		Endpoint:     filepath.Base(socket),
+		ResourceName: string(resource),
 		Options:      &pluginapi.DevicePluginOptions{},
 	})
 	return err

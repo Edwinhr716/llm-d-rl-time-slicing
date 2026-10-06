@@ -58,7 +58,7 @@ func NewKubeActions(cs kubernetes.Interface, orch *KubernetesOrchestrator) *Kube
 // jobPods returns the watched pods of the group's job, background (mirror)
 // pods or not, on node when node is set.
 func (a *KubeActions) jobPods(group, job, node string, background bool) ([]*corev1.Pod, error) {
-	selector := labels.SelectorFromSet(labels.Set{PodLabelKey: group, JobLabelKey: job})
+	selector := GroupSelector(group, labels.Set{JobLabelKey: job})
 	var out []*corev1.Pod
 	for _, lister := range a.orch.podListers {
 		pods, err := lister.List(selector)

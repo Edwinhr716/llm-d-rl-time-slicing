@@ -36,7 +36,7 @@ func Discover(devRoot, procDriverRoot string) ([]api.GPU, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", devRoot, err)
 	}
-	uuids, err := readUUIDs(filepath.Join(procDriverRoot, "gpus"))
+	uuids, pcis, err := readUUIDs(filepath.Join(procDriverRoot, "gpus"))
 	if err != nil {
 		return nil, err
 	}
@@ -52,6 +52,7 @@ func Discover(devRoot, procDriverRoot string) ([]api.GPU, error) {
 		}
 		gpus = append(gpus, api.GPU{
 			Minor: minor, UUID: uuids[minor], Device: e.Name(), Resource: api.ShadowResource(minor),
+			PCI: pcis[minor], NUMA: -1,
 		})
 	}
 	if len(gpus) == 0 {
@@ -61,23 +62,43 @@ func Discover(devRoot, procDriverRoot string) ([]api.GPU, error) {
 	return gpus, nil
 }
 
-// readUUIDs maps device minor to GPU UUID from <dir>/<pci address>/information.
-func readUUIDs(dir string) (map[int]string, error) {
-	out := map[int]string{}
+// readUUIDs maps device minor to GPU UUID and to PCI address from
+// <dir>/<pci address>/information.
+func readUUIDs(dir string) (map[int]string, map[int]string, error) {
+	out, pcis := map[int]string{}, map[int]string{}
 	infos, err := filepath.Glob(filepath.Join(dir, "*", "information"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, p := range infos {
 		gpu, err := parseInformation(p)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if gpu.Minor >= 0 {
 			out[gpu.Minor] = gpu.UUID
+			pcis[gpu.Minor] = strings.ToLower(filepath.Base(filepath.Dir(p)))
 		}
 	}
-	return out, nil
+	return out, pcis, nil
+}
+
+// AddNUMA sets each GPU's NUMA node from <sysRoot>/bus/pci/devices/<pci>/numa_node. A GPU
+// without a PCI address or a readable value keeps -1 (no topology reported).
+func AddNUMA(gpus []api.GPU, sysRoot string) {
+	for i := range gpus {
+		gpus[i].NUMA = -1
+		if gpus[i].PCI == "" || sysRoot == "" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(sysRoot, "bus", "pci", "devices", gpus[i].PCI, "numa_node"))
+		if err != nil {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && n >= 0 {
+			gpus[i].NUMA = n
+		}
+	}
 }
 
 // parseInformation reads "Device Minor:" and "GPU UUID:" from one information file (only Minor

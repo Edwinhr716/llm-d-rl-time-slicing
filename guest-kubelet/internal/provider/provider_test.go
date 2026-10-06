@@ -238,6 +238,9 @@ func TestAdmitGPU(t *testing.T) {
 	if r := Admit(withGPU(guestPod("g"), "amd.com/gpu"), l4Policy()); r == nil || r.Rule != "gpu-resource" {
 		t.Errorf("other vendor: got %v", r)
 	}
+	if r := Admit(withGPU(guestPod("g"), "timeslice.io/gpu-shadow-1"), l4Policy()); r == nil || r.Rule != "gpu-resource" {
+		t.Errorf("shadow resource named by a guest: got %v", r)
+	}
 	p := withGPU(guestPod("g"), GPUResource)
 	p.Spec.NodeSelector = map[string]string{"cloud.google.com/gke-accelerator": "nvidia-h100-80gb"}
 	if r := Admit(p, l4Policy()); r == nil || r.Rule != "gpu-allowlist" {

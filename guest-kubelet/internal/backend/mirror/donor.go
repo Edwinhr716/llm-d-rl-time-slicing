@@ -71,9 +71,28 @@ func (h HTTPHolders) Holders(ctx context.Context) (*api.Holders, error) {
 
 // refusalError is a reason the mirror cannot get a GPU. The create fails (no mirror: fail closed)
 // and the library retries it.
-type refusalError struct{ reason string }
+//
+// The library writes Error() into the guest's status.message
+// (ProviderFailed) and a ProviderCreateFailed event, and refused() records an event on the
+// guest. The guest's owner can read all three, and the reason names the donor pod, the donor
+// selector and other tenants' mirrors. So Error() carries only public; reason goes to the VK
+// log. public is set only for reasons about the guest itself (guestRefusal).
+type refusalError struct{ reason, public string }
 
-func (r *refusalError) Error() string { return "gpu attach refused: " + r.reason }
+// PublicRefusal is what a guest sees when no GPU can be lent to its mirror.
+const PublicRefusal = "no GPU is free for this guest on its node right now; it stays pending and is retried"
+
+func (r *refusalError) Error() string {
+	if r.public != "" {
+		return "gpu attach refused: " + r.public
+	}
+	return "gpu attach refused: " + PublicRefusal
+}
+
+// guestRefusal is a refusal whose reason is about the guest's own spec, safe to show it.
+func guestRefusal(err error) error {
+	return &refusalError{reason: err.Error(), public: err.Error()}
+}
 
 func refuse(format string, args ...any) error {
 	return &refusalError{reason: fmt.Sprintf(format, args...)}
@@ -203,7 +222,7 @@ func (b *Backend) resolveGPU(ctx context.Context, guest *corev1.Pod) (*GPUAttach
 // "gpu attach refused", records GPUUnavailable on the guest and returns the error: no mirror.
 func (b *Backend) attachGPU(ctx context.Context, guest *corev1.Pod) (*GPUAttachment, error) {
 	if err := CheckDevicePluginGuest(guest); err != nil {
-		return nil, b.refused(ctx, guest, &refusalError{reason: err.Error()})
+		return nil, b.refused(ctx, guest, guestRefusal(err))
 	}
 	att, err := b.resolveGPU(ctx, guest)
 	if err != nil {
@@ -213,14 +232,19 @@ func (b *Backend) attachGPU(ctx context.Context, guest *corev1.Pod) (*GPUAttachm
 }
 
 func (b *Backend) refused(ctx context.Context, guest *corev1.Pod, err error) error {
-	reason := err.Error()
+	reason, public := err.Error(), PublicRefusal
 	var r *refusalError
 	if errors.As(err, &r) {
 		reason = r.reason
+		if r.public != "" {
+			public = r.public
+		}
+	} else {
+		err = &refusalError{reason: reason} // never hand an unredacted error to the library
 	}
 	log.G(ctx).WithField("guest", guest.Namespace+"/"+guest.Name).WithField("reason", reason).Warn("gpu attach refused")
 	if b.opts.Recorder != nil {
-		b.opts.Recorder.Event(guest, corev1.EventTypeWarning, EventGPUUnavailable, "no donor GPU for the mirror: "+reason)
+		b.opts.Recorder.Event(guest, corev1.EventTypeWarning, EventGPUUnavailable, public)
 	}
 	return err
 }

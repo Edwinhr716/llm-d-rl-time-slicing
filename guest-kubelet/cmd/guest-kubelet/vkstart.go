@@ -44,6 +44,9 @@ func lookupController(ctx context.Context, client kubernetes.Interface, namespac
 		log.G(ctx).WithError(err).Warn("could not read own pod for the controller kind")
 		return "unknown"
 	}
+	if ref := metav1.GetControllerOf(pod); ref != nil {
+		startOwner.Store(ref)
+	}
 	return controllerKind(pod)
 }
 
@@ -75,14 +78,14 @@ func logStart(ctx context.Context, client kubernetes.Interface, o *options) {
 }
 
 // logStop writes msg="vk stopping" when a signal (SIGTERM from the kubelet, for example on a
-// rollout, a pod delete or a DaemonSet unbind when the donor label goes) ends the VK. The VK
-// does not deregister (delete) its Node on exit: that is --deregister, run separately.
+// rollout, a pod delete or a DaemonSet unbind when the donor label goes) ends the VK. With
+// --stop-cleanup (default) run has already deleted or cordoned the Node (stop.go).
 func logStop(ctx context.Context) {
 	if ctx.Err() == nil || started.node == "" {
 		return
 	}
 	log.G(context.WithoutCancel(ctx)).WithField("host", started.host).WithField("node", started.node).
-		WithField("deregister", false).Info("vk stopping; the virtual Node is left registered")
+		WithField("servedNode", roleRan.Load()).Info("vk stopping")
 }
 
 // withRateLimit sets the client-side rate limit; zero or less keeps client-go's default (5 QPS,

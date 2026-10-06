@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
+	"github.com/edwinhr716/guest-kubelet/internal/gpushadow/api"
 	"github.com/edwinhr716/guest-kubelet/internal/group"
 )
 
@@ -60,7 +62,7 @@ type Options struct {
 	DonorSelector labels.Selector
 
 	// GPUMode is how guests' nvidia.com/gpu is attached (--gpu-mode). Empty means claim.
-	// The fields below are for GPUModeDevicePlugin only.
+	// The fields below are for GPUModeDevicePlugin and GPUModePooled only (Holders: deviceplugin).
 	GPUMode GPUMode
 	// GPUDonorSelector selects donor pods on the host (label selector, --gpu-donor-selector).
 	GPUDonorSelector string
@@ -104,6 +106,8 @@ type Backend struct {
 	// assigned covers the gap until the mirror informer has a just-created mirror.
 	attachMu sync.Mutex
 	assigned map[corev1.ResourceName]assignment
+	// pooledAssigned is the same for pooled mode, per guest.
+	pooledAssigned map[types.UID]pooledAssignment
 
 	mu          sync.Mutex
 	onStatus    func(*corev1.Pod) // the library's notify callback, wrapped by the provider
@@ -174,13 +178,15 @@ func New(client kubernetes.Interface, guests corev1listers.PodLister, options *O
 		killing:     map[types.UID]string{},
 		attempts:    map[types.UID]int{},
 		assigned:    map[corev1.ResourceName]assignment{},
+
+		pooledAssigned: map[types.UID]pooledAssignment{},
 	}
 	_, _ = inf.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { b.mirrorChanged(obj) },
 		UpdateFunc: func(_, obj any) { b.mirrorChanged(obj) },
 		DeleteFunc: b.mirrorDeleted,
 	})
-	if opts.GPUMode == GPUModeDevicePlugin {
+	if opts.GPUMode.SharesDonorGPU() {
 		b.watchDonors(inf.Informer())
 	}
 	return b
@@ -426,7 +432,10 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 			if b.opts.OnUnresolved != nil {
 				b.opts.OnUnresolved(guest, res.Reason)
 			}
-			return fmt.Errorf("%w: host %s: %s", ErrGroupUnresolved, cfg.HostNode, res.Reason)
+			// The error becomes the guest's status.message: keep the reason code, drop the
+			// group names some reasons carry (they embed the owner namespace).
+			code, _, _ := strings.Cut(res.Reason, ":")
+			return fmt.Errorf("%w: host %s: %s", ErrGroupUnresolved, cfg.HostNode, code)
 		}
 		cfg.Group = g
 	}
@@ -447,7 +456,7 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 		}
 	}
 	var att *GPUAttachment
-	if b.opts.GPUMode == GPUModeDevicePlugin && RequestsGPU(guest) {
+	if b.opts.GPUMode.SharesDonorGPU() && RequestsGPU(guest) {
 		// D-NS-10: the donor's own GPU through its shadow resource.
 		b.attachMu.Lock()
 		defer b.attachMu.Unlock()
@@ -455,7 +464,11 @@ func (b *Backend) Create(ctx context.Context, guest *corev1.Pod) error {
 			b.emit(b.translate(guest, m)) // already attached (a retry, or a restart)
 			return nil
 		}
-		if att, err = b.attachGPU(ctx, guest); err != nil {
+		attach := b.attachGPU
+		if b.opts.GPUMode == GPUModePooled {
+			attach = b.attachPooled
+		}
+		if att, err = attach(ctx, guest); err != nil {
 			return err // fail closed: no mirror; the library retries the create
 		}
 	}
@@ -531,6 +544,13 @@ func logResources(logger log.Logger, res *Resources) {
 // The caller holds attachMu.
 func (b *Backend) attached(ctx context.Context, guest, mirror *corev1.Pod, att *GPUAttachment) {
 	name := mirror.Namespace + "/" + mirror.Name
+	if att.Pooled {
+		log.G(ctx).WithField("mirror", name).WithField("mode", string(GPUModePooled)).
+			WithField("attach", AttachShadowDevicePlugin).WithField("resource", string(api.PooledResource)).
+			WithField("qty", att.Qty).WithField("donor", att.Donor).Info("mirror gpu attached")
+		b.pooledAssigned[guest.UID] = pooledAssignment{mirror: name, qty: att.Qty, at: time.Now()}
+		return
+	}
 	log.G(ctx).WithField("mirror", name).WithField("mode", string(GPUModeDevicePlugin)).
 		WithField("uuid", att.UUID).WithField("attach", AttachShadowDevicePlugin).
 		WithField("resource", string(att.Resource)).WithField("donor", att.Donor).Info("mirror gpu attached")
