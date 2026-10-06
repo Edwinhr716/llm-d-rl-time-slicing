@@ -73,11 +73,51 @@ order. A key whose value is "" or null renders nothing, so the binary default ap
 The guest kubelet's user name, exempt from the CEL policy (W7).
 */}}
 {{- define "timeslice-webhook.vkUsername" -}}
+{{- printf "system:serviceaccount:%s" (include "timeslice-webhook.vkServiceAccount" .) }}
+{{- end }}
+
+{{/*
+flags.vk-service-account, else the umbrella chart's guest kubelet in this namespace: <namespace>:<its
+default fullname>, which is the release name when it contains "guest-kubelet" and
+<release>-guest-kubelet otherwise. Set the flag when the guest kubelet has another namespace or name.
+*/}}
+{{- define "timeslice-webhook.vkServiceAccount" -}}
 {{- $sa := index .Values.flags "vk-service-account" | default "" }}
 {{- if not $sa }}
-{{- fail "timeslice-webhook: flags.vk-service-account (<namespace>:<name>) is required when policy.enabled" }}
+{{- $full := printf "%s-guest-kubelet" .Release.Name }}
+{{- if contains "guest-kubelet" .Release.Name }}{{ $full = .Release.Name }}{{ end }}
+{{- $sa = printf "%s:%s" (include "timeslice-webhook.namespace" .) ($full | trunc 63 | trimSuffix "-") }}
 {{- end }}
-{{- printf "system:serviceaccount:%s" $sa }}
+{{- $sa }}
+{{- end }}
+
+{{/*
+flags.orchestrator-addr, else the umbrella chart's orchestrator Service in this namespace:
+<its default fullname>.<namespace>.svc:50051.
+*/}}
+{{- define "timeslice-webhook.orchestratorAddr" -}}
+{{- $a := index .Values.flags "orchestrator-addr" | default "" }}
+{{- if not $a }}
+{{- $full := printf "%s-timesliceorchestrator" .Release.Name }}
+{{- if contains "timesliceorchestrator" .Release.Name }}{{ $full = .Release.Name }}{{ end }}
+{{- $a = printf "%s.%s.svc:50051" ($full | trunc 63 | trimSuffix "-") (include "timeslice-webhook.namespace" .) }}
+{{- end }}
+{{- $a }}
+{{- end }}
+
+{{/*
+The flags with the derived defaults filled in (vk-service-account, orchestrator-addr).
+*/}}
+{{- define "timeslice-webhook.effectiveFlags" -}}
+{{- $f := deepCopy .Values.flags }}
+{{- $_ := set $f "vk-service-account" (include "timeslice-webhook.vkServiceAccount" .) }}
+{{- $_ := set $f "orchestrator-addr" (include "timeslice-webhook.orchestratorAddr" .) }}
+{{- if .Values.rlIntegration.enabled }}
+{{- $img := .Values.rlIntegration.image }}
+{{- $_ := set $f "rl-integration-image" (printf "%s:%s" $img.repository ($img.tag | default .Chart.AppVersion)) }}
+{{- with .Values.rlIntegration.path }}{{ $_ := set $f "rl-integration-path" . }}{{ end }}
+{{- end }}
+{{- toYaml $f }}
 {{- end }}
 
 {{/*

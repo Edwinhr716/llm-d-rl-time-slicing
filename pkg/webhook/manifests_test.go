@@ -148,7 +148,7 @@ func TestManifests_Policy(t *testing.T) {
 	for i := range vap.Spec.Validations {
 		rules = append(rules, strings.Fields(vap.Spec.Validations[i].Message)[0])
 	}
-	if strings.Join(rules, ",") != "[W10],[W6],[W9],[W2]" {
+	if strings.Join(rules, ",") != "[W10],[W6],[W9],[W2],[W12]" {
 		t.Errorf("validations = %v", rules)
 	}
 	if !strings.Contains(vap.Spec.MatchConditions[0].Expression, "'"+vkUsername+"'") {
@@ -157,5 +157,38 @@ func TestManifests_Policy(t *testing.T) {
 	if binding.Spec.PolicyName != vap.Name || len(binding.Spec.ValidationActions) != 1 ||
 		binding.Spec.ValidationActions[0] != admissionregistrationv1.Deny {
 		t.Errorf("binding = %+v", binding.Spec)
+	}
+}
+
+// The W11 shadow policy is cluster-wide (no namespace or label match), fails closed, exempts only
+// the virtual kubelet and covers both the pooled and the per-GPU shadow resource names.
+func TestManifests_ShadowPolicy(t *testing.T) {
+	docs := render(t, "shadow-policy.yaml", nil)
+	if len(docs) != 2 {
+		t.Fatalf("shadow-policy.yaml has %d documents, want 2", len(docs))
+	}
+	var vap admissionregistrationv1.ValidatingAdmissionPolicy
+	unmarshal(t, docs[0], &vap)
+	var binding admissionregistrationv1.ValidatingAdmissionPolicyBinding
+	unmarshal(t, docs[1], &binding)
+	if vap.Spec.FailurePolicy == nil || *vap.Spec.FailurePolicy != admissionregistrationv1.Fail {
+		t.Errorf("failurePolicy = %v", vap.Spec.FailurePolicy)
+	}
+	if len(vap.Spec.Validations) != 1 || !strings.HasPrefix(vap.Spec.Validations[0].Message, "[W11] ") {
+		t.Errorf("validations = %+v", vap.Spec.Validations)
+	}
+	if len(vap.Spec.MatchConditions) != 1 ||
+		!strings.Contains(vap.Spec.MatchConditions[0].Expression, "'"+vkUsername+"'") {
+		t.Errorf("match conditions %+v do not exempt exactly the virtual kubelet", vap.Spec.MatchConditions)
+	}
+	expr := vap.Spec.Variables[0].Expression
+	for _, want := range []string{"'" + webhook.ShadowResource + "'", "'" + webhook.ShadowResourcePrefix + "'", "initContainers"} {
+		if !strings.Contains(expr, want) {
+			t.Errorf("asksShadow does not cover %s: %s", want, expr)
+		}
+	}
+	if binding.Spec.PolicyName != vap.Name || binding.Spec.MatchResources != nil ||
+		len(binding.Spec.ValidationActions) != 1 || binding.Spec.ValidationActions[0] != admissionregistrationv1.Deny {
+		t.Errorf("binding must deny cluster-wide: %+v", binding.Spec)
 	}
 }

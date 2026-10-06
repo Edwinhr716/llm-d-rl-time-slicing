@@ -277,3 +277,68 @@ func TestRecover_FinishesInterruptedKill(t *testing.T) {
 		t.Fatalf("restores %d; kills finished after the restore: %t", f.restores, f.killsLate)
 	}
 }
+
+// The journal is bound to the host Node UID: Save stamps it, Load with the same UID returns
+// the record, Load with another UID (the host Node was recreated) or an unstamped record is a
+// *StaleJournalError.
+func TestNodeJournal_HostUIDBinding(t *testing.T) {
+	ctx := context.Background()
+	client := fake.NewClientset(journalNode(nil))
+	j := &provider.NodeJournal{Nodes: client.CoreV1().Nodes(), Name: "vk-x", HostUID: "host-uid-1"}
+	in := &hostcmd.Record{Epoch: 3, Command: "COMMAND_RESUME", Phase: hostcmd.PhaseDone}
+	if err := j.Save(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if in.HostUID != "" {
+		t.Fatal("Save must not modify the caller's record")
+	}
+	got, err := j.Load(ctx)
+	if err != nil || got == nil || got.HostUID != "host-uid-1" || got.Epoch != 3 {
+		t.Fatalf("same host: %+v, %v", got, err)
+	}
+
+	recreated := &provider.NodeJournal{Nodes: client.CoreV1().Nodes(), Name: "vk-x", HostUID: "host-uid-2"}
+	got, err = recreated.Load(ctx)
+	var stale *provider.StaleJournalError
+	if got != nil || !errors.As(err, &stale) || stale.SavedUID != "host-uid-1" || stale.ActualUID != "host-uid-2" {
+		t.Fatalf("recreated host: want a stale error, got %+v, %v", got, err)
+	}
+
+	// A record without a host UID (written before the binding) is not trusted either.
+	unstamped := fake.NewClientset(journalNode(map[string]string{
+		provider.AnnotationHostCommand: `{"epoch":1,"command":"COMMAND_RESUME","phase":"done"}`,
+	}))
+	j2 := &provider.NodeJournal{Nodes: unstamped.CoreV1().Nodes(), Name: "vk-x", HostUID: "host-uid-2"}
+	if got, err := j2.Load(ctx); got != nil || !errors.As(err, &stale) || stale.SavedUID != "" {
+		t.Fatalf("unstamped record: want a stale error, got %+v, %v", got, err)
+	}
+	// No HostUID configured: no check (the binding is opt-in for callers without a host Node).
+	j3 := &provider.NodeJournal{Nodes: unstamped.CoreV1().Nodes(), Name: "vk-x"}
+	if got, err := j3.Load(ctx); err != nil || got == nil || got.Epoch != 1 {
+		t.Fatalf("unbound journal: %+v, %v", got, err)
+	}
+}
+
+// A lent (COMMAND_RESUME) journal written on an earlier host Node object is not restored:
+// the server restores with no record (held, fail closed) and no attempt counters.
+func TestRecover_HostCommand_StaleHostJournalFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	client := recoverClient(t, journalNode(nil))
+	old := &provider.NodeJournal{Nodes: client.CoreV1().Nodes(), Name: "vk-x", HostUID: "old-host"}
+	if err := old.Save(ctx, &hostcmd.Record{
+		Epoch: 9, Command: "COMMAND_RESUME", Phase: hostcmd.PhaseDone, Attempts: map[types.UID]int{"guest-uid": 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &recoverFake{}
+	out, err := provider.Recover(ctx, &provider.RecoverConfig{
+		Pods: client.CoreV1().Pods(""), NodeName: "vk-x", Host: f, Server: f, IsGuest: onlyGuest,
+		Journal: &provider.NodeJournal{Nodes: client.CoreV1().Nodes(), Name: "vk-x", HostUID: "new-host"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Journal != "stale-host" || f.restores != 1 || f.restored != nil || f.attempts != nil {
+		t.Fatalf("recovery %+v; restores %d with %+v, attempts %v", out, f.restores, f.restored, f.attempts)
+	}
+}

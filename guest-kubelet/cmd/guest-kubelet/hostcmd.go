@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/types"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	hcpb "github.com/edwinhr716/guest-kubelet/api/hostcommand/v1alpha1"
@@ -104,11 +105,14 @@ func parseAllow(v string) ([]netip.Prefix, error) {
 // are off. ctx bounds the server's detached work.
 func (w *hostCommandWiring) build(
 	ctx context.Context, backend *mirror.Backend, resolver *group.Resolver, nodes corev1client.NodeInterface,
+	hostUID types.UID,
 ) (provider.CreateOwner, error) {
 	if w.o.hostCommandPort == 0 {
 		return nil, nil //nolint:nilnil // nil owner means host commands are off
 	}
-	w.journal = &provider.NodeJournal{Nodes: nodes, Name: w.o.nodeName}
+	// The journal is bound to this host Node object: a record from before a host recreate
+	// (same name, new UID) is refused at restore (fail closed).
+	w.journal = &provider.NodeJournal{Nodes: nodes, Name: w.o.nodeName, HostUID: hostUID}
 	cfg := &hostcmd.Config{
 		Node:              w.o.hostNode,
 		Group:             func() (string, bool) { return resolver.Current().Group() },

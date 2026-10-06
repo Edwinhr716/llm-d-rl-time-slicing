@@ -23,9 +23,11 @@ rbac:
   create: true
 
 # Controller flags, one "--<key>=<value>" each, in key order. "" = not rendered
-# (the controller default). release-dead-hosts: true also grants nodes/delete.
+# (the controller default). release-dead-hosts: true also grants nodes/delete;
+# clear-stale-fences: true also grants nodes/update.
 flags:
-  # host:port of the orchestrator (required).
+  # host:port of the orchestrator. "" = the umbrella chart's orchestrator
+  # Service in this namespace (<release>-timesliceorchestrator.<ns>.svc:50051).
   orchestrator-addr: ""
   # Node label layout: prefix (group.timeslice.io/<group>) or ns.
   label-keys: ""
@@ -37,6 +39,8 @@ flags:
   era-ttl: ""
   vk-deregister-grace: ""
   release-dead-hosts: ""
+  # Remove a stale timeslice.io/gpu-fence taint (shadow device plugin path).
+  clear-stale-fences: ""
   lock-poll-interval: ""
 
 extraArgs: []

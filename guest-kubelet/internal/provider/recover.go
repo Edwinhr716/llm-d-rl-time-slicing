@@ -41,10 +41,33 @@ const AnnotationHostCommand = "timeslice.io/host-command"
 type NodeJournal struct {
 	Nodes corev1client.NodeInterface
 	Name  string
+	// HostUID binds the journal to one host Node object. Save stamps it on the record; Load
+	// refuses a record stamped with another UID (or none) with a *StaleJournalError, so a lent
+	// state written for a host Node that was since deleted and recreated (same name, new UID,
+	// GPUs and pods gone) is never restored. Empty disables the check.
+	HostUID types.UID
+}
+
+// StaleJournalError is returned by NodeJournal.Load when the record was written for another
+// host Node object than the one this process runs on.
+type StaleJournalError struct {
+	Node      string
+	SavedUID  string
+	ActualUID types.UID
+}
+
+func (e *StaleJournalError) Error() string {
+	saved := e.SavedUID
+	if saved == "" {
+		saved = "<none>"
+	}
+	return fmt.Sprintf("host command journal on Node %s was written for host Node UID %s, not %s",
+		e.Node, saved, e.ActualUID)
 }
 
 // Load returns the journal record on the Node, or nil when there is none (no Node, no
-// annotation). An unreadable record is an error; the caller then treats it as none.
+// annotation). An unreadable record is an error; the caller then treats it as none. A record
+// from another host Node object is a *StaleJournalError (see HostUID).
 func (j *NodeJournal) Load(ctx context.Context) (*hostcmd.Record, error) {
 	n, err := j.Nodes.Get(ctx, j.Name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -61,11 +84,19 @@ func (j *NodeJournal) Load(ctx context.Context) (*hostcmd.Record, error) {
 	if err := json.Unmarshal([]byte(v), rec); err != nil {
 		return nil, fmt.Errorf("host command journal on Node %s unreadable: %w", j.Name, err)
 	}
+	if j.HostUID != "" && rec.HostUID != string(j.HostUID) {
+		return nil, &StaleJournalError{Node: j.Name, SavedUID: rec.HostUID, ActualUID: j.HostUID}
+	}
 	return rec, nil
 }
 
 // Save writes the record on the Node with a merge patch of the one annotation.
 func (j *NodeJournal) Save(ctx context.Context, rec *hostcmd.Record) error {
+	if j.HostUID != "" {
+		stamped := *rec
+		stamped.HostUID = string(j.HostUID)
+		rec = &stamped
+	}
 	v, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("encode the host command journal: %w", err)
@@ -119,7 +150,7 @@ type RecoverConfig struct {
 type Recovery struct {
 	Guests     int                   `json:"guests"`
 	Mirrors    int                   `json:"mirrors"`
-	Journal    string                `json:"journal"` // none, unreadable, or "<command> epoch <n> <phase>"
+	Journal    string                `json:"journal"` // none, unreadable, stale-host, or "<command> epoch <n> <phase>"
 	Restored   *hostcmd.Restored     `json:"restored,omitempty"`
 	Reconciled []mirror.Reconciled   `json:"reconciled,omitempty"`
 	Killed     []mirror.FinishedKill `json:"killed,omitempty"`
@@ -178,7 +209,14 @@ func Recover(ctx context.Context, cfg *RecoverConfig) (*Recovery, error) {
 		var rec *hostcmd.Record
 		if cfg.Journal != nil {
 			rec, err = cfg.Journal.Load(ctx)
+			var stale *StaleJournalError
 			switch {
+			case errors.As(err, &stale):
+				// The host Node was recreated: whatever the record says (lent, epoch, attempts)
+				// was about pods and GPUs that are gone. Restore nothing; held until the
+				// orchestrator's next command.
+				logger.WithError(err).Warn("host command journal is from another host Node; fail closed until the next command")
+				out.Journal, rec = "stale-host", nil
 			case err != nil:
 				logger.WithError(err).Warn("host command journal not read; fail closed until the next command")
 				out.Journal, rec = "unreadable", nil

@@ -846,7 +846,7 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			// pc.Pods lists the pods bound to the virtual node (the library's informer).
 			backend = mirror.New(client, pc.Pods, &mopts)
-			owner, err := hc.build(ctx, backend, resolver, client.CoreV1().Nodes())
+			owner, err := hc.build(ctx, backend, resolver, client.CoreV1().Nodes(), host.UID)
 			if err != nil {
 				return nil, nil, err
 			}

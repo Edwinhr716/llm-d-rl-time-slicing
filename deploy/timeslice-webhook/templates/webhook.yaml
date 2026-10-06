@@ -7,10 +7,21 @@
 # {{- $secret := .Values.tls.secretName | default (printf "%s-tls" $name) }}
 # {{- $caBundle := .Values.tls.caBundle }}
 # {{- if .Values.tls.generate }}
+# {{- $crt := "" }}{{- $key := "" }}
+# The Secret of a previous install (lookup; empty under helm template and dry runs) is reused, so
+# an upgrade keeps the CA, the caBundle and the pods. tls.rotate: true makes a new pair.
+# {{- $old := lookup "v1" "Secret" $ns $secret }}
+# {{- if and $old $old.data (not .Values.tls.rotate) }}
+# {{- if and (index $old.data "ca.crt") (index $old.data "tls.crt") (index $old.data "tls.key") }}
+# {{- $caBundle = index $old.data "ca.crt" }}{{- $crt = index $old.data "tls.crt" }}{{- $key = index $old.data "tls.key" }}
+# {{- end }}
+# {{- end }}
+# {{- if not $crt }}
 # {{- $dns := list (printf "%s.%s.svc" $name $ns) (printf "%s.%s.svc.cluster.local" $name $ns) }}
 # {{- $ca := genCA (printf "%s-ca" $name) (int .Values.tls.validityDays) }}
 # {{- $cert := genSignedCert (first $dns) nil $dns (int .Values.tls.validityDays) $ca }}
-# {{- $caBundle = $ca.Cert | b64enc }}
+# {{- $caBundle = $ca.Cert | b64enc }}{{- $crt = $cert.Cert | b64enc }}{{- $key = $cert.Key | b64enc }}
+# {{- end }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -20,8 +31,9 @@ metadata:
     # {{- include "timeslice-webhook.labels" . | nindent 4 }}
 type: kubernetes.io/tls
 data:
-  tls.crt: '{{ $cert.Cert | b64enc }}'
-  tls.key: '{{ $cert.Key | b64enc }}'
+  ca.crt: '{{ $caBundle }}'
+  tls.crt: '{{ $crt }}'
+  tls.key: '{{ $key }}'
 ---
 # {{- else if not $caBundle }}
 # {{- fail "timeslice-webhook: tls.caBundle is required when tls.generate is false" }}
@@ -77,7 +89,7 @@ spec:
             - '--port={{ .Values.port }}'
             - --cert-dir=/etc/timeslice-webhook/certs
           args:
-            # {{- include "timeslice-webhook.flags" .Values.flags | trim | nindent 12 }}
+            # {{- include "timeslice-webhook.flags" (include "timeslice-webhook.effectiveFlags" . | fromYaml) | trim | nindent 12 }}
             # {{- range .Values.extraArgs }}
             - '{{ . }}'
             # {{- end }}
@@ -125,7 +137,9 @@ metadata:
   labels:
     # {{- include "timeslice-webhook.labels" . | nindent 4 }}
 webhooks:
-  # {{- range $entry := list "donor" "guest" }}
+  # {{- $entries := list "donor" "guest" }}
+  # {{- if .Values.rlIntegration.enabled }}{{ $entries = append $entries "rl-integration" }}{{ end }}
+  # {{- range $entry := $entries }}
   - name: '{{ $entry }}.timeslice.io'
     admissionReviewVersions: ["v1"]
     clientConfig:

@@ -17,11 +17,14 @@ dependencies:
 - name: donor-controller
   repository: file://./donor-controller
   version: 0.1.0
+- name: gpu-shadow
+  repository: file://./gpu-shadow
+  version: 0.1.0
 - name: gpu-metrics
   repository: file://./gpu-metrics
   version: 0.1.0
 - name: nvidia-dra-driver-gpu
   repository: https://helm.ngc.nvidia.com/nvidia
   version: 25.8.0
-digest: sha256:4d9837443b2ac75913ab1a604c5679c4e359d97ead1974c45e9632d8bf9dd8d0
-generated: "2026-09-30T00:24:02.408375369Z"
+digest: sha256:088d4f37887b38cd9a0e1ab9c71e95c844a9bba96ed035c40f7129a1d47735cb
+generated: "2026-10-06T22:30:05.565586601Z"

@@ -18,6 +18,10 @@ rules:
   # --release-dead-hosts deletes a virtual Node whose host Node is gone.
   - {apiGroups: [""], resources: [nodes], verbs: [delete]}
   # {{- end }}
+  # {{- if eq (toString (index .Values.flags "clear-stale-fences")) "true" }}
+  # --clear-stale-fences removes a stale timeslice.io/gpu-fence taint (spec.taints).
+  - {apiGroups: [""], resources: [nodes], verbs: [update]}
+  # {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

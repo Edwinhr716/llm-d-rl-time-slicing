@@ -152,6 +152,14 @@ func TestAdmit_Denials(t *testing.T) {
 			webhook.LabelRole: "background", webhook.LabelGroup: "trainers", webhook.LabelJobID: "guest-uid-1",
 		}), "[W10]"},
 		{"donor with role", donorWithRole(), "[W10]"},
+		{"unlabelled pod asks for the pooled shadow", newPod(map[string]string{"app": "x"}, withShadow("timeslice.io/gpu-shadow", false)), "[W11]"},
+		{"donor asks for a per-GPU shadow limit", explicitDonorWith(withShadow("timeslice.io/gpu-shadow-0", true)), "[W11]"},
+		{"guest asks for the shadow in an init container", guest(func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "i", Image: "x"}}
+			p.Spec.InitContainers[0].Resources.Requests = corev1.ResourceList{"timeslice.io/gpu-shadow": resource.MustParse("1")}
+		}), "[W11]"},
+		{"privileged guest", guest(withPrivileged(false)), "[W12]"},
+		{"privileged guest init container", guest(withPrivileged(true)), "[W12]"},
 	}
 	for _, flags := range [][]string{todayFlags, nsFlags} {
 		cfg := mustConfig(t, flags)
@@ -167,6 +175,63 @@ func TestAdmit_Denials(t *testing.T) {
 			if res.resp.Result.Code != 403 {
 				t.Errorf("%s: code %d, want 403", tc.name, res.resp.Result.Code)
 			}
+		}
+	}
+}
+
+func withShadow(name corev1.ResourceName, limit bool) func(*corev1.Pod) {
+	return func(p *corev1.Pod) {
+		rl := corev1.ResourceList{name: resource.MustParse("1")}
+		if limit {
+			p.Spec.Containers[0].Resources.Limits = rl
+		} else {
+			p.Spec.Containers[0].Resources.Requests = rl
+		}
+	}
+}
+
+func withPrivileged(initContainer bool) func(*corev1.Pod) {
+	return func(p *corev1.Pod) {
+		yes := true
+		c := corev1.Container{Name: "priv", Image: "x", SecurityContext: &corev1.SecurityContext{Privileged: &yes}}
+		if initContainer {
+			p.Spec.InitContainers = append(p.Spec.InitContainers, c)
+		} else {
+			p.Spec.Containers = append(p.Spec.Containers, c)
+		}
+	}
+}
+
+func explicitDonorWith(opt func(*corev1.Pod)) *corev1.Pod {
+	pod := explicitDonor()
+	opt(pod)
+	return pod
+}
+
+// The virtual kubelet's mirror pods request the shadow resource; only they may (W11). A guest
+// that is explicitly not privileged is admitted (W12 looks at privileged=true only).
+func TestAdmit_ShadowOnlyFromVirtualKubelet(t *testing.T) {
+	mirror := newPod(map[string]string{
+		webhook.LabelRole: "background", webhook.LabelGroup: "trainers", webhook.LabelJobID: "g-uid-a1",
+	}, withShadow("timeslice.io/gpu-shadow", false))
+	notPriv := guest(func(p *corev1.Pod) {
+		no := false
+		p.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{Privileged: &no}
+	})
+	for _, flags := range [][]string{todayFlags, nsFlags} {
+		cfg := mustConfig(t, flags)
+		mustAllow(t, admit(t, cfg, mirror, vkUsername, admissionv1.Create))
+		if res := create(t, cfg, mirror); res.resp.Allowed || !strings.HasPrefix(res.message(), "[W11] ") {
+			t.Errorf("the mirror from a user: allowed %t, message %q; want W11", res.resp.Allowed, res.message())
+		}
+		mustAllow(t, create(t, cfg, notPriv))
+		// nvidia.com/gpu and look-alike names are not shadow resources.
+		mustAllow(t, create(t, cfg, newPod(map[string]string{"app": "x"}, withShadow("nvidia.com/gpu", true))))
+		mustAllow(t, create(t, cfg, newPod(map[string]string{"app": "x"}, withShadow("timeslice.io/gpu-shadowx", true))))
+	}
+	for _, name := range []corev1.ResourceName{"timeslice.io/gpu-shadow", "timeslice.io/gpu-shadow-3"} {
+		if !webhook.IsShadowResource(name) {
+			t.Errorf("%s is a shadow resource", name)
 		}
 	}
 }

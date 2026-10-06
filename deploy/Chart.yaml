@@ -34,6 +34,12 @@ dependencies:
     version: 0.1.0
     repository: "file://./donor-controller"
     condition: donor-controller.enabled
+  # The GPU shadow device plugin for the guest kubelet's --gpu-mode=pooled
+  # (no DRA driver needed). Needs timeslice-webhook.shadowPolicy (W11).
+  - name: gpu-shadow
+    version: 0.1.0
+    repository: "file://./gpu-shadow"
+    condition: gpu-shadow.enabled
   - name: gpu-metrics
     version: 0.1.0
     repository: "file://./gpu-metrics"

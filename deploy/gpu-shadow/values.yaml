@@ -1,0 +1,52 @@
+# GPU shadow device plugin (guest-kubelet cmd/gpu-shadow-plugin) as a DaemonSet
+# on the donor hosts. With mode pooled it advertises timeslice.io/gpu-shadow:
+# its devices are the GPUs the node's single nvidia.com/gpu holder (the donor)
+# holds, and 0 when more than one pod holds GPUs (fail closed). The guest
+# kubelet (--gpu-mode=pooled) asks for it on each mirror, so the real kubelet
+# attaches exactly the donor's GPUs to the mirror and sets its device cgroup:
+# the mirror needs no privilege and no hostPath. Only the guest kubelet may
+# request the resource: keep the webhook chart's shadowPolicy (W11) on.
+#
+# The plugin runs as root, because the kubelet's device-plugin and
+# pod-resources sockets are root-only, but it is not privileged: every
+# capability is dropped, the root filesystem is read-only and only the
+# device-plugin directory is mounted writable. It has no API token. Off by
+# default in the parent chart.
+
+namespace: timeslice-system
+
+image:
+  repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/gpu-shadow-plugin
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Plugin flags, one "--<key>=<value>" each, in key order. "" = not rendered.
+flags:
+  # The device plugin resource donors hold.
+  gpu-resource: nvidia.com/gpu
+  # pooled (timeslice.io/gpu-shadow) or per-gpu (timeslice.io/gpu-shadow-<minor>).
+  mode: pooled
+
+extraArgs: []
+
+resources:
+  requests: {cpu: 10m, memory: 32Mi}
+  limits: {memory: 64Mi}
+
+# Donor hosts. Set nodeSelector to the guest kubelet's (for example
+# timeslice.io/donor: "true") so the plugin runs where virtual Nodes do.
+nodeSelector: {}
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: cloud.google.com/gke-accelerator, operator: Exists}
+# The fence taint is the guest kubelet's (timeslice.io/gpu-fence): the plugin
+# must keep running while it is on.
+tolerations:
+  - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+  - {key: timeslice.io/gpu-fence, operator: Exists, effect: NoSchedule}

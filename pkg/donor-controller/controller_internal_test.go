@@ -85,12 +85,21 @@ type testEnv struct {
 	locks *testLocks
 	mode  string
 	stop  func()
+	// fences turns on --clear-stale-fences.
+	fences bool
 }
 
 // newEnv starts a controller on a fake clientset holding objs. The group starts IDLE.
 func newEnv(t *testing.T, mode string, release bool, objs ...runtime.Object) *testEnv {
 	t.Helper()
+	return newEnvWith(t, mode, release, false, objs...)
+}
+
+// newEnvWith is newEnv with --clear-stale-fences set to fences.
+func newEnvWith(t *testing.T, mode string, release, fences bool, objs ...runtime.Object) *testEnv {
+	t.Helper()
 	env := &testEnv{
+		fences: fences,
 		t:     t,
 		cs:    fake.NewClientset(objs...),
 		mode:  mode,
@@ -109,7 +118,7 @@ func (env *testEnv) start(release bool) func() {
 	env.t.Helper()
 	run, err := evalController(env.cs, env.locks, env.clk.Now, Config{
 		LabelKeys: env.mode, EraTTL: testTTL, DonorSelector: DefaultDonorSelector, GroupFilter: `^ns1\.`,
-		VKDeregisterGrace: testGrace, ReleaseDeadHosts: release,
+		VKDeregisterGrace: testGrace, ReleaseDeadHosts: release, ClearStaleFences: env.fences,
 	})
 	if err != nil {
 		env.t.Fatal(err)

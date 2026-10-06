@@ -13,6 +13,7 @@ func TestConfigFromFlags_Defaults(t *testing.T) {
 		GuestSteering: webhook.SteeringRequired, VirtualNodeLabel: "timeslice.io/virtual-node",
 		DonorClientWiring: webhook.WiringNone, PodinfoPath: "/etc/timeslice/podinfo",
 		GroupFormat: webhook.GroupFormatNsJobGroup, Port: 8443, CertDir: "/etc/timeslice-webhook/certs",
+		RLIntegrationPath: webhook.DefaultRLIntegrationPath,
 	}
 	if *cfg != want {
 		t.Errorf("defaults = %+v, want %+v", *cfg, want)
@@ -42,6 +43,7 @@ func TestConfigFromFlags_Invalid(t *testing.T) {
 		"--vk-service-account":  {"--vk-service-account=guest-kubelet"},
 		"--port":                {"--port=0"},
 		"--cert-dir":            {"--cert-dir="},
+		"--rl-integration-path": {"--rl-integration-image=img", "--rl-integration-path=rel"},
 		"unexpected arguments":  {"extra"},
 		"not defined":           {"--no-such-flag"},
 	}

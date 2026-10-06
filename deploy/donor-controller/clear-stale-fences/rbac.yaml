@@ -1,0 +1,27 @@
+# Extra RBAC for --clear-stale-fences: remove a stale timeslice.io/gpu-fence taint (spec.taints,
+# a Node update). Placeholder: __NS__.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: __NS__-donor-controller-fences
+  labels:
+    app.kubernetes.io/name: donor-controller
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: __NS__-donor-controller-fences
+  labels:
+    app.kubernetes.io/name: donor-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: __NS__-donor-controller-fences
+subjects:
+  - kind: ServiceAccount
+    name: donor-controller
+    namespace: __NS__

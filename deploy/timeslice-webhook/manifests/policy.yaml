@@ -3,6 +3,7 @@
 #   W6   a pod with timeslice.io/group also carries timeslice.io/job-id
 #   W9   a guest carries no group, job-id or role label (also enforced while the guest entry is down)
 #   W2   a guest requests no resource claims (same)
+#   W12  a guest container is not privileged (CREATE only; also enforced while the guest entry is down)
 # Placeholder __VK_USERNAME__: the virtual kubelet's user name,
 # system:serviceaccount:<ns>:<name>, the same identity as the webhook's --vk-service-account.
 # Its requests are not checked (mirror passthrough, W7). On UPDATE a rule is checked only when the
@@ -59,6 +60,16 @@ spec:
       message: >-
         [W2] a guest pod must not request resource claims: the mirror pod runs on the donor's GPU
         through the virtual kubelet
+      reason: Forbidden
+    - expression: >-
+        request.operation != 'CREATE' || !variables.guest ||
+        (!object.spec.containers.exists(c, has(c.securityContext) && has(c.securityContext.privileged) &&
+        c.securityContext.privileged) &&
+        (!has(object.spec.initContainers) || !object.spec.initContainers.exists(c, has(c.securityContext) &&
+        has(c.securityContext.privileged) && c.securityContext.privileged)))
+      message: >-
+        [W12] a guest container must not be privileged: a guest shares a GPU another pod holds and a
+        privileged container sees every host device
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

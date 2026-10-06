@@ -7,21 +7,28 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// patchOp is one RFC 6902 operation. The webhook only ever adds.
+// patchOp is one RFC 6902 operation. The webhook adds, and replaces only the value of a
+// container's PYTHONPATH (the RL integration injection prepends to it).
 type patchOp struct {
 	Op    string `json:"op"`
 	Path  string `json:"path"`
 	Value any    `json:"value"`
 }
 
-// patch collects add operations. Every helper checks the pod first and adds nothing when the field
+// patch collects the operations. Every helper checks the pod first and adds nothing when the field
 // is already there, so a second admission of an admitted pod yields no operations (reinvocation).
+// The env, volume and mount helpers also apply their change to the in-memory pod, so a later
+// helper in the same admission sees it (and never re-adds a list another helper created).
 type patch struct {
 	ops []patchOp
 }
 
 func (p *patch) add(path string, value any) {
 	p.ops = append(p.ops, patchOp{Op: "add", Path: path, Value: value})
+}
+
+func (p *patch) replace(path string, value any) {
+	p.ops = append(p.ops, patchOp{Op: "replace", Path: path, Value: value})
 }
 
 // escape encodes a JSON pointer token (RFC 6901).
@@ -132,6 +139,7 @@ func (p *patch) ensureEnv(pod *corev1.Pod, vars []corev1.EnvVar) {
 				p.add(containerPath(i)+"/env/-", ev)
 			}
 		}
+		ctr.Env = append(ctr.Env, missing...)
 	}
 }
 
@@ -153,9 +161,10 @@ func (p *patch) ensureVolume(pod *corev1.Pod, vol *corev1.Volume) {
 	}
 	if len(pod.Spec.Volumes) == 0 {
 		p.add("/spec/volumes", []corev1.Volume{*vol})
-		return
+	} else {
+		p.add("/spec/volumes/-", vol)
 	}
-	p.add("/spec/volumes/-", vol)
+	pod.Spec.Volumes = append(pod.Spec.Volumes, *vol)
 }
 
 // ensureMount adds mount to every container that has no mount of that volume.
@@ -168,10 +177,12 @@ func (p *patch) ensureMount(pod *corev1.Pod, mount *corev1.VolumeMount) {
 		}
 		switch {
 		case found:
+			continue
 		case len(mounts) == 0:
 			p.add(containerPath(i)+"/volumeMounts", []corev1.VolumeMount{*mount})
 		default:
 			p.add(containerPath(i)+"/volumeMounts/-", mount)
 		}
+		pod.Spec.Containers[i].VolumeMounts = append(mounts, *mount)
 	}
 }

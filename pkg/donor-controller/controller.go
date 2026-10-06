@@ -53,6 +53,10 @@ type nodeState struct {
 	clockSig    string
 	conflicts   map[string]bool
 	note        string
+	// ambiguous: more than one donor pod holds GPUs (lendable 0, event raised once).
+	ambiguous bool
+	// shadowSig is the last lendable/shadow-allocatable pair logged.
+	shadowSig string
 }
 
 // groupState is what the controller knows about one group's lock.
@@ -82,7 +86,9 @@ type Controller struct {
 	nodes    map[string]*nodeState
 	groups   map[string]*groupState
 	released map[types.UID]time.Time
-	eventSeq uint64
+	// fenceGone tracks hosts whose fence taint names a missing virtual Node (--clear-stale-fences).
+	fenceGone map[string]fenceWait
+	eventSeq  uint64
 }
 
 // New builds a Controller. locks may be nil (no orchestrator: donor pods alone drive the era).
@@ -106,7 +112,8 @@ func New(cs kubernetes.Interface, locks LockSource, clock func() time.Time, cfg 
 		wake:     make(chan struct{}, 1),
 		nodes:    map[string]*nodeState{},
 		groups:   map[string]*groupState{},
-		released: map[types.UID]time.Time{},
+		released:  map[types.UID]time.Time{},
+		fenceGone: map[string]fenceWait{},
 	}
 	if err := ctl.setupInformers(); err != nil {
 		return nil, err
@@ -181,7 +188,8 @@ func (c *Controller) loop(ctx context.Context) error {
 	c.log.Info("donor controller started", "label_keys", c.cfg.LabelKeys, "era_ttl", c.cfg.EraTTL.String(),
 		"donor_selector", c.cfg.DonorSelector, "group_filter", c.cfg.GroupFilter,
 		"vk_deregister_grace", c.cfg.VKDeregisterGrace.String(), "watch_namespaces", strings.Join(c.cfg.WatchNamespaces, ","),
-		"release_dead_hosts", c.cfg.ReleaseDeadHosts, "lock_source", c.locks != nil)
+		"release_dead_hosts", c.cfg.ReleaseDeadHosts, "clear_stale_fences", c.cfg.ClearStaleFences,
+		"lock_source", c.locks != nil)
 	ticker := time.NewTicker(c.cfg.Tick)
 	defer ticker.Stop()
 	for {
@@ -242,6 +250,9 @@ func (c *Controller) reconcileAll(ctx context.Context) {
 	}
 	if c.cfg.ReleaseDeadHosts {
 		c.releaseDeadHosts(ctx, now, nodes)
+	}
+	if c.cfg.ClearStaleFences {
+		c.clearStaleFences(ctx, now, nodes)
 	}
 }
 
@@ -364,6 +375,7 @@ func (c *Controller) reconcileNode(ctx context.Context, now time.Time, node *cor
 		return
 	}
 	c.noteConflicts(ctx, node, st, donors)
+	c.syncLendable(ctx, node, st, donors)
 	gs := c.groups[st.group]
 	if gs == nil {
 		gs = &groupState{}
@@ -509,6 +521,7 @@ func (c *Controller) unlabel(ctx context.Context, node *corev1.Node, st *nodeSta
 	}
 	anns := map[string]*string{
 		AnnotationLabelledBy: nil, AnnotationLabelledGroup: nil, AnnotationLabelledKeys: nil, AnnotationEraIdleSince: nil,
+		AnnotationLendableGPUs: nil,
 	}
 	if err := c.patchNode(ctx, node.Name, lbls, anns); err != nil {
 		c.log.Warn("removing labels failed", "node", node.Name, "err", err)

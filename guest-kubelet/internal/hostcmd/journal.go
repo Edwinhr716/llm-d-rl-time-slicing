@@ -34,6 +34,9 @@ type Record struct {
 	// Attempts is the mirror attempt counter per guest UID (job ids must not repeat).
 	Attempts map[types.UID]int `json:"attempts,omitempty"`
 	Updated  time.Time         `json:"updated"`
+	// HostUID is the UID of the host Node the record was written on (provider.NodeJournal
+	// stamps it). A record from an earlier host Node object of the same name is not restored.
+	HostUID string `json:"hostUID,omitempty"`
 }
 
 // Guest is one guest's entry of a finished command.

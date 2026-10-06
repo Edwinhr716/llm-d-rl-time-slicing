@@ -42,6 +42,9 @@ type Config struct {
 	WatchNamespaces []string
 	// ReleaseDeadHosts turns on H11: release a virtual Node whose host Node is gone or recreated.
 	ReleaseDeadHosts bool
+	// ClearStaleFences removes a host's timeslice.io/gpu-fence taint once the virtual Node it
+	// names has been gone for VKDeregisterGrace and no mirror pod is left on the host.
+	ClearStaleFences bool
 	// LockPollInterval is how often GetGroupStatus is polled per labelled group (by the clock).
 	LockPollInterval time.Duration
 	// LockRPCTimeout bounds one GetGroupStatus call.

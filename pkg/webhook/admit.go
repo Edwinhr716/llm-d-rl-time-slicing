@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,12 @@ const (
 	EnvJobID      = "TIMESLICE_JOB_ID"
 	EnvGroup      = "TIMESLICE_GROUP"
 	EnvOrchAddr   = "TIMESLICE_ORCH_ADDR"
+	// ShadowResource is the pooled GPU shadow resource the shadow device plugin advertises on a
+	// donor's host: its devices are the GPUs the donor holds. Only the virtual kubelet's mirror
+	// pods may request it (W11), or any pod could take a GPU another pod already holds.
+	ShadowResource = "timeslice.io/gpu-shadow"
+	// ShadowResourcePrefix starts the per-GPU shadow resources (timeslice.io/gpu-shadow-<minor>).
+	ShadowResourcePrefix = ShadowResource + "-"
 )
 
 // Kind is how the webhook classified the pod, for the log line and metrics.
@@ -38,7 +45,9 @@ const (
 	KindDonor      Kind = "donor"
 	KindGuest      Kind = "guest"
 	KindBackground Kind = "background"
-	KindOther      Kind = "other"
+	// KindRLIntegration is a pod labelled only timeslice.io/rl-integration=true.
+	KindRLIntegration Kind = "rl-integration"
+	KindOther         Kind = "other"
 )
 
 // Result is what the webhook did with the request.
@@ -65,6 +74,9 @@ const (
 	RuleMirror      = "W7"  // the virtual kubelet's requests pass through
 	RuleGuestLabels = "W9"  // guests carry no group, job-id or role label
 	RuleRoleReserve = "W10" // timeslice.io/role is set only by the virtual kubelet
+	RuleShadow      = "W11" // the GPU shadow resources are requested only by the virtual kubelet
+	RulePrivileged  = "W12" // guests are not privileged
+	RuleRLOnly      = "W13" // RL integration injected into a timeslice.io/rl-integration pod
 	RuleNone        = "-"
 	RuleDecode      = "decode"
 )
@@ -119,6 +131,9 @@ func Review(_ context.Context, req *admissionv1.AdmissionRequest, cfg *Config) (
 		out.Rule = RuleMirror
 	case req.Operation != admissionv1.Create:
 		// Mutation happens once, at creation. Other operations are not registered; allow them.
+	case requestsShadow(pod):
+		out.Rule, out.Message = RuleShadow, "[W11] "+ShadowResource+" and "+ShadowResourcePrefix+
+			"* are requested only by the virtual kubelet on mirror pods; request nvidia.com/gpu instead"
 	case out.Kind == KindDonor && isTrue(pod.Labels, LabelGuest):
 		out.Rule, out.Message = RuleBothRoles, "[R19] a pod is either a donor (timeslice.io/donor) "+
 			"or a guest (timeslice.io/guest), not both"
@@ -132,6 +147,9 @@ func Review(_ context.Context, req *admissionv1.AdmissionRequest, cfg *Config) (
 	case pod.Labels[LabelGroup] != "" && pod.Labels[LabelJobID] == "":
 		out.Rule, out.Message = RuleJobIDGroup, "[W6] a pod with timeslice.io/group needs timeslice.io/job-id; "+
 			"label it timeslice.io/donor=true to have both derived, or set both"
+	case out.Kind == KindRLIntegration && cfg.RLIntegrationImage != "":
+		edits.injectRLIntegration(pod, cfg)
+		out.Rule = RuleRLOnly
 	default:
 		out.Rule = RulePassThrough
 	}
@@ -165,6 +183,8 @@ func classify(labels map[string]string) Kind {
 		return KindGuest
 	case labels[LabelRole] != "":
 		return KindBackground
+	case isTrue(labels, LabelRLIntegration):
+		return KindRLIntegration
 	}
 	return KindOther
 }
@@ -184,6 +204,10 @@ func admitGuest(pod *corev1.Pod, cfg *Config, edits *patch) (string, string) {
 				"are set by the virtual kubelet on the mirror pod", key)
 		}
 	}
+	if c := privilegedContainer(pod); c != "" {
+		return RulePrivileged, fmt.Sprintf("[W12] guest container %s is privileged: a guest shares a GPU "+
+			"another pod holds and a privileged container sees every host device; remove privileged", c)
+	}
 	if hasClaims(pod) {
 		return RuleNoClaims, "[W2] a guest pod must not request resource claims: the mirror pod runs " +
 			"on the donor's GPU through the virtual kubelet"
@@ -202,6 +226,41 @@ func admitGuest(pod *corev1.Pod, cfg *Config, edits *patch) (string, string) {
 	return RuleGuestRoute, ""
 }
 
+// IsShadowResource reports whether name is a GPU shadow resource, pooled or per-GPU.
+func IsShadowResource(name corev1.ResourceName) bool {
+	return name == ShadowResource || strings.HasPrefix(string(name), ShadowResourcePrefix)
+}
+
+// requestsShadow reports whether any container or init container requests or limits a GPU
+// shadow resource.
+func requestsShadow(pod *corev1.Pod) bool {
+	for _, list := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for i := range list {
+			for _, rl := range []corev1.ResourceList{list[i].Resources.Requests, list[i].Resources.Limits} {
+				for name := range rl {
+					if IsShadowResource(name) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// privilegedContainer returns the name of the first privileged container or init container,
+// or "" when there is none.
+func privilegedContainer(pod *corev1.Pod) string {
+	for _, list := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for i := range list {
+			if sc := list[i].SecurityContext; sc != nil && sc.Privileged != nil && *sc.Privileged {
+				return list[i].Name
+			}
+		}
+	}
+	return ""
+}
+
 func hasClaims(pod *corev1.Pod) bool {
 	if len(pod.Spec.ResourceClaims) > 0 {
 		return true
@@ -216,7 +275,8 @@ func hasClaims(pod *corev1.Pod) bool {
 
 // admitDonor keeps explicit timeslice.io/job-id and timeslice.io/group labels and derives the
 // missing ones: job-id = ray.io/cluster, group = <ns>.<ray.io/cluster>.<ray.io/group>. Then it
-// injects the client wiring. It returns the rule and, for a denial, the message.
+// injects the client wiring and the RL integration (--rl-integration-image). It returns the rule
+// and, for a denial, the message.
 //
 //nolint:gocritic // unnamedResult conflicts with nonamedreturns.
 func admitDonor(pod *corev1.Pod, namespace string, cfg *Config, edits *patch) (string, string) {
@@ -253,6 +313,7 @@ func admitDonor(pod *corev1.Pod, namespace string, cfg *Config, edits *patch) (s
 		}})
 		edits.ensureMount(pod, &corev1.VolumeMount{Name: PodinfoVolume, MountPath: cfg.PodinfoPath, ReadOnly: true})
 	}
+	edits.injectRLIntegration(pod, cfg)
 	return rule, ""
 }
 

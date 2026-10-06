@@ -50,6 +50,8 @@ func run() error {
 		"at era end, wait at most this long for the host's virtual Node to go before removing the labels")
 	fs.BoolVar(&cfg.ReleaseDeadHosts, "release-dead-hosts", false,
 		"release (delete and unfinalize) a virtual Node whose host Node is gone or was recreated")
+	fs.BoolVar(&cfg.ClearStaleFences, "clear-stale-fences", false,
+		"remove a host's timeslice.io/gpu-fence taint once the virtual node it names is gone for --vk-deregister-grace and no mirror pod is left (needs nodes update)")
 	fs.DurationVar(&cfg.LockPollInterval, "lock-poll-interval", donorcontroller.DefaultLockPollInterval,
 		"how often GetGroupStatus is polled per labelled group")
 	fs.StringVar(&kubeconfig, "kubeconfig", "", "kubeconfig path; empty means in-cluster, then the default loading rules")

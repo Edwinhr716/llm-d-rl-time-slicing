@@ -54,6 +54,12 @@ type Config struct {
 	PodinfoPath string
 	// GroupFormat is GroupFormatNsJobGroup.
 	GroupFormat string
+	// RLIntegrationImage, when set, is the image of the init container injected into donor pods and
+	// pods labelled timeslice.io/rl-integration=true: it copies the timeslice Python packages into
+	// an emptyDir that every container mounts at RLIntegrationPath, with PYTHONPATH pointing there.
+	RLIntegrationImage string
+	// RLIntegrationPath is where the containers mount the injected packages (absolute).
+	RLIntegrationPath string
 	// VKUsername is the virtual kubelet's user name (system:serviceaccount:<ns>:<name>). Its
 	// requests pass through untouched (mirror pods). Empty means no identity is trusted.
 	VKUsername string
@@ -81,6 +87,10 @@ func ConfigFromFlags(args []string) (Config, error) {
 		"Mount path of the downward-API podinfo volume (--donor-client-wiring=downward).")
 	fs.StringVar(&cfg.GroupFormat, "group-format", GroupFormatNsJobGroup,
 		"Format of the derived timeslice.io/group value. Only ns.job.group is supported.")
+	fs.StringVar(&cfg.RLIntegrationImage, "rl-integration-image", "",
+		"Image of the RL integration init container injected into donors and timeslice.io/rl-integration=true pods; empty injects nothing.")
+	fs.StringVar(&cfg.RLIntegrationPath, "rl-integration-path", DefaultRLIntegrationPath,
+		"Mount path of the injected RL integration packages; PYTHONPATH gets <path>/python first.")
 	fs.StringVar(&vkSA, "vk-service-account", "",
 		"<namespace>:<name> of the virtual kubelet ServiceAccount; its pods (mirrors) pass through untouched.")
 	fs.IntVar(&cfg.Port, "port", 8443, "HTTPS port.")
@@ -126,6 +136,9 @@ func (c *Config) validate() error {
 		}
 	default:
 		errs = append(errs, fmt.Errorf("--donor-client-wiring must be env, downward or none, got %q", c.DonorClientWiring))
+	}
+	if c.RLIntegrationImage != "" && (!path.IsAbs(c.RLIntegrationPath) || path.Clean(c.RLIntegrationPath) == "/") {
+		errs = append(errs, fmt.Errorf("--rl-integration-path must be an absolute path other than /, got %q", c.RLIntegrationPath))
 	}
 	if c.GroupFormat != GroupFormatNsJobGroup {
 		errs = append(errs, fmt.Errorf("--group-format must be %s, got %q", GroupFormatNsJobGroup, c.GroupFormat))
