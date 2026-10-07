@@ -1,0 +1,152 @@
+# Long-CoT math RL (DeepSeek-R1-Distill-Qwen-1.5B, DAPO-Math-17k 512/64, 16K responses, staleness 8),
+# verl fully-async, 1 trainer H100 + 1 rollout H100: the benchmark's single 2-GPU Job as a KubeRay RayJob.
+# This is the RL team's normal manifest, with no time-slicing changes.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: longcot
+  namespace: longcot
+spec:
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 1800
+  # The head runs no tasks (num-cpus 0); the driver runs on a worker.
+  entrypointNumCpus: 1
+  entrypoint: >-
+    timeout --signal=INT --kill-after=120 6600
+    python3 -m verl.experimental.fully_async_policy.fully_async_main
+    data.train_files=/workspace/data/dapo_math/train.parquet
+    data.val_files=/workspace/data/dapo_math/val.parquet
+    data.prompt_key=prompt
+    data.truncation=left
+    data.max_prompt_length=2048
+    data.max_response_length=16384
+    data.train_batch_size=0
+    data.gen_batch_size=1
+    data.return_raw_chat=True
+    actor_rollout_ref.model.path=/workspace/models/DeepSeek-R1-Distill-Qwen-1.5B
+    actor_rollout_ref.model.use_remove_padding=True
+    actor_rollout_ref.model.enable_gradient_checkpointing=True
+    actor_rollout_ref.hybrid_engine=False
+    actor_rollout_ref.actor.strategy=fsdp
+    actor_rollout_ref.actor.ppo_mini_batch_size=64
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+    actor_rollout_ref.actor.use_kl_loss=False
+    actor_rollout_ref.actor.kl_loss_coef=0.0
+    actor_rollout_ref.actor.entropy_coeff=0
+    actor_rollout_ref.actor.grad_clip=1.0
+    actor_rollout_ref.actor.loss_agg_mode=token-mean
+    actor_rollout_ref.actor.use_dynamic_bsz=True
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=36864
+    actor_rollout_ref.actor.optim.lr=1e-6
+    actor_rollout_ref.actor.optim.lr_warmup_steps=-1
+    actor_rollout_ref.actor.fsdp_config.param_offload=False
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=36864
+    actor_rollout_ref.rollout.name=vllm
+    actor_rollout_ref.rollout.mode=async
+    actor_rollout_ref.rollout.n=8
+    actor_rollout_ref.rollout.calculate_log_probs=True
+    actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1
+    actor_rollout_ref.rollout.max_model_len=18432
+    actor_rollout_ref.rollout.max_num_batched_tokens=18432
+    actor_rollout_ref.rollout.enable_chunked_prefill=True
+    actor_rollout_ref.rollout.temperature=1.0
+    actor_rollout_ref.rollout.top_p=1.0
+    actor_rollout_ref.rollout.top_k=-1
+    algorithm.adv_estimator=grpo
+    algorithm.use_kl_in_reward=False
+    algorithm.kl_ctrl.kl_coef=0.0
+    trainer.logger=console
+    trainer.val_before_train=False
+    trainer.save_freq=-1
+    trainer.resume_mode=disable
+    trainer.nnodes=1
+    trainer.n_gpus_per_node=1
+    trainer.total_epochs=10
+    trainer.test_freq=-1
+    trainer.project_name=async-longcot
+    trainer.experiment_name=r1distill1.5b-dapomath-16k-s8
+    trainer.default_local_dir=/workspace/results/ckpts
+    rollout.nnodes=1
+    rollout.n_gpus_per_node=1
+    rollout.total_rollout_steps=65536
+    async_training.staleness_threshold=8
+    async_training.trigger_parameter_sync_step=1
+  runtimeEnvYAML: |
+    env_vars:
+      PYTHONUNBUFFERED: "1"
+      HYDRA_FULL_ERROR: "1"
+      VLLM_USE_V1: "1"
+  rayClusterSpec:
+    headGroupSpec:
+      rayStartParams:
+        num-cpus: "0"
+        dashboard-host: "0.0.0.0"
+      template:
+        spec:
+          nodeSelector: {cloud.google.com/gke-nodepool: cpu-pool}   # your CPU pool
+          containers:
+            - name: ray-head
+              image: verlai/verl:vllm020.dev2
+              resources:
+                requests: {cpu: "2", memory: 8Gi}
+                limits: {memory: 8Gi}
+    workerGroupSpecs:
+      - groupName: trainer
+        replicas: 1
+        rayStartParams:
+          num-cpus: "20"
+          num-gpus: "1"
+        template:
+          spec:
+            nodeSelector: {cloud.google.com/gke-nodepool: h100-trainer-pool}   # your trainer pool
+            tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+            containers:
+              - name: ray-worker
+                image: verlai/verl:vllm020.dev2
+                env: &env
+                  - {name: HF_HOME, value: /workspace/hf}
+                  - {name: VLLM_USE_V1, value: "1"}
+                # Per-node prep (verl at the benchmark commit, model, dataset); KubeRay starts Ray after it.
+                args: &prep
+                  - >-
+                    set -eo pipefail;
+                    pip install -q TransferQueue cupy-cuda12x;
+                    pip install -q --no-deps "verl @ git+https://github.com/verl-project/verl.git@983cb0f24443f87b3d161fad318445130a620b07";
+                    python3 -c "from huggingface_hub import snapshot_download as d; d('deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B', local_dir='/workspace/models/DeepSeek-R1-Distill-Qwen-1.5B')";
+                    python3 /workspace/scripts/data_prep.py --out_dir /workspace/data/dapo_math --train_size 512 --val_size 64
+                # The prep takes minutes; the default liveness probe would restart the pod before Ray starts.
+                livenessProbe: &live
+                  exec: {command: ["true"]}
+                resources:
+                  requests: {cpu: "20", memory: 120Gi, nvidia.com/gpu: "1"}
+                  limits: {memory: 120Gi, nvidia.com/gpu: "1"}
+                volumeMounts: &mounts
+                  - {name: scripts, mountPath: /workspace/scripts}
+                  - {name: dshm, mountPath: /dev/shm}
+            volumes: &vols
+              - {name: scripts, configMap: {name: async-longcot-scripts}}
+              - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 32Gi}}
+      - groupName: rollout
+        replicas: 1
+        rayStartParams:
+          num-cpus: "20"
+          num-gpus: "1"
+        template:
+          spec:
+            nodeSelector: {cloud.google.com/gke-nodepool: h100-rollout-pool}   # your rollout pool
+            tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+            containers:
+              - name: ray-worker
+                image: verlai/verl:vllm020.dev2
+                env: *env
+                args: *prep
+                livenessProbe: *live
+                resources:
+                  requests: {cpu: "20", memory: 120Gi, nvidia.com/gpu: "1"}
+                  limits: {memory: 120Gi, nvidia.com/gpu: "1"}
+                volumeMounts: *mounts
+            volumes: *vols

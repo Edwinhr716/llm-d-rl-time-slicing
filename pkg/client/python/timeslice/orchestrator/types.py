@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
-from typing import List
+from typing import List, Optional
 
 
 class GroupLockState(str, Enum):
@@ -11,6 +11,8 @@ class GroupLockState(str, Enum):
     IDLE_YIELDED = "IDLE_YIELDED"
     LOCKED = "LOCKED"
     SWITCHING = "SWITCHING"
+    BACKGROUND = "BACKGROUND"
+    VACATING = "VACATING"
 
 
 class AgentJobState(str, Enum):
@@ -20,6 +22,7 @@ class AgentJobState(str, Enum):
     TRANSITIONING = "TRANSITIONING"
     SAVED = "SAVED"
     FAULTED = "FAULTED"
+    SUSPENDED = "SUSPENDED"
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,9 @@ class AcquireResult:
     success: bool
     waited_ms: int
     context_restored: bool
+    # True only when the accelerator was handed back after a background guest
+    # kill that did not confirm, so device memory may still be held.
+    vram_unconfirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,10 @@ class GroupStatus:
     active_job: str
     waiter_queue_depth: int
     loaded_job: str
+    # 1 when the server speaks the background participant protocol.
+    background_protocol: int = 0
+    # Time left until background guests must vacate; set only while a notice runs.
+    vacate_within: Optional[timedelta] = None
 
 
 @dataclass(frozen=True)

@@ -20,7 +20,11 @@ from verl.experimental.fully_async_policy.fully_async_trainer import (
     register_trainer,
 )
 
+from timeslice_verl import defaults
 from timeslice_verl.hooks import TimesliceHooksMixin
+
+# With the env gate on, default the settings time-slicing needs (see defaults.py).
+defaults.apply()
 
 
 @register_trainer("timeslice")

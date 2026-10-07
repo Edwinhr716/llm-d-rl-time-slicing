@@ -4,6 +4,10 @@ image:
   pullPolicy: Always
   tag: "latest"
 
+# Namespace for the DaemonSet and ServiceAccount. Keep the default unless you
+# run a second, independent install next to its own orchestrator.
+namespace: timeslice-system
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -33,6 +37,13 @@ affinity: {}
 
 port: 9001
 
+# Pod DNS policy. The agent runs with hostNetwork; "ClusterFirstWithHostNet"
+# lets it resolve cluster Services. "" keeps the Kubernetes default.
+dnsPolicy: ""
+
+# Extra container env entries (a list of EnvVar), after the ones above.
+extraEnv: []
+
 securityContext:
   privileged: true
 
@@ -49,6 +60,23 @@ nvidia:
     enabled: true
     hostPath: /dev
     mountPath: /dev
+
+# Host cgroup v2 hierarchy, mounted read-write at /sys/fs/cgroup. The Suspend
+# and Resume pipelines freeze, thaw and read the memory of guest pod cgroups.
+# cgroup v2 is required.
+cgroup:
+  enabled: true
+  hostPath: /sys/fs/cgroup
+
+# GPUs and driver branches on which Suspend is allowed, as comma-separated
+# "<GPU name>:<driver branch>" entries (the agent's --vram-zeroing-qualified).
+# Empty keeps the agent default, "NVIDIA L4:580".
+vramZeroingQualified: ""
+
+# VRAM handling at a GPU handoff (the agent's --scrub-policy): keep (driver
+# zeroing plus vramZeroingQualified), ns-scrub (the agent scrubs the freed
+# VRAM after every Suspend) or flag. Empty keeps the agent default, keep.
+scrubPolicy: ""
 
 # Kubernetes-style feature gates (map of Name: bool), rendered into the
 # agent's FEATURE_GATES env var. Experimental capabilities are off by

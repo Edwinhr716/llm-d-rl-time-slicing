@@ -1,0 +1,53 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+# flags.orchestrator-addr defaults to the umbrella chart's orchestrator Service in this namespace.
+# {{- $flags := deepCopy .Values.flags }}
+# {{- if not (index $flags "orchestrator-addr") }}
+# {{- $full := printf "%s-timesliceorchestrator" .Release.Name }}
+# {{- if contains "timesliceorchestrator" .Release.Name }}{{ $full = .Release.Name }}{{ end }}
+# {{- $_ := set $flags "orchestrator-addr" (printf "%s.%s.svc:50051" ($full | trunc 63 | trimSuffix "-") (include "donor-controller.namespace" .)) }}
+# {{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: '{{ include "donor-controller.fullname" . }}'
+  namespace: '{{ include "donor-controller.namespace" . }}'
+  labels:
+    # {{- include "donor-controller.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      # {{- include "donor-controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        # {{- include "donor-controller.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: '{{ include "donor-controller.serviceAccountName" . }}'
+      nodeSelector:
+        # {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        # {{- toYaml .Values.tolerations | nindent 8 }}
+      affinity:
+        # {{- toYaml .Values.affinity | nindent 8 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: donor-controller
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}'
+          imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+          args:
+            # {{- include "donor-controller.flags" $flags | trim | nindent 12 }}
+            # {{- range .Values.extraArgs }}
+            - '{{ . }}'
+            # {{- end }}
+          resources:
+            # {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}

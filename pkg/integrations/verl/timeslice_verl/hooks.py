@@ -50,6 +50,14 @@ Environment contract:
                                experimental: torch.cuda.empty_cache() right
                                before each yield's release (best-effort probe
                                for smaller cuda-checkpoint snapshots)
+  TIMESLICE_EXPECTED_IDLE      expected_idle hint sent with each yield
+                               (timeslice_verl.estimator): "off" (default,
+                               no hint), "auto" (per yield point, EWMA of the
+                               measured gaps between that point's yield and
+                               the next acquire; no hint on a point's first
+                               yield) or a fixed number of seconds. The
+                               orchestrator lends the GPU to guests on a hint
+                               >= its --min-bubble (--lend-policy=hint).
 
 Config this module depends on directly: async_training.trainer_name=timeslice
 selects the subclass (see trainer.py); trainer.save_freq=-1 is enforced by the
@@ -61,7 +69,9 @@ verl integration guide (guides/rl-frameworks/verl/).
 import asyncio
 import os
 import threading
+from time import monotonic as _now
 
+from timeslice_verl import estimator
 from timeslice_verl.locks import PhaseLocks, _log
 
 ENV_ENABLE = "TIMESLICE_FULLY_ASYNC"
@@ -94,6 +104,10 @@ class TimesliceHooksMixin:
         self._state_lock = threading.Lock()
         self._locks: PhaseLocks | None = None
         self._warned: set = set()
+        # expected_idle estimator state, and the (point, monotonic time) of
+        # the last yield whose gap to the next acquire is not measured yet.
+        self._idle_state = estimator.new()
+        self._pending_gap: tuple[str, float] | None = None
         if enabled():
             _log("fully_async: timeslice lifecycle hooks active (TIMESLICE_FULLY_ASYNC=1)")
 
@@ -187,16 +201,44 @@ class TimesliceHooksMixin:
         event loop stays free (the wait can be minutes while the other job
         holds the group). Acquire errors propagate."""
         locks = await asyncio.to_thread(self._get_locks)
+        self._observe_gap(locks)
         await asyncio.to_thread(locks.ensure)
 
     async def _yield_lock(self, point: str) -> None:
         """Idempotent release (PhaseLocks.drop_all: errors logged, never
-        raised), run in a worker thread."""
+        raised), run in a worker thread. Sends the expected_idle hint for
+        `point` (TIMESLICE_EXPECTED_IDLE) and starts timing the gap to the
+        next acquire."""
         locks = self._locks
         if locks is None or not locks.enabled or not locks.held:
             return
         await asyncio.to_thread(self._maybe_empty_cache, point)  # experimental, inert by default
-        await asyncio.to_thread(locks.drop_all)
+        await asyncio.to_thread(locks.drop_all, self._expected_idle(point))
+        self._pending_gap = (point, _now())
+
+    # ------------------------------------------------------------ expected_idle
+
+    def _expected_idle(self, point: str) -> float | None:
+        """The hint for a yield at `point` in seconds, or None for no hint."""
+        try:
+            mode, seconds = estimator.parse_mode(os.environ.get(estimator.ENV_MODE))
+        except ValueError as e:
+            self._warn_once("expected_idle_mode", f"{e}; sending no expected_idle hint")
+            return None
+        if mode == estimator.MODE_FIXED:
+            return seconds
+        if mode == estimator.MODE_AUTO:
+            return estimator.next(self._idle_state, point)
+        return None
+
+    def _observe_gap(self, locks: PhaseLocks) -> None:
+        """Feed the estimator the gap from the last yield to this acquire
+        (only when the acquire is real, i.e. the lock is not held)."""
+        pending, self._pending_gap = self._pending_gap, None
+        if pending is None or not locks.enabled or locks.held:
+            return
+        point, yielded_at = pending
+        estimator.observe(self._idle_state, point, _now() - yielded_at)
 
     # ------------------------------------------------------------ misc
 

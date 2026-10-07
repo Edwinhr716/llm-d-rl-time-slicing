@@ -137,7 +137,6 @@ snapshot-agent-image-push: ## Build and push snapshot-agent container image
 		-f $(SNAPSHOT_AGENT_DOCKERFILE) \
 		.
 
-
 ##@ CI Helpers
 
 .PHONY: ci-lint

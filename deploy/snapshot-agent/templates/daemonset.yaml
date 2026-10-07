@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: {{ include "snapshot-agent.fullname" . }}
-  namespace: timeslice-system
+  namespace: '{{ include "snapshot-agent.namespace" . }}'
   labels:
     {{- include "snapshot-agent.labels" . | nindent 4 }}
 spec:
@@ -123,6 +123,9 @@ spec:
               echo "ctl tmpfs mounted at {{ .Values.directMemory.hostCtlPath }}/ctl"
       {{- end }}
       {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -133,7 +136,7 @@ spec:
             - name: DEPLOYMENT_MODE
               value: "k8s"
             - name: PATH
-              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin{{ if .Values.nvidia.driver.enabled }}:{{ .Values.nvidia.driver.mountPath }}/bin{{ end }}
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
@@ -171,10 +174,21 @@ spec:
             - name: LD_LIBRARY_PATH
               value: {{ join ":" .Values.nvidia.driver.libraryPaths }}
             {{- end }}
+            {{- if .Values.vramZeroingQualified }}
+            - name: VRAM_ZEROING_QUALIFIED
+              value: {{ .Values.vramZeroingQualified | quote }}
+            {{- end }}
+            {{- if .Values.scrubPolicy }}
+            - name: SCRUB_POLICY
+              value: {{ .Values.scrubPolicy | quote }}
+            {{- end }}
             - name: NVIDIA_VISIBLE_DEVICES
               value: "all"
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: "compute,utility"
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.port }}
@@ -210,6 +224,10 @@ spec:
               # though the hostPath was captured before it ran.
               mountPropagation: HostToContainer
             {{- end }}
+            {{- if .Values.cgroup.enabled }}
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+            {{- end }}
       volumes:
         {{- if .Values.nvidia.driver.enabled }}
         - name: nvidia-driver
@@ -228,6 +246,12 @@ spec:
           hostPath:
             path: {{ .Values.directMemory.hostCtlPath }}
             type: DirectoryOrCreate
+        {{- end }}
+        {{- if .Values.cgroup.enabled }}
+        - name: cgroup
+          hostPath:
+            path: {{ .Values.cgroup.hostPath }}
+            type: Directory
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

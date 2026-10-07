@@ -1,0 +1,25 @@
+# Builds the timeslice-webhook image (cmd/timeslice-webhook). Run from the repository root:
+#   gcloud builds submit --config=deploy/timeslice-webhook/cloudbuild.yaml \
+#     --substitutions=_REGISTRY=<image registry prefix>,_TAG=<tag> .
+# The image is <_REGISTRY>/timeslice-webhook:<_TAG>.
+steps:
+  - id: image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --platform
+      - linux/amd64
+      - -f
+      - docker/timeslice-webhook/Dockerfile
+      - -t
+      - ${_REGISTRY}/timeslice-webhook:${_TAG}
+      - .
+images:
+  - ${_REGISTRY}/timeslice-webhook:${_TAG}
+substitutions:
+  _REGISTRY: gcr.io/${PROJECT_ID}
+  _TAG: dev
+options:
+  dynamicSubstitutions: true
+  machineType: E2_HIGHCPU_8
+timeout: 1200s

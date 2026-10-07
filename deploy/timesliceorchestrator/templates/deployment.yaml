@@ -2,11 +2,15 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "timesliceorchestrator.fullname" . }}
-  namespace: timeslice-system
+  namespace: '{{ include "timesliceorchestrator.namespace" . }}'
   labels:
     {{- include "timesliceorchestrator.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "timesliceorchestrator.selectorLabels" . | nindent 6 }}
@@ -22,6 +26,64 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--snapshot-agent-port={{ .Values.snapshotAgentPort }}"
+            - "--serving-quantum={{ .Values.servingQuantum }}"
+            {{- $lockNamespace := include "timesliceorchestrator.lockNamespace" . }}
+            {{- if ne $lockNamespace "timeslice-system" }}
+            - "--lock-namespace={{ $lockNamespace }}"
+            {{- end }}
+            {{- with .Values.lock.configMap }}
+            - "--lock-configmap={{ . }}"
+            {{- end }}
+            {{- with .Values.scope.watchNamespaces }}
+            - "--watch-namespaces={{ join "," . }}"
+            {{- end }}
+            {{- with .Values.scope.nodeSelector }}
+            - "--node-selector={{ . }}"
+            {{- end }}
+            {{- if .Values.scope.nodeSelectorExemptBackground }}
+            - "--node-selector-exempt-background=true"
+            {{- end }}
+            {{- with .Values.maxServingOffwindow }}
+            - "--max-serving-offwindow={{ . }}"
+            {{- end }}
+            {{- with .Values.hostCommand.port }}
+            - "--host-command-port={{ . }}"
+            {{- end }}
+            {{- with .Values.settleTimeout }}
+            - "--settle-timeout={{ . }}"
+            {{- end }}
+            {{- with .Values.guest }}
+            {{- if ne (toString .backgroundRole) "" }}
+            - "--background-role={{ .backgroundRole }}"
+            {{- end }}
+            {{- with .lendPolicy }}
+            - "--lend-policy={{ . }}"
+            {{- end }}
+            {{- with .minBubble }}
+            - "--min-bubble={{ . }}"
+            {{- end }}
+            {{- with .noticeWindow }}
+            - "--notice-window={{ . }}"
+            {{- end }}
+            {{- with .killBudget }}
+            - "--kill-budget={{ . }}"
+            {{- end }}
+            {{- with .backgroundLiveness }}
+            - "--background-liveness={{ . }}"
+            {{- end }}
+            {{- with .nodeGroupLabels }}
+            - "--node-group-labels={{ . }}"
+            {{- end }}
+            {{- end }}
+            {{- with .Values.controllerWorkers }}
+            - "--controller-workers={{ . }}"
+            {{- end }}
+            {{- with .Values.resyncPeriod }}
+            - "--resync-period={{ . }}"
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: 50051
@@ -31,3 +93,15 @@ spec:
               protocol: TCP
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

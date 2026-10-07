@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: async-longcot-scripts
+  namespace: longcot
+data:
+  data_prep.py: "#!/usr/bin/env python3\n\"\"\"Prepare DAPO-Math-17k subsets for the async long-CoT experiment.\n\nSource: HF dataset BytedTsinghua-SIA/DAPO-Math-17k (data/dapo-math-17k.parquet),\nwhich\
+    \ is ALREADY in verl RLHFDataset format:\n  - data_source = \"math_dapo\"  -> default reward routing hits\n    verl.utils.reward_score.math_dapo.compute_score (Answer: <ans> extraction,\n    matching\
+    \ the instruction baked into every prompt)\n  - prompt = [{\"role\": \"user\", \"content\": \"...Remember to put your answer on its\n    own line after \\\"Answer:\\\"...\"}]\n  - reward_model = {\"\
+    style\": \"rule\", \"ground_truth\": \"<answer string>\"}\n\nWe only subsample (512 train / 64 val, disjoint) and sanity-check the schema.\nNo agent_name column -> single_turn_agent (default), single-turn\
+    \ long CoT.\n\"\"\"\n\nimport argparse\nimport os\n\nimport pandas as pd\nfrom huggingface_hub import hf_hub_download\n\n\ndef main():\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--repo_id\"\
+    , default=\"BytedTsinghua-SIA/DAPO-Math-17k\")\n    ap.add_argument(\"--filename\", default=\"data/dapo-math-17k.parquet\")\n    ap.add_argument(\"--out_dir\", default=\"/workspace/data/dapo_math\"\
+    )\n    ap.add_argument(\"--train_size\", type=int, default=512)\n    ap.add_argument(\"--val_size\", type=int, default=64)\n    ap.add_argument(\"--seed\", type=int, default=17)\n    args = ap.parse_args()\n\
+    \n    local = hf_hub_download(repo_id=args.repo_id, filename=args.filename, repo_type=\"dataset\")\n    df = pd.read_parquet(local)\n    print(f\"loaded {len(df)} rows, columns: {list(df.columns)}\"\
+    )\n\n    # ---- schema sanity checks (fail fast, before burning GPU time) ----\n    row = df.iloc[0]\n    prompt = row[\"prompt\"]\n    assert row[\"data_source\"] == \"math_dapo\", f\"unexpected data_source\
+    \ {row['data_source']!r}\"\n    p0 = prompt[0] if not isinstance(prompt, dict) else prompt\n    p0 = dict(p0)\n    assert p0.get(\"role\") == \"user\" and isinstance(p0.get(\"content\"), str), f\"bad\
+    \ prompt row: {p0}\"\n    assert \"Answer:\" in p0[\"content\"], \"prompt lacks the Answer: instruction the reward fn expects\"\n    rm = dict(row[\"reward_model\"])\n    gt = rm.get(\"ground_truth\"\
+    )\n    assert isinstance(gt, str) and gt, f\"bad ground_truth: {gt!r}\"\n    print(\"schema OK; sample prompt (first 400 chars):\")\n    print(p0[\"content\"][:400])\n    print(\"sample ground_truth:\"\
+    , gt[:100])\n\n    # Deduplicate on prompt text so train/val are truly distinct problems.\n    df = df.assign(_ptext=df[\"prompt\"].map(lambda p: dict(list(p)[0])[\"content\"]))\n    df = df.drop_duplicates(\"\
+    _ptext\").drop(columns=\"_ptext\").reset_index(drop=True)\n    print(f\"{len(df)} unique problems after dedup\")\n\n    n = args.train_size + args.val_size\n    sub = df.sample(n=min(n, len(df)), random_state=args.seed).reset_index(drop=True)\n\
+    \    train = sub.iloc[: args.train_size]\n    val = sub.iloc[args.train_size : args.train_size + args.val_size]\n\n    os.makedirs(args.out_dir, exist_ok=True)\n    train.to_parquet(os.path.join(args.out_dir,\
+    \ \"train.parquet\"), index=False)\n    val.to_parquet(os.path.join(args.out_dir, \"val.parquet\"), index=False)\n    print(f\"wrote {len(train)} train / {len(val)} val -> {args.out_dir}\")\n\n\nif\
+    \ __name__ == \"__main__\":\n    main()\n"

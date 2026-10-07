@@ -22,9 +22,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Single-platform (amd64) for both components: the platform is adopted
+          # Single-platform (amd64) for every component: the platform is adopted
           # as a unit, and the snapshot-agent is x86_64-only today (cuda-checkpoint
-          # binary + CGO build). Revisit both together when an aarch64
+          # binary + CGO build). Revisit together when an aarch64
           # cuda-checkpoint is available.
           - component: timesliceorchestrator
             dockerfile: docker/timesliceorchestrator/Dockerfile
