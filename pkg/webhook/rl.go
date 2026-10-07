@@ -18,7 +18,11 @@ import (
 //     /opt/timeslice-rl/python into that volume;
 //   - a read-only mount of the volume at --rl-integration-path in every container;
 //   - PYTHONPATH=<path>/python in front of the container's own PYTHONPATH, so the injected
-//     packages win over copies installed in the image's site-packages.
+//     packages win over copies installed in the image's site-packages;
+//   - with --rl-integration-verl, also the verl build the image carries (/opt/timeslice-rl/verl,
+//     a verl with the fully-async lifecycle hooks, trainer registry and per-pool placement-group
+//     resources the timeslice trainer needs): copied too, and <path>/verl follows <path>/python on
+//     PYTHONPATH, so it wins over the verl in the RL image.
 //
 // Donor pods get it with the rest of the donor wiring. Ray pods of the same job that are not
 // donors (the head, the rollout workers: the job driver and verl actors can run there and import
@@ -34,6 +38,8 @@ const (
 	DefaultRLIntegrationPath = "/opt/timeslice-rl"
 	// RLIntegrationSource is the package tree inside the init image.
 	RLIntegrationSource = "/opt/timeslice-rl/python"
+	// RLIntegrationVerlSource is the verl tree inside the init image (--rl-integration-verl).
+	RLIntegrationVerlSource = "/opt/timeslice-rl/verl"
 	// rlIntegrationTarget is where the init container mounts the volume.
 	rlIntegrationTarget = "/timeslice-rl"
 	// EnvPythonPath is the variable the injection prepends to.
@@ -50,21 +56,29 @@ func (p *patch) injectRLIntegration(pod *corev1.Pod, cfg *Config) {
 		Name:         RLIntegrationVolume,
 		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 	})
-	p.ensureInitContainer(pod, rlInitContainer(cfg.RLIntegrationImage))
+	p.ensureInitContainer(pod, rlInitContainer(cfg.RLIntegrationImage, cfg.RLIntegrationVerl))
 	p.ensureMount(pod, &corev1.VolumeMount{Name: RLIntegrationVolume, MountPath: cfg.RLIntegrationPath, ReadOnly: true})
-	p.ensurePythonPath(pod, path.Join(cfg.RLIntegrationPath, "python"))
+	dirs := path.Join(cfg.RLIntegrationPath, "python")
+	if cfg.RLIntegrationVerl {
+		dirs += ":" + path.Join(cfg.RLIntegrationPath, "verl")
+	}
+	p.ensurePythonPath(pod, dirs)
 }
 
 // rlInitContainer copies the packages into the volume. It satisfies the restricted Pod Security
 // profile and asks for almost nothing (an init container's requests only count when they exceed
 // the app containers').
-func rlInitContainer(image string) *corev1.Container {
+func rlInitContainer(image string, verl bool) *corev1.Container {
 	yes, no, uid := true, false, int64(65532)
+	cmd := []string{"cp", "-R", RLIntegrationSource, rlIntegrationTarget + "/"}
+	if verl {
+		cmd = []string{"cp", "-R", RLIntegrationSource, RLIntegrationVerlSource, rlIntegrationTarget + "/"}
+	}
 	return &corev1.Container{
 		Name:            RLIntegrationInit,
 		Image:           image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"cp", "-R", RLIntegrationSource, rlIntegrationTarget + "/"},
+		Command:         cmd,
 		VolumeMounts:    []corev1.VolumeMount{{Name: RLIntegrationVolume, MountPath: rlIntegrationTarget}},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
@@ -92,14 +106,14 @@ func (p *patch) ensureInitContainer(pod *corev1.Pod, c *corev1.Container) {
 		}
 	}
 	if len(pod.Spec.InitContainers) == 0 {
-		p.add("/spec/initContainers", []corev1.Container{*c})
+		p.add(p.base+"/spec/initContainers", []corev1.Container{*c})
 	} else {
-		p.add("/spec/initContainers/-", c)
+		p.add(p.base+"/spec/initContainers/-", c)
 	}
 	pod.Spec.InitContainers = append(pod.Spec.InitContainers, *c)
 }
 
-// ensurePythonPath puts dir first in every container's PYTHONPATH: it adds the variable, or
+// ensurePythonPath puts dir (one directory, or several joined by ":") first in every container's PYTHONPATH: it adds the variable, or
 // prepends dir to a literal value. A PYTHONPATH from valueFrom is left alone (it cannot be
 // prepended to); so is a PYTHONPATH the image sets in its own ENV, which the added variable
 // replaces (the documented image assumption).
@@ -111,19 +125,19 @@ func (p *patch) ensurePythonPath(pod *corev1.Pod, dir string) {
 		case j < 0:
 			ev := corev1.EnvVar{Name: EnvPythonPath, Value: dir}
 			if len(ctr.Env) == 0 {
-				p.add(containerPath(i)+"/env", []corev1.EnvVar{ev})
+				p.add(p.containerPath(i)+"/env", []corev1.EnvVar{ev})
 			} else {
-				p.add(containerPath(i)+"/env/-", ev)
+				p.add(p.containerPath(i)+"/env/-", ev)
 			}
 			ctr.Env = append(ctr.Env, ev)
 		case ctr.Env[j].ValueFrom != nil:
-		case strings.Split(ctr.Env[j].Value, ":")[0] == dir:
+		case ctr.Env[j].Value == dir || strings.HasPrefix(ctr.Env[j].Value, dir+":"):
 		default:
 			v := dir
 			if ctr.Env[j].Value != "" {
 				v = dir + ":" + ctr.Env[j].Value
 			}
-			p.replace(containerPath(i)+"/env/"+strconv.Itoa(j)+"/value", v)
+			p.replace(p.containerPath(i)+"/env/"+strconv.Itoa(j)+"/value", v)
 			ctr.Env[j].Value = v
 		}
 	}

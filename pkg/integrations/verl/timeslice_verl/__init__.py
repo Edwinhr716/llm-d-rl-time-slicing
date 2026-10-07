@@ -8,8 +8,9 @@ trainer name ``timeslice`` via verl's fully-async trainer registry
 (``register_trainer``); the ``verl.plugins`` entry point declared in this
 package's pyproject.toml makes ``import verl`` load the registering module
 automatically. Select it with the hydra override
-``async_training.trainer_name=timeslice`` — no verl source changes and no
-monkey-patching.
+``async_training.trainer_name=timeslice`` — no verl source changes. With the
+env gate on, ``timeslice_verl.defaults`` changes one default
+(the NCCL weight-sync group is rebuilt at every sync).
 
 This module deliberately imports only the verl-free parts (the lock protocol
 lives in :class:`TimesliceHooksMixin`), so the package is importable and

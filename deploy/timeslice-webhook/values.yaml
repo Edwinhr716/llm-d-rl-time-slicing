@@ -49,6 +49,21 @@ failurePolicy:
   guest: Ignore
   # A Ray pod admitted without the RL integration fails at import: fail closed.
   rl-integration: Fail
+  # A RayCluster admitted unwired runs without time-slicing (and without its
+  # Ray pods' plugin): fail open, so a webhook outage never blocks Ray clusters
+  # that do not use time-slicing.
+  raycluster: Ignore
+
+# RayCluster wiring. With enabled, the RL team labels only the trainer worker
+# group (timeslice.io/donor=true): at RayCluster creation the webhook labels
+# the head and the other worker groups timeslice.io/rl-integration=true and,
+# with donor-client-wiring=env and one donor group, sets TIMESLICE_FULLY_ASYNC=1,
+# TIMESLICE_JOB_ID, TIMESLICE_GROUP and TIMESLICE_ORCH_ADDR in every group (the
+# trainer's driver actor can run in any Ray pod of the job), plus
+# NCCL_CUMEM_ENABLE=0 and NCCL_NVLS_ENABLE=0 (no NCCL buffers cuda-checkpoint
+# cannot handle). Settings the user already has are kept. Needs no RBAC; harmless without KubeRay.
+rayCluster:
+  enabled: true
 
 # RL integration injection (--rl-integration-image). enabled: donor pods
 # (timeslice.io/donor=true) and pods labelled timeslice.io/rl-integration=true
@@ -73,6 +88,15 @@ rlIntegration:
     tag: "latest"
   # "" = /opt/timeslice-rl.
   path: ""
+  # Also inject verl (--rl-integration-verl). Upstream verl does not yet have
+  # the fully-async lifecycle hooks and trainer registry the plugin needs; the
+  # image carries the verl package source of a fork that adds them (pinned
+  # commit, Apache-2.0, LICENSE and NOTICE under <path>/verl; see
+  # docker/rl-integration/Dockerfile). PYTHONPATH becomes
+  # <path>/python:<path>/verl:<yours>, so this verl replaces the RL image's own
+  # verl in the injected pods; verl's dependencies still come from the RL
+  # image. Set false when the RL image already has a verl with the hooks.
+  injectVerl: true
 
 # The CEL ValidatingAdmissionPolicy (W10, W6, W9, W2, W12) and its binding.
 policy:
@@ -103,6 +127,10 @@ flags:
   virtual-node-label: ""
   group-format: ""
   podinfo-path: ""
+  # Per-GPU memory added to a donor container's memory limit, for the trainer's
+  # GPU memory checkpointed into host memory while the GPU is lent: auto (by
+  # the pod's GPU model nodeSelector, else 80Gi), 0 (off) or a quantity.
+  donor-gpu-memory: ""
 
 extraArgs: []
 

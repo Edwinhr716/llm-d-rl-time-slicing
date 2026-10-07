@@ -44,6 +44,7 @@ import (
 	"github.com/edwinhr716/guest-kubelet/internal/gpushadow/api"
 	"github.com/edwinhr716/guest-kubelet/internal/group"
 	"github.com/edwinhr716/guest-kubelet/internal/hostcmd"
+	"github.com/edwinhr716/guest-kubelet/internal/prepull"
 	"github.com/edwinhr716/guest-kubelet/internal/probe"
 	"github.com/edwinhr716/guest-kubelet/internal/provider"
 )
@@ -103,6 +104,7 @@ type options struct {
 
 	// VK-A7: admission and mirror memory
 	gpuAllowlist       string
+	prepullImages      bool
 	gpuMemory          string
 	mirrorMemoryFactor float64
 
@@ -283,11 +285,15 @@ func main() {
 		"extra taints on the virtual Node, k=v:Effect,k2:Effect, next to timeslice.io/guest; set at registration, so "+
 			"only guests that tolerate them ever bind; empty adds none")
 
-	flag.StringVar(&o.gpuAllowlist, "gpu-allowlist", "nvidia-l4",
+	flag.BoolVar(&o.prepullImages, "prepull-images", true,
+		"pull an admitted guest's images onto the host at once (a short-lived <guest>-prepull pod), so the first "+
+			"lend does not wait for the pull; false leaves the pull to the mirror")
+	flag.StringVar(&o.gpuAllowlist, "gpu-allowlist", provider.DefaultGPUAllowlist,
 		"comma-separated GPU models guests may use; a GPU guest is rejected unless the host Node's model label "+
 			"(cloud.google.com/gke-accelerator or nvidia.com/gpu.product) is listed")
-	flag.StringVar(&o.gpuMemory, "gpu-memory", "23034Mi",
-		"device memory of one host GPU (L4: 23034Mi); the device reserve is this times --mirror-memory-factor")
+	flag.StringVar(&o.gpuMemory, "gpu-memory", provider.GPUMemoryAuto,
+		"device memory of one host GPU (L4: 23034Mi, H100: 81559Mi), or auto (from the host's GPU model label, "+
+			"fallback "+provider.FallbackGPUMemory+"); the device reserve is this times --mirror-memory-factor")
 	flag.Float64Var(&o.mirrorMemoryFactor, "mirror-memory-factor", 1.1,
 		"a GPU mirror container's memory limit = its limit + ceil(--gpu-memory x factor), "+
 			"so Suspend can hold the device memory in the cgroup")
@@ -663,7 +669,12 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 	if mopts.MemoryHeadroom, err = resource.ParseQuantity(o.memHeadroom); err != nil {
 		return fmt.Errorf("--mirror-memory-headroom: %w", err)
 	}
-	gpuMem, err := resource.ParseQuantity(o.gpuMemory)
+	gpuMemValue, gpuMemFallback := provider.ResolveGPUMemory(o.gpuMemory, provider.HostGPUModel(host))
+	if gpuMemFallback {
+		log.G(ctx).WithField("hostGPUModel", provider.HostGPUModel(host)).WithField("gpuMemory", gpuMemValue).
+			Warn("--gpu-memory=auto: unknown host GPU model, using the fallback; set --gpu-memory")
+	}
+	gpuMem, err := resource.ParseQuantity(gpuMemValue)
 	if err != nil {
 		return fmt.Errorf("--gpu-memory: %w", err)
 	}
@@ -855,6 +866,9 @@ func runNode(ctx context.Context, client kubernetes.Interface, o *options, gate 
 				prov = provider.NewWithCreateOwner(backend, owner)
 			}
 			prov = prov.WithAdmission(&provider.Admission{Policy: policy, Recorder: recorder, Rejected: rejected})
+			if o.prepullImages {
+				prov = prov.WithPrepull(prepull.New(ctx, client, host.Name))
+			}
 			if gate != nil {
 				prov = prov.WithGate(gate) // D-NS-13 ns-era
 				backend.SetDeletedReason(gate.MirrorDeletedReason)

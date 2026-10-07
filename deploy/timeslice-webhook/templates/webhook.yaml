@@ -158,3 +158,23 @@ webhooks:
     timeoutSeconds: 3
     reinvocationPolicy: IfNeeded
   # {{- end }}
+  # {{- if .Values.rayCluster.enabled }}
+  # KubeRay RayClusters (a RayJob's cluster) at creation: when a worker group is
+  # labelled timeslice.io/donor=true, the head and the other groups get the
+  # rl-integration label and every group the TIMESLICE_* settings. A RayCluster
+  # without a donor group is not changed.
+  - name: 'raycluster.timeslice.io'
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service: {name: '{{ $name }}', namespace: '{{ $ns }}', path: /mutate, port: 443}
+      caBundle: '{{ $caBundle }}'
+    rules:
+      - {apiGroups: ["ray.io"], apiVersions: ["v1"], operations: ["CREATE"], resources: ["rayclusters"], scope: Namespaced}
+    namespaceSelector:
+      # {{- include "timeslice-webhook.namespaceSelector" $ | nindent 6 }}
+    matchPolicy: Equivalent
+    failurePolicy: '{{ .Values.failurePolicy.raycluster }}'
+    sideEffects: None
+    timeoutSeconds: 3
+    reinvocationPolicy: IfNeeded
+  # {{- end }}

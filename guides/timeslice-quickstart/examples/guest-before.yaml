@@ -1,0 +1,36 @@
+# The batch team's normal vLLM model server (llm-d-async sends it work through the llm-d router).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guest-vllm
+  namespace: batch
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: guest-vllm}
+  template:
+    metadata:
+      labels:
+        app: guest-vllm
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.9.2
+          args:
+            - --model=Qwen/Qwen2.5-0.5B-Instruct
+            - --port=8000
+            - --gpu-memory-utilization=0.2
+            - --max-model-len=4096
+            - --enforce-eager
+            - --disable-log-requests
+          env:
+            - {name: HF_HOME, value: /tmp/hf}
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests: {cpu: "2", memory: 10Gi, nvidia.com/gpu: "1"}
+            limits: {memory: 12Gi, nvidia.com/gpu: "1"}

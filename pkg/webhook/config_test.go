@@ -13,7 +13,7 @@ func TestConfigFromFlags_Defaults(t *testing.T) {
 		GuestSteering: webhook.SteeringRequired, VirtualNodeLabel: "timeslice.io/virtual-node",
 		DonorClientWiring: webhook.WiringNone, PodinfoPath: "/etc/timeslice/podinfo",
 		GroupFormat: webhook.GroupFormatNsJobGroup, Port: 8443, CertDir: "/etc/timeslice-webhook/certs",
-		RLIntegrationPath: webhook.DefaultRLIntegrationPath,
+		RLIntegrationPath: webhook.DefaultRLIntegrationPath, DonorGPUMemory: webhook.DonorGPUMemoryAuto,
 	}
 	if *cfg != want {
 		t.Errorf("defaults = %+v, want %+v", *cfg, want)

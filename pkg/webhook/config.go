@@ -60,6 +60,17 @@ type Config struct {
 	RLIntegrationImage string
 	// RLIntegrationPath is where the containers mount the injected packages (absolute).
 	RLIntegrationPath string
+	// RLIntegrationVerl also injects the verl build the init image carries (<path>/verl, after
+	// <path>/python on PYTHONPATH): a verl with the fully-async lifecycle hooks, trainer registry
+	// and per-pool placement-group resources the timeslice trainer needs, so the RL image can
+	// ship a stock verl. Off: the RL image must provide such a verl itself.
+	RLIntegrationVerl bool
+	// DonorGPUMemory is how much a donor container's memory limit grows per GPU it holds
+	// (nvidia.com/gpu), because the trainer's GPU memory is checkpointed into the container's
+	// memory while the GPU is lent. "auto" takes the GPU model from the pod's node selection
+	// (GPUMemoryByModel) and falls back to DefaultDonorGPUMemory; "0" turns the raise off;
+	// anything else is a quantity (e.g. 80Gi).
+	DonorGPUMemory string
 	// VKUsername is the virtual kubelet's user name (system:serviceaccount:<ns>:<name>). Its
 	// requests pass through untouched (mirror pods). Empty means no identity is trusted.
 	VKUsername string
@@ -91,6 +102,11 @@ func ConfigFromFlags(args []string) (Config, error) {
 		"Image of the RL integration init container injected into donors and timeslice.io/rl-integration=true pods; empty injects nothing.")
 	fs.StringVar(&cfg.RLIntegrationPath, "rl-integration-path", DefaultRLIntegrationPath,
 		"Mount path of the injected RL integration packages; PYTHONPATH gets <path>/python first.")
+	fs.BoolVar(&cfg.RLIntegrationVerl, "rl-integration-verl", false,
+		"Also inject the verl build carried by the RL integration image (<path>/verl on PYTHONPATH after <path>/python).")
+	fs.StringVar(&cfg.DonorGPUMemory, "donor-gpu-memory", DonorGPUMemoryAuto,
+		"Memory added to a donor container's memory limit per nvidia.com/gpu it holds (room for the GPU checkpoint): "+
+			"auto (by GPU model, fallback "+DefaultDonorGPUMemory+"), 0 (off) or a quantity.")
 	fs.StringVar(&vkSA, "vk-service-account", "",
 		"<namespace>:<name> of the virtual kubelet ServiceAccount; its pods (mirrors) pass through untouched.")
 	fs.IntVar(&cfg.Port, "port", 8443, "HTTPS port.")
@@ -139,6 +155,9 @@ func (c *Config) validate() error {
 	}
 	if c.RLIntegrationImage != "" && (!path.IsAbs(c.RLIntegrationPath) || path.Clean(c.RLIntegrationPath) == "/") {
 		errs = append(errs, fmt.Errorf("--rl-integration-path must be an absolute path other than /, got %q", c.RLIntegrationPath))
+	}
+	if _, _, err := parseDonorGPUMemory(c.DonorGPUMemory); err != nil {
+		errs = append(errs, fmt.Errorf("--donor-gpu-memory: %w", err))
 	}
 	if c.GroupFormat != GroupFormatNsJobGroup {
 		errs = append(errs, fmt.Errorf("--group-format must be %s, got %q", GroupFormatNsJobGroup, c.GroupFormat))

@@ -116,6 +116,7 @@ The flags with the derived defaults filled in (vk-service-account, orchestrator-
 {{- $img := .Values.rlIntegration.image }}
 {{- $_ := set $f "rl-integration-image" (printf "%s:%s" $img.repository ($img.tag | default .Chart.AppVersion)) }}
 {{- with .Values.rlIntegration.path }}{{ $_ := set $f "rl-integration-path" . }}{{ end }}
+{{- if .Values.rlIntegration.injectVerl }}{{ $_ := set $f "rl-integration-verl" "true" }}{{ end }}
 {{- end }}
 {{- toYaml $f }}
 {{- end }}

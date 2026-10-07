@@ -13,7 +13,7 @@ namespace: timeslice-system
 image:
   repository: nvcr.io/nvidia/k8s/dcgm-exporter
   pullPolicy: IfNotPresent
-  tag: "3.3.9-3.6.1-ubuntu22.04"
+  tag: "4.4.1-4.6.0-ubuntu22.04"
 
 nameOverride: ""
 fullnameOverride: ""
@@ -24,9 +24,13 @@ port: 9400
 # too coarse for a 30 s notice window).
 collectIntervalMs: 1000
 
-# Counter list inside the image. dcp-metrics-included.csv adds the profiling
-# counters above to the default set.
-collectors: /etc/dcgm-exporter/dcp-metrics-included.csv
+# Counter list. The chart ships its own list (templates/counters.yaml, the
+# counters above) and mounts it at countersPath: the image's
+# dcp-metrics-included.csv comments out SM_ACTIVE and SM_OCCUPANCY. Set
+# collectors to a file inside the image (e.g.
+# /etc/dcgm-exporter/dcp-metrics-included.csv) to use that instead.
+collectors: /etc/timeslice-gpu-metrics/counters.csv
+countersPath: /etc/timeslice-gpu-metrics
 
 # Map GPUs to the pods using them through the kubelet pod-resources API.
 # Off: DRA-allocated GPUs are not listed there.

@@ -21,6 +21,9 @@ type patchOp struct {
 // helper in the same admission sees it (and never re-adds a list another helper created).
 type patch struct {
 	ops []patchOp
+	// base is the JSON pointer of the pod-shaped object the helpers edit: "" for a Pod, or the
+	// path of a pod template inside another object (a RayCluster's group templates).
+	base string
 }
 
 func (p *patch) add(path string, value any) {
@@ -36,18 +39,28 @@ func escape(token string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(token, "~", "~0"), "/", "~1")
 }
 
-func containerPath(i int) string {
-	return "/spec/containers/" + strconv.Itoa(i)
+func (p *patch) containerPath(i int) string {
+	return p.base + "/spec/containers/" + strconv.Itoa(i)
 }
 
 func (p *patch) addLabel(pod *corev1.Pod, key, value string) {
 	if len(pod.Labels) == 0 {
-		p.add("/metadata/labels", map[string]string{key: value})
+		p.add(p.base+"/metadata/labels", map[string]string{key: value})
 		pod.Labels = map[string]string{key: value}
 		return
 	}
-	p.add("/metadata/labels/"+escape(key), value)
+	p.add(p.base+"/metadata/labels/"+escape(key), value)
 	pod.Labels[key] = value
+}
+
+func (p *patch) addAnnotation(pod *corev1.Pod, key, value string) {
+	if len(pod.Annotations) == 0 {
+		p.add(p.base+"/metadata/annotations", map[string]string{key: value})
+		pod.Annotations = map[string]string{key: value}
+		return
+	}
+	p.add(p.base+"/metadata/annotations/"+escape(key), value)
+	pod.Annotations[key] = value
 }
 
 // ensureToleration adds toleration unless the pod already tolerates its key.
@@ -58,10 +71,10 @@ func (p *patch) ensureToleration(pod *corev1.Pod, tol *corev1.Toleration) {
 		}
 	}
 	if len(pod.Spec.Tolerations) == 0 {
-		p.add("/spec/tolerations", []corev1.Toleration{*tol})
+		p.add(p.base+"/spec/tolerations", []corev1.Toleration{*tol})
 		return
 	}
-	p.add("/spec/tolerations/-", tol)
+	p.add(p.base+"/spec/tolerations/-", tol)
 }
 
 // ensureNodeSelector sets nodeSelector key=value unless it is already set to value.
@@ -70,10 +83,10 @@ func (p *patch) ensureNodeSelector(pod *corev1.Pod, key, value string) {
 		return
 	}
 	if len(pod.Spec.NodeSelector) == 0 {
-		p.add("/spec/nodeSelector", map[string]string{key: value})
+		p.add(p.base+"/spec/nodeSelector", map[string]string{key: value})
 		return
 	}
-	p.add("/spec/nodeSelector/"+escape(key), value)
+	p.add(p.base+"/spec/nodeSelector/"+escape(key), value)
 }
 
 // ensurePreferred adds a weight-100 preferred node affinity term key In [value], unless a preferred
@@ -88,19 +101,19 @@ func (p *patch) ensurePreferred(pod *corev1.Pod, key, value string) {
 	aff := pod.Spec.Affinity
 	switch {
 	case aff == nil:
-		p.add("/spec/affinity", corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+		p.add(p.base+"/spec/affinity", corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
 			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{term},
 		}})
 	case aff.NodeAffinity == nil:
-		p.add("/spec/affinity/nodeAffinity", corev1.NodeAffinity{
+		p.add(p.base+"/spec/affinity/nodeAffinity", corev1.NodeAffinity{
 			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{term},
 		})
 	case hasPreferred(aff.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution, key, value):
 	case len(aff.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution) == 0:
-		p.add("/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution",
+		p.add(p.base+"/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution",
 			[]corev1.PreferredSchedulingTerm{term})
 	default:
-		p.add("/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution/-", term)
+		p.add(p.base+"/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution/-", term)
 	}
 }
 
@@ -133,10 +146,10 @@ func (p *patch) ensureEnv(pod *corev1.Pod, vars []corev1.EnvVar) {
 		switch {
 		case len(missing) == 0:
 		case len(ctr.Env) == 0:
-			p.add(containerPath(i)+"/env", missing)
+			p.add(p.containerPath(i)+"/env", missing)
 		default:
 			for _, ev := range missing {
-				p.add(containerPath(i)+"/env/-", ev)
+				p.add(p.containerPath(i)+"/env/-", ev)
 			}
 		}
 		ctr.Env = append(ctr.Env, missing...)
@@ -160,9 +173,9 @@ func (p *patch) ensureVolume(pod *corev1.Pod, vol *corev1.Volume) {
 		}
 	}
 	if len(pod.Spec.Volumes) == 0 {
-		p.add("/spec/volumes", []corev1.Volume{*vol})
+		p.add(p.base+"/spec/volumes", []corev1.Volume{*vol})
 	} else {
-		p.add("/spec/volumes/-", vol)
+		p.add(p.base+"/spec/volumes/-", vol)
 	}
 	pod.Spec.Volumes = append(pod.Spec.Volumes, *vol)
 }
@@ -179,9 +192,9 @@ func (p *patch) ensureMount(pod *corev1.Pod, mount *corev1.VolumeMount) {
 		case found:
 			continue
 		case len(mounts) == 0:
-			p.add(containerPath(i)+"/volumeMounts", []corev1.VolumeMount{*mount})
+			p.add(p.containerPath(i)+"/volumeMounts", []corev1.VolumeMount{*mount})
 		default:
-			p.add(containerPath(i)+"/volumeMounts/-", mount)
+			p.add(p.containerPath(i)+"/volumeMounts/-", mount)
 		}
 		pod.Spec.Containers[i].VolumeMounts = append(mounts, *mount)
 	}

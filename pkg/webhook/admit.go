@@ -109,6 +109,9 @@ func Review(_ context.Context, req *admissionv1.AdmissionRequest, cfg *Config) (
 		return deny("", out.Message), out
 	}
 	out := Outcome{Kind: KindOther, Op: string(req.Operation), Namespace: req.Namespace, Rule: RuleNone}
+	if req.Resource.Resource == "rayclusters" && req.SubResource == "" {
+		return reviewRayCluster(req, cfg, out)
+	}
 	if req.Resource.Resource != "pods" || req.SubResource != "" {
 		out.Result = ResultAllowed
 		return allow(req.UID), out
@@ -153,6 +156,12 @@ func Review(_ context.Context, req *admissionv1.AdmissionRequest, cfg *Config) (
 	default:
 		out.Rule = RulePassThrough
 	}
+	return respond(req, out, &edits)
+}
+
+// respond turns the decision into the AdmissionResponse: a denial when out has a message, an
+// allow with the JSONPatch when there are edits, a plain allow otherwise.
+func respond(req *admissionv1.AdmissionRequest, out Outcome, edits *patch) (*admissionv1.AdmissionResponse, Outcome) {
 	switch {
 	case out.Message != "":
 		out.Result = ResultDenied
@@ -313,6 +322,7 @@ func admitDonor(pod *corev1.Pod, namespace string, cfg *Config, edits *patch) (s
 		}})
 		edits.ensureMount(pod, &corev1.VolumeMount{Name: PodinfoVolume, MountPath: cfg.PodinfoPath, ReadOnly: true})
 	}
+	edits.raiseDonorMemory(pod, cfg.DonorGPUMemory)
 	edits.injectRLIntegration(pod, cfg)
 	return rule, ""
 }

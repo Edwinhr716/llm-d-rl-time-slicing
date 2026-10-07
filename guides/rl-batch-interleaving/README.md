@@ -1,4 +1,167 @@
-# Interleaving a verl RL Trainer with a Batch-Inference Server on One GPU
+# Interleaving a verl RL Trainer with Batch Inference on the Trainer's GPU
+
+In verl's fully-async recipe the rollout GPUs generate all the time, while the
+trainer GPU sits idle whenever it waits for the next batch of samples. On long
+chain-of-thought math RL that wait is minutes per step: about half of every
+step. This guide shows how the llm-d-rl-time-slicing platform lends that idle
+trainer GPU to batch inference servers and takes it back whenever the trainer
+needs it. The trainer has absolute priority. Neither workload's source is
+modified, and neither team installs anything except labels.
+
+The step-by-step setup is in the
+**[time-slicing quickstart](../timeslice-quickstart/README.md)**. This page
+explains how the pieces fit together and what to expect.
+
+> The previous version of this guide used a shared DRA ResourceClaim and a
+> supervisor container in the batch pod. That path still works and is kept in
+> [Appendix A](#appendix-a-the-dra-shared-claim-path-previous-version). The
+> path described here needs no DRA driver and no change to the batch pod
+> beyond one label.
+
+---
+
+## Table of Contents
+1. [How it works](#1-how-it-works)
+2. [What each team does](#2-what-each-team-does)
+3. [One step, end to end](#3-one-step-end-to-end)
+4. [What to expect](#4-what-to-expect)
+5. [Batch traffic: llm-d-async and the router](#5-batch-traffic-llm-d-async-and-the-router)
+6. [Observe it](#6-observe-it)
+7. [Limits and open items](#7-limits-and-open-items)
+- [Appendix A: the DRA shared-claim path (previous version)](#appendix-a-the-dra-shared-claim-path-previous-version)
+
+---
+
+## 1. How it works
+
+```
+  ROLLOUT NODE (dedicated)              TRAINER NODE (lent while the trainer waits)
+  ┌──────────────────────────┐          ┌───────────────────────────────────────────┐
+  │ RL rollout pod           │   Ray    │ RL trainer pod (donor)                    │
+  │ vLLM, generates          │◀────────▶│   FSDP trainer ── checkpointed to host RAM│
+  │ continuously             │          │ guest pod (mirror of a batch server pod)  │
+  └──────────────────────────┘          │   vLLM ── frozen in place at reclaim      │
+                                        └───────────────────────────────────────────┘
+  owner of the trainer GPU over time:
+  trainer ███░░░░░░░░░███░░░░░░░░░███   (update, then wait for samples)
+  guest   ░░░██████████░░░█████████░░░   (serves batch requests while lent)
+```
+
+The components (all installed by one Helm chart):
+
+| Component | Role |
+|---|---|
+| Admission webhook | Injects the time-slicing plugin into labelled Ray clusters, raises the trainer pod's memory limit for the checkpoint, and steers labelled batch pods to virtual nodes. |
+| Donor controller | Watches trainer pods labelled `timeslice.io/donor`, and groups them per job. |
+| Shadow device plugin | Advertises the trainer node's GPU a second time, for guests, without a DRA driver. |
+| Guest kubelet (virtual node) | One virtual node `vk-<trainer node>` per trainer node. Batch pods scheduled there are run as mirror pods on the trainer node, started, frozen and resumed on command. |
+| Orchestrator | Decides when to lend and when to reclaim, from the trainer's yield and acquire calls. |
+| Snapshot agent | Checkpoints and restores GPU processes with `cuda-checkpoint` (trainer and guests), and scrubs freed GPU memory where needed. |
+| verl plugin (`trainer_name=timeslice`) | A subclass of verl's fully-async trainer that yields the GPU when the trainer starts waiting and acquires it before the update. |
+
+## 2. What each team does
+
+| Who | What |
+|---|---|
+| Cluster admin | `helm install timeslice`. On GPUs other than the L4, also `--set snapshot-agent.scrubPolicy=flag` (see section 7). |
+| RL team | The `timeslice.io/donor: "true"` label on the trainer worker group, one `resources` line per worker group in `rayStartParams`, and two verl settings: `async_training.trainer_name=timeslice` and `ray_pg_extra_resources=...`. |
+| Batch team | The `timeslice.io/guest: "true"` label on the model server pods. |
+
+The full manifests and diffs are in the quickstart.
+
+## 3. One step, end to end
+
+1. **The trainer finishes its update and starts waiting for samples.** The
+   plugin calls Yield. The orchestrator decides to lend; the snapshot agent
+   checkpoints the trainer's GPU state into the trainer pod's host memory with
+   `cuda-checkpoint`.
+2. **The guest runs.** The guest kubelet starts the guest (first lend) or
+   resumes it from its frozen state (every later lend). The guest's readiness
+   probe passes and it serves batch requests on the full GPU.
+3. **The trainer's samples are ready.** The plugin calls Acquire. The
+   orchestrator tells the guest kubelet to vacate: the snapshot agent freezes
+   the guest in place (its GPU memory goes to host RAM with `cuda-checkpoint`),
+   scrubs the freed GPU memory if the policy asks for it, and restores the
+   trainer. The trainer continues where it stopped.
+4. Requests that reach a frozen guest wait in the queue (llm-d-async) and are
+   served after the next lend.
+
+The trainer never waits for a guest to finish its work: a reclaim is a freeze,
+not a drain.
+
+## 4. What to expect
+
+Measured on H100 80GB with the long chain-of-thought example of the
+quickstart (DeepSeek-R1-Distill-Qwen-1.5B, 16K responses, 1 trainer GPU and 1
+rollout GPU; a vLLM guest using 20% of the GPU):
+
+| | |
+|---|---|
+| Reclaim (freeze the guest, scrub, restore the trainer) | the trainer waits about 15 s (at most 16 s) for its GPU: guest checkpoint about 9 s for 17.7 GB, scrub about 0.4 s for the whole 80 GB, trainer restore about 4.5 s |
+| Lend (resume a frozen guest until it is Ready) | about 4 s; the first lend of a new guest is a cold start (tens of seconds, more if the image is not yet on the node) |
+| Trainer step time | unchanged within run-to-run noise (the reclaim fits inside the trainer's wait for rollouts, about 200 s per step) |
+| Trainer GPU busy time | about 47% without time-slicing, about 85% with it |
+
+Busy time counts the seconds in which some kernel ran, not how much of the GPU
+was used: with a light batch load (2 short requests per second) the guest kept
+its model on the GPU and answered every request, but used few SMs. A busier
+guest uses more of the lent time.
+
+The full report, with the run data and the analysis script, is published
+separately from this repository.
+
+## 5. Batch traffic: llm-d-async and the router
+
+Install llm-d-async and the llm-d router with their own charts, unchanged;
+label only the model server pods. A guest is frozen for the length of a
+trainer update (minutes), so check two timeouts:
+
+- **Router route timeout**: Envoy's default is 15 s. Set the route `timeout`
+  to `0s` (or above your longest update) and the `idle_timeout` above the
+  longest update.
+- **Async processor request timeout**: the default (5 minutes) covers updates
+  up to about 4 minutes. Requests that time out are retried until their
+  deadline, so none are lost, but they take longer.
+
+## 6. Observe it
+
+```bash
+kubectl get nodes -l type=virtual-kubelet                     # one virtual node per trainer node
+kubectl get pods -l timeslice.io/guest=true -o wide -w        # guests on the virtual nodes
+kubectl -n timeslice-system logs ds/timeslice-guest-kubelet -f | grep 'host command'
+kubectl logs <rayjob submitter pod> | grep '\[timeslice\]'    # ACQUIRE / RELEASE per step
+```
+
+Each step shows one reclaim (`host command done ... COMMAND_VACATE`, with the
+`SuspendAll` duration) and one lend (`COMMAND_RESUME`, then `guest Ready`). The
+`ACQUIRE ... waited=Nms` line is the time the trainer waited for its GPU. The
+`gpu-metrics` exporter in the chart serves 1 s DCGM samples on port 9400 of
+every GPU node.
+
+## 7. Limits and open items
+
+- One trainer pod per trainer node; that node runs no other GPU pods.
+- The verl plugin targets verl's fully-async mode, through a pinned verl fork
+  with lifecycle hooks (see the quickstart, section 5).
+- **Scrub policy on non-L4 GPUs.** The snapshot agent will freeze a guest only
+  if it can trust the GPU to hand out zeroed memory, which is qualified per GPU
+  model and driver (default: L4 with driver 580). On other GPUs, set
+  `snapshot-agent.scrubPolicy=flag`: the agent then zeroes the freed memory
+  itself. Without it, guests are killed at each reclaim and cold-start at the
+  next lend.
+- After a trainer pod ends, its node's virtual node stays `Ready` for the era
+  TTL (15 minutes by default) in case a new trainer arrives. A guest scheduled
+  there in that time stays `Pending`; delete it and let its Deployment
+  re-create it. After the TTL the virtual node goes `NotReady` and is left in
+  place; delete it with `kubectl delete node` if you want it gone.
+- A guest frozen before it has ever answered a request is deleted instead of
+  suspended; its Deployment re-creates it (a cold start).
+
+---
+
+## Appendix A: the DRA shared-claim path (previous version)
+
+This is the previous version of this guide, unchanged except for heading levels. It time-slices the trainer GPU through a shared DRA ResourceClaim, with a supervisor container in the batch pod that sleeps and wakes vLLM. Its example manifests are in [examples/](examples/README.md).
 
 This guide is a step-by-step walkthrough for time-slicing **one verl
 `fully_async_policy` RL training job** with **a batch-inference server** on
@@ -50,7 +213,7 @@ and a load generator, launchable in a handful of commands — is in
 
 ---
 
-## Table of Contents
+### Table of Contents
 1. [Cluster Prerequisites](#1-cluster-prerequisites)
 2. [Deploy the Time-Slicing Platform](#2-deploy-the-time-slicing-platform)
 3. [Integrate Your RL Workload](#3-integrate-your-rl-workload)
@@ -61,7 +224,7 @@ and a load generator, launchable in a handful of commands — is in
 
 ---
 
-## 1. Cluster Prerequisites
+### 1. Cluster Prerequisites
 
 Before deploying, ensure your environment meets the following requirements:
 
@@ -79,7 +242,7 @@ Before deploying, ensure your environment meets the following requirements:
 * **Two 1-GPU nodes minimum**: one **shared trainer node** (RL head pod +
   batch server pod, one GPU between them) and one dedicated RL rollout node.
 
-### Node Labeling and Time-Slice Groups
+#### Node Labeling and Time-Slice Groups
 
 The orchestrator discovers resource pools (*groups*) from node labels. Jobs
 in the same group take turns holding the group's accelerator lock. The
@@ -126,7 +289,7 @@ On clusters with GPU nodes beyond the recipe's, rollouts may schedule onto
 any free GPU node; operators running amid other workloads should scope
 their GPU pool (e.g. with their own labels/taints).
 
-### Shared DRA Resource Claim
+#### Shared DRA Resource Claim
 
 Cooperative time-slicing leverages Kubernetes **Dynamic Resource Allocation
 (DRA)** so multiple tenants' pods can share physical GPU hardware without
@@ -166,7 +329,7 @@ file as `examples/resource-claims.yaml`):
 kubectl apply -f resource-claims.yaml
 ```
 
-### Host-RAM Sizing Rule
+#### Host-RAM Sizing Rule
 
 Everything yielded on the shared node lands in host RAM, so size the trainer
 node for BOTH tenants' offloads:
@@ -181,14 +344,14 @@ node for BOTH tenants' offloads:
 
 ---
 
-## 2. Deploy the Time-Slicing Platform
+### 2. Deploy the Time-Slicing Platform
 
 Deploy the core platform components — **TimeSlice Orchestrator** (Deployment:
 the gRPC lock service) and **Snapshot Agent** (DaemonSet on the time-sliced
 nodes: performs each tenant's snapshot/restore when the orchestrator hands
 the lock over) — using the parent Helm chart.
 
-### Step 1: Clone the Repository
+#### Step 1: Clone the Repository
 
 ```bash
 git clone https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git
@@ -209,7 +372,7 @@ cd llm-d-rl-time-slicing
 > cuda-checkpointing it (the official images at `latest`, the chart default,
 > do).
 
-### Step 2: Install the Helm Chart
+#### Step 2: Install the Helm Chart
 
 Install into a dedicated namespace (`timeslice-system`), pinning the
 node-level platform components to `timeslice.io/enabled` nodes:
@@ -244,7 +407,7 @@ workload: standard scheduling, no special machinery.
 > on an existing release name. (Note: uninstalling also removes the bundled
 > NVIDIA DRA driver DaemonSet until you reinstall.)
 
-### Step 3: Verify Platform Health
+#### Step 3: Verify Platform Health
 
 Verify the orchestrator is Running, and that an agent pod and a
 `nvidia-dra-driver-gpu-kubelet-plugin` pod run on the trainer node — and
@@ -276,9 +439,9 @@ rollout pod is unlabeled on another node.
 
 ---
 
-## 3. Integrate Your RL Workload
+### 3. Integrate Your RL Workload
 
-### How It Works
+#### How It Works
 
 The `llm-d-timeslice-verl` package ships `TimesliceFullyAsyncTrainer`, a
 subclass of verl's `fully_async_policy` trainer that overrides the trainer's
@@ -302,7 +465,7 @@ Lock protocol:
 | a batch of samples is ready | ACQUIRE (this is the resume point) |
 | weight update + param sync done | YIELD |
 
-### Placement-Group Pinning
+#### Placement-Group Pinning
 
 Pin trainer/rollout placement with Ray **custom resources** — start ray on
 the head with `--resources='{"trainer_node": 100}'`, on the worker with
@@ -312,7 +475,7 @@ placement-group bundle resources (hydra override
 so verl's trainer placement group requests `{trainer_node: 1}` and the
 rollout PG `{rollout_node: 1}`.
 
-### Installing verl (Pinned Fork)
+#### Installing verl (Pinned Fork)
 
 In each job pod (or your job image), clone the
 [`feat/fully-async-lifecycle-hooks`](https://github.com/aishukamal/verl/tree/feat/fully-async-lifecycle-hooks)
@@ -324,7 +487,7 @@ commits land upstream; once they do, point the install at mainline verl
 instead (the example manifests parameterize this as the `VERL_REPO`/`VERL_REF`
 pod envs).
 
-### Installing the `llm-d-timeslice-verl` Package
+#### Installing the `llm-d-timeslice-verl` Package
 
 Install the timeslice client and the integration package in every job pod
 (or bake them into your job image):
@@ -341,7 +504,7 @@ pip install --no-cache-dir --no-deps "llm-d-timeslice-verl @ git+https://github.
 > timeslice client it uses is installed separately (above), so there is
 > nothing for pip to resolve.
 
-### The Job Contract
+#### The Job Contract
 
 Every time-sliced verl job must carry this contract:
 
@@ -395,7 +558,7 @@ Every time-sliced verl job must carry this contract:
 
 ---
 
-## 4. The Batch Tenant and the Supervisor
+### 4. The Batch Tenant and the Supervisor
 
 Everything in §3 is the standard time-sliced verl setup. The ONE component
 this recipe adds is the batch tenant's side of the lock protocol: an RL
@@ -418,7 +581,7 @@ freezes. Two requirements, and they generalize to any batch engine:
    error (vllm#28714; requests sent to a sleeping engine crash it too,
    vllm#15483).
 
-### The Supervisor (Reference Implementation)
+#### The Supervisor (Reference Implementation)
 
 `examples/shadow-vllm.yaml` (EXAMPLE-ONLY, demo-quality) wraps **stock
 `vllm serve`** with a ~100-line supervisor script that adapts it to the
@@ -461,7 +624,7 @@ A handoff, end to end:
    the Service (connection refused — the pod is NotReady). Production
    clients should queue and retry — see §7.
 
-### Swapping In Your Engine or Model
+#### Swapping In Your Engine or Model
 
 - **Bigger batch model**: anything that fits in the engine's GPU-memory
   fraction (the example's `VLLM_GPU_FRAC`, default 0.7) of the shared GPU
@@ -477,9 +640,9 @@ A handoff, end to end:
 
 ---
 
-## 5. Deploy the Tenants
+### 5. Deploy the Tenants
 
-### The RL Job
+#### The RL Job
 
 Deploy the RL job as a **2-node Ray cluster**:
 
@@ -502,7 +665,7 @@ Deploy the RL job as a **2-node Ray cluster**:
   must land on (the example tolerates `nvidia.com/gpu` and
   `timeslice.io/shared=true:NoSchedule`).
 
-### The Batch Server Pod
+#### The Batch Server Pod
 
 * Schedule it on the SAME group-labeled trainer node and reference the SAME
   shared `ResourceClaim` as the RL head pod — the shared claim is what lets
@@ -516,7 +679,7 @@ Deploy the RL job as a **2-node Ray cluster**:
 * Front it with a regular Service; the supervisor's readiness gate controls
   endpoint membership during drains.
 
-### Launch Order
+#### Launch Order
 
 Start the **batch server first**, so it owns the GPU (and serves traffic)
 throughout the RL job's long CPU-side setup; then the RL job (both pods at
@@ -532,7 +695,7 @@ GPU (`nvidia.com/gpu: 1`). Neither path needs elevated pod permissions.
 
 ---
 
-## 6. Submit and Observe
+### 6. Submit and Observe
 
 Apply the batch tenant, the RL job, and your load in the order above
 (§5; the [example](examples/README.md) is the literal command sequence).
@@ -546,7 +709,7 @@ AGENT_POD=$(kubectl -n timeslice-system get pods -l app.kubernetes.io/name=snaps
 echo "$AGENT_POD"
 ```
 
-### Watch the Lock
+#### Watch the Lock
 
 Port-forward the orchestrator gRPC service and watch the shared pool with
 the `rlts` CLI (built in §2):
@@ -564,7 +727,7 @@ supervisor drains and yields within seconds, and the lock flips to the
 trainer for the training burst. The RL rollout never appears here — it takes
 no locks.
 
-### Watch the Logs
+#### Watch the Logs
 
 ```bash
 # lock handoffs: the integration package logs every acquire/release
@@ -585,7 +748,7 @@ kubectl logs <batch-pod> --tail=10
 kubectl -n timeslice-system logs "$AGENT_POD" --tail=100 | grep -i "cuda-checkpoint"
 ```
 
-### What Healthy Looks Like
+#### What Healthy Looks Like
 
 Batch throughput **alternates by design**: full throughput in every
 trainer-idle window, then a few-minutes-long window of fast failures during
@@ -607,7 +770,7 @@ Success criteria to check after ~3 training steps:
 
 ---
 
-## 7. Troubleshooting
+### 7. Troubleshooting
 
 Failures specific to the example's manifests are in the
 [example's troubleshooting section](examples/README.md#7-troubleshooting).

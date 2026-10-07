@@ -50,6 +50,7 @@ type Provider struct {
 	hook      func(*corev1.Pod)
 	creator   CreateOwner // nil: CreatePod creates the mirror itself (M1)
 	gate      Gate        // nil: every guest is admitted (D-NS-13 era gate)
+	prepull   Prepuller   // nil: the mirror pulls the guest's images at the first lend
 	// logged holds "<uid>/<message>" for the once-per-pod guest verdict lines.
 	logged sync.Map
 
@@ -81,6 +82,19 @@ func (p *Provider) WithAdmission(a *Admission) *Provider {
 		a.Rejected = NewRejectedSet()
 	}
 	p.admission = a
+	return p
+}
+
+// Prepuller pulls an admitted guest's images onto the host before its first mirror exists.
+// Prepull must not block; Forget stops the pull of a deleted guest.
+type Prepuller interface {
+	Prepull(ctx context.Context, guest *corev1.Pod)
+	Forget(guest *corev1.Pod)
+}
+
+// WithPrepull sets the image prepuller (nil: none) and returns p.
+func (p *Provider) WithPrepull(pp Prepuller) *Provider {
+	p.prepull = pp
 	return p
 }
 
@@ -156,6 +170,9 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 			return nil
 		}
 	}
+	if p.prepull != nil {
+		p.prepull.Prepull(ctx, pod)
+	}
 	if p.creator != nil {
 		log.G(ctx).WithField("pod", key(pod)).Debug("guest waits for the host command server to create its mirror")
 		p.creator.GuestWaiting(pod)
@@ -210,6 +227,9 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	if p.admission != nil {
 		p.admission.Rejected.Remove(pod.UID)
+	}
+	if p.prepull != nil {
+		p.prepull.Forget(pod)
 	}
 	return p.backend.Delete(ctx, pod)
 }

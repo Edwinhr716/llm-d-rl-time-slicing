@@ -192,3 +192,24 @@ func TestAdmit_RLIntegration_PythonPathEdges(t *testing.T) {
 		t.Errorf("%d replace ops, want 1", replaces)
 	}
 }
+
+func TestAdmit_RLIntegration_Verl(t *testing.T) {
+	cfg := mustConfig(t, append(append([]string{}, rlFlags...), "--rl-integration-verl"))
+	pod := kuberayDonor()
+	pod.Spec.Containers[0].Env = []corev1.EnvVar{{Name: webhook.EnvPythonPath, Value: "/app"}}
+	got := mustAllow(t, create(t, cfg, pod))
+	inits := got.Spec.InitContainers
+	ic := inits[len(inits)-1]
+	want := "cp -R " + webhook.RLIntegrationSource + " " + webhook.RLIntegrationVerlSource + " /timeslice-rl/"
+	if strings.Join(ic.Command, " ") != want {
+		t.Errorf("init command = %v, want %s", ic.Command, want)
+	}
+	verl := webhook.DefaultRLIntegrationPath + "/verl"
+	if pp, _ := env(&got.Spec.Containers[0], webhook.EnvPythonPath); pp != rlPython()+":"+verl+":/app" {
+		t.Errorf("PYTHONPATH = %q, want %s:%s:/app", pp, rlPython(), verl)
+	}
+	again := create(t, cfg, got)
+	if n := again.patchOps(t); n != 0 {
+		t.Errorf("reinvocation patched %d ops: %s", n, again.resp.Patch)
+	}
+}

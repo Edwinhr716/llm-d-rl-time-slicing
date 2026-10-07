@@ -21,7 +21,7 @@ WORKDIR /workspace
 COPY pkg/client/python /workspace/client-python
 
 # grpcio and protobuf are deliberately NOT pinned here. They are declared in
-# pkg/client/python/pyproject.toml (grpcio>=1.81.0, protobuf>=6.33.5), which is
+# pkg/client/python/pyproject.toml (grpcio>=1.66.0, protobuf>=6.33.5), which is
 # the single source of truth — 6.33.5 is exactly the gencode version baked into
 # the generated *_pb2.py stubs by ValidateProtobufRuntimeVersion. Restating a
 # different floor here is how the image silently drifts away from the stubs it

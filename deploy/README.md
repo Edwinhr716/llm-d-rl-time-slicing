@@ -15,8 +15,8 @@ The guest time-slicing subcharts `guest-kubelet/` (the virtual kubelet),
 `timeslice-webhook/` (admission webhook and policies), `donor-controller/` and
 `gpu-shadow/` (the GPU shadow device plugin for the guest kubelet's
 `--gpu-mode=pooled`) are **on by default**: together they are the shadow path
-described below. `gpu-metrics/` (a DCGM exporter for SM utilization) and the
-NVIDIA DRA driver are off by default. Each chart's `values.yaml` documents its
+described below. `gpu-metrics/` (a DCGM exporter with 1 s samples, including
+SM activity and occupancy) is also on by default; the NVIDIA DRA driver is off. Each chart's `values.yaml` documents its
 values. Set `createNamespace: false` to install into a namespace that already
 exists.
 
@@ -29,19 +29,32 @@ helm dependency update .
 helm upgrade --install timeslice . -n timeslice-system --create-namespace
 ```
 
+The defaults place the snapshot agent on GPU nodes only, detect each host's
+GPU model and memory in the guest kubelet, and pull a guest's images onto the
+host as soon as the guest is admitted (`guest-kubelet --prepull-images`), so the
+first lend does not wait for a pull.
+
 What each team does after that:
 
-*   **RL team** (trainer pods lend their GPUs while idle):
-    *   label the trainer pods `timeslice.io/donor: "true"`;
-    *   label the other pods of the same job that import the trainer plugin
-        (Ray head, rollout workers) `timeslice.io/rl-integration: "true"`;
+*   **RL team** (trainer pods lend their GPUs while idle), in a normal KubeRay
+    RayJob:
+    *   label the trainer worker group `timeslice.io/donor: "true"`;
+    *   add one rayStartParams `resources` line per worker group and
+        `ray_pg_extra_resources=...` (Ray placement pinning, so verl's trainer
+        lands on the donor group);
     *   set `async_training.trainer_name=timeslice`.
-    The webhook injects the timeslice Python packages (client and verl plugin) into
-    those pods through an init container (`timeslice-webhook.rlIntegration`), puts
-    them first on `PYTHONPATH`, and wires the donor pods to the orchestrator. The
-    RL image must provide Python >= 3.10, `grpcio`, `protobuf` >= 6 and a verl with
-    the fully-async lifecycle hooks; the injected packages are pure Python and
-    do not depend on torch.
+    At RayCluster creation the webhook (`timeslice-webhook.rayCluster`) labels
+    the head and the other worker groups for the RL integration and sets
+    `TIMESLICE_FULLY_ASYNC=1`, `TIMESLICE_JOB_ID`, `TIMESLICE_GROUP` and
+    `TIMESLICE_ORCH_ADDR` in every group (values you set are kept). Every pod of
+    that job then gets an init container (`timeslice-webhook.rlIntegration`) that
+    copies the timeslice Python packages (client and verl plugin) and a pinned verl
+    fork with the fully-async lifecycle hooks (verl 983cb0f2 + 2 commits, Apache-2.0,
+    `rlIntegration.injectVerl`, on by default) in front of `PYTHONPATH`. The RL
+    image must provide Python >= 3.10, `grpcio` and `protobuf` >= 6 (stock verl
+    images do). Donor pods also get their memory limit raised by one GPU's memory
+    per GPU (`timeslice-webhook.flags.donor-gpu-memory`, default: by GPU model),
+    because the trainer's checkpoint lands in pod memory.
 *   **Batch team**: label guest pods `timeslice.io/guest: "true"`. The webhook
     steers them onto the virtual nodes and gives them the pooled
     `timeslice.io/gpu-shadow` resource.
@@ -136,7 +149,7 @@ helm upgrade --install timeslice . -n timeslice-system --create-namespace
 
 ### 4. Deploying on GKE GPU Clusters
 
-To deploy the system on a GKE cluster with GPU nodes, you should use the GKE-specific configuration file `values-gke.yaml` to apply GKE-specific defaults (such as node selectors).
+The defaults already keep the snapshot agent on GPU nodes (GKE's `cloud.google.com/gke-accelerator` label or NVIDIA feature discovery's `nvidia.com/gpu.present=true`). `values-gke.yaml` is optional: it pins the agent with a `nodeSelector` instead.
 
 The `values-gke.yaml` file contains:
 *   **Target GKE GPU Nodes**: Targets nodes labeled with `cloud.google.com/gke-gpu=true`.

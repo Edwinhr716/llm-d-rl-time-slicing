@@ -4,7 +4,9 @@
 
 # Create the timeslice-system Namespace. Set false when the release installs
 # into a namespace that already exists (for example a second, independent
-# install whose subcharts set their own namespace).
+# install whose subcharts set their own namespace). Skipped when the release
+# itself is installed in timeslice-system (`-n timeslice-system
+# --create-namespace`): Helm creates that namespace.
 createNamespace: true
 
 # Override values for the timesliceorchestrator subchart
@@ -26,6 +28,16 @@ snapshot-agent:
   enabled: true
   image:
     tag: latest
+  # GPU nodes only (GKE accelerator label, or the NVIDIA GPU feature discovery label), so a
+  # default install needs no cloud-specific values file. The terms are ORed.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - {key: cloud.google.com/gke-accelerator, operator: Exists}
+          - matchExpressions:
+              - {key: nvidia.com/gpu.present, operator: In, values: ["true"]}
   tolerations:
     - key: "nvidia.com/gpu"
       operator: "Equal"
@@ -112,9 +124,10 @@ donor-controller:
     # Remove a timeslice.io/gpu-fence taint whose guest kubelet is gone.
     clear-stale-fences: "true"
 
-# DCGM exporter on GPU hosts (SM active, SM occupancy, GPU utilization).
+# DCGM exporter on GPU hosts (SM active, SM occupancy, GPU utilization),
+# sampled every second.
 gpu-metrics:
-  enabled: false
+  enabled: true
 
 # The GPU shadow device plugin, on the donor hosts only.
 gpu-shadow:

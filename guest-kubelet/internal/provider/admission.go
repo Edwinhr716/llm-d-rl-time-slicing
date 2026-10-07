@@ -230,3 +230,41 @@ func (s *RejectedSet) Remove(uid types.UID) {
 	defer s.mu.Unlock()
 	delete(s.uids, uid)
 }
+
+// DefaultGPUAllowlist is the --gpu-allowlist default: the GPU models guests have been validated on.
+const DefaultGPUAllowlist = "nvidia-l4,nvidia-h100-80gb,nvidia-h100-mega-80gb,nvidia-h100-80gb-hbm3"
+
+// GPUMemoryAuto is the --gpu-memory value that picks the device memory from the host's GPU model.
+const GPUMemoryAuto = "auto"
+
+// FallbackGPUMemory is the auto device memory of a host whose model is not in HostGPUMemory: the
+// largest common size, so the mirror's reserve is never too small on 80 GB parts.
+const FallbackGPUMemory = "81920Mi"
+
+// HostGPUMemory is the usable device memory of one GPU (what nvidia-smi reports as total), by
+// normalized model (NormalizeGPUModel).
+var HostGPUMemory = map[string]string{
+	"nvidia-tesla-t4":       "15360Mi",
+	"nvidia-l4":             "23034Mi",
+	"nvidia-tesla-a100":     "40960Mi",
+	"nvidia-a100-sxm4-40gb": "40960Mi",
+	"nvidia-a100-80gb":      "81920Mi",
+	"nvidia-a100-sxm4-80gb": "81920Mi",
+	"nvidia-h100-80gb":      "81559Mi",
+	"nvidia-h100-mega-80gb": "81559Mi",
+	"nvidia-h100-80gb-hbm3": "81559Mi",
+	"nvidia-h200-141gb":     "143771Mi",
+}
+
+// ResolveGPUMemory turns the --gpu-memory value into a quantity string: a quantity is returned
+// as is; auto looks the host model up in HostGPUMemory and reports whether it fell back to
+// FallbackGPUMemory.
+func ResolveGPUMemory(setting, hostModel string) (value string, fallback bool) {
+	if setting != GPUMemoryAuto {
+		return setting, false
+	}
+	if v, ok := HostGPUMemory[NormalizeGPUModel(hostModel)]; ok {
+		return v, false
+	}
+	return FallbackGPUMemory, true
+}

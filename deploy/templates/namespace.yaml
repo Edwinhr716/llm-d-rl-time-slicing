@@ -1,5 +1,8 @@
 # Template directives sit in comments so the file stays valid YAML for linters.
-# {{- if .Values.createNamespace }}
+# The Namespace object is skipped when the release itself lives in timeslice-system: Helm needs that
+# namespace before it renders (`-n timeslice-system --create-namespace` creates it), and a second
+# Namespace object would fail the install with "already exists".
+# {{- if and .Values.createNamespace (ne .Release.Namespace "timeslice-system") }}
 apiVersion: v1
 kind: Namespace
 metadata:
