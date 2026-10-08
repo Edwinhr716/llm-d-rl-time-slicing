@@ -11,8 +11,28 @@ dependencies:
   - name: snapshot-agent
     version: 0.1.0
     repository: "file://./snapshot-agent"
-  - name: nvidia-dra-driver-gpu
-    version: 25.8.0
-    repository: "https://helm.ngc.nvidia.com/nvidia"
-    condition: nvidia-dra-driver-gpu.enabled
-
+  # Guest time-slicing components, off by default: the guest kubelet, the
+  # admission webhook and the donor controller. gpu-metrics is a DCGM exporter
+  # for SM utilization on GPU hosts.
+  - name: guest-kubelet
+    version: 0.1.0
+    repository: "file://./guest-kubelet"
+    condition: guest-kubelet.enabled
+  - name: timeslice-webhook
+    version: 0.1.0
+    repository: "file://./timeslice-webhook"
+    condition: timeslice-webhook.enabled
+  - name: donor-controller
+    version: 0.1.0
+    repository: "file://./donor-controller"
+    condition: donor-controller.enabled
+  # The GPU shadow device plugin for the guest kubelet's --gpu-mode=pooled
+  # (no DRA driver needed). Needs timeslice-webhook.shadowPolicy (W11).
+  - name: gpu-shadow
+    version: 0.1.0
+    repository: "file://./gpu-shadow"
+    condition: gpu-shadow.enabled
+  - name: gpu-metrics
+    version: 0.1.0
+    repository: "file://./gpu-metrics"
+    condition: gpu-metrics.enabled

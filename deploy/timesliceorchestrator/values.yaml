@@ -1,15 +1,131 @@
 replicaCount: 1
 
+# Namespace for the Deployment, Service, ServiceAccount and bindings. Keep the
+# default unless you run a second, independent orchestrator install.
+namespace: timeslice-system
+
+# Recreate stops the old pod before the new one starts, so two orchestrator
+# replicas never run at once and never both act on the lock ConfigMap during
+# an upgrade. A RollingUpdate would briefly run two.
+strategy:
+  type: Recreate
+
+# Where group lock holders are persisted. Each orchestrator install in a
+# cluster needs its own ConfigMap; two installs sharing one fight over the same
+# groups. namespace "" = the chart namespace above. configMap "" = the
+# orchestrator's default name (timeslice-orchestrator-locks). The chart grants
+# ConfigMap access in the lock namespace.
+lock:
+  namespace: ""
+  configMap: ""
+
+# What this orchestrator watches. Defaults watch everything, as before.
+#   watchNamespaces: pods are watched only in these namespaces; pods elsewhere
+#     join no group. [] = all namespaces.
+#   nodeSelector: label selector (kubectl syntax, e.g. "pool=demo") limiting the
+#     nodes this orchestrator sees; nodes outside it contribute to no group and
+#     pods bound to them are ignored. Group membership still comes from the
+#     group.timeslice.io/<group> node label. "" = all nodes. Not to be confused
+#     with the pod-scheduling nodeSelector further down.
+#     The selector must select every real host that carries the group label;
+#     mirrors are bound there. See examples/ for the two label layouts.
+#   nodeSelectorExemptBackground: keep pods labelled timeslice.io/role=background
+#     in their group even when they are bound to a node outside nodeSelector.
+#     Only pods are exempt: such a node still contributes to no group. false =
+#     they are dropped like any other pod. No effect without nodeSelector.
+scope:
+  watchNamespaces: []
+  nodeSelector: ""
+  nodeSelectorExemptBackground: false
+
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator
   pullPolicy: Always
-  tag: "latest"
+  # "" = global.imageTag from the parent chart (one tag for every platform
+  # image, e.g. a release's demo-<short sha>), else "latest".
+  tag: ""
 
 service:
   type: ClusterIP
   port: 50051
 
 snapshotAgentPort: 9001
+
+# Minimum serving quantum: the shortest time a job that has just acquired the
+# group lock and had its context restored is allowed to run before
+# GetGroupStatus advertises waiting jobs to it. Cooperative tenants poll that
+# field and yield as soon as it is non-zero, so without a quantum a tenant can
+# be pre-empted before it serves anything. "0s" disables it (default: previous
+# behaviour is unchanged).
+servingQuantum: "0s"
+
+# Alert threshold on a guest's off-window, the time it stays suspended while
+# the RL job runs (flag --max-serving-offwindow). Past it the orchestrator logs
+# a warning and counts timeslice_guest_offwindow_exceeded_total; it never cuts
+# the RL job short. Requests held on a frozen guest start failing once the
+# off-window passes the request timeout of whatever holds them. "" = the
+# orchestrator default (4m); "0s" turns the alert off.
+maxServingOffwindow: ""
+
+# Host commands (D-NS-4 ns-push-vk, flag --host-command-port): the port of the
+# guest-kubelet host-command endpoint on every host of a group. A foreground
+# Acquire then commands each host to vacate by T and a lend commands it to
+# resume. 0 (default) = off: no flag is rendered and nothing changes. Each
+# guest-kubelet must list this orchestrator's pod IP (or its CIDR) in its
+# --host-command-allow; see guest-kubelet/deploy/daemonset.yaml.
+hostCommand:
+  port: 0
+
+# Bound on how long promotion of the next waiter is held while another job's
+# grant is unconsumed (granted, never seen on the accelerator); flag
+# --settle-timeout. "" = the orchestrator default (30s).
+settleTimeout: ""
+
+# Guest time-slicing (background role) flags. Each is rendered only when set, so
+# the defaults leave the orchestrator's own defaults in place.
+#   backgroundRole: --background-role, accept ROLE_BACKGROUND participants
+#     (guest kubelets). "" = not rendered (orchestrator default: off).
+#   lendPolicy: --lend-policy, when an idle group is lent to its background
+#     participant (for example "always").
+#   minBubble: --min-bubble, the shortest expected idle a Yield must announce
+#     for the group to be lent.
+#   noticeWindow / killBudget / backgroundLiveness: N, K and L
+#     (--notice-window, --kill-budget, --background-liveness).
+#   nodeGroupLabels: --node-group-labels, which node label layout names a
+#     group (see examples/).
+guest:
+  backgroundRole: ""
+  lendPolicy: ""
+  minBubble: ""
+  noticeWindow: ""
+  killBudget: ""
+  backgroundLiveness: ""
+  nodeGroupLabels: ""
+
+# Controller tuning: --controller-workers and --resync-period. "" / 0 = not
+# rendered (orchestrator defaults).
+controllerWorkers: 0
+resyncPeriod: ""
+
+# Extra orchestrator flags, passed as is after the ones above, e.g.
+#   extraArgs: ["--background-role=true", "--min-bubble=30s"]
+extraArgs: []
+
+# Prometheus scraping and alerting through Google Cloud Managed Service for
+# Prometheus (monitoring.googleapis.com/v1 CRDs). Both are off by default.
+#   podMonitoring: a PodMonitoring that scrapes the metrics port.
+#   rules: a Rules object with the TimesliceGuestOffwindowExceeded alert, which
+#     fires while a guest's off-window is over --max-serving-offwindow
+#     (timeslice_max_serving_offwindow_seconds), and
+#     TimesliceAgentUnreachable, which fires while a grant waits on an
+#     unreachable snapshot agent.
+monitoring:
+  podMonitoring:
+    enabled: false
+    interval: 15s
+  rules:
+    enabled: false
+    agentUnreachableFor: 1m
 
 resources: {}
   # limits:
@@ -19,6 +135,7 @@ resources: {}
   #   cpu: 100m
   #   memory: 128Mi
 
+# Scheduling of the orchestrator pod itself.
 nodeSelector: {}
 tolerations: []
 affinity: {}

@@ -1,0 +1,50 @@
+# W11: nobody but the virtual kubelet may request a GPU shadow resource
+# (timeslice.io/gpu-shadow, pooled, or timeslice.io/gpu-shadow-<minor>, per GPU). The shadow
+# device plugin advertises the GPUs a donor already holds through nvidia.com/gpu; any other pod
+# that got one would share the donor's GPU outside the orchestrator's lend and reclaim cycle.
+# Cluster-wide on purpose: unlike the pods policy (policy.yaml) there is no namespaceSelector and
+# no label match, because the pod to stop carries neither. The webhook (W11) gives the same
+# answer for the labelled pods it sees; this policy is the guard that does not depend on it.
+# Placeholder __VK_USERNAME__ as in policy.yaml.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: timeslice-webhook-gpu-shadow
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: not-the-virtual-kubelet
+      expression: "request.userInfo.username != '__VK_USERNAME__'"
+  variables:
+    - name: asksShadow
+      expression: >-
+        object.spec.containers.exists(c, has(c.resources) &&
+        ((has(c.resources.requests) && c.resources.requests.exists(r,
+        r == 'timeslice.io/gpu-shadow' || r.startsWith('timeslice.io/gpu-shadow-'))) ||
+        (has(c.resources.limits) && c.resources.limits.exists(r,
+        r == 'timeslice.io/gpu-shadow' || r.startsWith('timeslice.io/gpu-shadow-'))))) ||
+        (has(object.spec.initContainers) && object.spec.initContainers.exists(c, has(c.resources) &&
+        ((has(c.resources.requests) && c.resources.requests.exists(r,
+        r == 'timeslice.io/gpu-shadow' || r.startsWith('timeslice.io/gpu-shadow-'))) ||
+        (has(c.resources.limits) && c.resources.limits.exists(r,
+        r == 'timeslice.io/gpu-shadow' || r.startsWith('timeslice.io/gpu-shadow-'))))))
+  validations:
+    - expression: "!variables.asksShadow"
+      message: >-
+        [W11] timeslice.io/gpu-shadow and timeslice.io/gpu-shadow-* are requested only by the
+        virtual kubelet on mirror pods; request nvidia.com/gpu instead
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: timeslice-webhook-gpu-shadow
+spec:
+  policyName: timeslice-webhook-gpu-shadow
+  validationActions: [Deny]

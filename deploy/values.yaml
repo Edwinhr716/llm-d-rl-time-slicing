@@ -2,17 +2,52 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
+# Create the timeslice-system Namespace. Set false when the release installs
+# into a namespace that already exists (for example a second, independent
+# install whose subcharts set their own namespace). Skipped when the release
+# itself is installed in timeslice-system (`-n timeslice-system
+# --create-namespace`): Helm creates that namespace.
+createNamespace: true
+
+global:
+  # One tag for every platform image (orchestrator, snapshot agent, guest
+  # kubelet, webhook, RL integration, donor controller, shadow device plugin),
+  # unless a component sets its own image.tag. "demo-batch" is the moving tag
+  # CI publishes on every merge to the demo/batch branch, so an install from a
+  # clone of that branch needs no tag. "" = "latest", which follows main. Pin
+  # it for a reproducible install, for example to the release CI published for
+  # the commit you cloned:
+  #   --set global.imageTag=demo-$(git rev-parse --short=7 HEAD)
+  # (see .github/workflows/ci-release.yaml for the tag scheme).
+  imageTag: "demo-batch"
+
 # Override values for the timesliceorchestrator subchart
 timesliceorchestrator:
   enabled: true
-  # You can add specific overrides here, for example:
-  # replicaCount: 2
+  # Guest time-slicing (shadow path): accept guest kubelets as background
+  # participants, lend every idle group, read the donor controller's ns
+  # labels, and push Vacate/Resume to the guest kubelets on hostCommand.port
+  # (the same port as guest-kubelet.flags.host-command-port).
+  hostCommand:
+    port: 9002
+  guest:
+    backgroundRole: "true"
+    lendPolicy: always
+    nodeGroupLabels: either
 
 # Override values for the snapshot-agent subchart
 snapshot-agent:
   enabled: true
-  image:
-    tag: latest
+  # GPU nodes only (GKE accelerator label, or the NVIDIA GPU feature discovery label), so a
+  # default install needs no cloud-specific values file. The terms are ORed.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - {key: cloud.google.com/gke-accelerator, operator: Exists}
+          - matchExpressions:
+              - {key: nvidia.com/gpu.present, operator: In, values: ["true"]}
   tolerations:
     - key: "nvidia.com/gpu"
       operator: "Equal"
@@ -22,35 +57,70 @@ snapshot-agent:
       operator: "Equal"
       value: "true"
       effect: "NoSchedule"
+    # The guest kubelet's fence on a donor host must not keep the agent off.
+    - key: "timeslice.io/gpu-fence"
+      operator: "Exists"
+      effect: "NoSchedule"
 
-# Override values for the nvidia-dra-driver-gpu subchart
-nvidia-dra-driver-gpu:
+# Guest time-slicing, shadow path (the default): no DRA driver. GPU nodes keep
+# GKE's stock nvidia.com/gpu device plugin; the RL donor pods ask
+# nvidia.com/gpu as usual and carry timeslice.io/donor: "true"; guests carry
+# timeslice.io/guest: "true" and ask nvidia.com/gpu.
+#   donor-controller  labels a donor pod's node timeslice.io/donor=true and
+#                     timeslice.io/group=<group> (label-keys ns);
+#   gpu-shadow        on those nodes advertises timeslice.io/gpu-shadow, the
+#                     GPUs the node's single nvidia.com/gpu holder holds;
+#   guest-kubelet     on those nodes registers a virtual Node whose
+#                     nvidia.com/gpu follows that resource (gpu-mode pooled)
+#                     and runs each guest as a mirror pod asking for it;
+#   timeslice-webhook wires donors (TIMESLICE_* env), steers guests, and its
+#                     cluster-wide CEL policy (W11) lets only the guest kubelet
+#                     ask for timeslice.io/gpu-shadow.
+# Cross-references (the webhook's vk-service-account and orchestrator-addr,
+# the donor controller's orchestrator-addr) default to this release's objects
+# in the chart namespace; pods are watched in every namespace.
+guest-kubelet:
   enabled: true
-  namespaceOverride: "timeslice-system"
-  nvidiaDriverRoot: "/home/kubernetes/bin/nvidia/" # Use "/opt/nvidia" for Ubuntu nodes
+  flags:
+    gpu-mode: pooled
+    gpu-donor-selector: "timeslice.io/donor=true"
+    # Mirrors in the guest's namespace carry an opaque group token, not the
+    # donor's namespace (the orchestrator matches tokens).
+    mirror-group-label: token
+    guest-budget: computed
+    group-source: either
+    # Same port as timesliceorchestrator.hostCommand.port. host-command-allow
+    # "" accepts every caller: set it to the orchestrator pod IP or CIDR.
+    host-command-port: 9002
+    freezer: agent
+timeslice-webhook:
+  enabled: true
+  flags:
+    donor-client-wiring: env
+  # Off: RL jobs run the prebuilt verl image
+  # (ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/verl), which has the verl
+  # fork and the timeslice packages built in. For a stock verl image, install
+  # with -f values-inject-verl.yaml so the webhook injects them into the RL
+  # pods (donors and timeslice.io/rl-integration=true pods); see the chart's
+  # values.yaml.
+  rlIntegration:
+    enabled: false
+donor-controller:
+  enabled: true
+  flags:
+    label-keys: ns
+    # Delete a virtual Node whose host Node is gone (a recreated host).
+    release-dead-hosts: "true"
+    # Remove a timeslice.io/gpu-fence taint whose guest kubelet is gone.
+    clear-stale-fences: "true"
 
-  gpuResourcesEnabledOverride: true
-  resources:
-    computeDomains:
-      enabled: false
-  kubeletPlugin:
-    priorityClassName: ""
-    tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Exists"
-        effect: "NoSchedule"
-      - key: "timeslice.io/shared"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
-    affinity:
-      nodeAffinity:
-        requiredDuringSchedulingIgnoredDuringExecution:
-          nodeSelectorTerms:
-          - matchExpressions:
-            - key: "cloud.google.com/gke-gpu"
-              operator: "In"
-              values:
-              - "true"
+# DCGM exporter on GPU hosts (SM active, SM occupancy, GPU utilization),
+# sampled every second.
+gpu-metrics:
+  enabled: true
 
-
+# The GPU shadow device plugin, on the donor hosts only.
+gpu-shadow:
+  enabled: true
+  nodeSelector:
+    timeslice.io/donor: "true"

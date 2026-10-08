@@ -5,7 +5,9 @@ import warnings
 
 from timeslice.orchestrator._generated import timeslice_orchestrator_pb2 as timeslice_dot_orchestrator_dot___generated_dot_timeslice__orchestrator__pb2
 
-GRPC_GENERATED_VERSION = '1.81.0'
+# Lowered from 1.81.0: this module uses no gRPC API newer than 1.66 (grpcio-tools 1.66.2 generates the
+# same calls), and common RL images (verl) ship grpcio 1.80. Keep in sync when regenerating.
+GRPC_GENERATED_VERSION = '1.66.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -69,6 +71,8 @@ class TimeSliceOrchestratorServiceServicer:
         If the group is idle and the job's context is already RUNNING on the accelerator,
         it returns immediately. Otherwise, it queues the job and waits for the current
         locking_job to yield, then drives the snapshot/restore cycle.
+        With ROLE_BACKGROUND it never queues: it blocks until the node is lent to
+        the background participant and no notice is running.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

@@ -11,6 +11,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/backends"
+	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/cgroup"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/features"
 	sm "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/state-machine"
 	podutils "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/utils"
@@ -30,27 +31,35 @@ type Server struct {
 	deploymentMode  string
 	channelRegistry *backends.ChannelRegistry
 	featureGates    features.Gates
+	// guest runs the Suspend and Resume pipelines; nil until StartServer
+	// wires it.
+	guest *guestPipeline
+	// killer runs Kill; it shares the scrub step with guest.
+	killer *killer
 }
 
 // NewServer creates a new Server instance. channelRegistry is shared with
 // the app-channel backend so workloads registered through the
 // WorkloadChannel RPC are reachable by Snapshot/Restore. featureGates
 // selects which experimental capabilities are enabled; nil means every
-// gate at its default (experimental capabilities off).
+// gate at its default (experimental capabilities off). stateOpts configure
+// the server's StateManager.
 func NewServer(
 	backendMap map[backends.BackendType]backends.Backend,
 	defaultBackend backends.BackendType,
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
 	featureGates features.Gates,
+	stateOpts ...sm.Option,
 ) *Server {
 	return &Server{
-		state:           sm.NewStateManager(),
+		state:           sm.NewStateManager(stateOpts...),
 		backendMap:      backendMap,
 		defaultBackend:  defaultBackend,
 		deploymentMode:  deploymentMode,
 		channelRegistry: channelRegistry,
 		featureGates:    featureGates,
+		killer:          newKiller(),
 	}
 }
 
@@ -458,8 +467,11 @@ func (s *Server) GetOperation(ctx context.Context, req *pb.GetOperationRequest) 
 	}
 
 	resp := &pb.GetOperationResponse{
-		Status:    op.Status,
-		ElapsedMs: elapsed,
+		Status:          op.Status,
+		ElapsedMs:       elapsed,
+		Outcome:         op.Outcome,
+		ErrorReason:     op.ErrorReason,
+		HostBytesPinned: op.HostBytesPinned,
 	}
 
 	if op.Status == pb.OperationStatus_OPERATION_STATUS_COMPLETE {
@@ -472,6 +484,15 @@ func (s *Server) GetOperation(ctx context.Context, req *pb.GetOperationRequest) 
 	if op.Status == pb.OperationStatus_OPERATION_STATUS_FAILED {
 		errStr := op.Error
 		resp.Error = &errStr
+	}
+	for _, t := range op.Targets {
+		resp.Targets = append(resp.Targets, &pb.TargetResult{
+			JobId:       t.JobID,
+			Status:      t.Status,
+			Outcome:     t.Outcome,
+			ErrorReason: t.ErrorReason,
+			Error:       t.Error,
+		})
 	}
 
 	return resp, nil
@@ -534,7 +555,9 @@ func (h *HealthServer) Watch(req *grpc_health_v1.HealthCheckRequest, stream grpc
 }
 
 // StartServer starts the gRPC server on the specified port. featureGates
-// may be nil, which leaves every gate at its default.
+// may be nil, which leaves every gate at its default. guestCfg configures
+// the Suspend, Resume and Kill pipelines and their shared scrub step; nil
+// means the defaults (scrub policy keep). stateOpts configure the StateManager.
 func StartServer(
 	ctx context.Context,
 	port int,
@@ -543,6 +566,8 @@ func StartServer(
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
 	featureGates features.Gates,
+	guestCfg *GuestConfig,
+	stateOpts ...sm.Option,
 ) error {
 	lc := net.ListenConfig{}
 	lis, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
@@ -557,14 +582,46 @@ func StartServer(
 	}
 
 	// 2. Create Server (which creates StateManager internally)
-	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry, featureGates)
+	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry, featureGates, stateOpts...)
 
 	// 3. Start the Watcher internally
 	watcher, err := NewWatcher(k8sClient, srv.state)
 	if err != nil {
 		return fmt.Errorf("failed to create watcher: %w", err)
 	}
+	// SuspendAll and ResumeAll find their targets in the watcher's
+	// node-scoped pod cache. Set before the server serves any call.
+	sm.WithTargetLister(watcher.LabelledJobs)(srv.state)
+	// Kill finds the job's pods in the watcher's cache.
+	if guestCfg == nil {
+		guestCfg = &GuestConfig{}
+	}
+	srv.killer.pods = watcher
+	srv.killer.cgroups = cgroup.New(guestCfg.CgroupRoot)
+	srv.killer.configure(&KillConfig{Scrub: guestCfg.Scrub})
+	// The GPU detection loop waits for restart recovery (step 5).
+	watcher.HoldDetection()
 	watcher.Start(ctx)
+
+	// 4. Wire the Suspend and Resume pipelines to the cuda-checkpoint
+	// backend, sharing its node lock with Snapshot and Restore.
+	if cuda, ok := backendMap[backends.BackendCuda].(*backends.CudaCheckpoint); ok {
+		srv.guest = newGuestPipeline(guestCfg, watcher, k8sClient, cuda)
+		// One scrub at a time on the node, whether Suspend or Kill runs it.
+		srv.guest.scrubGate = srv.killer.scrubGate
+	} else {
+		slog.WarnContext(ctx, "cuda-checkpoint backend not registered; Suspend and Resume are unavailable")
+	}
+
+	// 5. Restart recovery: observe every local job's state on the node and
+	// re-seed the host fences before serving any RPC.
+	if watcher.Synced() {
+		srv.recoverJobs(ctx, watcher.LocalJobs())
+		srv.seedHostEpochs(ctx, watcher.RoleEpochs())
+	} else {
+		slog.ErrorContext(ctx, "Restart recovery skipped: the pod cache did not sync")
+	}
+	watcher.ReleaseDetection()
 
 	s := grpc.NewServer()
 	pb.RegisterSnapshotAgentServiceServer(s, srv)

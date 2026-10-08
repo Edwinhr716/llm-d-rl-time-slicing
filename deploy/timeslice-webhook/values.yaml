@@ -1,0 +1,147 @@
+# Timeslice admission webhook (cmd/timeslice-webhook): the Deployment, its
+# Service, its TLS Secret, the MutatingWebhookConfiguration (donor and guest
+# entries) and the CEL ValidatingAdmissionPolicy for the pods it does not see.
+# Off by default in the parent chart. The raw manifests under manifests/ are
+# the same objects for a install without Helm.
+
+# Namespace for the Deployment, Service and Secret.
+namespace: timeslice-system
+
+image:
+  repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timeslice-webhook
+  pullPolicy: IfNotPresent
+  # "" = global.imageTag from the parent chart (one tag for every platform
+  # image, e.g. a release's demo-<short sha>), else "latest".
+  tag: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+# HTTPS port in the container. Use 10250 on a private GKE control plane
+# without a firewall rule for other ports; the Service always listens on 443.
+port: 8443
+
+# TLS for the webhook Service name <fullname>.<namespace>.svc.
+#   generate: true makes a CA and a serving certificate in Helm (no
+#     cert-manager, no manual Secret) and sets the caBundle. The Secret keeps
+#     the CA (ca.crt); an upgrade finds it with lookup and reuses the pair, so
+#     the caBundle and the pods stay as they are. rotate: true forces a new
+#     pair (the pods restart). Under helm template (no cluster) every render
+#     makes a new pair.
+#   generate: false uses the kubernetes.io/tls Secret secretName, signed by
+#     the CA in caBundle (base64 PEM).
+tls:
+  generate: true
+  rotate: false
+  validityDays: 3650
+  secretName: ""
+  caBundle: ""
+
+# Namespaces whose pods the webhook entries and the CEL policy check.
+# {} = every namespace except kube-system and the webhook's own.
+namespaceSelector: {}
+
+# failurePolicy per entry: a donor admitted without its job-id and group is
+# invisible to the orchestrator, so donors fail closed; a guest admitted as
+# written only loses its steering, so guests fail open.
+failurePolicy:
+  donor: Fail
+  guest: Ignore
+  # A Ray pod admitted without the RL integration fails at import: fail closed.
+  rl-integration: Fail
+  # A RayCluster admitted unwired runs without time-slicing (and without its
+  # Ray pods' plugin): fail open, so a webhook outage never blocks Ray clusters
+  # that do not use time-slicing.
+  raycluster: Ignore
+
+# RayCluster wiring. With enabled, the RL team labels only the trainer worker
+# group (timeslice.io/donor=true): at RayCluster creation the webhook labels
+# the head and the other worker groups timeslice.io/rl-integration=true and,
+# with donor-client-wiring=env and one donor group, sets TIMESLICE_FULLY_ASYNC=1,
+# TIMESLICE_JOB_ID, TIMESLICE_GROUP and TIMESLICE_ORCH_ADDR in every group (the
+# trainer's driver actor can run in any Ray pod of the job), plus
+# NCCL_CUMEM_ENABLE=0 and NCCL_NVLS_ENABLE=0 (no NCCL buffers cuda-checkpoint
+# cannot handle). Settings the user already has are kept. Needs no RBAC; harmless without KubeRay.
+rayCluster:
+  enabled: true
+
+# RL integration injection (--rl-integration-image). enabled: donor pods
+# (timeslice.io/donor=true) and pods labelled timeslice.io/rl-integration=true
+# (the Ray head and the non-donor worker groups of the same job: the job driver
+# and verl actors can run there) get an init container from this image that
+# copies the timeslice Python packages (the timeslice client and the
+# llm-d-timeslice-verl plugin, async_training.trainer_name=timeslice) into an
+# emptyDir mounted read-only at path in every container, with PYTHONPATH set to
+# <path>/python in front of the container's own PYTHONPATH. A third webhook
+# entry matches the opt-in label.
+# Image assumptions: the packages are pure Python (Python >= 3.10, no
+# compiled code, no torch dependency) and installed without dependencies, so
+# the RL image must already have grpcio and protobuf >= 6 (the generated
+# stubs' runtime floor) and a verl with the fully-async lifecycle hooks and
+# trainer registry. A PYTHONPATH the image sets in its Dockerfile ENV is
+# replaced, not extended (set it in the pod spec to keep it); a PYTHONPATH
+# from valueFrom is left alone (the injection then does not take effect).
+rlIntegration:
+  enabled: false
+  image:
+    repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/rl-integration
+    # "" = global.imageTag, else "latest" (same as image.tag).
+    tag: ""
+  # "" = /opt/timeslice-rl.
+  path: ""
+  # Also inject verl (--rl-integration-verl). Upstream verl does not yet have
+  # the fully-async lifecycle hooks and trainer registry the plugin needs; the
+  # image carries the verl package source of a fork that adds them (pinned
+  # commit, Apache-2.0, LICENSE and NOTICE under <path>/verl; see
+  # docker/rl-integration/Dockerfile). PYTHONPATH becomes
+  # <path>/python:<path>/verl:<yours>, so this verl replaces the RL image's own
+  # verl in the injected pods; verl's dependencies still come from the RL
+  # image. Set false when the RL image already has a verl with the hooks.
+  injectVerl: true
+
+# The CEL ValidatingAdmissionPolicy (W10, W6, W9, W2, W12) and its binding.
+policy:
+  enabled: true
+
+# The cluster-wide CEL policy W11: only the guest kubelet (flags.vk-service-account)
+# may create pods that request timeslice.io/gpu-shadow or timeslice.io/gpu-shadow-*.
+# Required with the shadow device plugin; harmless without it.
+shadowPolicy:
+  enabled: true
+
+# Webhook flags (pkg/webhook/config.go), one "--<key>=<value>" each, in key
+# order. "" = not rendered (the webhook default). --port and --cert-dir come
+# from the values above.
+flags:
+  # required | preferred: how a guest is steered to virtual Nodes.
+  guest-steering: ""
+  # <namespace>:<name> of the guest kubelet's ServiceAccount (W7); the CEL
+  # policies exempt the same identity. "" = the umbrella chart's guest kubelet
+  # in this namespace (<namespace>:<release>-guest-kubelet).
+  vk-service-account: ""
+  # How donors learn their job-id, group and orchestrator address.
+  donor-client-wiring: ""
+  # host:port of the orchestrator, injected into donors. "" = the umbrella
+  # chart's orchestrator Service in this namespace
+  # (<release>-timesliceorchestrator.<ns>.svc:50051).
+  orchestrator-addr: ""
+  virtual-node-label: ""
+  group-format: ""
+  podinfo-path: ""
+  # Per-GPU memory added to a donor container's memory limit, for the trainer's
+  # GPU memory checkpointed into host memory while the GPU is lent: auto (by
+  # the pod's GPU model nodeSelector, else 80Gi), 0 (off) or a quantity.
+  donor-gpu-memory: ""
+
+extraArgs: []
+
+resources:
+  requests: {cpu: 10m, memory: 32Mi}
+  limits: {memory: 128Mi}
+
+nodeSelector: {}
+tolerations: []
+# {} = spread the replicas over nodes (preferred anti-affinity).
+affinity: {}

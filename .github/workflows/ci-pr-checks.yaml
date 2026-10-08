@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - "demo/**"
 
 jobs:
   # Detect if PR contains code changes (skip expensive checks for docs-only PRs)

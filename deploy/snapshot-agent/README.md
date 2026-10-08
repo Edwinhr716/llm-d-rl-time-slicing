@@ -2,7 +2,7 @@
 
 This directory contains the Helm chart for deploying the Snapshot Agent DaemonSet in a Kubernetes cluster.
 
-Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` by CI: `latest` on every merge to main; versioned tags via a manual workflow run.
+Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` by CI: `latest` on every merge to main, `demo-<short sha>` plus a branch tag on release branches, versioned tags via a manual workflow run (see `deploy/README.md`). An empty `image.tag` uses the parent chart's `global.imageTag`, else `latest`.
 
 ## Prerequisites
 
@@ -50,6 +50,15 @@ To deploy the agent independently using the local Helm chart:
 
 *   `nvidia.driver.hostPath`: `/home/kubernetes/bin/nvidia` (Standard path for GPU drivers on GKE COS).
 *   `nvidia.devices.hostPath`: `/dev` (Standard path for device access).
+*   `cgroup.hostPath`: `/sys/fs/cgroup`, mounted read-write (cgroup v2
+    required; Suspend and Resume freeze and thaw guest pod cgroups).
+*   `vramZeroingQualified`: GPUs and driver branches on which Suspend is
+    allowed. Empty keeps the agent default, `NVIDIA L4:580`.
+*   `scrubPolicy`: VRAM handling at a handoff: `keep`, `ns-scrub` (scrub the
+    freed VRAM after every Suspend) or `flag`. The chart default, `flag`,
+    relies on driver zeroing on the GPUs in `vramZeroingQualified` and scrubs
+    the freed VRAM on every other GPU. Empty keeps the agent default, `keep`,
+    which refuses Suspend on unqualified GPUs.
 *   `tolerations`: Includes `nvidia.com/gpu` to allow the agent to run on GPU-tainted nodes.
 
 ### 3. Installation on GKE
