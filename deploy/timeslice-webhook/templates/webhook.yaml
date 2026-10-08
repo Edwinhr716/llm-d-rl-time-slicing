@@ -82,7 +82,7 @@ spec:
         # {{- end }}
       containers:
         - name: webhook
-          image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}'
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default (.Values.global | default dict).imageTag | default "latest" }}'
           imagePullPolicy: '{{ .Values.image.pullPolicy }}'
           command:
             - /timeslice-webhook

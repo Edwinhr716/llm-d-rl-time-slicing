@@ -30,7 +30,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: plugin
-          image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default (.Values.global | default dict).imageTag | default "latest" }}'
           imagePullPolicy: '{{ .Values.image.pullPolicy }}'
           args:
             # {{- include "gpu-shadow.flags" .Values.flags | nindent 12 }}

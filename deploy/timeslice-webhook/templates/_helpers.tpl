@@ -114,7 +114,7 @@ The flags with the derived defaults filled in (vk-service-account, orchestrator-
 {{- $_ := set $f "orchestrator-addr" (include "timeslice-webhook.orchestratorAddr" .) }}
 {{- if .Values.rlIntegration.enabled }}
 {{- $img := .Values.rlIntegration.image }}
-{{- $_ := set $f "rl-integration-image" (printf "%s:%s" $img.repository ($img.tag | default .Chart.AppVersion)) }}
+{{- $_ := set $f "rl-integration-image" (printf "%s:%s" $img.repository ($img.tag | default (.Values.global | default dict).imageTag | default "latest")) }}
 {{- with .Values.rlIntegration.path }}{{ $_ := set $f "rl-integration-path" . }}{{ end }}
 {{- if .Values.rlIntegration.injectVerl }}{{ $_ := set $f "rl-integration-verl" "true" }}{{ end }}
 {{- end }}

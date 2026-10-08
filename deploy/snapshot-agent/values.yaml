@@ -2,7 +2,9 @@
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/snapshot-agent
   pullPolicy: Always
-  tag: "latest"
+  # "" = global.imageTag from the parent chart (one tag for every platform
+  # image, e.g. a release's demo-<short sha>), else "latest".
+  tag: ""
 
 # Namespace for the DaemonSet and ServiceAccount. Keep the default unless you
 # run a second, independent install next to its own orchestrator.

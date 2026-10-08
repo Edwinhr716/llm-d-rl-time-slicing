@@ -11,8 +11,9 @@
 #   /opt/timeslice-rl/verl/LICENSE, NOTICE               verl's Apache-2.0 license and notice
 #
 # verl: upstream verl does not yet have the fully-async lifecycle hooks and trainer registry the
-# plugin needs. The image carries the verl package source of a fork that adds them, pinned to
-# VERL_COMMIT (upstream 983cb0f2 plus two commits). The webhook puts it on PYTHONPATH after the
+# plugin needs. The image carries the verl package source of a fork that adds them, pinned in
+# docker/verl/verl-pin.env (upstream 983cb0f2 plus two commits; docker/verl/Dockerfile, the verl
+# image with the integration built in, uses the same pin). The webhook puts it on PYTHONPATH after the
 # timeslice packages and before the RL image's own site-packages (--rl-integration-verl), so it
 # replaces the image's verl in those pods; verl's dependencies still come from the RL image.
 # This goes away once the hooks are upstream.
@@ -35,9 +36,14 @@ RUN pip install --no-cache-dir --no-deps --no-compile --target /out/python ./cli
 
 # --- verl stage: the pinned verl source ---
 FROM alpine/git:2.47.2 AS verl
-ARG VERL_REPO=https://github.com/aishukamal/verl.git
-ARG VERL_COMMIT=976b5f57f7e4872b6fa1aef36a6b6086eedff11c
-RUN git init /src && cd /src \
+# The pin lives in docker/verl/verl-pin.env (shared with docker/verl/Dockerfile);
+# these build args override it for one build.
+ARG VERL_REPO
+ARG VERL_COMMIT
+COPY docker/verl/verl-pin.env /verl-pin.env
+RUN set -eu; repo="${VERL_REPO:-}"; commit="${VERL_COMMIT:-}"; . /verl-pin.env; \
+    VERL_REPO="${repo:-$VERL_REPO}"; VERL_COMMIT="${commit:-$VERL_COMMIT}"; \
+    git init /src && cd /src \
  && git fetch --depth 1 "$VERL_REPO" "$VERL_COMMIT" && git checkout --detach FETCH_HEAD \
  && test "$(git rev-parse HEAD)" = "$VERL_COMMIT" \
  && mkdir -p /out/verl && cp -R verl /out/verl/verl && cp LICENSE /out/verl/LICENSE \

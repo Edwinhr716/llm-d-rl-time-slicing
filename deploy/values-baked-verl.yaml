@@ -1,0 +1,16 @@
+# Overlay for RL jobs that run the verl image with the timeslice integration
+# built in (ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/verl, built from
+# docker/verl/Dockerfile): the image already has the verl fork with the
+# lifecycle hooks, the timeslice client and the verl plugin, so the webhook
+# does not inject them.
+#
+#   helm install timeslice . -n timeslice-system --create-namespace -f values-baked-verl.yaml
+#
+# The webhook still wires the Ray pods (TIMESLICE_* env, NCCL settings, the
+# trainer's memory limit) and labels the head and rollout groups. Leave this
+# overlay out when the RL team keeps a stock verl image: the webhook then
+# injects the same verl fork and packages (rl-integration image), pinned to the
+# same commit (docker/verl/verl-pin.env).
+timeslice-webhook:
+  rlIntegration:
+    enabled: false

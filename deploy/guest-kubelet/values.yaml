@@ -8,7 +8,9 @@ namespace: timeslice-system
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/guest-kubelet
   pullPolicy: IfNotPresent
-  tag: "latest"
+  # "" = global.imageTag from the parent chart (one tag for every platform
+  # image, e.g. a release's demo-<short sha>), else "latest".
+  tag: ""
 
 nameOverride: ""
 fullnameOverride: ""

@@ -10,7 +10,9 @@ namespace: timeslice-system
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timeslice-webhook
   pullPolicy: IfNotPresent
-  tag: "latest"
+  # "" = global.imageTag from the parent chart (one tag for every platform
+  # image, e.g. a release's demo-<short sha>), else "latest".
+  tag: ""
 
 nameOverride: ""
 fullnameOverride: ""
@@ -85,7 +87,8 @@ rlIntegration:
   enabled: false
   image:
     repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/rl-integration
-    tag: "latest"
+    # "" = global.imageTag, else "latest" (same as image.tag).
+    tag: ""
   # "" = /opt/timeslice-rl.
   path: ""
   # Also inject verl (--rl-integration-verl). Upstream verl does not yet have

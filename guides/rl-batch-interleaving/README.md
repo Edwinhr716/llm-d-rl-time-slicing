@@ -364,11 +364,10 @@ cd llm-d-rl-time-slicing
 > from the clone. To pin a release, clone the repo at the release tag
 > (`git clone --branch <version> https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git`)
 > so the chart matches the pinned images, and pin the images with
-> `--set timesliceorchestrator.image.tag=<version> --set snapshot-agent.image.tag=<version>`
-> (the chart defaults pull the official
-> `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` images at `latest`).
-> Until the first tagged release is cut, `main` + `latest` is the only
-> option. One constraint specific to this recipe: whatever you pin, the
+> `--set global.imageTag=<version>` (the chart defaults pull the official
+> `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` images at `latest`; a
+> release branch's commits are also published as `demo-<short sha>`, see
+> `deploy/README.md`). One constraint specific to this recipe: whatever you pin, the
 > snapshot agent must support **per-job backend resolution** — the workload
 > channel is how the agent drives the batch engine's sleep/wake instead of
 > cuda-checkpointing it (the official images at `latest`, the chart default,

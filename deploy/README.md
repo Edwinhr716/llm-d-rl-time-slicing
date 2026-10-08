@@ -2,12 +2,32 @@
 
 This is the parent Helm chart that coordinates the deployment of both the **TimeSlice Orchestrator** and the **Snapshot Agent**.
 
-Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` by CI: `latest` on every merge to main; versioned tags via a manual workflow run.
+Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` by CI
+(`.github/workflows/ci-release.yaml`): `timesliceorchestrator`, `snapshot-agent`,
+`guest-kubelet`, `gpu-shadow-plugin`, `timeslice-webhook`, `donor-controller`,
+`rl-integration`, and `verl` (verl with the timeslice integration built in,
+`docker/verl/Dockerfile`). Tags:
+
+*   `latest` on every merge to main;
+*   on every push to a release branch (`demo`, `demo-*`, `demo/**`), or a manual
+    run on any other branch without a version: an immutable `demo-<short sha>`
+    and a moving tag named after the branch (`/` becomes `-`);
+*   a manual run with a version: that version.
+
+`global.imageTag` sets the tag of every platform image at once (a component's
+own `image.tag` wins); it defaults to `latest`. Pin it for a reproducible
+install, for example to the commit you cloned:
+
+```bash
+helm install timeslice . -n timeslice-system --create-namespace \
+  --set global.imageTag=demo-$(git rev-parse HEAD | cut -c1-7)
+```
 
 ## Directory Structure
 
 *   `Chart.yaml`: Defines the parent chart and its dependencies.
 *   `values.yaml`: Allows overriding configuration for both subcharts.
+*   `values-baked-verl.yaml`: Overlay for RL jobs on the prebuilt verl image (turns off the webhook's package injection).
 *   `timesliceorchestrator/`: Subchart for the TimeSlice Orchestrator.
 *   `snapshot-agent/`: Subchart for the Snapshot Agent DaemonSet.
 
@@ -78,12 +98,24 @@ How it fits together:
     derived from the release name and namespace; trainers and guests may live in
     any namespace.
 
-Images: CI publishes the orchestrator, snapshot agent and node supervisor. Until
-the other images are published, set the repositories of `guest-kubelet`,
-`timeslice-webhook`, `timeslice-webhook.rlIntegration`, `donor-controller` and
-`gpu-shadow` to your own registry (Dockerfiles: `guest-kubelet/Dockerfile`,
-`guest-kubelet/Dockerfile.gpu-shadow`, `docker/timeslice-webhook/`,
-`deploy/donor-controller/`, `docker/rl-integration/`).
+Prebuilt verl image: instead of the injection above, the RL team can run
+`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/verl` (stock
+`verlai/verl:vllm020.dev2` plus the same pinned verl fork, the timeslice client
+and verl plugin, TransferQueue and cupy-cuda12x). Install with
+`-f values-baked-verl.yaml` (`timeslice-webhook.rlIntegration.enabled=false`):
+the webhook then injects no packages but still sets the environment, the
+trainer's memory limit and the labels. Do not `pip install` verl at pod start
+with that image; it would replace the fork. Example:
+`guides/timeslice-quickstart/examples/rayjob-after-baked.yaml`.
+
+Images: CI publishes every image the chart uses (see the top of this page).
+To use your own registry, set the repositories of `timesliceorchestrator`,
+`snapshot-agent`, `guest-kubelet`, `timeslice-webhook`,
+`timeslice-webhook.rlIntegration`, `donor-controller` and `gpu-shadow`
+(Dockerfiles: `docker/timesliceorchestrator/`, `docker/snapshot-agent/`,
+`guest-kubelet/Dockerfile`, `guest-kubelet/Dockerfile.gpu-shadow`,
+`docker/timeslice-webhook/`, `deploy/donor-controller/`,
+`docker/rl-integration/`; build context is the repository root).
 
 ## Prerequisites
 
@@ -112,14 +144,15 @@ DRA is not required: the shadow path uses the device plugin, and the chart does 
 Example `values.yaml`:
 
 ```yaml
+global:
+  imageTag: demo-1a2b3c4   # every platform image
+
 timesliceorchestrator:
   replicaCount: 2
-  image:
-    tag: latest
 
 snapshot-agent:
   image:
-    tag: latest
+    tag: v0.1.0   # overrides global.imageTag for this component
 ```
 
 

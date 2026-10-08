@@ -9,6 +9,16 @@
 # --create-namespace`): Helm creates that namespace.
 createNamespace: true
 
+global:
+  # One tag for every platform image (orchestrator, snapshot agent, guest
+  # kubelet, webhook, RL integration, donor controller, shadow device plugin),
+  # unless a component sets its own image.tag. "" = "latest", which CI moves on
+  # every merge to main. Pin it for a reproducible install, for example to the
+  # release CI published for the commit you cloned:
+  #   --set global.imageTag=demo-$(git rev-parse --short=7 HEAD)
+  # (see .github/workflows/ci-release.yaml for the tag scheme).
+  imageTag: ""
+
 # Override values for the timesliceorchestrator subchart
 timesliceorchestrator:
   enabled: true
@@ -26,8 +36,6 @@ timesliceorchestrator:
 # Override values for the snapshot-agent subchart
 snapshot-agent:
   enabled: true
-  image:
-    tag: latest
   # GPU nodes only (GKE accelerator label, or the NVIDIA GPU feature discovery label), so a
   # default install needs no cloud-specific values file. The terms are ORed.
   affinity:

@@ -2,7 +2,7 @@
 
 This directory contains the Helm chart for deploying the TimeSlice Orchestrator in a Kubernetes cluster.
 
-Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` by CI: `latest` on every merge to main; versioned tags via a manual workflow run.
+Public images are published to `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` by CI: `latest` on every merge to main, `demo-<short sha>` plus a branch tag on release branches, versioned tags via a manual workflow run (see `deploy/README.md`). An empty `image.tag` uses the parent chart's `global.imageTag`, else `latest`.
 
 ## Prerequisites
 

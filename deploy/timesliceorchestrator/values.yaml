@@ -41,7 +41,9 @@ scope:
 image:
   repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator
   pullPolicy: Always
-  tag: "latest"
+  # "" = global.imageTag from the parent chart (one tag for every platform
+  # image, e.g. a release's demo-<short sha>), else "latest".
+  tag: ""
 
 service:
   type: ClusterIP

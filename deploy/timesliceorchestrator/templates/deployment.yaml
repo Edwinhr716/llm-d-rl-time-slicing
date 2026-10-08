@@ -22,7 +22,7 @@ spec:
       serviceAccountName: {{ include "timesliceorchestrator.serviceAccountName" . }}
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (.Values.global | default dict).imageTag | default "latest" }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--snapshot-agent-port={{ .Values.snapshotAgentPort }}"

@@ -26,7 +26,9 @@ pipeline. The whole setup is:
 
 The RL team keeps its stock verl image: **the platform's admission webhook
 injects the verl fork with the lifecycle hooks and the timeslice packages into
-the Ray pods** (see [section 5](#5-what-the-platform-injects)).
+the Ray pods** (see [section 5](#5-what-the-platform-injects)). Or it swaps in
+the prebuilt verl image that has all of that built in, and the webhook injects
+nothing (see [Use the prebuilt verl image](#use-the-prebuilt-verl-image)).
 
 A few settings beyond the labels remain; they are listed honestly in
 [section 6](#6-settings-beyond-the-labels).
@@ -58,7 +60,8 @@ A few settings beyond the labels remain; they are listed honestly in
   of the trainer's normal use.
 - The RL image: Python 3.10 or later with `grpcio` 1.66 or later and `protobuf` 6 or later
   (stock `verlai/verl` images have them). The platform brings the verl version
-  and plugin it needs (see [section 5](#5-what-the-platform-injects)).
+  and plugin it needs (see [section 5](#5-what-the-platform-injects)), or use
+  the prebuilt verl image (`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/verl`).
 - The batch server: anything that serves over HTTP and tolerates pauses of a
   few minutes. Put a queue in front of it (for example llm-d-async) so requests
   wait instead of failing.
@@ -66,13 +69,25 @@ A few settings beyond the labels remain; they are listed honestly in
 ## 2. Install the platform (cluster admin)
 
 ```bash
-git clone https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git
+# <DEMO_BRANCH> is a placeholder: the branch of this release in the upstream repo.
+git clone --branch <DEMO_BRANCH> https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git
 cd llm-d-rl-time-slicing/deploy
+# The images CI published for this commit (immutable tag demo-<short sha>).
+TAG=demo-$(git rev-parse HEAD | cut -c1-7)
 helm dependency update .
-helm install timeslice . -n timeslice-system --create-namespace
+helm install timeslice . -n timeslice-system --create-namespace --set global.imageTag=$TAG
 ```
 
-That is all. The defaults:
+That is all. CI publishes every image the chart uses to
+`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/<component>`:
+`timesliceorchestrator`, `snapshot-agent`, `guest-kubelet`,
+`gpu-shadow-plugin`, `timeslice-webhook`, `donor-controller`,
+`rl-integration`, and the prebuilt `verl` image. Each push to the release
+branch gets an immutable `demo-<short sha>` tag and a moving tag named after
+the branch (`/` becomes `-`); `global.imageTag` sets the tag of every platform
+image at once. Without it the chart uses `latest`, which follows main.
+
+The defaults:
 
 - run the node agents only on GPU nodes;
 - detect the GPU model and its memory on each node;
@@ -84,8 +99,11 @@ On GPUs other than the L4 (for example H100), also set
 `--set snapshot-agent.scrubPolicy=flag`; see
 [Troubleshooting](#8-troubleshooting).
 
-To pin a release, clone at the release tag and set the image tags (each
-component's `image.tag`). To limit the platform to some namespaces, set
+If your RL team uses the prebuilt verl image, add `-f values-baked-verl.yaml`
+(see [Use the prebuilt verl image](#use-the-prebuilt-verl-image)).
+
+To pin a versioned release, clone at the release tag and set
+`global.imageTag` to it. To limit the platform to some namespaces, set
 `timeslice-webhook.namespaceSelector`.
 
 ## 3. Change the RayJob (RL team)
@@ -144,6 +162,36 @@ and use the node pool names `cpu-pool`, `h100-trainer-pool` and
 Nothing else changes: same image, same command, same resources. Apply it with
 `kubectl apply -f rayjob-after.yaml`.
 
+### Use the prebuilt verl image
+
+Instead of keeping the stock image and letting the webhook inject the verl
+fork and the timeslice packages, the RL team can run
+`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/verl`, built by CI from
+[`docker/verl/Dockerfile`](../../docker/verl/Dockerfile): `verlai/verl:vllm020.dev2`
+plus the same verl fork the webhook would inject (one pin,
+`docker/verl/verl-pin.env`), the timeslice client and verl plugin from the
+same commit as the platform, and `TransferQueue` and `cupy-cuda12x`, so the
+pods install nothing from PyPI at start. It is large (about 24 GB unpacked,
+11 GB to pull), like the stock image it is built on.
+
+1. Install the platform with the overlay that turns the injection off (the
+   webhook still sets the environment, the trainer's memory limit and the
+   labels):
+
+   ```bash
+   helm install timeslice . -n timeslice-system --create-namespace \
+     --set global.imageTag=$TAG -f values-baked-verl.yaml
+   ```
+
+2. Use [`examples/rayjob-after-baked.yaml`](examples/rayjob-after-baked.yaml):
+   `rayjob-after.yaml` with the image swapped to the prebuilt one and without
+   the `pip install` lines (a runtime install of verl would replace the fork
+   in the image). Use the same tag as the platform:
+
+   ```bash
+   sed "s/IMAGE_TAG/$TAG/" examples/rayjob-after-baked.yaml | kubectl apply -f -
+   ```
+
 ## 4. Label the model server (batch team)
 
 Add `timeslice.io/guest: "true"` to the model server's pod labels. Keep asking
@@ -193,7 +241,8 @@ both against your longest single generation instead:
 ## 5. What the platform injects
 
 The admission webhook changes only pods and Ray clusters that opted in with the
-labels above. It adds:
+labels above. It adds (with `values-baked-verl.yaml`, everything except the
+first item, which the prebuilt verl image already contains):
 
 - **Into every pod of a Ray cluster that has a donor group** (head, trainer and
   rollout workers): an init container that copies the timeslice Python
@@ -235,11 +284,13 @@ so you can plan for them:
 | Setting | Who | When it is needed |
 |---|---|---|
 | `snapshot-agent.scrubPolicy=flag` (Helm value) | Cluster admin | On every GPU other than the qualified NVIDIA L4 with driver 580, for example H100. Without it the agent refuses to freeze guests there and kills them at each reclaim instead. With it, the agent zeroes freed GPU memory itself: about 0.4 s for 84 GB on an H100. |
-| Image references (`<component>.image.repository` / `.tag`, and `timeslice-webhook.rlIntegration.image`) | Cluster admin | Only when you install from a source checkout instead of a published release, or mirror images to your own registry. |
+| `global.imageTag` (Helm value) | Cluster admin | To pin the images to the release you cloned (`demo-<short sha>` or a version); without it every platform image is `latest`. |
+| Image references (`<component>.image.repository`, and `timeslice-webhook.rlIntegration.image.repository`) | Cluster admin | Only when you mirror the images to your own registry or build them yourself. |
+| `-f values-baked-verl.yaml` | Cluster admin | Only if the RL team uses the prebuilt verl image. |
 | One `resources` line per Ray worker group | RL team | Always (Ray placement pinning, so verl's trainer and rollout placement groups land on the right pods). |
 | `async_training.trainer_name=timeslice` and `ray_pg_extra_resources=...` | RL team | Always (two verl command-line settings). |
 | `timeslice.io/rl-integration: "true"` pod label | RL team | Not for KubeRay: the webhook adds it to the head and rollout groups of a Ray cluster that has a donor group. Only if your RL pods are not created by KubeRay, label every non-trainer pod of the job yourself so they get the same packages. |
-| `timeslice-webhook.rlIntegration.injectVerl=false` | Cluster admin | Only if your RL image already has a verl with the lifecycle hooks. |
+| `timeslice-webhook.rlIntegration.injectVerl=false` | Cluster admin | Only if your RL image already has a verl with the lifecycle hooks but not the timeslice packages. For the prebuilt verl image, use `values-baked-verl.yaml` instead. |
 | Router route `timeout` above your longest single generation (or `0s`) | Batch team | If requests go through the llm-d router and a generation can take more than 15 s (Envoy's default route timeout). |
 | A separate node for the trainer pod | RL team | Always: the trainer must be the only GPU pod on its node. |
 
@@ -288,6 +339,7 @@ and power, 1 s samples). Point your Prometheus at it, or scrape it directly.
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
+| Platform pods in `ImagePullBackOff` or `ErrImagePull` | No image with that tag: CI has not published the commit you cloned yet (or its release run failed) | Wait for the release workflow run of that commit, or set `global.imageTag` to the branch tag (the release branch's name, `/` replaced by `-`) |
 | The RayJob's pods are not created; an admission error names the webhook | The webhook is not ready yet | Wait until both webhook replicas are Ready, then re-apply |
 | No virtual node appears | More than one pod holds `nvidia.com/gpu` on the trainer node, or the trainer pod lacks the donor label | Keep only the trainer pod on that node; check the label on the pod template |
 | The job fails at start with an import error for `timeslice_verl` | The pod was created before the platform was installed, or outside a labelled Ray cluster | Re-create the RayJob after installing the platform |
