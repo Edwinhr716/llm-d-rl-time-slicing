@@ -165,9 +165,12 @@ type guestPipeline struct {
 	// cache.
 	mirror func(jobID string) (*corev1.Pod, bool)
 	// getPod reads one pod from the API server.
-	getPod   func(ctx context.Context, namespace, name string) (*corev1.Pod, error)
-	cgroups  *cgroup.Manager
-	backend  guestBackend
+	getPod  func(ctx context.Context, namespace, name string) (*corev1.Pod, error)
+	cgroups *cgroup.Manager
+	backend guestBackend
+	// app suspends the guests whose mirror declares the app_endpoint
+	// backend (guest_app.go); nil refuses them.
+	app      appGuestBackend
 	gpu      gpuInspector
 	scrubCfg ScrubConfig
 	// scrub runs one VRAM scrub; scrubGate serializes scrubs node-wide
@@ -382,13 +385,17 @@ func (g *guestPipeline) suspend(ctx context.Context, jobID string, deadline time
 		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
 	}
 	procSet := toSet(procs)
+	appCfg, err := g.guestAppConfig(ctx, target.pod)
+	if err != nil {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
 
 	vram, err := g.deviceBytes(procSet)
 	if err != nil {
 		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
 	}
 	deviceBytes, guestGPUs := vram.bytes, vram.gpus
-	scrubGPUs, err := g.checkPreconditions(ctx, target, deviceBytes)
+	scrubGPUs, err := g.checkPreconditions(ctx, target, deviceBytes, appCfg == nil)
 	if err != nil {
 		return sm.GuestResult{}, err
 	}
@@ -417,7 +424,20 @@ func (g *guestPipeline) suspend(ctx context.Context, jobID string, deadline time
 		return released, nil
 	}
 
-	if !frozen {
+	// A cuda-checkpointed guest must hold no VRAM once suspended; a
+	// sleeping application guest keeps its CUDA context.
+	var residualMax int64
+	switch {
+	case frozen:
+		if appCfg != nil {
+			residualMax = appResidualMaxBytes
+		}
+	case appCfg != nil:
+		residualMax = appResidualMaxBytes
+		if err := g.appSuspend(ctx, jobID, appCfg, target, procs, deviceBytes, len(scrubGPUs), deadline); err != nil {
+			return sm.GuestResult{}, err
+		}
+	default:
 		g.abortInFlight(ctx, jobID, "before-checkpoint", target, procs[0])
 		if err := g.ensureCheckpointed(ctx, jobID, procs, deviceBytes, len(scrubGPUs), deadline); err != nil {
 			return sm.GuestResult{}, err
@@ -427,7 +447,7 @@ func (g *guestPipeline) suspend(ctx context.Context, jobID string, deadline time
 		return sm.GuestResult{}, backendError(ctx, fmt.Errorf("freeze: %w", err))
 	}
 	g.abortInFlight(ctx, jobID, "after-freeze", target, procs[0])
-	hostBytes, err := g.verifySuspended(target, procSet)
+	hostBytes, err := g.verifySuspended(target, procSet, residualMax)
 	if err != nil {
 		return sm.GuestResult{}, err
 	}
@@ -448,7 +468,9 @@ func (g *guestPipeline) suspend(ctx context.Context, jobID string, deadline time
 // fails the operation with the precondition's reason, and the job is left
 // FAULTED. It returns the UUIDs of the GPUs the scrub policy scrubs at this
 // Suspend.
-func (g *guestPipeline) checkPreconditions(ctx context.Context, t *guestTarget, deviceBytes int64) (map[string]bool, error) {
+func (g *guestPipeline) checkPreconditions(
+	ctx context.Context, t *guestTarget, deviceBytes int64, cuda bool,
+) (map[string]bool, error) {
 	if err := g.checkReadiness(ctx, t.pod); err != nil {
 		return nil, sm.NewOpError(pb.ErrorReason_PRECONDITION_READINESS, err)
 	}
@@ -458,7 +480,7 @@ func (g *guestPipeline) checkPreconditions(ctx context.Context, t *guestTarget, 
 	if err := g.checkMemory(t.podDir, deviceBytes); err != nil {
 		return nil, sm.NewOpError(pb.ErrorReason_PRECONDITION_MEMORY, err)
 	}
-	scrubGPUs, err := g.checkNode()
+	scrubGPUs, err := g.checkNode(cuda)
 	if err != nil {
 		return nil, sm.NewOpError(pb.ErrorReason_PRECONDITION_NODE, err)
 	}
@@ -548,16 +570,19 @@ func (g *guestPipeline) checkMemory(podDir string, deviceBytes int64) error {
 	return nil
 }
 
-// checkNode requires cgroup v2 and the cuda-checkpoint binary, and asks the
-// scrub policy (scrub.Decide at the Suspend boundary) about every GPU: a
-// refusal (keep, on a GPU off --vram-zeroing-qualified) fails the
-// precondition. It returns the UUIDs of the GPUs the policy scrubs.
-func (g *guestPipeline) checkNode() (map[string]bool, error) {
+// checkNode requires cgroup v2 and, for a cuda-checkpointed guest, the
+// cuda-checkpoint binary, and asks the scrub policy (scrub.Decide at the
+// Suspend boundary) about every GPU: a refusal (keep, on a GPU off
+// --vram-zeroing-qualified) fails the precondition. It returns the UUIDs of
+// the GPUs the policy scrubs.
+func (g *guestPipeline) checkNode(cuda bool) (map[string]bool, error) {
 	if !g.cgroups.IsV2() {
 		return nil, fmt.Errorf("%s is not a cgroup v2 hierarchy", g.cgroups.Root)
 	}
-	if err := g.backend.Available(); err != nil {
-		return nil, err
+	if cuda {
+		if err := g.backend.Available(); err != nil {
+			return nil, err
+		}
 	}
 	return g.policyScrubGPUs()
 }
@@ -774,22 +799,17 @@ func (g *guestPipeline) ensureCheckpointed(
 	return nil
 }
 
-// verifySuspended checks with its own NVML query that no guest process
-// holds VRAM ("not available" counts as holding VRAM) and that the pod
-// cgroup is frozen. It returns the host bytes the frozen guest pins.
-func (g *guestPipeline) verifySuspended(target *guestTarget, procSet map[int]bool) (int64, error) {
+// verifySuspended checks with its own NVML query that the guest processes
+// hold at most residualMax bytes of VRAM in all (0 for a checkpointed guest;
+// "not available" counts as over) and that the pod cgroup is frozen. It
+// returns the host bytes the frozen guest pins.
+func (g *guestPipeline) verifySuspended(target *guestTarget, procSet map[int]bool, residualMax int64) (int64, error) {
 	gpuProcs, err := g.gpu.Processes()
 	if err != nil {
 		return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, fmt.Errorf("query GPU processes: %w", err))
 	}
-	for _, p := range gpuProcs {
-		if procSet[p.PID] && p.UsedBytes > 0 {
-			used := fmt.Sprint(p.UsedBytes)
-			if p.UsedBytes == nvmlNotAvailable {
-				used = "not available"
-			}
-			return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, fmt.Errorf("guest pid %d still holds VRAM (%s)", p.PID, used))
-		}
+	if err := checkResidual(gpuProcs, procSet, residualMax); err != nil {
+		return 0, sm.NewOpError(pb.ErrorReason_VERIFY_FAILED, err)
 	}
 	frozen, err := g.cgroups.Frozen(target.podDir)
 	if err != nil {
@@ -805,6 +825,29 @@ func (g *guestPipeline) verifySuspended(target *guestTarget, procSet map[int]boo
 	return cgroup.HostBytes(stat), nil
 }
 
+// checkResidual fails when the guest processes hold more than residualMax
+// bytes of VRAM in all, or when NVML cannot tell how much one holds.
+func checkResidual(gpuProcs []gpuProcess, procSet map[int]bool, residualMax int64) error {
+	var total int64
+	for _, p := range gpuProcs {
+		if !procSet[p.PID] || p.UsedBytes == 0 {
+			continue
+		}
+		if p.UsedBytes == nvmlNotAvailable {
+			return fmt.Errorf("guest pid %d still holds VRAM (not available)", p.PID)
+		}
+		total += int64(p.UsedBytes) //nolint:gosec // VRAM sizes fit in int64
+		if total > residualMax {
+			if residualMax == 0 {
+				return fmt.Errorf("guest pid %d still holds VRAM (%d)", p.PID, p.UsedBytes)
+			}
+			return fmt.Errorf("guest processes hold %d bytes of VRAM, more than the %d a sleeping application may keep",
+				total, residualMax)
+		}
+	}
+	return nil
+}
+
 // resume is the Resume pipeline: thaw first, then restore, then verify.
 // Toggling a frozen process blocks, so the thaw must come first.
 func (g *guestPipeline) resume(ctx context.Context, jobID string) (sm.GuestResult, error) {
@@ -818,6 +861,17 @@ func (g *guestPipeline) resume(ctx context.Context, jobID string) (sm.GuestResul
 	procs, err := t.procs(g.cgroups)
 	if err != nil {
 		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
+	appCfg, err := g.guestAppConfig(ctx, t.pod)
+	if err != nil {
+		return sm.GuestResult{}, sm.NewOpError(pb.ErrorReason_BACKEND_ERROR, err)
+	}
+	if appCfg != nil {
+		deviceBytes, err := g.appResume(ctx, jobID, appCfg, procs)
+		if err != nil {
+			return sm.GuestResult{}, err
+		}
+		return sm.GuestResult{DeviceBytes: deviceBytes}, nil
 	}
 	states := map[int]string{}
 	var cudaPIDs []int

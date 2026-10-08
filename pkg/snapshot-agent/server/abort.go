@@ -39,13 +39,15 @@ type abortFunc func(nsPath string, ports []int, deadline time.Time) (int, error)
 // guest is resumed. It runs once the guest is NotReady, before the checkpoint (vLLM sees the
 // disconnects and drops the work), and again after the freeze, for a request that reached the
 // guest before every router dropped its endpoint.
-func (g *guestPipeline) abortInFlight(ctx context.Context, jobID, phase string, t *guestTarget, pid int) {
+//
+// It returns how many connections it reset; 0 when it did not run or failed.
+func (g *guestPipeline) abortInFlight(ctx context.Context, jobID, phase string, t *guestTarget, pid int) int {
 	if g.abortConns == nil || t.pod.Spec.HostNetwork {
-		return
+		return 0
 	}
 	ports := g.servingPorts(ctx, t.pod)
 	if len(ports) == 0 {
-		return
+		return 0
 	}
 	procRoot := g.procRoot
 	if procRoot == "" {
@@ -57,9 +59,10 @@ func (g *guestPipeline) abortInFlight(ctx context.Context, jobID, phase string, 
 	if err != nil {
 		slog.WarnContext(ctx, "Suspend: aborting in-flight connections failed; suspending anyway",
 			append(attrs, "error", err)...)
-		return
+		return 0
 	}
 	slog.InfoContext(ctx, "Suspend: aborted in-flight connections", attrs...)
+	return n
 }
 
 // servingPorts returns the TCP ports the guest serves on: the mirror's container ports, else the

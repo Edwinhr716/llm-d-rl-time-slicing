@@ -604,9 +604,12 @@ func StartServer(
 	watcher.Start(ctx)
 
 	// 4. Wire the Suspend and Resume pipelines to the cuda-checkpoint
-	// backend, sharing its node lock with Snapshot and Restore.
+	// backend, sharing its node lock with Snapshot and Restore, and to an
+	// app-endpoint client for the guests whose mirror declares
+	// timeslice.io/backend: app_endpoint.
 	if cuda, ok := backendMap[backends.BackendCuda].(*backends.CudaCheckpoint); ok {
 		srv.guest = newGuestPipeline(guestCfg, watcher, k8sClient, cuda)
+		srv.guest.app = newAppGuestBackend()
 		// One scrub at a time on the node, whether Suspend or Kill runs it.
 		srv.guest.scrubGate = srv.killer.scrubGate
 	} else {

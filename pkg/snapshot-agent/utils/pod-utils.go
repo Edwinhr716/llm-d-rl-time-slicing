@@ -25,6 +25,16 @@ const (
 	// GuestEpochAnnotation is written on a guest's mirror pod by the virtual
 	// kubelet, before each Suspend or Resume, with that call's epoch.
 	GuestEpochAnnotation = "timeslice.io/guest-epoch"
+	// BackendAnnotation declares on a workload's pods how the agent
+	// suspends it. The value is a BackendConfig field name; the guest
+	// Suspend and Resume pipelines accept "cuda" (the default when the
+	// annotation is absent) and "app_endpoint". The guest kubelet copies it
+	// from a guest pod onto its mirror pod.
+	BackendAnnotation = "timeslice.io/backend"
+	// BackendConfigAnnotation optionally carries the declared backend's
+	// config message in protobuf JSON, for example an AppEndpointConfig
+	// such as {"app": "APP_VLLM", "endpoints": ["http://localhost:8000"]}.
+	BackendConfigAnnotation = "timeslice.io/backend-config"
 )
 
 var (

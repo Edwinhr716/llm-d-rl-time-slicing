@@ -259,3 +259,28 @@ func TestMirrorMemoryLimitAddsDeviceReserve(t *testing.T) {
 		t.Errorf("cpu-only guest got limits %v", got)
 	}
 }
+
+// The backend declaration is the only guest annotation copied onto the mirror: the
+// snapshot-agent reads it there to suspend the guest through its own API.
+func TestBuildMirrorCopiesBackendAnnotations(t *testing.T) {
+	g := testGuest()
+	g.Annotations[AnnotationBackend] = "app_endpoint"
+	g.Annotations[AnnotationBackendConfig] = `{"app": "APP_VLLM"}`
+	m, err := Build(g, ref(testConfig()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Annotations[AnnotationBackend] != "app_endpoint" || m.Annotations[AnnotationBackendConfig] != `{"app": "APP_VLLM"}` {
+		t.Errorf("backend annotations not copied: %v", m.Annotations)
+	}
+	if _, ok := m.Annotations["a"]; ok {
+		t.Errorf("other guest annotations must not be copied: %v", m.Annotations)
+	}
+	plain, err := Build(testGuest(), ref(testConfig()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := plain.Annotations[AnnotationBackend]; ok {
+		t.Errorf("a guest without the declaration gets none: %v", plain.Annotations)
+	}
+}

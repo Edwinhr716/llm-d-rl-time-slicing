@@ -44,6 +44,11 @@ const (
 	// AnnotationGuestEpoch is the fencing epoch, written by compare-and-swap before each
 	// Suspend or Resume.
 	AnnotationGuestEpoch = "timeslice.io/guest-epoch"
+	// AnnotationBackend and AnnotationBackendConfig declare how the snapshot-agent suspends
+	// the guest (cuda-checkpoint by default, or app_endpoint with its config). They are the
+	// only guest annotations copied onto the mirror, where the agent reads them.
+	AnnotationBackend       = "timeslice.io/backend"
+	AnnotationBackendConfig = "timeslice.io/backend-config"
 
 	// Suffix is appended to the guest's name to get the mirror's name. The name is
 	// deterministic, so a create is idempotent (AlreadyExists), like LWS's StatefulSet names.
@@ -224,6 +229,11 @@ func BuildWithGPU(guest *corev1.Pod, cfg *Config, att *GPUAttachment) (*corev1.P
 			},
 		},
 		Spec: spec,
+	}
+	for _, k := range []string{AnnotationBackend, AnnotationBackendConfig} {
+		if v, ok := guest.Annotations[k]; ok {
+			pod.Annotations[k] = v
+		}
 	}
 	if cfg.Group != "" {
 		pod.Labels[LabelGroup] = cfg.Group

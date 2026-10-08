@@ -95,22 +95,30 @@ func (g *guestPipeline) observe(ctx context.Context, jobID string) (observation,
 	if err != nil {
 		return observation{}, fmt.Errorf("read cgroup.events: %w", err)
 	}
+	appCfg, err := g.guestAppConfig(ctx, target.pod)
+	if err != nil {
+		return observation{}, err
+	}
 	obs := observation{frozen: frozen, procs: procs}
 	switch {
 	case len(procs) == 0:
 		obs.rec = idle
 		obs.why = "no process in the container cgroups"
 	case frozen:
-		g.observeFrozen(ctx, jobID, target, &obs)
+		g.observeFrozen(ctx, jobID, target, appCfg != nil, &obs)
 	default:
 		g.observeThawed(ctx, &obs)
+		if appCfg != nil {
+			g.observeThawedApp(ctx, appCfg, &obs)
+		}
 	}
 	return obs, nil
 }
 
 // observeFrozen classifies a frozen guest by NVML alone (the CLI may block
-// on a frozen process), and redoes its scrub.
-func (g *guestPipeline) observeFrozen(ctx context.Context, jobID string, target *guestTarget, obs *observation) {
+// on a frozen process), and redoes its scrub. A frozen application guest is
+// asleep, and may keep up to appResidualMaxBytes of VRAM.
+func (g *guestPipeline) observeFrozen(ctx context.Context, jobID string, target *guestTarget, app bool, obs *observation) {
 	faulted := func(why string) {
 		obs.rec = sm.Recovered{State: pb.JobState_JOB_STATE_FAULTED, PIDs: obs.procs}
 		obs.why = why
@@ -121,13 +129,15 @@ func (g *guestPipeline) observeFrozen(ctx context.Context, jobID string, target 
 		return
 	}
 	procSet := toSet(obs.procs)
-	for _, p := range gpuProcs {
-		if procSet[p.PID] && p.UsedBytes > 0 {
-			faulted(fmt.Sprintf("frozen, and guest pid %d holds VRAM", p.PID))
-			return
-		}
+	residualMax := int64(0)
+	if app {
+		residualMax = appResidualMaxBytes
 	}
-	scrubbed, err := g.recoveryScrub(ctx, jobID, obs.procs)
+	if err := checkResidual(gpuProcs, procSet, residualMax); err != nil {
+		faulted(fmt.Sprintf("frozen, and %v", err))
+		return
+	}
+	scrubbed, err := g.recoveryScrub(ctx, jobID, obs.procs, app)
 	obs.scrubbed = scrubbed
 	if err != nil {
 		faulted(fmt.Sprintf("frozen with no guest VRAM, but the recovery scrub failed: %v", err))
@@ -141,12 +151,16 @@ func (g *guestPipeline) observeFrozen(ctx context.Context, jobID string, target 
 	}
 	obs.rec = sm.Recovered{State: pb.JobState_JOB_STATE_SUSPENDED, PIDs: obs.procs, HostBytesPinned: hostBytes}
 	obs.why = "frozen, and no guest process holds VRAM"
+	if app {
+		obs.why = "frozen application guest, within the residual VRAM of a sleeping application"
+	}
 }
 
 // recoveryScrub redoes the Suspend-boundary scrub of a frozen guest under a
 // scrubbing policy: on each GPU the policy scrubs, among the guest's device
-// nodes, that no process is on. It returns the GPUs scrubbed.
-func (g *guestPipeline) recoveryScrub(ctx context.Context, jobID string, procs []int) ([]string, error) {
+// nodes, that no process is on (for a sleeping application guest, which NVML
+// still lists, those no other process is on). It returns the GPUs scrubbed.
+func (g *guestPipeline) recoveryScrub(ctx context.Context, jobID string, procs []int, app bool) ([]string, error) {
 	if !g.scrubCfg.scrubs() {
 		return nil, nil
 	}
@@ -154,7 +168,12 @@ func (g *guestPipeline) recoveryScrub(ctx context.Context, jobID string, procs [
 	if err != nil {
 		return nil, err
 	}
-	gpus, err := g.idleGuestGPUs(procs)
+	var gpus map[string]bool
+	if app {
+		gpus, err = g.exclusiveGuestGPUs(toSet(procs))
+	} else {
+		gpus, err = g.idleGuestGPUs(procs)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +234,25 @@ func (g *guestPipeline) observeThawed(ctx context.Context, obs *observation) {
 	default:
 		obs.rec = sm.Recovered{State: pb.JobState_JOB_STATE_IDLE}
 		obs.why = "not frozen, and no CUDA process"
+	}
+}
+
+// observeThawedApp reclassifies a thawed application guest that sleeps: a
+// restart between the sleep and the freeze of a Suspend, or between the thaw
+// and the wake up of a Resume. Like a checkpointed process that is not
+// frozen, it is SAVED: a re-issued Suspend freezes it, a Resume wakes it.
+func (g *guestPipeline) observeThawedApp(ctx context.Context, cfg *pb.BackendConfig, obs *observation) {
+	if g.app == nil || obs.rec.State != pb.JobState_JOB_STATE_RUNNING {
+		return
+	}
+	sleeping, err := g.app.IsSuspended(ctx, cfg)
+	if err != nil {
+		slog.WarnContext(ctx, "Restart recovery: cannot read an application guest's sleep state", "error", err)
+		return
+	}
+	if sleeping {
+		obs.rec = sm.Recovered{State: pb.JobState_JOB_STATE_SAVED, PIDs: obs.rec.PIDs}
+		obs.why = "not frozen, and the application guest sleeps"
 	}
 }
 

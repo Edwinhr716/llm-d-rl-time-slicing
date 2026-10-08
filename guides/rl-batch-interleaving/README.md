@@ -91,6 +91,27 @@ The full manifests and diffs are in the quickstart.
 The trainer never waits for a guest to finish its work: a reclaim is a freeze,
 not a drain.
 
+**Application-aware guests.** A vLLM guest can instead be put to sleep through
+its own API, while the trainer on the same node is still checkpointed with
+`cuda-checkpoint`. Annotate the guest pod (the guest kubelet copies these two
+annotations onto the mirror pod, where the snapshot agent reads them):
+
+```yaml
+metadata:
+  annotations:
+    timeslice.io/backend: app_endpoint
+    # optional; the default endpoint is the pod IP and the first serving port
+    timeslice.io/backend-config: '{"app": "APP_VLLM", "endpoints": ["http://localhost:8000"]}'
+```
+
+and start vLLM with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1`. At a
+reclaim the agent resets the guest's connections until none is left, resets its
+prefix cache, calls `POST /sleep?level=1` (weights to host RAM, KV cache
+dropped), confirms with `GET /is_sleeping`, then freezes the guest as before. A
+sleeping vLLM keeps its CUDA context, so up to 4 GiB of guest GPU memory is
+accepted at verify. At a lend the agent thaws the guest and calls
+`POST /wake_up`. Only vLLM is supported for guests, in `SUSPEND_MODE_OFFLOAD`.
+
 ## 4. What to expect
 
 Measured on H100 80GB with the long chain-of-thought example of the
