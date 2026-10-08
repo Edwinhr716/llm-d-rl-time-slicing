@@ -409,6 +409,11 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 	// restores; a peer's restore then parks in the rendezvous until the next
 	// pass catches the node up. On the symmetric path (job loaded on every
 	// node of the slice) this does not occur.
+	//
+	// cancelPeers only stops this controller's waits: agent operations run
+	// detached from the RPC context and libtpu has no abort, so a peer's
+	// already-issued RESTORE stays parked (with its vfio groups reopened)
+	// until the agent's CLI timeout, then FAULTs the job on that node.
 	nodes := group.Status().Nodes()
 	opCtx, cancelPeers := context.WithCancel(ctx)
 	defer cancelPeers()

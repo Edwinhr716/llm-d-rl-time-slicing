@@ -41,8 +41,17 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/tests/integration/harness"
 )
 
+// namespace is where the suite deploys its agent and workload pods:
+// TEST_NAMESPACE when set (e.g. a scratch namespace on a shared cluster),
+// else "default".
+var namespace = func() string {
+	if ns := os.Getenv("TEST_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return "default"
+}()
+
 const (
-	namespace    = "default"
 	agentPodName = "snapshot-agent-test"
 	agentPort    = 9001
 	// chartNamespace is where the official Helm charts install components:

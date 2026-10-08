@@ -1,0 +1,47 @@
+# TPU shadow device plugin (guest-kubelet cmd/tpu-shadow-plugin) as a DaemonSet
+# on single-host TPU nodes. It advertises timeslice.io/tpu-shadow: its devices
+# are the TPU chips (VFIO groups) the node's single google.com/tpu holder (the
+# donor) holds, and 0 when more than one pod holds chips (fail closed). A guest
+# that requests it gets the donor's /dev/vfio/N, /dev/vfio/vfio, the TPU
+# runtime socket and log directories and the TPU environment, with no
+# privilege and no hostPath of its own. It does not request google.com/tpu, so
+# GKE's TPU topology admission check does not apply to it. Only one of donor
+# and guest may have the chips open at a time: the snapshot agent parks the
+# donor before the guest opens them. Only trusted callers may request the
+# resource: gate it with an admission policy as for gpu-shadow.
+#
+# Same posture as gpu-shadow: root (the kubelet sockets are root-only), not
+# privileged, every capability dropped, read-only root filesystem, no API token.
+
+namespace: timeslice-system
+
+image:
+  repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/tpu-shadow-plugin
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Plugin flags, one "--<key>=<value>" each, in key order. "" = not rendered.
+flags:
+  # The device plugin resource donors hold.
+  tpu-resource: google.com/tpu
+  # TPU_ACCELERATOR_TYPE prefix handed to guests.
+  generation: v6e
+
+extraArgs: []
+
+resources:
+  requests: {cpu: 10m, memory: 32Mi}
+  limits: {memory: 64Mi}
+
+nodeSelector: {}
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: cloud.google.com/gke-tpu-accelerator, operator: Exists}
+tolerations:
+  - {key: google.com/tpu, operator: Exists, effect: NoSchedule}

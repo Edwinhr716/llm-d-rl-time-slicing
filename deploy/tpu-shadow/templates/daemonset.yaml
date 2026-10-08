@@ -1,0 +1,56 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: '{{ include "tpu-shadow.fullname" . }}'
+  namespace: '{{ include "tpu-shadow.namespace" . }}'
+  labels:
+    # {{- include "tpu-shadow.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      # {{- include "tpu-shadow.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        # {{- include "tpu-shadow.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        # {{- toYaml .Values.nodeSelector | nindent 8 }}
+      affinity:
+        # {{- toYaml .Values.affinity | nindent 8 }}
+      tolerations:
+        # {{- toYaml .Values.tolerations | nindent 8 }}
+      securityContext:
+        runAsUser: 0
+        runAsNonRoot: false
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: plugin
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'
+          imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+          args:
+            # {{- include "tpu-shadow.flags" .Values.flags | nindent 12 }}
+            # {{- with .Values.extraArgs }}{{ toYaml . | nindent 12 }}{{ end }}
+          resources:
+            # {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: device-plugins, mountPath: /var/lib/kubelet/device-plugins}
+            - {name: pod-resources, mountPath: /var/lib/kubelet/pod-resources, readOnly: true}
+            - {name: dev, mountPath: /host/dev, readOnly: true}
+      volumes:
+        - name: device-plugins
+          hostPath: {path: /var/lib/kubelet/device-plugins, type: Directory}
+        - name: pod-resources
+          hostPath: {path: /var/lib/kubelet/pod-resources, type: Directory}
+        # Read only to check which /dev/vfio/N exist; the kubelet hands the nodes to the guest.
+        - name: dev
+          hostPath: {path: /dev, type: Directory}

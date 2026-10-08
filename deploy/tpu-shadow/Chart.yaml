@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tpu-shadow
+description: TPU shadow device plugin DaemonSet (single-host TPU slices)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

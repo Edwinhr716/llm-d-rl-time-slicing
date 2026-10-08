@@ -150,7 +150,7 @@ func TestTpuCliArgs(t *testing.T) {
 				return c.Restore(context.Background(), backends.Request{JobID: "j", Config: tpuConfig(11, 22)})
 			},
 			want: [][]string{
-				{"--action", "restore", "--pid", "11,22", "--timeout", "600"},
+				{"--action", "restore", "--pid", "11,22", "--timeout", "1200"},
 			},
 		},
 	}

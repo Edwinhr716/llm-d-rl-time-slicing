@@ -1,0 +1,41 @@
+# Snapshot agent for TPU nodes: the standard agent image plus gVisor's
+# tpucheckpoint CLI (tools/tpucheckpoint), which the TPU backend shells out
+# to. gVisor publishes no tpucheckpoint binary, and the tool imports one
+# Bazel-generated proto package, so this stage generates that package with
+# protoc and builds the CLI with plain `go build`.
+#
+#   docker build -f docker/snapshot-agent/Dockerfile.tpu \
+#     --build-arg AGENT_IMAGE=<snapshot-agent image> -t <tag> .
+ARG AGENT_IMAGE=ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/snapshot-agent:latest
+
+FROM golang:1.26.2 AS tpucheckpoint
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# gVisor commit with tools/tpucheckpoint (gVisor PR 14455 and follow-ups).
+ARG GVISOR_COMMIT=0a438edc99965c50bac288b57f048db78a4d9006
+# tpu_control.proto uses `edition = "2024"`, which needs protoc >= 32.
+ARG PROTOC_VERSION=36.2
+ARG PROTOC_GEN_GO_VERSION=v1.36.12
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSLo /tmp/protoc.zip \
+      "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" && \
+    unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
+    go install "google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION}"
+WORKDIR /src
+RUN git init -q gvisor && cd gvisor && \
+    git fetch -q --depth 1 https://github.com/google/gvisor "${GVISOR_COMMIT}" && \
+    git checkout -q FETCH_HEAD
+WORKDIR /build
+RUN cp -r /src/gvisor/tools/tpucheckpoint/. . && \
+    mkdir -p tpucontrolpb && \
+    protoc -I /src/gvisor/pkg/sentry/control --go_out=tpucontrolpb --go_opt=paths=source_relative \
+      --go_opt=Mtpu_control.proto=tpucheckpoint/tpucontrolpb tpu_control.proto && \
+    grep -rl 'gvisor.dev/gvisor/' --include='*.go' . | xargs sed -i \
+      -e 's#gvisor.dev/gvisor/tools/tpucheckpoint#tpucheckpoint#g' \
+      -e 's#gvisor.dev/gvisor/pkg/sentry/control/tpu_control_proto_go_proto#tpucheckpoint/tpucontrolpb#g' && \
+    go mod init tpucheckpoint && go mod tidy && \
+    go test ./... && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tpucheckpoint . && \
+    /out/tpucheckpoint --help >/dev/null
+
+FROM ${AGENT_IMAGE}
+COPY --from=tpucheckpoint /out/tpucheckpoint /usr/local/bin/tpucheckpoint

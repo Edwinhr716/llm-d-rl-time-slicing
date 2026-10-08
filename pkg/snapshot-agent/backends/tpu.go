@@ -24,8 +24,12 @@ const (
 	// tpuRestoreCLITimeoutSecs is the per-process --timeout passed to the
 	// CLI for the restore rendezvous: every mesh member's RESTORE parks in
 	// libtpu's barrier until its peers arrive, so this bounds the whole
-	// slice-wide rendezvous, not one process's work.
-	tpuRestoreCLITimeoutSecs = 600
+	// slice-wide rendezvous, not one process's work. On a multi-host slice
+	// a peer host's agent may still be in its own vfio gate (up to
+	// tpuVfioGateTimeout) while this host's RESTORE is already parked, so
+	// the bound covers the peer's gate plus the rendezvous itself; a
+	// shorter bound FAULTs the early host and strands the late one.
+	tpuRestoreCLITimeoutSecs = 1200
 
 	// tpuVfioGateTimeout bounds the wait for the previous occupant to
 	// release its vfio iommu groups before restore is issued.
@@ -39,8 +43,8 @@ const (
 
 	// tpuRestoreTimeout is a context backstop for one Restore call: up to
 	// 600s waiting for the previous occupant's vfio groups to be released,
-	// up to 600s for the slice-wide restore rendezvous, plus slack.
-	tpuRestoreTimeout = 1300 * time.Second
+	// up to 1200s for the slice-wide restore rendezvous, plus slack.
+	tpuRestoreTimeout = 1900 * time.Second
 
 	// tpuCheckpointRetryBackoff is the pause before the single checkpoint
 	// retry. Restore is never retried at any layer.
@@ -102,9 +106,10 @@ func NewTpuCheckpoint() *TpuCheckpoint {
 }
 
 // Snapshot parks the TPU state of every process of the job with one batched
-// CLI invocation. Failed PIDs get one retry (a failed checkpoint leaves the
-// process attached and is safe to re-issue, unlike restore); PIDs that
-// succeeded are parked and are excluded from the retry.
+// CLI invocation. Failed PIDs get one retry (a checkpoint the server rejected
+// leaves the process attached and is safe to re-issue, unlike restore); PIDs
+// that succeeded are parked and are excluded from the retry. A PID whose
+// request timed out is never retried: see checkpointWithRetry.
 func (t *TpuCheckpoint) Snapshot(ctx context.Context, req Request) error {
 	pids := ExtractTpuPIDStrings(req.Config)
 	if len(pids) == 0 {
@@ -189,6 +194,16 @@ func (t *TpuCheckpoint) checkpointWithRetry(ctx context.Context, pids []string) 
 	if len(retryPids) == 0 {
 		retryPids = pids
 	}
+	// A timed-out CHECKPOINT is still in flight inside libtpu (multi-host:
+	// parked in the slice-wide rendezvous waiting for a slow peer). Its reply
+	// arrives later on the control pipe, so a second request would read the
+	// first reply and every later request (RESTORE, get-state) would read the
+	// one before it: the next restore gets reported as failed although
+	// libtpu restored. Fail the job instead of desynchronizing the pipe.
+	if timedOut := timedOutPids(out, retryPids); len(timedOut) > 0 {
+		return fmt.Errorf("checkpoint pids %v timed out with the request in flight; "+
+			"not re-issuing (job must be treated as faulted): %w", timedOut, err)
+	}
 	select {
 	case <-ctx.Done():
 		return fmt.Errorf("checkpoint pids %v: %w (last attempt: %w)", pids, ctx.Err(), err)
@@ -220,6 +235,26 @@ func (t *TpuCheckpoint) runBatch(ctx context.Context, action string, pids []stri
 // tpuFailureLine matches the CLI's per-PID failure report on stderr:
 // "tpucheckpoint: pid <N>: <err>".
 var tpuFailureLine = regexp.MustCompile(`(?m)^tpucheckpoint: pid (\d+):`)
+
+// tpuTimeoutLine matches a per-PID failure caused by the CLI's own deadline
+// expiring after the control request was sent.
+var tpuTimeoutLine = regexp.MustCompile(`(?m)^tpucheckpoint: pid (\d+):.*(?:timed out|i/o timeout)`)
+
+// timedOutPids returns the subset of pids whose reported failure was a
+// timeout (request issued, reply never read).
+func timedOutPids(out []byte, pids []string) []string {
+	reported := make(map[string]bool)
+	for _, m := range tpuTimeoutLine.FindAllSubmatch(out, -1) {
+		reported[string(m[1])] = true
+	}
+	var timedOut []string
+	for _, pid := range pids {
+		if reported[pid] {
+			timedOut = append(timedOut, pid)
+		}
+	}
+	return timedOut
+}
 
 // failedPids extracts the PIDs the CLI reported as failed, restricted to the
 // PIDs that were actually requested (in request order).

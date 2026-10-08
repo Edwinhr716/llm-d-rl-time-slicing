@@ -159,6 +159,10 @@ func tpuAgentPod(node string) *corev1.Pod {
 				Env: []corev1.EnvVar{
 					// /opt/rlts/bin provides the tpucheckpoint CLI.
 					{Name: "PATH", Value: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/rlts/bin"},
+					// The agent registers the TPU backend (and TPU process
+					// discovery) only when told it runs on a TPU node.
+					{Name: "ACCELERATOR_TYPE", Value: "tpu"},
+					{Name: "DEFAULT_BACKEND", Value: "tpu"},
 					{Name: "NODE_NAME", ValueFrom: &corev1.EnvVarSource{
 						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
 					}},
@@ -303,6 +307,11 @@ func tpuWorkloadPod(h *Harness, image string, chips int, nodeSelector map[string
 	mounts := []corev1.VolumeMount{
 		{Name: "src", MountPath: "/opt/src"},
 		{Name: "state", MountPath: tpuStateDir},
+	}
+	// TPU_WORKLOAD_LIBRARY_PATH selects a libtpu already in the image
+	// (e.g. one of several pinned builds) without the fetch step below.
+	if p := os.Getenv("TPU_WORKLOAD_LIBRARY_PATH"); p != "" {
+		env = append(env, corev1.EnvVar{Name: "TPU_LIBRARY_PATH", Value: p})
 	}
 	var initContainers []corev1.Container
 	if uri := os.Getenv("TPU_LIBTPU_URI"); uri != "" {
