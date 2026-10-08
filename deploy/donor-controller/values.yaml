@@ -1,0 +1,62 @@
+# Donor controller (cmd/donor-controller): labels real hosts
+# group.timeslice.io/<group> (or the ns layout) from the donor pods bound to
+# them and unlabels them when the donors leave. One replica (Recreate): it keeps
+# its era state in node annotations. Off by default in the parent chart. The
+# raw manifests next to this chart are the same objects without Helm.
+
+namespace: timeslice-system
+
+image:
+  repository: ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/donor-controller
+  pullPolicy: IfNotPresent
+  # "" = global.imageTag from the parent chart (one tag for every platform
+  # image, e.g. a release's demo-<short sha>), else "latest".
+  tag: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+rbac:
+  create: true
+
+# Controller flags, one "--<key>=<value>" each, in key order. "" = not rendered
+# (the controller default). release-dead-hosts: true also grants nodes/delete;
+# clear-stale-fences: true also grants nodes/update.
+flags:
+  # host:port of the orchestrator. "" = the umbrella chart's orchestrator
+  # Service in this namespace (<release>-timesliceorchestrator.<ns>.svc:50051).
+  orchestrator-addr: ""
+  # Node label layout: prefix (group.timeslice.io/<group>) or ns.
+  label-keys: ""
+  # Comma-separated namespaces watched for donor pods; "" = all.
+  watch-namespaces: ""
+  # Regular expression a group must match to be labelled.
+  group-filter: ""
+  donor-selector: ""
+  era-ttl: ""
+  vk-deregister-grace: ""
+  release-dead-hosts: ""
+  # Remove a stale timeslice.io/gpu-fence taint (shadow device plugin path).
+  clear-stale-fences: ""
+  lock-poll-interval: ""
+
+extraArgs: []
+
+resources:
+  requests: {cpu: 20m, memory: 32Mi}
+  limits: {memory: 128Mi}
+
+nodeSelector: {}
+tolerations: []
+# The controller needs no GPU: keep it off accelerator nodes.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: cloud.google.com/gke-accelerator, operator: DoesNotExist}

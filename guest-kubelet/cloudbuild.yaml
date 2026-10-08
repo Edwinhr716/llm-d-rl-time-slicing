@@ -1,0 +1,54 @@
+# Runs every check remotely: nothing is built or tested on a laptop. From the repository root
+# (the module imports the root module's gRPC APIs through a replace directive):
+#   gcloud builds submit --project=YOUR_PROJECT --config guest-kubelet/cloudbuild.yaml \
+#     --substitutions=_TAG=$(git rev-parse --short HEAD) .
+# If go.mod/go.sum are not tidy: add _ALLOW_TIDY=true, then commit the go.mod/go.sum that the
+# build uploads to gs://${PROJECT_ID}_cloudbuild/guest-kubelet/${BUILD_ID}/.
+substitutions:
+  _REGION: YOUR_REGION
+  _REPO: guest-kubelet
+  _TAG: dev
+  _ALLOW_TIDY: "false"
+queueTtl: 14400s
+options:
+  logging: GCS_ONLY
+  machineType: E2_HIGHCPU_8
+steps:
+  - id: tidy
+    name: golang:1.26
+    dir: guest-kubelet
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p /tmp/orig out
+        cp go.mod /tmp/orig/; touch go.sum; cp go.sum /tmp/orig/
+        go mod tidy
+        cp go.mod go.sum out/
+        if ! diff -q /tmp/orig/go.mod go.mod || ! diff -q /tmp/orig/go.sum go.sum; then
+          if [ "${_ALLOW_TIDY}" != "true" ]; then echo "go.mod/go.sum not tidy"; exit 1; fi
+          echo "go.mod/go.sum were rewritten (allowed); commit out/go.mod and out/go.sum"
+        fi
+  - id: vet-test-build
+    name: golang:1.26
+    dir: guest-kubelet
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        test -z "$$(gofmt -l .)" || { gofmt -l .; echo "gofmt needed"; exit 1; }
+        go vet ./...
+        go test -race ./...
+        CGO_ENABLED=0 go build -o out/guest-kubelet ./cmd/guest-kubelet
+        CGO_ENABLED=0 go build -o out/gpu-shadow-plugin ./cmd/gpu-shadow-plugin
+  - id: image
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "guest-kubelet/Dockerfile", "-t", "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/guest-kubelet:${_TAG}", "."]
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/guest-kubelet:${_TAG}
+artifacts:
+  objects:
+    location: gs://${PROJECT_ID}_cloudbuild/guest-kubelet/${BUILD_ID}/
+    paths: ["guest-kubelet/out/go.mod", "guest-kubelet/out/go.sum"]

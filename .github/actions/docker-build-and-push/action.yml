@@ -8,12 +8,16 @@ inputs:
   tag:
     required: true
     description: Image tag (e.g., v0.1.0)
+  extra-tags:
+    required: false
+    description: More tags for the same image, space-separated (e.g., "demo-abc1234 demo")
+    default: ""
   github-token:
     required: true
     description: GitHub token for ghcr.io login
   registry:
     required: false
-    description: Container registry
+    description: Container registry (lowercased before use; image references must be lowercase)
     default: ghcr.io/llm-d
   dockerfile:
     required: false
@@ -28,6 +32,14 @@ inputs:
     description: If true, skip tagging as 'latest'
     default: "false"
 
+outputs:
+  image:
+    description: The pushed image reference (registry/image-name:tag)
+    value: ${{ steps.build.outputs.image }}
+  digest:
+    description: The pushed image digest (sha256:...)
+    value: ${{ steps.build.outputs.digest }}
+
 runs:
   using: "composite"
   steps:
@@ -38,22 +50,45 @@ runs:
       uses: docker/setup-buildx-action@v3
 
     - name: Log in to GitHub Container Registry
-      run: echo "${{ inputs.github-token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ACTOR: ${{ github.actor }}
+      run: echo "${GH_TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
       shell: bash
 
     - name: Build and push image
+      id: build
+      env:
+        IMAGE_NAME: ${{ inputs.image-name }}
+        TAG: ${{ inputs.tag }}
+        EXTRA_TAGS: ${{ inputs.extra-tags }}
+        REGISTRY: ${{ inputs.registry }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        PLATFORMS: ${{ inputs.platforms }}
+        PRERELEASE: ${{ inputs.prerelease }}
+        SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
       run: |
-        if [[ "${{ inputs.prerelease }}" == "true" ]]; then
-          LATEST_TAG=""
-        else
-          LATEST_TAG="-t ${{ inputs.registry }}/${{ inputs.image-name }}:latest"
+        set -euo pipefail
+        IMAGE="${REGISTRY,,}/${IMAGE_NAME}"
+        TAGS=(-t "${IMAGE}:${TAG}")
+        for t in ${EXTRA_TAGS}; do
+          TAGS+=(-t "${IMAGE}:${t}")
+        done
+        if [[ "${PRERELEASE}" != "true" ]]; then
+          TAGS+=(-t "${IMAGE}:latest")
         fi
         docker buildx build \
-          -f ${{ inputs.dockerfile }} \
-          --platform ${{ inputs.platforms }} \
+          -f "${DOCKERFILE}" \
+          --platform "${PLATFORMS}" \
           --push \
-          --annotation "index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+          --metadata-file /tmp/build-metadata.json \
+          --annotation "index:org.opencontainers.image.source=${SOURCE_URL}" \
           --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
-          -t ${{ inputs.registry }}/${{ inputs.image-name }}:${{ inputs.tag }} \
-          ${LATEST_TAG} .
+          --label "org.opencontainers.image.source=${SOURCE_URL}" \
+          --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+          "${TAGS[@]}" .
+        DIGEST="$(jq -r '."containerimage.digest" // empty' /tmp/build-metadata.json)"
+        echo "image=${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+        echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+        echo "Pushed ${IMAGE}:${TAG}${EXTRA_TAGS:+ (also: ${EXTRA_TAGS})} ${DIGEST}"
       shell: bash

@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
+	"strconv"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +41,12 @@ type Watcher struct {
 	state     *sm.StateManager
 	nodeName  string
 	informer  cache.SharedIndexInformer
+
+	// detectGate, when HoldDetection set it, keeps the GPU detection loop
+	// from promoting IDLE jobs until ReleaseDetection: restart recovery
+	// sets the job states first.
+	detectGate    chan struct{}
+	releaseDetect sync.Once
 }
 
 // NewWatcher creates a new Watcher instance.
@@ -65,6 +74,7 @@ func NewWatcher(clientset kubernetes.Interface, state *sm.StateManager) (*Watche
 	_, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    w.handlePodAdd,
 		UpdateFunc: w.handlePodUpdate,
+		DeleteFunc: w.handlePodDelete,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to add event handler to informer: %w", err)
@@ -102,6 +112,43 @@ func (w *Watcher) handlePodUpdate(oldObj, newObj interface{}) {
 	w.registerPodJob(pod)
 }
 
+// handlePodDelete forgets a job when its last local pod is gone. A FAULTED
+// job (for example after KILL_UNCONFIRMED) clears this way, and a new pod
+// with the same job ID starts clean. It unwraps the tombstone the informer
+// hands over when it missed the delete event.
+func (w *Watcher) handlePodDelete(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, isTombstone := obj.(cache.DeletedFinalStateUnknown)
+		if !isTombstone {
+			return
+		}
+		if pod, ok = tombstone.Obj.(*corev1.Pod); !ok {
+			return
+		}
+	}
+	jobID, hasJob := pod.Labels[podutils.JobIDLabel]
+	if !hasJob {
+		return
+	}
+	// The informer's store drops the pod before this handler runs; the UID
+	// check also covers a store that still holds it.
+	for _, other := range w.getLocalPodsForJob(jobID) {
+		if other.UID != pod.UID {
+			slog.Info("Pod deleted; the job has other local pods", "pod", pod.Name, "jobID", jobID)
+			return
+		}
+	}
+	slog.Info("Last local pod of job deleted; forgetting the job", "pod", pod.Name, "jobID", jobID)
+	w.state.RemoveJob(jobID)
+}
+
+// PodsForJob returns the pods on this node that carry jobID, from the
+// informer cache.
+func (w *Watcher) PodsForJob(jobID string) []*corev1.Pod {
+	return w.getLocalPodsForJob(jobID)
+}
+
 func (w *Watcher) registerPodJob(pod *corev1.Pod) {
 	jobID, hasJob := pod.Labels[podutils.JobIDLabel]
 	if !hasJob {
@@ -113,9 +160,34 @@ func (w *Watcher) registerPodJob(pod *corev1.Pod) {
 
 	slog.Info("Detected pod for job", "pod", pod.Name, "jobID", jobID, "group", group)
 	w.state.RegisterJob(jobID, group)
+	w.seedGuestEpoch(pod, jobID)
+}
+
+// seedGuestEpoch raises the job's epoch fence to the mirror pod's
+// guest-epoch annotation. The epoch fence then holds across agent restarts,
+// and a late call is refused even if it arrives before the call that
+// replaced it. An invalid value is logged and ignored.
+func (w *Watcher) seedGuestEpoch(pod *corev1.Pod, jobID string) {
+	value, ok := pod.Annotations[podutils.GuestEpochAnnotation]
+	if !ok {
+		return
+	}
+	epoch, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		slog.Warn("Ignoring invalid guest-epoch annotation", "pod", pod.Name, "jobID", jobID, "value", value, "error", err)
+		return
+	}
+	w.state.SeedEpoch(jobID, epoch)
 }
 
 func (w *Watcher) detectionLoop(ctx context.Context) {
+	if w.detectGate != nil {
+		select {
+		case <-w.detectGate:
+		case <-ctx.Done():
+			return
+		}
+	}
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -133,6 +205,11 @@ func (w *Watcher) checkIdleJobs(ctx context.Context) {
 	statuses := w.state.GetJobStatus()
 	for _, status := range statuses {
 		if status.State != pb.JobState_JOB_STATE_IDLE {
+			continue
+		}
+		// A killed job stays IDLE with last outcome KILLED until its pod is
+		// gone; promoting it would hide that it was vacated.
+		if status.LastOutcome == pb.Outcome_OUTCOME_KILLED {
 			continue
 		}
 
@@ -170,4 +247,100 @@ func (w *Watcher) getLocalPodsForJob(jobID string) []*corev1.Pod {
 		}
 	}
 	return localPods
+}
+
+// LabelledJobs returns the job IDs of the pods on this node that carry the
+// label timeslice.io/role=<role> and a job ID, read from the pod cache when
+// it is called. It is the target lister of SuspendAll and ResumeAll. A pod
+// that has terminated (Succeeded or Failed) is skipped: it no longer runs on
+// the accelerator. A pod with a deletionTimestamp is still listed; it may
+// still be running.
+func (w *Watcher) LabelledJobs(role string) []string {
+	var jobIDs []string
+	for _, obj := range w.informer.GetStore().List() {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok || pod.Spec.NodeName != w.nodeName || pod.Labels[podutils.RoleLabel] != role {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if jobID := pod.Labels[podutils.JobIDLabel]; jobID != "" {
+			jobIDs = append(jobIDs, jobID)
+		}
+	}
+	return jobIDs
+}
+
+// HoldDetection keeps the GPU detection loop from promoting IDLE jobs to
+// RUNNING until ReleaseDetection. Call it before Start.
+func (w *Watcher) HoldDetection() {
+	w.detectGate = make(chan struct{})
+}
+
+// ReleaseDetection lets the GPU detection loop run. It is safe to call more
+// than once, and without HoldDetection.
+func (w *Watcher) ReleaseDetection() {
+	w.releaseDetect.Do(func() {
+		if w.detectGate != nil {
+			close(w.detectGate)
+		}
+	})
+}
+
+// Synced reports whether the informer cache has synced.
+func (w *Watcher) Synced() bool {
+	return w.informer.HasSynced()
+}
+
+// LocalJobs registers the job of every pod on this node in the informer
+// cache and returns the job IDs, sorted. Registration is idempotent; doing
+// it here means restart recovery does not depend on the informer's event
+// handlers having run for every cached pod.
+func (w *Watcher) LocalJobs() []string {
+	seen := map[string]bool{}
+	for _, obj := range w.informer.GetStore().List() {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok || pod.Spec.NodeName != w.nodeName {
+			continue
+		}
+		jobID, hasJob := pod.Labels[podutils.JobIDLabel]
+		if !hasJob || jobID == "" {
+			continue
+		}
+		w.registerPodJob(pod)
+		seen[jobID] = true
+	}
+	jobs := make([]string, 0, len(seen))
+	for id := range seen {
+		jobs = append(jobs, id)
+	}
+	sort.Strings(jobs)
+	return jobs
+}
+
+// RoleEpochs returns, per timeslice.io/role label value, the highest
+// guest-epoch annotation among the pods on this node that carry that role
+// and a job ID and have not terminated (the pods LabelledJobs lists).
+// Restart recovery seeds the SuspendAll and ResumeAll fences from it.
+func (w *Watcher) RoleEpochs() map[string]int64 {
+	out := map[string]int64{}
+	for _, obj := range w.informer.GetStore().List() {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok || pod.Spec.NodeName != w.nodeName || pod.Labels[podutils.JobIDLabel] == "" {
+			continue
+		}
+		role := pod.Labels[podutils.RoleLabel]
+		if role == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		epoch, err := strconv.ParseInt(pod.Annotations[podutils.GuestEpochAnnotation], 10, 64)
+		if err != nil {
+			continue
+		}
+		if cur, ok := out[role]; !ok || epoch > cur {
+			out[role] = epoch
+		}
+	}
+	return out
 }

@@ -1,0 +1,16 @@
+# The API server calls the webhook on 443; the Service forwards to the container's named port
+# (__PORT__), so --port=10250 works on a private GKE control plane.
+apiVersion: v1
+kind: Service
+metadata:
+  name: timeslice-webhook
+  namespace: __NS__
+  labels:
+    app.kubernetes.io/name: timeslice-webhook
+spec:
+  selector:
+    app.kubernetes.io/name: timeslice-webhook
+  ports:
+    - name: https
+      port: 443
+      targetPort: https

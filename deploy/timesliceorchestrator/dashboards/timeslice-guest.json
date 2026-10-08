@@ -1,0 +1,202 @@
+{
+  "displayName": "Timeslice guest lending",
+  "mosaicLayout": {
+    "columns": 48,
+    "tiles": [
+      {
+        "xPos": 0, "yPos": 0, "width": 24, "height": 16,
+        "widget": {
+          "title": "Guest off-window (s) vs --max-serving-offwindow",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (group_id, job_id, node) (timeslice_guest_offwindow_seconds)",
+                  "unitOverride": "s"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${metric.labels.job_id} on ${metric.labels.node}"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max (timeslice_max_serving_offwindow_seconds > 0)",
+                  "unitOverride": "s"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "max serving off-window"
+              }
+            ],
+            "yAxis": {"label": "seconds", "scale": "LINEAR"}
+          }
+        }
+      },
+      {
+        "xPos": 24, "yPos": 0, "width": 24, "height": 16,
+        "widget": {
+          "title": "Off-window alerts vs dispatcher requests past deadline (per 5m)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (group_id) (increase(timeslice_guest_offwindow_exceeded_total[5m]))"
+                },
+                "plotType": "STACKED_BAR",
+                "legendTemplate": "off-window over limit, ${metric.labels.group_id}"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum (increase(llm_d_async_async_exceeded_deadline_requests_total[5m]))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "dispatcher requests past deadline"
+              }
+            ],
+            "yAxis": {"label": "count", "scale": "LINEAR"}
+          }
+        }
+      },
+      {
+        "xPos": 0, "yPos": 16, "width": 24, "height": 16,
+        "widget": {
+          "title": "Notice until all guests vacated (s)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.5, sum by (le, group_id) (rate(timeslice_notice_seconds_bucket[5m])))",
+                  "unitOverride": "s"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p50 ${metric.labels.group_id}"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, group_id) (rate(timeslice_notice_seconds_bucket[5m])))",
+                  "unitOverride": "s"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p95 ${metric.labels.group_id}"
+              }
+            ],
+            "yAxis": {"label": "seconds", "scale": "LINEAR"}
+          }
+        }
+      },
+      {
+        "xPos": 24, "yPos": 16, "width": 24, "height": 16,
+        "widget": {
+          "title": "Foreground Acquire wait (s)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.5, sum by (le, group_id) (rate(timeslice_foreground_wait_seconds_bucket[5m])))",
+                  "unitOverride": "s"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p50 ${metric.labels.group_id}"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, group_id) (rate(timeslice_foreground_wait_seconds_bucket[5m])))",
+                  "unitOverride": "s"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p95 ${metric.labels.group_id}"
+              }
+            ],
+            "yAxis": {"label": "seconds", "scale": "LINEAR"}
+          }
+        }
+      },
+      {
+        "xPos": 0, "yPos": 32, "width": 24, "height": 16,
+        "widget": {
+          "title": "Host vacate latency p95 (s), by node and how it cleared",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, node, how) (rate(timeslice_host_vacate_seconds_bucket[5m])))",
+                  "unitOverride": "s"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${metric.labels.node} ${metric.labels.how}"
+              }
+            ],
+            "yAxis": {"label": "seconds", "scale": "LINEAR"}
+          }
+        }
+      },
+      {
+        "xPos": 24, "yPos": 32, "width": 24, "height": 16,
+        "widget": {
+          "title": "Host resume latency p95 (s), by node",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, node) (rate(timeslice_host_resume_seconds_bucket[5m])))",
+                  "unitOverride": "s"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${metric.labels.node}"
+              }
+            ],
+            "yAxis": {"label": "seconds", "scale": "LINEAR"}
+          }
+        }
+      },
+      {
+        "xPos": 0, "yPos": 48, "width": 24, "height": 16,
+        "widget": {
+          "title": "Guest kills by reason, and unconfirmed kills (per 5m)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (reason) (increase(timeslice_guest_kills_total[5m]))"
+                },
+                "plotType": "STACKED_BAR",
+                "legendTemplate": "kill ${metric.labels.reason}"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum (increase(timeslice_kill_unconfirmed_total[5m]))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "kill unconfirmed"
+              }
+            ],
+            "yAxis": {"label": "count", "scale": "LINEAR"}
+          }
+        }
+      },
+      {
+        "xPos": 24, "yPos": 48, "width": 24, "height": 16,
+        "widget": {
+          "title": "Agent unreachable and background participants, by node",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (node) (timeslice_agent_unreachable)"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "agent unreachable ${metric.labels.node}"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (node) (timeslice_background_participants)"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "background participant ${metric.labels.node}"
+              }
+            ],
+            "yAxis": {"label": "0 / 1", "scale": "LINEAR"}
+          }
+        }
+      }
+    ]
+  }
+}

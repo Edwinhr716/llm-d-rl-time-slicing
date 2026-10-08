@@ -3,6 +3,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
@@ -16,6 +17,7 @@ type MockSnapshotAgentStore struct {
 	SnapshotFunc  func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.SnapshotResponse, error)
 	OperationFunc func(ctx context.Context, nodeName, operationID string) (*agentpb.GetOperationResponse, error)
 	RestoreFunc   func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error)
+	KillFunc      func(ctx context.Context, nodeName, jobID, reason string, deadline time.Time) (*agentpb.KillResponse, error)
 
 	// Queued responses for GetOperation
 	OperationResponses []*agentpb.GetOperationResponse
@@ -66,4 +68,13 @@ func (m *MockSnapshotAgentStore) Restore(
 		return m.RestoreFunc(ctx, nodeName, jobID, groupID)
 	}
 	return &agentpb.RestoreResponse{}, nil
+}
+
+func (m *MockSnapshotAgentStore) Kill(
+	ctx context.Context, nodeName, jobID, reason string, deadline time.Time,
+) (*agentpb.KillResponse, error) {
+	if m.KillFunc != nil {
+		return m.KillFunc(ctx, nodeName, jobID, reason, deadline)
+	}
+	return &agentpb.KillResponse{}, nil
 }

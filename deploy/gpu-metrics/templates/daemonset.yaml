@@ -1,0 +1,72 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: '{{ include "gpu-metrics.fullname" . }}'
+  namespace: '{{ include "gpu-metrics.namespace" . }}'
+  labels:
+    # {{- include "gpu-metrics.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      # {{- include "gpu-metrics.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/counters: '{{ include (print $.Template.BasePath "/counters.yaml") . | sha256sum }}'
+      labels:
+        # {{- include "gpu-metrics.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        # {{- toYaml .Values.nodeSelector | nindent 8 }}
+      affinity:
+        # {{- toYaml .Values.affinity | nindent 8 }}
+      tolerations:
+        # {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: dcgm-exporter
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'
+          imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+          env:
+            - name: DCGM_EXPORTER_LISTEN
+              value: ':{{ .Values.port }}'
+            - name: DCGM_EXPORTER_INTERVAL
+              value: '{{ .Values.collectIntervalMs }}'
+            - name: DCGM_EXPORTER_COLLECTORS
+              value: '{{ .Values.collectors }}'
+            - name: DCGM_EXPORTER_KUBERNETES
+              value: '{{ .Values.kubernetesPodMapping }}'
+            - name: LD_LIBRARY_PATH
+              value: '{{ .Values.nvidia.driver.mountPath }}/lib64'
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          ports:
+            # {{- printf "- {name: metrics, containerPort: %d}" (int .Values.port) | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /health, port: metrics}
+            periodSeconds: 10
+          securityContext:
+            # {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            # {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: counters
+              mountPath: '{{ .Values.countersPath }}'
+              readOnly: true
+            - name: nvidia-driver
+              mountPath: '{{ .Values.nvidia.driver.mountPath }}'
+              readOnly: true
+            # {{- if .Values.nvidia.devices.enabled }}
+            - {name: dev, mountPath: /dev}
+            # {{- end }}
+      volumes:
+        - name: counters
+          configMap: {name: '{{ include "gpu-metrics.fullname" . }}-counters'}
+        - name: nvidia-driver
+          hostPath: {path: '{{ .Values.nvidia.driver.hostPath }}', type: Directory}
+        # {{- if .Values.nvidia.devices.enabled }}
+        - name: dev
+          hostPath: {path: '{{ .Values.nvidia.devices.hostPath }}', type: Directory}
+        # {{- end }}

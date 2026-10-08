@@ -3,6 +3,7 @@ package backends_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -337,4 +338,61 @@ func TestAppEndpointNilConfig(t *testing.T) {
 
 func TestInterfaceCompliance(t *testing.T) {
 	var _ backends.Backend = (*backends.AppEndpointBackend)(nil)
+}
+
+func TestVLLMIsSuspended(t *testing.T) {
+	for _, tc := range []struct {
+		body    string
+		want    bool
+		wantErr bool
+	}{
+		{body: `{"is_sleeping": true}`, want: true},
+		{body: `{"is_sleeping": false}`, want: false},
+		{body: `{}`, wantErr: true},
+		{body: `not json`, wantErr: true},
+	} {
+		var gotMethod, gotPath string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath = r.Method, r.URL.Path
+			if _, err := io.WriteString(w, tc.body); err != nil {
+				t.Error(err)
+			}
+		}))
+		b := backends.NewAppEndpointBackendWithClient(srv.Client())
+		got, err := b.IsSuspended(context.Background(), appConfig(pb.App_APP_VLLM, srv.URL, pb.SuspendMode_SUSPEND_MODE_OFFLOAD).Config)
+		srv.Close()
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("body %q: got %v, %v; want %v, error %v", tc.body, got, err, tc.want, tc.wantErr)
+		}
+		if gotMethod != http.MethodGet || gotPath != "/is_sleeping" {
+			t.Errorf("request %s %s, want GET /is_sleeping", gotMethod, gotPath)
+		}
+	}
+}
+
+func TestVLLMResetCache(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+	}))
+	defer srv.Close()
+	b := backends.NewAppEndpointBackend()
+	cfg := appConfig(pb.App_APP_VLLM, srv.URL, pb.SuspendMode_SUSPEND_MODE_OFFLOAD).Config
+	if err := b.ResetCache(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/reset_prefix_cache" {
+		t.Errorf("request %s %s, want POST /reset_prefix_cache", gotMethod, gotPath)
+	}
+}
+
+func TestSGLangSleepStateUnsupported(t *testing.T) {
+	b := backends.NewAppEndpointBackend()
+	cfg := appConfig(pb.App_APP_SGLANG, "http://127.0.0.1:1", pb.SuspendMode_SUSPEND_MODE_OFFLOAD).Config
+	if _, err := b.IsSuspended(context.Background(), cfg); !errors.Is(err, backends.ErrUnsupported) {
+		t.Errorf("IsSuspended: %v, want ErrUnsupported", err)
+	}
+	if err := b.ResetCache(context.Background(), cfg); !errors.Is(err, backends.ErrUnsupported) {
+		t.Errorf("ResetCache: %v, want ErrUnsupported", err)
+	}
 }

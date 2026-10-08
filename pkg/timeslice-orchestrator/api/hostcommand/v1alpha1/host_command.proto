@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package timeslice_hostcommand.v1alpha1;
+
+option go_package = "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/hostcommand/v1alpha1;v1alpha1";
+
+import "google/protobuf/timestamp.proto";
+
+// HostCommandService is served by the per-host component of a shared host
+// (the virtual kubelet) at <node InternalIP>:<host command port>. The
+// orchestrator is its only caller.
+//
+// On a foreground Acquire the orchestrator sends Vacate to every host of the
+// group, waits until every host has acked OUTCOME_VACATED, and only then
+// grants the foreground. On a foreground Yield that lends the accelerator it
+// sends Resume to every host.
+//
+// Every command carries an epoch. Epochs increase strictly across commands,
+// also across orchestrator restarts. A host keeps the highest epoch it has
+// seen and answers a command with a lower epoch with OUTCOME_STALE_EPOCH
+// without acting on it. A command with a higher epoch supersedes a running
+// command of the other kind (a Vacate aborts a running Resume). A Vacate with
+// a higher epoch while a Vacate is already running joins it: the host acks the
+// new epoch when the running vacate finishes.
+//
+// Both RPCs return only when the command is done: the response is the ack.
+// Commands are idempotent: a Vacate on a host with nothing to vacate acks
+// OUTCOME_VACATED at once.
+service HostCommandService {
+  // Vacate makes the host stop every guest on it: for each guest, mark it not
+  // ready and confirm that, then suspend it, all before deadline. It returns
+  // OUTCOME_VACATED only when every guest is suspended.
+  rpc Vacate(VacateRequest) returns (HostAck);
+
+  // Resume lets the host run its guests again: for each suspended guest,
+  // resume it and then mark it ready.
+  rpc Resume(ResumeRequest) returns (HostAck);
+}
+
+// Command names a host command in an ack.
+enum Command {
+  COMMAND_UNSPECIFIED = 0;
+  COMMAND_VACATE = 1;
+  COMMAND_RESUME = 2;
+}
+
+// Outcome is the result of a host command, for the host or for one guest.
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  // Every guest is suspended: the host is clear.
+  OUTCOME_VACATED = 1;
+  // Every guest was resumed and marked ready.
+  OUTCOME_RESUMED = 2;
+  // The command failed; error says why. For Vacate the host is not clear.
+  OUTCOME_FAILED = 3;
+  // The command's epoch is lower than one the host has already seen. The host
+  // did nothing. HostAck.current_epoch holds the higher epoch.
+  OUTCOME_STALE_EPOCH = 4;
+  // The command was superseded by a command with a higher epoch.
+  OUTCOME_ABORTED = 5;
+}
+
+message VacateRequest {
+  string group_id = 1;
+  // The real node the command is for. A host refuses a command for another
+  // node.
+  string node_name = 2;
+  int64 epoch = 3;
+  // Absolute time by which every guest must be suspended: T = notice + N - K.
+  google.protobuf.Timestamp deadline = 4;
+}
+
+message ResumeRequest {
+  string group_id = 1;
+  string node_name = 2;
+  int64 epoch = 3;
+  // Absolute time by which every guest should be resumed.
+  google.protobuf.Timestamp deadline = 4;
+}
+
+// GuestResult is the outcome of a command for one guest.
+message GuestResult {
+  string guest = 1;
+  Outcome outcome = 2;
+  string error = 3;
+}
+
+// HostAck acknowledges a command. The orchestrator acts on an ack only when
+// its epoch and command match the command it is waiting for.
+message HostAck {
+  string node_name = 1;
+  // The epoch of the command this ack answers.
+  int64 epoch = 2;
+  Command command = 3;
+  Outcome outcome = 4;
+  // The highest epoch the host has seen.
+  int64 current_epoch = 5;
+  repeated GuestResult guests = 6;
+  string error = 7;
+}

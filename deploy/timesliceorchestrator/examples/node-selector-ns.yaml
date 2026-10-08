@@ -1,0 +1,9 @@
+# Scope an orchestrator install to the donor hosts, with every donor host
+# labelled timeslice.io/donor=true (whatever group it belongs to).
+#
+# The selector must select every real host that carries the group label;
+# mirrors are bound there.
+#
+# One selector covers every group, so one install serves all of them.
+scope:
+  nodeSelector: timeslice.io/donor=true

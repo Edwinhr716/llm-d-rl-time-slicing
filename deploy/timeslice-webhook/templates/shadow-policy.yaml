@@ -1,0 +1,56 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+# W11: nobody but the virtual kubelet may request a GPU shadow resource
+# (timeslice.io/gpu-shadow or timeslice.io/gpu-shadow-<minor>). Cluster-wide:
+# no namespaceSelector and no label match, because the pod to stop carries
+# neither. See manifests/shadow-policy.yaml for the rationale.
+# {{- if .Values.shadowPolicy.enabled }}
+# {{- $name := printf "%s-gpu-shadow-%s" (include "timeslice-webhook.fullname" .) (include "timeslice-webhook.namespace" .) }}
+# {{- $vk := include "timeslice-webhook.vkUsername" . }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: '{{ $name }}'
+  labels:
+    # {{- include "timeslice-webhook.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: not-the-virtual-kubelet
+      expression: "request.userInfo.username != '{{ $vk }}'"
+  variables:
+    - name: asksShadow
+      expression: >-
+        object.spec.containers.exists(c, has(c.resources) &&
+        ((has(c.resources.requests) && c.resources.requests.exists(r,
+        r == 'timeslice.io/gpu-shadow' || r.startsWith('timeslice.io/gpu-shadow-'))) ||
+        (has(c.resources.limits) && c.resources.limits.exists(r,
+        r == 'timeslice.io/gpu-shadow' || r.startsWith('timeslice.io/gpu-shadow-'))))) ||
+        (has(object.spec.initContainers) && object.spec.initContainers.exists(c, has(c.resources) &&
+        ((has(c.resources.requests) && c.resources.requests.exists(r,
+        r == 'timeslice.io/gpu-shadow' || r.startsWith('timeslice.io/gpu-shadow-'))) ||
+        (has(c.resources.limits) && c.resources.limits.exists(r,
+        r == 'timeslice.io/gpu-shadow' || r.startsWith('timeslice.io/gpu-shadow-'))))))
+  validations:
+    - expression: "!variables.asksShadow"
+      message: >-
+        [W11] timeslice.io/gpu-shadow and timeslice.io/gpu-shadow-* are requested only by the
+        virtual kubelet on mirror pods; request nvidia.com/gpu instead
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: '{{ $name }}'
+  labels:
+    # {{- include "timeslice-webhook.labels" . | nindent 4 }}
+spec:
+  policyName: '{{ $name }}'
+  validationActions: [Deny]
+# {{- end }}

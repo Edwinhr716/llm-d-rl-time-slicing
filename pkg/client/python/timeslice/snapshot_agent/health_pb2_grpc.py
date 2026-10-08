@@ -5,7 +5,9 @@ import warnings
 
 from . import health_pb2 as health__pb2
 
-GRPC_GENERATED_VERSION = '1.81.0'
+# Lowered from 1.81.0: this module uses no gRPC API newer than 1.66 (grpcio-tools 1.66.2 generates the
+# same calls), and common RL images (verl) ship grpcio 1.80. Keep in sync when regenerating.
+GRPC_GENERATED_VERSION = '1.66.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 

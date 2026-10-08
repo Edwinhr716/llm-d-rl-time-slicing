@@ -12,22 +12,54 @@ import (
 )
 
 const (
-	// Namespace is the namespace where the locks configmap resides.
+	// Namespace is the default namespace where the locks configmap resides.
 	Namespace = "timeslice-system"
-	// ConfigMapName is the name of the configmap storing the locks.
+	// ConfigMapName is the default name of the configmap storing the locks.
 	ConfigMapName = "timeslice-orchestrator-locks"
 )
 
 // ConfigMapLockStore implements LockStore using a Kubernetes ConfigMap.
 type ConfigMapLockStore struct {
-	client kubernetes.Interface
+	client    kubernetes.Interface
+	namespace string
+	name      string
 }
 
-// NewConfigMapLockStore creates a new ConfigMapLockStore.
-func NewConfigMapLockStore(client kubernetes.Interface) *ConfigMapLockStore {
-	return &ConfigMapLockStore{
-		client: client,
+// ConfigMapLockStoreOption configures a ConfigMapLockStore.
+type ConfigMapLockStoreOption func(*ConfigMapLockStore)
+
+// WithConfigMap stores the locks in the ConfigMap namespace/name instead of
+// the default Namespace/ConfigMapName, so that two orchestrator installs in
+// one cluster do not share (and fight over) one lock table. An empty value
+// keeps the corresponding default.
+func WithConfigMap(namespace, name string) ConfigMapLockStoreOption {
+	return func(s *ConfigMapLockStore) {
+		if namespace != "" {
+			s.namespace = namespace
+		}
+		if name != "" {
+			s.name = name
+		}
 	}
+}
+
+// NewConfigMapLockStore creates a new ConfigMapLockStore. Without options it
+// uses the ConfigMap Namespace/ConfigMapName.
+func NewConfigMapLockStore(client kubernetes.Interface, opts ...ConfigMapLockStoreOption) *ConfigMapLockStore {
+	s := &ConfigMapLockStore{
+		client:    client,
+		namespace: Namespace,
+		name:      ConfigMapName,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// ConfigMapRef returns "namespace/name" of the ConfigMap holding the locks.
+func (s *ConfigMapLockStore) ConfigMapRef() string {
+	return s.namespace + "/" + s.name
 }
 
 func (s *ConfigMapLockStore) getOrCreateConfigMap(ctx context.Context) (*corev1.ConfigMap, error) {
@@ -35,7 +67,7 @@ func (s *ConfigMapLockStore) getOrCreateConfigMap(ctx context.Context) (*corev1.
 
 	err := retry.OnError(retry.DefaultRetry, apierrors.IsAlreadyExists, func() error {
 		var getErr error
-		cm, getErr = s.client.CoreV1().ConfigMaps(Namespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+		cm, getErr = s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.name, metav1.GetOptions{})
 		if getErr == nil {
 			return nil
 		}
@@ -46,13 +78,13 @@ func (s *ConfigMapLockStore) getOrCreateConfigMap(ctx context.Context) (*corev1.
 		// Create it
 		newCM := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      ConfigMapName,
-				Namespace: Namespace,
+				Name:      s.name,
+				Namespace: s.namespace,
 			},
 			Data: make(map[string]string),
 		}
 		var createErr error
-		cm, createErr = s.client.CoreV1().ConfigMaps(Namespace).Create(ctx, newCM, metav1.CreateOptions{})
+		cm, createErr = s.client.CoreV1().ConfigMaps(s.namespace).Create(ctx, newCM, metav1.CreateOptions{})
 		return createErr
 	})
 	if err != nil {
@@ -63,7 +95,7 @@ func (s *ConfigMapLockStore) getOrCreateConfigMap(ctx context.Context) (*corev1.
 
 // GetLock returns the job_id currently holding the lock for the group.
 func (s *ConfigMapLockStore) GetLock(ctx context.Context, groupID string) (string, error) {
-	cm, err := s.client.CoreV1().ConfigMaps(Namespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+	cm, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return "", nil // ConfigMap doesn't exist, so no locks
@@ -94,7 +126,7 @@ func (s *ConfigMapLockStore) Lock(ctx context.Context, groupID, jobID string) er
 		}
 
 		cm.Data[groupID] = jobID
-		_, err = s.client.CoreV1().ConfigMaps(Namespace).Update(ctx, cm, metav1.UpdateOptions{})
+		_, err = s.client.CoreV1().ConfigMaps(s.namespace).Update(ctx, cm, metav1.UpdateOptions{})
 		return err
 	})
 }
@@ -102,7 +134,7 @@ func (s *ConfigMapLockStore) Lock(ctx context.Context, groupID, jobID string) er
 // Unlock persistently releases the lock for the group.
 func (s *ConfigMapLockStore) Unlock(ctx context.Context, groupID, jobID string) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		cm, err := s.client.CoreV1().ConfigMaps(Namespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+		cm, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.name, metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil // ConfigMap doesn't exist, so already unlocked
@@ -123,7 +155,7 @@ func (s *ConfigMapLockStore) Unlock(ctx context.Context, groupID, jobID string) 
 		}
 
 		delete(cm.Data, groupID)
-		_, err = s.client.CoreV1().ConfigMaps(Namespace).Update(ctx, cm, metav1.UpdateOptions{})
+		_, err = s.client.CoreV1().ConfigMaps(s.namespace).Update(ctx, cm, metav1.UpdateOptions{})
 		return err
 	})
 }

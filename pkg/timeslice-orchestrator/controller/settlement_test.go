@@ -164,3 +164,72 @@ func TestController_Reconcile_SettlementTimeoutUnblocks(t *testing.T) {
 		t.Fatalf("Expected promotion to proceed after SettleTimeout: %v", err)
 	}
 }
+
+// TestController_Reconcile_SettlementNoSelfWait: the job holding the
+// unconsumed grant asks again (it yielded before its engine was seen on the
+// accelerator). It must not wait on its own grant: it is granted at once, well
+// before SettleTimeout.
+func TestController_Reconcile_SettlementNoSelfWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	agentStore := &controller.MockSnapshotAgentStore{
+		OperationResponses: []*agentpb.GetOperationResponse{
+			{Status: agentpb.OperationStatus_OPERATION_STATUS_COMPLETE},
+		},
+	}
+	c, group, _, testQueue := settlementFixture(t, ctx, agentStore)
+	group.Spec().GetWaitingJobQueue().Remove("job-a")
+	group.Spec().RequestLock("job-b") // the active job itself, grant still unconsumed
+	c.SettleTimeout = time.Hour
+
+	go func() {
+		if err := c.Run(ctx, 1); err != nil {
+			t.Errorf("Controller Run failed: %v", err)
+		}
+	}()
+	testQueue.Add("group-1")
+
+	if err := waitWithTimeout(func() bool { return group.Spec().LockingJob() == "job-b" }, 3*time.Second); err != nil {
+		t.Fatalf("Expected job-b to be re-granted at once, not held on its own grant: %v", err)
+	}
+}
+
+// TestController_Reconcile_SettlementHoldsOtherBeforeSelf: fail closed. With
+// another job at the head of the queue and the active job queued behind it,
+// the hold stays: nothing is granted while job-b's grant is unconsumed.
+func TestController_Reconcile_SettlementHoldsOtherBeforeSelf(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	agentStore := &controller.MockSnapshotAgentStore{
+		SnapshotFunc: func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.SnapshotResponse, error) {
+			t.Errorf("unexpected Snapshot(%s) while promotion is held", jobID)
+			return &agentpb.SnapshotResponse{}, nil
+		},
+		RestoreFunc: func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error) {
+			t.Errorf("unexpected Restore(%s) while promotion is held", jobID)
+			return &agentpb.RestoreResponse{}, nil
+		},
+	}
+	c, group, _, testQueue := settlementFixture(t, ctx, agentStore)
+	group.Spec().RequestLock("job-b") // queued behind job-a
+	c.SettleTimeout = time.Hour
+
+	go func() {
+		if err := c.Run(ctx, 1); err != nil {
+			t.Errorf("Controller Run failed: %v", err)
+		}
+	}()
+	testQueue.Add("group-1")
+
+	if err := waitWithTimeout(func() bool { return testQueue.getDoneCount() >= 3 }, 3*time.Second); err != nil {
+		t.Fatalf("Timed out waiting for reconciles: %v", err)
+	}
+	if got := group.Spec().LockingJob(); got != "" {
+		t.Errorf("Expected promotion to be held (no locking job), got %q", got)
+	}
+	if depth := group.Spec().GetWaitingJobQueue().Len(); depth != 2 {
+		t.Errorf("Expected job-a and job-b to remain queued (depth 2), got %d", depth)
+	}
+}
