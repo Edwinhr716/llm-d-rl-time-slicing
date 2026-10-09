@@ -100,7 +100,7 @@ git clone https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git
 cd llm-d-rl-time-slicing
 ```
 
-> **Release pin:** the chart is not published to a registry — you install it from the clone. To pin a release, clone the repo at the release tag (`git clone --branch <version> https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git`) so the chart matches the pinned images, and pin the images with `--set timesliceorchestrator.image.tag=<version> --set snapshot-agent.image.tag=<version>` (the chart defaults pull the official `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` images at `latest`). Until the first tagged release is cut, `main` + `latest` is the only option.
+> **Release pin:** the chart is not published to a registry — you install it from the clone. To pin a release, clone the repo at the release tag (`git clone --branch <version> https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git`) so the chart matches the pinned images, and pin the images with `--set global.imageTag=<version>` (on the `demo/batch` branch the chart pulls the official `ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/*` images at `demo-batch`, that branch's newest release; each of its commits is also published as `demo-<short sha>`, see `deploy/README.md`).
 
 ### Step 2: Install the Helm Chart
 
