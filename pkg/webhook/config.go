@@ -54,6 +54,9 @@ type Config struct {
 	PodinfoPath string
 	// GroupFormat is GroupFormatNsJobGroup.
 	GroupFormat string
+	// AgentPort is the snapshot agent's port, injected as TIMESLICE_AGENT_PORT into the Ray pods
+	// of an application-aware donor (timeslice.io/backend: app_channel).
+	AgentPort int
 	// RLIntegrationImage, when set, is the image of the init container injected into donor pods and
 	// pods labelled timeslice.io/rl-integration=true: it copies the timeslice Python packages into
 	// an emptyDir that every container mounts at RLIntegrationPath, with PYTHONPATH pointing there.
@@ -98,6 +101,8 @@ func ConfigFromFlags(args []string) (Config, error) {
 		"Mount path of the downward-API podinfo volume (--donor-client-wiring=downward).")
 	fs.StringVar(&cfg.GroupFormat, "group-format", GroupFormatNsJobGroup,
 		"Format of the derived timeslice.io/group value. Only ns.job.group is supported.")
+	fs.IntVar(&cfg.AgentPort, "agent-port", DefaultAgentPort,
+		"Snapshot agent port injected as TIMESLICE_AGENT_PORT into the Ray pods of an application-aware donor.")
 	fs.StringVar(&cfg.RLIntegrationImage, "rl-integration-image", "",
 		"Image of the RL integration init container injected into donors and timeslice.io/rl-integration=true pods; "+
 			"empty injects nothing.")
@@ -165,6 +170,9 @@ func (c *Config) validate() error {
 	}
 	if c.Port < 1 || c.Port > 65535 {
 		errs = append(errs, fmt.Errorf("--port must be 1-65535, got %d", c.Port))
+	}
+	if c.AgentPort < 1 || c.AgentPort > 65535 {
+		errs = append(errs, fmt.Errorf("--agent-port must be 1-65535, got %d", c.AgentPort))
 	}
 	if c.CertDir == "" {
 		errs = append(errs, errors.New("--cert-dir must not be empty"))

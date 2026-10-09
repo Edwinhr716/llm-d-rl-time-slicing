@@ -26,9 +26,19 @@ Lock protocol (single trainers-pool group lock):
                                fully_async_main runs after init_workers)
   on_update_weights_end        YIELD iff synced (update_actor + NCCL param sync
                                + reset_staleness complete)
-  on_save_checkpoint           veto (return False) when trainer.save_freq > 0:
-                               saving RPCs the FSDP worker, which may be
-                               checkpointed off; run with trainer.save_freq=-1
+  on_update_weights_end        a checkpoint due at this param version
+  (synced, before the YIELD)   (trainer.save_freq) is saved here, while the
+                               lock is still held and the worker is resident
+  _fit_save_checkpoint         a due save outside a locked window (verl's
+                               final save, after fit's loop) ACQUIREs, saves,
+                               YIELDs (trainer.py)
+  load_checkpoint              ACQUIRE before a resume loads (resume_mode !=
+                               disable); held until the initial param sync
+                               yields (trainer.py)
+  on_save_checkpoint           veto (return False) a save without the lock
+                               (the FSDP worker may be parked or
+                               checkpointed off): a safety net, the paths
+                               above never get here unlocked
   on_exception                 crash-release: never die holding the group lock
 
 All lock RPCs run in the CPU-only trainer driver actor (never checkpointed)
@@ -50,6 +60,14 @@ Environment contract:
                                experimental: torch.cuda.empty_cache() right
                                before each yield's release (best-effort probe
                                for smaller cuda-checkpoint snapshots)
+  TIMESLICE_DONOR_BACKEND=app_channel
+                               opt-in application-aware parking: the trainer
+                               parks itself (model and optimizer to host
+                               memory) when the snapshot agent asks, instead
+                               of being cuda-checkpointed (timeslice_verl.
+                               app_aware; registered at on_init_workers_end,
+                               and every granted acquire makes sure the
+                               trainer is resident again)
   TIMESLICE_EXPECTED_IDLE      expected_idle hint sent with each yield
                                (timeslice_verl.estimator): "off" (default,
                                no hint), "auto" (per yield point, EWMA of the
@@ -60,10 +78,11 @@ Environment contract:
                                >= its --min-bubble (--lend-policy=hint).
 
 Config this module depends on directly: async_training.trainer_name=timeslice
-selects the subclass (see trainer.py); trainer.save_freq=-1 is enforced by the
-on_save_checkpoint veto; ray_pg_extra_resources.* feeds placement-group
-pinning. The full required-overrides list for time-sliced runs lives in the
-verl integration guide (guides/rl-frameworks/verl/).
+selects the subclass (see trainer.py); trainer.save_freq (checkpoints are
+saved inside the locked window of the update that reaches a multiple of it);
+ray_pg_extra_resources.* feeds placement-group pinning. The full
+required-overrides list for time-sliced runs lives in the verl integration
+guide (guides/rl-frameworks/verl/).
 """
 
 import asyncio
@@ -71,7 +90,7 @@ import os
 import threading
 from time import monotonic as _now
 
-from timeslice_verl import estimator
+from timeslice_verl import app_aware, estimator
 from timeslice_verl.locks import PhaseLocks, _log
 
 ENV_ENABLE = "TIMESLICE_FULLY_ASYNC"
@@ -108,6 +127,9 @@ class TimesliceHooksMixin:
         # the last yield whose gap to the next acquire is not measured yet.
         self._idle_state = estimator.new()
         self._pending_gap: tuple[str, float] | None = None
+        # Application-aware parking (TIMESLICE_DONOR_BACKEND=app_channel).
+        self._park: app_aware.TrainerPark | None = None
+        self._park_handles: list = []
         if enabled():
             _log("fully_async: timeslice lifecycle hooks active (TIMESLICE_FULLY_ASYNC=1)")
 
@@ -121,6 +143,15 @@ class TimesliceHooksMixin:
     async def on_init_workers_end(self) -> None:
         if not enabled():
             return
+        if app_aware.enabled():
+            try:
+                await asyncio.to_thread(self._start_app_park)
+            except BaseException:
+                # Never leave holding the group lock.
+                locks = self._locks
+                if locks is not None and locks.enabled:
+                    await asyncio.to_thread(locks.drop_all)
+                raise
         await self._yield_lock(point="init_workers")
 
     async def on_sample_end(self) -> None:
@@ -141,6 +172,9 @@ class TimesliceHooksMixin:
         if not enabled():
             return
         if synced:
+            # verl saves after the update's yield, when the worker may already
+            # be parked or lent: save a due checkpoint now, while still held.
+            self._save_in_window()
             await self._yield_lock(point="update_weights")
         else:
             self._warn_once(
@@ -153,20 +187,16 @@ class TimesliceHooksMixin:
     def on_save_checkpoint(self, force: bool) -> bool:
         if not enabled():
             return True
-        save_freq = None
-        try:
-            save_freq = self.config.trainer.save_freq
-        except Exception:  # noqa: BLE001
-            save_freq = None
-        if save_freq is not None and save_freq > 0:
-            self._warn_once(
-                "save_checkpoint",
-                f"vetoing checkpoint save (save_freq={save_freq}, force={force}): "
-                "checkpoint saving is disabled under fully-async time-slicing "
-                "(the trainer worker may be checkpointed off). Set trainer.save_freq=-1.",
-            )
-            return False
-        return True
+        # verl calls this hook before its own due check, so after every yield:
+        # only a save that would actually run needs the lock (unknown => veto)
+        if not self._save_needs_lock() or not self._checkpoint_due(force, unknown=True):
+            return True
+        self._warn_once(
+            "save_checkpoint",
+            f"vetoing a checkpoint save without the group lock (force={force}): "
+            "the FSDP worker may be parked or checkpointed off the GPU.",
+        )
+        return False
 
     async def on_exception(self, point: str, exc: BaseException) -> None:
         """Best-effort lock release on a crash path: a job must never die
@@ -203,6 +233,11 @@ class TimesliceHooksMixin:
         locks = await asyncio.to_thread(self._get_locks)
         self._observe_gap(locks)
         await asyncio.to_thread(locks.ensure)
+        park = self._park
+        if park is not None:
+            # The orchestrator grants only once the agent restored the
+            # trainer; this redoes a restore the agent lost (agent restart).
+            await asyncio.to_thread(park.ensure_resident)
 
     async def _yield_lock(self, point: str) -> None:
         """Idempotent release (PhaseLocks.drop_all: errors logged, never
@@ -215,6 +250,97 @@ class TimesliceHooksMixin:
         await asyncio.to_thread(self._maybe_empty_cache, point)  # experimental, inert by default
         await asyncio.to_thread(locks.drop_all, self._expected_idle(point))
         self._pending_gap = (point, _now())
+
+    # ------------------------------------------------------------ checkpoints
+
+    def _save_needs_lock(self) -> bool:
+        """True when a save would run while the trainer does not hold the
+        group lock (so its worker may be parked or lent)."""
+        locks = self._locks
+        return locks is not None and locks.enabled and not locks.held
+
+    def _checkpoint_due(self, force: bool = False, unknown: bool = False) -> bool:
+        """Whether verl's _fit_save_checkpoint would save at the current param
+        version (save_freq > 0, not saved yet, forced or a multiple); `unknown`
+        is returned when the trainer state cannot be read."""
+        try:
+            save_freq = self.config.trainer.save_freq
+            version = self.current_param_version
+        except Exception:  # noqa: BLE001
+            return unknown
+        if save_freq is None or save_freq <= 0:
+            return False
+        if version == getattr(self, "last_ckpt_version", None):
+            return False
+        return bool(force or version % save_freq == 0)
+
+    def _save_in_window(self) -> None:
+        """Save a due checkpoint inside the update's locked window (the lock
+        is held, the worker resident). verl's own call after the yield then
+        finds the version saved and returns."""
+        if not self._checkpoint_due():
+            return
+        save = getattr(self, "_fit_save_checkpoint", None)
+        if save is None:
+            return
+        t0 = _now()
+        save()
+        _log(f"checkpoint saved in the locked window: version={self.current_param_version} took={_now() - t0:.1f}s")
+
+    def _save_with_lock(self, save, force: bool = False):
+        """Run verl's save `save(force=...)`; a due save outside a locked
+        window first takes the lock (blocking: verl's save path is
+        synchronous and blocks the actor anyway) and yields it after."""
+        if not enabled() or not self._save_needs_lock() or not self._checkpoint_due(force):
+            return save(force=force)
+        locks = self._locks
+        locks.ensure()
+        try:
+            if self._park is not None:
+                self._park.ensure_resident()
+            return save(force=force)
+        finally:
+            locks.drop_all()
+
+    async def _lock_for_load(self) -> None:
+        """Take the lock before a resume loads a checkpoint into the worker
+        (init_workers yielded, so it may be parked or lent). Held until the
+        initial param sync yields."""
+        if not enabled():
+            return
+        try:
+            mode = self.config.trainer.resume_mode
+        except Exception:  # noqa: BLE001
+            mode = None
+        if mode in (None, "disable"):
+            return
+        await self._ensure_lock(point="load_checkpoint")
+
+    # ------------------------------------------------------------ app-aware parking
+
+    def _at_safe_point(self) -> bool:
+        """A park is safe only while the trainer does not hold the lock."""
+        locks = self._locks
+        return locks is None or not locks.enabled or not locks.held
+
+    def _start_app_park(self) -> None:
+        """Register the park/restore workload of the actor worker group with
+        the node agents (once, after the worker groups exist)."""
+        if self._park is not None:
+            return
+        worker_group = getattr(self, "actor_wg", None)
+        if worker_group is None:
+            raise RuntimeError("app_channel donor: the trainer has no actor worker group to park")
+        locks = self._get_locks()
+        if not locks.enabled:
+            self._warn_once(
+                "app_park_no_locks",
+                "TIMESLICE_DONOR_BACKEND=app_channel without lock settings: not parking",
+            )
+            return
+        self._park, self._park_handles = app_aware.start(
+            worker_group, job_id=locks.job_id, group=locks.group, is_safe=self._at_safe_point
+        )
 
     # ------------------------------------------------------------ expected_idle
 

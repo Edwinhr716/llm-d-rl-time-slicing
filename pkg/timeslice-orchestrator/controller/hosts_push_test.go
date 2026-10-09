@@ -388,3 +388,37 @@ func TestNS4_Push_ControllerNoLendWhileAgentUnanswered(t *testing.T) {
 		t.Fatalf("events = %v, want the trainer saved before the hosts resume", got)
 	}
 }
+
+// TestNS4_Push_ControllerNoLendWhileForegroundFaulted: a foreground job whose
+// save failed (FAULTED on a node, for example an application that did not
+// park) may still hold the accelerator, so the hosts are not resumed (fail
+// closed): lending would put a guest on a device the trainer still fills.
+func TestNS4_Push_ControllerNoLendWhileForegroundFaulted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fix := newPushFixture(t, ctx, pb.SnapshotAgentJobState_STATE_FAULTED)
+	fix.hosts.setAllClear()
+	spec := fix.group.Spec()
+	spec.RequestLock("trainer")
+	if _, err := spec.TryPromote(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := spec.Yield(ctx, "trainer"); err != nil {
+		t.Fatal(err)
+	}
+	spec.SetLend(true)
+	fix.run(t, ctx)
+	fix.queue.Add(pushGroup)
+
+	if err := waitWithTimeout(func() bool { return fix.queue.getDoneCount() >= 1 }, 5*time.Second); err != nil {
+		t.Fatalf("timed out waiting for reconciles: %v", err)
+	}
+	fix.queue.Add(pushGroup)
+	done := fix.queue.getDoneCount()
+	if err := waitWithTimeout(func() bool { return fix.queue.getDoneCount() > done }, 3*time.Second); err != nil {
+		t.Fatalf("timed out waiting for a reconcile: %v", err)
+	}
+	if n := fix.hosts.resumeCount(); n != 0 {
+		t.Fatalf("resumes = %d while the foreground job is FAULTED on the node, want 0", n)
+	}
+}

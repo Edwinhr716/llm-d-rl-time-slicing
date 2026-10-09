@@ -112,6 +112,14 @@ sleeping vLLM keeps its CUDA context, so up to 4 GiB of guest GPU memory is
 accepted at verify. At a lend the agent thaws the guest and calls
 `POST /wake_up`. Only vLLM is supported for guests, in `SUSPEND_MODE_OFFLOAD`.
 
+**Application-aware trainers.** The trainer can likewise park itself instead
+of being checkpointed: annotate the donor pods with
+`timeslice.io/backend: app_channel`. The verl plugin then registers with the
+node's snapshot agent and, on the agent's command, moves its model and
+optimizer state to host memory through verl's offload control and back; the
+agent lends the GPU only when the trainer keeps at most 4 GiB of GPU memory.
+See the [verl integration guide](../rl-frameworks/verl/README.md#optional-application-aware-parking-of-the-trainer).
+
 ## 4. What to expect
 
 Measured on H100 80GB with the long chain-of-thought example of the
@@ -537,11 +545,12 @@ Every time-sliced verl job must carry this contract:
   * `"ray_pg_extra_resources={trainer_pool: {trainer_node: 1}, rollout_pool: {rollout_node: 1}}"`
     — pins the placement groups (see
     [Placement-Group Pinning](#placement-group-pinning)).
-  * `trainer.save_freq=-1` — checkpoint saving is disabled under
-    time-slicing: a save RPCs the FSDP worker, which may be checkpointed off
-    the GPU at that moment. The timeslice trainer vetoes saves (with a
-    warning) if this is left `> 0`. Note the consequence: time-sliced runs
-    write no training checkpoints.
+  * `trainer.save_freq` works as usual. verl saves after the trainer yields
+    its GPU, when the FSDP worker may be checkpointed off or parked, so the
+    timeslice trainer saves a due checkpoint inside the update's locked
+    window instead (before the yield), takes the lock for a save outside it
+    (the final one) and before a resume loads a checkpoint, and vetoes (with
+    a warning) any save that would still run without the lock.
   * `+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true`
     — tears down and rebuilds the trainer↔rollout weight-sync NCCL
     communicator around each sync, so no communicator exists outside
@@ -806,7 +815,7 @@ Generic to the recipe:
 | The batch tenant never yields, or the trainer's restore fails with OOM on the shared GPU | The batch job's workload-channel registration didn't reach the agent, so the platform can't drive its sleep | Check the supervisor log for the registration and the agent log for the accepted channel; `TIMESLICE_AGENT_ADDR` must be the node-local agent (node IP :9001), not the orchestrator |
 | Batch engine crashes with a CUDA error seconds after a sleep | It was frozen with requests in flight — the engine does not drain itself (vLLM: vllm#28714, vllm#15483) | Your supervisor must drain (stop admitting + in-flight = 0) BEFORE `release()`; never call the engine's freeze endpoint directly while it serves |
 | Hydra error `Key 'use_trainer_do_validate' is not in struct trainer` | Wrong config key path | These flags live under `async_training.*`, not `trainer.*` |
-| `save_freq` / checkpoint-save-skipped warning in the trainer log | Checkpoint saving would RPC a possibly-frozen worker | By design: the timeslice trainer vetoes saves when `save_freq > 0`; keep `trainer.save_freq=-1` |
+| `vetoing a checkpoint save without the group lock` in the trainer log | A save would RPC a possibly-frozen worker | Should not happen: due saves run inside the locked window or take the lock; report it with the trainer log |
 | RL staleness queue near `staleness_threshold × batch` | Long trainer lock-out or very slow steps | Raise `async_training.staleness_threshold` or shorten training bursts; queue overflow drops samples |
 | `Found multiple active Ray instances` warning on the shared node | Ray's `address='auto'` discovery found more than one GCS on the node | `export RAY_ADDRESS="$(hostname -i):6379"` right after `ray start --head` |
 

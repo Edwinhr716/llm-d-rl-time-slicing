@@ -12,7 +12,10 @@ What is covered:
       - on_update_weights_begin is an ensure-held no-op in steady state and a
         real acquire on the pre-fit initial-param-sync path
       - on_update_weights_end yields only when synced=True
-      - on_save_checkpoint vetoes (returns False) when save_freq > 0
+      - a checkpoint due at the synced version is saved before the yield
+        (lock held); a due save outside a locked window acquires, saves and
+        yields; on_save_checkpoint vetoes only a save without the lock
+      - a resume (resume_mode != disable) acquires before load_checkpoint
       - on_exception releases the lock (crash-release)
   * acquire timeout: PhaseLocks.ensure passes timeout_sec to the client
     (default DEFAULT_ACQUIRE_TIMEOUT_SEC=600); a client TimeoutError propagates
@@ -83,11 +86,30 @@ class FakeClient:
 class FakeTrainer(TimesliceHooksMixin):
     """The hooks mixin over a stand-in for verl's FullyAsyncTrainer state."""
 
-    def __init__(self, save_freq=-1, client_factory=None):
+    def __init__(self, save_freq=-1, client_factory=None, resume_mode="disable", events=None):
         super().__init__(client_factory=client_factory)
         self.current_param_version = 3
+        self.last_ckpt_version = 0
         self.metrics = {}
-        self.config = SimpleNamespace(trainer=SimpleNamespace(save_freq=save_freq))
+        self.config = SimpleNamespace(trainer=SimpleNamespace(save_freq=save_freq, resume_mode=resume_mode))
+        self._events = events if events is not None else []
+
+    def _verl_save(self, force=False):
+        """verl's _fit_save_checkpoint: veto hook, then save when due."""
+        if self.on_save_checkpoint(force=force) is False:
+            self._events.append("save_vetoed")
+            return
+        if self.current_param_version == self.last_ckpt_version:
+            return
+        sf = self.config.trainer.save_freq
+        if sf > 0 and (force or self.current_param_version % sf == 0):
+            held = self._locks is not None and self._locks.held
+            self._events.append(("save", self.current_param_version, held))
+            self.last_ckpt_version = self.current_param_version
+
+    def _fit_save_checkpoint(self, force=False):
+        # what TimesliceFullyAsyncTrainer does over verl's method
+        return self._save_with_lock(self._verl_save, force=force)
 
 
 @pytest.fixture
@@ -106,10 +128,12 @@ def ts_env(monkeypatch, events):
     return SimpleNamespace(events=events)
 
 
-def make_trainer(events, save_freq=-1):
+def make_trainer(events, save_freq=-1, resume_mode="disable"):
     return FakeTrainer(
         save_freq=save_freq,
         client_factory=lambda target, job_id, group_id: FakeClient(events, job_id, group_id),
+        resume_mode=resume_mode,
+        events=events,
     )
 
 
@@ -252,15 +276,137 @@ class TestLockOrder:
         assert not held, f"lock leaked at end: {lock_events}"
         assert len(lock_events) == 2 * 4  # init, initial sync, 2 steps
 
-    def test_save_checkpoint_vetoed_when_save_freq_positive(self, ts_env, events):
+    def test_save_checkpoint_vetoed_without_lock(self, ts_env, events):
         t = make_trainer(events, save_freq=5)
+        run_init_workers(t, events)  # ends released
+        del events[:]
         assert t.on_save_checkpoint(force=True) is False
         assert events == []  # no lock traffic
         assert "save_checkpoint" in t._warned
 
+    def test_save_checkpoint_not_due_passes_without_lock(self, ts_env, events):
+        # verl asks before its own due check after every yield: no veto, no warning
+        t = make_trainer(events, save_freq=5)
+        run_init_workers(t, events)
+        t.current_param_version = 11
+        del events[:]
+        assert t.on_save_checkpoint(force=False) is True
+        assert events == []
+        assert "save_checkpoint" not in t._warned
+
+    def test_save_checkpoint_allowed_while_held(self, ts_env, events):
+        t = make_trainer(events, save_freq=5)
+        run_sample_end(t, events)
+        assert t.on_save_checkpoint(force=False) is True
+        assert "save_checkpoint" not in t._warned
+
     def test_save_checkpoint_allowed_when_disabled(self, ts_env, events):
         t = make_trainer(events, save_freq=-1)
         assert t.on_save_checkpoint(force=True) is True
+
+
+# ======================================================================
+# checkpoints under time-slicing
+# ======================================================================
+
+
+class TestCheckpoints:
+    def test_due_save_runs_before_the_yield(self, ts_env, events):
+        t = make_trainer(events, save_freq=5)
+        t.current_param_version = 10
+        run_sample_end(t, events)
+        run_update_weights(t, events, {"t": 1})
+        assert events == [
+            "orig_get_samples",
+            ("acquire", GROUP),
+            "orig_update_weights",
+            ("save", 10, True),
+            ("release", GROUP),
+        ]
+        # verl's own call after the yield finds the version saved: no lock traffic
+        del events[:]
+        t._fit_save_checkpoint()
+        assert events == []
+
+    def test_no_save_when_not_due(self, ts_env, events):
+        t = make_trainer(events, save_freq=5)
+        t.current_param_version = 11
+        run_sample_end(t, events)
+        run_update_weights(t, events, {"t": 1})
+        assert [e for e in events if isinstance(e, tuple) and e[0] == "save"] == []
+        del events[:]
+        t._fit_save_checkpoint()
+        assert events == []
+
+    def test_no_save_on_unsynced_update(self, ts_env, events):
+        t = make_trainer(events, save_freq=5)
+        t.current_param_version = 10
+        run_sample_end(t, events)
+        run_update_weights(t, events, None)
+        assert ("save", 10, True) not in events
+        assert t._locks.held
+
+    def test_no_save_when_save_freq_off(self, ts_env, events):
+        t = make_trainer(events, save_freq=-1)
+        t.current_param_version = 10
+        run_sample_end(t, events)
+        run_update_weights(t, events, {"t": 1})
+        assert [e for e in events if isinstance(e, tuple) and e[0] == "save"] == []
+
+    def test_forced_save_outside_window_acquires_saves_yields(self, ts_env, events):
+        t = make_trainer(events, save_freq=5)
+        run_init_workers(t, events)  # released
+        t.current_param_version = 12  # final save after fit's loop
+        del events[:]
+        t._fit_save_checkpoint(force=True)
+        assert events == [("acquire", GROUP), ("save", 12, True), ("release", GROUP)]
+        assert not t._locks.held
+
+    def test_save_outside_window_restores_a_parked_trainer(self, ts_env, events):
+        t = make_trainer(events, save_freq=5)
+        run_init_workers(t, events)
+        t.current_param_version = 15
+        t._park = SimpleNamespace(ensure_resident=lambda: events.append("ensure_resident"))
+        del events[:]
+        t._fit_save_checkpoint()
+        assert events == [("acquire", GROUP), "ensure_resident", ("save", 15, True), ("release", GROUP)]
+
+    def test_lock_released_when_save_fails(self, ts_env, events):
+        t = make_trainer(events, save_freq=5)
+        run_init_workers(t, events)
+        t.current_param_version = 20
+
+        def boom(force=False):
+            raise OSError("disk full")
+
+        del events[:]
+        with pytest.raises(OSError):
+            t._save_with_lock(boom, force=True)
+        assert events == [("acquire", GROUP), ("release", GROUP)]
+
+    def test_inert_without_gate_saves_without_lock(self, monkeypatch, events):
+        monkeypatch.delenv("TIMESLICE_FULLY_ASYNC", raising=False)
+        t = make_trainer(events, save_freq=5)
+        t.current_param_version = 10
+        t._fit_save_checkpoint()
+        assert events == [("save", 10, False)]
+
+    def test_resume_acquires_before_load(self, ts_env, events):
+        t = make_trainer(events, resume_mode="auto")
+        run_init_workers(t, events)
+        del events[:]
+        asyncio.run(t._lock_for_load())
+        assert events == [("acquire", GROUP)]
+        # the initial param sync then only yields
+        run_update_weights(t, events, {"t": 1})
+        assert events == [("acquire", GROUP), "orig_update_weights", ("release", GROUP)]
+
+    def test_no_acquire_for_load_when_resume_disabled(self, ts_env, events):
+        t = make_trainer(events, resume_mode="disable")
+        run_init_workers(t, events)
+        del events[:]
+        asyncio.run(t._lock_for_load())
+        assert events == []
 
 
 # ======================================================================
@@ -474,6 +620,15 @@ def stub_verl_trainer_module(monkeypatch):
         async def _fit_update_weights(self):
             raise RuntimeError("param sync blew up")
 
+        async def load_checkpoint(self):
+            self.calls = getattr(self, "calls", []) + ["base_load"]
+            if getattr(self, "load_fails", False):
+                raise RuntimeError("load blew up")
+            return 7
+
+        def _fit_save_checkpoint(self, force=False):
+            self.calls = getattr(self, "calls", []) + [("base_save", force)]
+
         async def _dispatch_on_exception(self, point, exc):
             # mirror verl's helper: fire on_exception once, awaiting coroutines
             if exc is getattr(self, "_last_on_exception_exc", None):
@@ -535,6 +690,39 @@ class TestTrainerRegistration:
         with pytest.raises(RuntimeError, match="param sync blew up"):
             asyncio.run(t._fit_update_weights())
         assert events == [("acquire", GROUP), ("release", GROUP)]
+
+    def _resume_trainer(self, stub, events):
+        t = stub.registered["timeslice"]()
+        t.current_param_version = 0
+        t.last_ckpt_version = 0
+        t.metrics = {}
+        t.config = SimpleNamespace(trainer=SimpleNamespace(save_freq=10, resume_mode="auto"))
+        t._client_factory = lambda target, job_id, group_id: FakeClient(events, job_id, group_id)
+        return t
+
+    def test_load_checkpoint_acquires_then_loads(self, stub_verl_trainer_module, ts_env, events):
+        t = self._resume_trainer(stub_verl_trainer_module, events)
+        assert asyncio.run(t.load_checkpoint()) == 7
+        assert events == [("acquire", GROUP)] and t.calls == ["base_load"]
+        assert t._locks.held  # until the initial param sync yields
+
+    def test_load_checkpoint_failure_releases(self, stub_verl_trainer_module, ts_env, events):
+        t = self._resume_trainer(stub_verl_trainer_module, events)
+        t.load_fails = True
+        with pytest.raises(RuntimeError, match="load blew up"):
+            asyncio.run(t.load_checkpoint())
+        assert events == [("acquire", GROUP), ("release", GROUP)]
+
+    def test_fit_save_checkpoint_goes_through_the_lock(self, stub_verl_trainer_module, ts_env, events):
+        t = self._resume_trainer(stub_verl_trainer_module, events)
+        asyncio.run(t.on_update_weights_begin())
+        asyncio.run(t.on_update_weights_end(synced=True))  # version 0 == last saved: no save
+        assert getattr(t, "calls", []) == []
+        t.current_param_version = 20
+        del events[:]
+        t._fit_save_checkpoint(force=True)
+        assert events == [("acquire", GROUP), ("release", GROUP)]
+        assert t.calls == [("base_save", True)]
 
 
 if __name__ == "__main__":

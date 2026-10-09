@@ -55,3 +55,33 @@ def test_apply_without_engine_is_noop(monkeypatch):
     monkeypatch.setenv("TIMESLICE_FULLY_ASYNC", "1")
     monkeypatch.setitem(sys.modules, "verl", None)
     assert defaults.apply() is False
+
+
+class _PG:
+    rebuild_group = True
+
+    def __init__(self):
+        self.calls = []
+
+    def init_process_group(self, rank, world_size, master_metadata=None):
+        self.calls.append((rank, world_size))
+        return "ok"
+
+
+def test_group_timing_logs_joining_ranks_only(capsys):
+    cls = type("PG", (_PG,), {"init_process_group": _PG.init_process_group})
+    assert defaults.patch_group_timing(cls)
+    first = cls.init_process_group
+    assert defaults.patch_group_timing(cls)  # idempotent
+    assert cls.init_process_group is first
+    pg = cls()
+    assert pg.init_process_group(0, 2, master_metadata="m") == "ok"
+    assert pg.init_process_group(rank=-1, world_size=2) == "ok"
+    assert pg.calls == [(0, 2), (-1, 2)]
+    out = capsys.readouterr().out
+    assert out.count("nccl-group init") == 1
+    assert "rank=0 world=2 rebuild=True took=" in out
+
+
+def test_group_timing_without_method():
+    assert defaults.patch_group_timing(type("X", (), {})) is False

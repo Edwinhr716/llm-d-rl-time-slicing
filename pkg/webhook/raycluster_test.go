@@ -37,7 +37,14 @@ type rcTemplate struct {
 	} `json:"metadata"`
 	Spec struct {
 		Containers []struct {
-			Env []struct{ Name, Value string } `json:"env"`
+			Env []struct {
+				Name, Value string
+				ValueFrom   *struct {
+					FieldRef *struct {
+						FieldPath string `json:"fieldPath"`
+					} `json:"fieldRef"`
+				} `json:"valueFrom"`
+			} `json:"env"`
 		} `json:"containers"`
 	} `json:"spec"`
 }
@@ -92,6 +99,19 @@ func rcEnv(tmpl *rcTemplate) map[string]string {
 	for _, c := range tmpl.Spec.Containers {
 		for _, e := range c.Env {
 			m[e.Name] = e.Value
+		}
+	}
+	return m
+}
+
+// rcEnvFrom returns the downward-API field path of every env var set from a pod field.
+func rcEnvFrom(tmpl *rcTemplate) map[string]string {
+	m := map[string]string{}
+	for _, c := range tmpl.Spec.Containers {
+		for _, e := range c.Env {
+			if e.ValueFrom != nil && e.ValueFrom.FieldRef != nil {
+				m[e.Name] = e.ValueFrom.FieldRef.FieldPath
+			}
 		}
 	}
 	return m
@@ -190,5 +210,74 @@ func TestRayCluster_TwoDonorGroupsLabelOnly(t *testing.T) {
 	}
 	if rc.Spec.HeadGroupSpec.Template.Metadata.Labels[webhook.LabelRLIntegration] != "true" {
 		t.Errorf("head not labelled for the RL integration")
+	}
+}
+
+func TestRayCluster_AppChannelDonorWiresAgent(t *testing.T) {
+	cfg := mustConfig(t, append(append([]string(nil), rlFlags...), "--agent-port=9100"))
+	raw := strings.Replace(rayClusterJSON, `{"labels": {"timeslice.io/donor": "true"}}`,
+		`{"labels": {"timeslice.io/donor": "true"}, "annotations": {"timeslice.io/backend": "app_channel"}}`, 1)
+	_, out := admitRayCluster(t, cfg, []byte(raw), admissionv1.Create)
+	var rc rcObj
+	if err := json.Unmarshal(out, &rc); err != nil {
+		t.Fatal(err)
+	}
+	for name, tmpl := range map[string]*rcTemplate{
+		"head":    &rc.Spec.HeadGroupSpec.Template,
+		"trainer": &rc.Spec.WorkerGroupSpecs[0].Template,
+		"rollout": &rc.Spec.WorkerGroupSpecs[1].Template,
+	} {
+		env := rcEnv(tmpl)
+		if env[webhook.EnvDonorBackend] != "app_channel" || env[webhook.EnvAgentPort] != "9100" ||
+			env[webhook.EnvFullyAsync] != "1" {
+			t.Errorf("%s env = %v, want the app_channel donor wiring", name, env)
+		}
+		// The agent is on the host network: the trainer reaches it at its node's IP, which
+		// in a pod-network Ray worker is not the Ray node IP (that is the pod IP).
+		if from := rcEnvFrom(tmpl); from[webhook.EnvNodeIP] != "status.hostIP" {
+			t.Errorf("%s env from fields = %v, want %s from status.hostIP", name, from, webhook.EnvNodeIP)
+		}
+	}
+}
+
+func TestRayCluster_CudaDonorHasNoAgentWiring(t *testing.T) {
+	cfg := mustConfig(t, rlFlags)
+	for _, ann := range []string{"", `, "annotations": {"timeslice.io/backend": "cuda"}`} {
+		raw := strings.Replace(rayClusterJSON, `{"labels": {"timeslice.io/donor": "true"}}`,
+			`{"labels": {"timeslice.io/donor": "true"}`+ann+`}`, 1)
+		_, out := admitRayCluster(t, cfg, []byte(raw), admissionv1.Create)
+		var rc rcObj
+		if err := json.Unmarshal(out, &rc); err != nil {
+			t.Fatal(err)
+		}
+		env := rcEnv(&rc.Spec.WorkerGroupSpecs[0].Template)
+		if _, ok := env[webhook.EnvDonorBackend]; ok {
+			t.Errorf("annotation %q: trainer env = %v, want no %s", ann, env, webhook.EnvDonorBackend)
+		}
+		if _, ok := env[webhook.EnvAgentPort]; ok {
+			t.Errorf("annotation %q: trainer env = %v, want no %s", ann, env, webhook.EnvAgentPort)
+		}
+		if _, ok := rcEnvFrom(&rc.Spec.WorkerGroupSpecs[0].Template)[webhook.EnvNodeIP]; ok {
+			t.Errorf("annotation %q: trainer has %s, want none for a cuda donor", ann, webhook.EnvNodeIP)
+		}
+	}
+}
+
+func TestRayCluster_UnknownDonorBackendDenied(t *testing.T) {
+	cfg := mustConfig(t, rlFlags)
+	raw := strings.Replace(rayClusterJSON, `{"labels": {"timeslice.io/donor": "true"}}`,
+		`{"labels": {"timeslice.io/donor": "true"}, "annotations": {"timeslice.io/backend": "app_endpoint"}}`, 1)
+	req := &admissionv1.AdmissionRequest{
+		UID:       "uid-rc",
+		Kind:      metav1.GroupVersionKind{Group: "ray.io", Version: "v1", Kind: "RayCluster"},
+		Resource:  metav1.GroupVersionResource{Group: "ray.io", Version: "v1", Resource: "rayclusters"},
+		Namespace: testNS,
+		Operation: admissionv1.Create,
+		UserInfo:  authv1.UserInfo{Username: "system:serviceaccount:kuberay:kuberay-operator"},
+		Object:    runtime.RawExtension{Raw: []byte(raw)},
+	}
+	resp := webhook.Admit(t.Context(), req, *cfg)
+	if resp == nil || resp.Allowed || resp.Result == nil || !strings.Contains(resp.Result.Message, "app_endpoint") {
+		t.Fatalf("response = %+v, want a denial naming the annotation value", resp)
 	}
 }

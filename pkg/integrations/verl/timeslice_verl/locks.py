@@ -137,6 +137,11 @@ class PhaseLocks:
         kwargs = {} if expected_idle is None else {"expected_idle": expected_idle}
         hint = "" if expected_idle is None else f" expected_idle={expected_idle:.3f}s"
         for g in list(self._held):
+            # Not held from here on: the orchestrator may lend inside the Yield
+            # RPC, so the agent's park can arrive before release() returns and
+            # must find the trainer at a safe point. (A failed release dropped
+            # the group too, so this changes nothing on errors.)
+            self._held.discard(g)
             try:
                 result = self._client.release(group_id=g, **kwargs)
                 _log(
@@ -146,8 +151,6 @@ class PhaseLocks:
                 )
             except Exception as e:  # noqa: BLE001 - never let a release error kill the job
                 _log(f"job={self.job_id} RELEASE group={g} FAILED: {e}")
-            finally:
-                self._held.discard(g)
 
     def close(self) -> None:
         """Release everything and close the gRPC channel."""

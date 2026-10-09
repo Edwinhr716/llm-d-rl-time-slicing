@@ -149,8 +149,9 @@ func (c *Controller) agentAnsweredLast(node string) bool {
 	return ok && !c.agentFailed[node].After(seen)
 }
 
-// foregroundResident reports whether any foreground job is RUNNING or
-// TRANSITIONING on a node of the group, or may be: a node whose agent did not
+// foregroundResident reports whether any foreground job is RUNNING,
+// TRANSITIONING or FAULTED (a failed save may leave it on the accelerator) on
+// a node of the group, or may be: a node whose agent did not
 // answer its last status call counts as resident (fail closed), because its
 // context states are unknown or stale and the foreground job's snapshot is
 // not confirmed. Guests do not count.
@@ -175,6 +176,12 @@ func (c *Controller) foregroundResident(ctx context.Context, group *store.Group)
 		for _, node := range group.Status().Nodes() {
 			switch states[node] {
 			case pb.SnapshotAgentJobState_STATE_RUNNING, pb.SnapshotAgentJobState_STATE_TRANSITIONING:
+				return true, nil
+			case pb.SnapshotAgentJobState_STATE_FAULTED:
+				// The save failed (or the restore did): the job may still
+				// hold the accelerator, so do not lend it (fail closed).
+				slog.WarnContext(ctx, "Not lending: the foreground job is FAULTED on the node and may still hold it",
+					"job", job.JobID(), "node", node)
 				return true, nil
 			default:
 			}

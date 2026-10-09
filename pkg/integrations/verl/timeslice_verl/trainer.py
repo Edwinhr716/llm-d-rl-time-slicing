@@ -51,3 +51,19 @@ class TimesliceFullyAsyncTrainer(TimesliceHooksMixin, FullyAsyncTrainer):
         except BaseException as e:
             await self._dispatch_on_exception("update_weights", e)
             raise
+
+    def _fit_save_checkpoint(self, force=False):
+        """A due save outside a locked window takes the group lock first
+        (verl's final save after fit's loop); saves inside the window are
+        already done by on_update_weights_end."""
+        return self._save_with_lock(super()._fit_save_checkpoint, force=force)
+
+    async def load_checkpoint(self):
+        """Take the group lock before a resume loads the checkpoint into the
+        (possibly parked) worker; crash-release like _fit_update_weights."""
+        try:
+            await self._lock_for_load()
+            return await super().load_checkpoint()
+        except BaseException as e:
+            await self._dispatch_on_exception("load_checkpoint", e)
+            raise
