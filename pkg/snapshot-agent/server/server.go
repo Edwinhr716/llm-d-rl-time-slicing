@@ -36,6 +36,14 @@ type Server struct {
 	guest *guestPipeline
 	// killer runs Kill; it shares the scrub step with guest.
 	killer *killer
+	// donorPods returns a job's pods on this node (the watcher's cache); nil
+	// until StartServer wires it, which keeps every donor on the default
+	// backend. donorPIDs, donorGPU and donorChannelWait serve the
+	// application-aware donors (see donor_app.go).
+	donorPods        func(jobID string) []*v1.Pod
+	donorPIDs        func(ctx context.Context, jobID string) ([]int, error)
+	donorGPU         gpuInspector
+	donorChannelWait time.Duration
 }
 
 // NewServer creates a new Server instance. channelRegistry is shared with
@@ -53,13 +61,16 @@ func NewServer(
 	stateOpts ...sm.Option,
 ) *Server {
 	return &Server{
-		state:           sm.NewStateManager(stateOpts...),
-		backendMap:      backendMap,
-		defaultBackend:  defaultBackend,
-		deploymentMode:  deploymentMode,
-		channelRegistry: channelRegistry,
-		featureGates:    featureGates,
-		killer:          newKiller(),
+		state:            sm.NewStateManager(stateOpts...),
+		backendMap:       backendMap,
+		defaultBackend:   defaultBackend,
+		deploymentMode:   deploymentMode,
+		channelRegistry:  channelRegistry,
+		featureGates:     featureGates,
+		killer:           newKiller(),
+		donorPIDs:        defaultDonorPIDs,
+		donorGPU:         nvmlInspector{},
+		donorChannelWait: donorChannelWait,
 	}
 }
 
@@ -94,8 +105,12 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 		return nil, err
 	}
 
-	backendType := s.getSnapshotBackendType(req.GetBackendConfig())
-	slog.InfoContext(ctx, "Snapshot called", "backend", backendType)
+	config, appDonor, err := s.donorConfig(req.GetJobId(), req.GetBackendConfig())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "job %s: %v", req.GetJobId(), err)
+	}
+	backendType := s.getSnapshotBackendType(config)
+	slog.InfoContext(ctx, "Snapshot called", "backend", backendType, "appDonor", appDonor)
 
 	backend, ok := s.backendMap[backendType]
 	if !ok {
@@ -105,11 +120,16 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 	s.ensureJobRunningIfOccupied(ctx, req.GetJobId(), req.GetGroup())
 
 	bgCtx := context.WithoutCancel(ctx)
-	config := req.GetBackendConfig()
 
-	snapshotFn, fnErr := s.buildSnapshotFn(bgCtx, req.GetJobId(), backendType, backend, config)
-	if fnErr != nil {
-		return nil, fnErr
+	var snapshotFn func() error
+	if appDonor {
+		snapshotFn = s.donorSnapshotFn(bgCtx, req.GetJobId(), backend, config)
+	} else {
+		var fnErr error
+		snapshotFn, fnErr = s.buildSnapshotFn(bgCtx, req.GetJobId(), backendType, backend, config)
+		if fnErr != nil {
+			return nil, fnErr
+		}
 	}
 
 	slot := memoryRegionsSlot(config, req.GetJobId())
@@ -426,8 +446,12 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 		return nil, err
 	}
 
-	backendType := s.getSnapshotBackendType(req.GetBackendConfig())
-	slog.InfoContext(ctx, "Restore called", "backend", backendType)
+	restoreConfig, appDonor, err := s.donorConfig(req.GetJobId(), req.GetBackendConfig())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "job %s: %v", req.GetJobId(), err)
+	}
+	backendType := s.getSnapshotBackendType(restoreConfig)
+	slog.InfoContext(ctx, "Restore called", "backend", backendType, "appDonor", appDonor)
 
 	backend, ok := s.backendMap[backendType]
 	if !ok {
@@ -435,11 +459,16 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 	}
 
 	bgCtx := context.WithoutCancel(ctx)
-	restoreConfig := req.GetBackendConfig()
 
-	restoreFn, fnErr := s.buildRestoreFn(bgCtx, req.GetJobId(), backendType, backend, restoreConfig)
-	if fnErr != nil {
-		return nil, fnErr
+	var restoreFn func() error
+	if appDonor {
+		restoreFn = s.donorRestoreFn(bgCtx, req.GetJobId(), backend, restoreConfig)
+	} else {
+		var fnErr error
+		restoreFn, fnErr = s.buildRestoreFn(bgCtx, req.GetJobId(), backendType, backend, restoreConfig)
+		if fnErr != nil {
+			return nil, fnErr
+		}
 	}
 
 	slot := memoryRegionsSlot(restoreConfig, req.GetJobId())
@@ -597,6 +626,8 @@ func StartServer(
 		guestCfg = &GuestConfig{}
 	}
 	srv.killer.pods = watcher
+	// Snapshot and Restore read a donor's backend annotation from the cache.
+	srv.donorPods = watcher.getLocalPodsForJob
 	srv.killer.cgroups = cgroup.New(guestCfg.CgroupRoot)
 	srv.killer.configure(&KillConfig{Scrub: guestCfg.Scrub})
 	// The GPU detection loop waits for restart recovery (step 5).

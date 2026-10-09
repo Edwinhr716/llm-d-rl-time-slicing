@@ -196,6 +196,16 @@ Every time-sliced verl job must carry this contract:
 * **Pod labels** on the head pod ONLY (the trainer is the sole time-sliced process; rollout pods stay unlabeled): `timeslice.io/job-id: <job id>` and `timeslice.io/group: <group>` — the exact keys the platform selects snapshot candidates on.
 * **NCCL environment**: set `NCCL_CUMEM_ENABLE=0` and `NCCL_NVLS_ENABLE=0` on every job pod (the example manifests set both) — precautionary settings around cuda-checkpoint; keep them as set.
 
+### Optional: Application-Aware Parking of the Trainer
+
+By default the snapshot agent parks the trainer while its GPU is lent by checkpointing the whole CUDA state of its processes with `cuda-checkpoint`. A trainer can instead park itself: annotate the donor (trainer) pods with `timeslice.io/backend: app_channel` (on a RayCluster, the donor worker group's pod template). The admission webhook then sets `TIMESLICE_DONOR_BACKEND=app_channel` and `TIMESLICE_AGENT_PORT` in the job's containers, and the plugin:
+
+* after `init_workers`, registers a park/restore workload with the snapshot agent of every node that runs an actor worker (the agent listens on the host network, so its address is the worker's node IP and `TIMESLICE_AGENT_PORT`; `TIMESLICE_AGENT_ADDRS=host:port,...` overrides the discovery);
+* parks on the agent's command by moving the actor's optimizer state, then its model and gradients, to host memory with verl's manual offload control (`actor_wg.to("cpu", ...)`), which also frees the cached GPU memory; it restores with `actor_wg.to("cuda")`;
+* refuses a park while it holds the group lock, and after every granted acquire restores itself if the agent's restore never came (for example after an agent restart).
+
+The agent waits up to 30 s for the trainer's registration, sends the park, and lends the GPU only if the trainer's processes keep at most 4 GiB of GPU memory (the CUDA context and allocator residue); otherwise the park fails and the GPU is not lent. No verl change is needed beyond the fork above, and nothing changes in the training config. Keep `rebuild_group=true`: the weight-sync communicator must not exist while the trainer is parked. The trainer pods need host RAM for the model and optimizer state, as with `cuda-checkpoint`.
+
 ---
 
 ## 4. Deploying Time-Sliced verl Jobs

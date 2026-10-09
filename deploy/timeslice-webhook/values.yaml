@@ -62,6 +62,11 @@ failurePolicy:
 # trainer's driver actor can run in any Ray pod of the job), plus
 # NCCL_CUMEM_ENABLE=0 and NCCL_NVLS_ENABLE=0 (no NCCL buffers cuda-checkpoint
 # cannot handle). Settings the user already has are kept. Needs no RBAC; harmless without KubeRay.
+# A donor group template annotated timeslice.io/backend: app_channel (opt-in;
+# cuda-checkpoint stays the default) also gets TIMESLICE_DONOR_BACKEND=app_channel
+# and TIMESLICE_AGENT_PORT (flags.agent-port, default 9001 = the snapshot agent's
+# port): the trainer then parks itself (model and optimizer to host memory)
+# through a workload channel to the node's snapshot agent.
 rayCluster:
   enabled: true
 
@@ -131,6 +136,9 @@ flags:
   # GPU memory checkpointed into host memory while the GPU is lent: auto (by
   # the pod's GPU model nodeSelector, else 80Gi), 0 (off) or a quantity.
   donor-gpu-memory: ""
+  # Snapshot agent port injected as TIMESLICE_AGENT_PORT into the Ray pods of
+  # an application-aware donor (timeslice.io/backend: app_channel). "" = 9001.
+  agent-port: ""
 
 extraArgs: []
 

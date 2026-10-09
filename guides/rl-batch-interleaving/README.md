@@ -112,6 +112,14 @@ sleeping vLLM keeps its CUDA context, so up to 4 GiB of guest GPU memory is
 accepted at verify. At a lend the agent thaws the guest and calls
 `POST /wake_up`. Only vLLM is supported for guests, in `SUSPEND_MODE_OFFLOAD`.
 
+**Application-aware trainers.** The trainer can likewise park itself instead
+of being checkpointed: annotate the donor pods with
+`timeslice.io/backend: app_channel`. The verl plugin then registers with the
+node's snapshot agent and, on the agent's command, moves its model and
+optimizer state to host memory through verl's offload control and back; the
+agent lends the GPU only when the trainer keeps at most 4 GiB of GPU memory.
+See the [verl integration guide](../rl-frameworks/verl/README.md#optional-application-aware-parking-of-the-trainer).
+
 ## 4. What to expect
 
 Measured on H100 80GB with the long chain-of-thought example of the
