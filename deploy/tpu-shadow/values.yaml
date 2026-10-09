@@ -1,5 +1,6 @@
 # TPU shadow device plugin (guest-kubelet cmd/tpu-shadow-plugin) as a DaemonSet
-# on single-host TPU nodes. It advertises timeslice.io/tpu-shadow: its devices
+# on TPU nodes, one per TPU VM (a multi-host donor's hosts each advertise their
+# own chips; a guest cannot span hosts). It advertises timeslice.io/tpu-shadow: its devices
 # are the TPU chips (VFIO groups) the node's single google.com/tpu holder (the
 # donor) holds, and 0 when more than one pod holds chips (fail closed). A guest
 # that requests it gets the donor's /dev/vfio/N, /dev/vfio/vfio, the TPU

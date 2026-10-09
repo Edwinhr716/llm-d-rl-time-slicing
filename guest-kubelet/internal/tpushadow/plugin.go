@@ -63,9 +63,18 @@ func (c *Config) spec(rel string) *pluginapi.DeviceSpec {
 	return &pluginapi.DeviceSpec{HostPath: filepath.Join(c.HostDevRoot, rel), ContainerPath: "/dev/" + rel, Permissions: "mrw"}
 }
 
-// ContainerResponse is what a guest container given chips receives: the VFIO group devices,
-// the VFIO container device, the runtime mounts and the TPU environment.
-func ContainerResponse(cfg *Config, chips []Chip) (*pluginapi.ContainerAllocateResponse, error) {
+// ContainerResponse is what a guest container given chips (out of the host's chips)
+// receives: the VFIO group devices, the VFIO container device, the runtime mounts and the
+// TPU environment for exactly those chips.
+func ContainerResponse(cfg *Config, chips, host []Chip) (*pluginapi.ContainerAllocateResponse, error) {
+	idx, ok := Indices(chips, host)
+	if !ok {
+		return nil, fmt.Errorf("chips %v are not all on this host", chips)
+	}
+	chips = make([]Chip, len(idx))
+	for i, x := range idx {
+		chips[i] = host[x]
+	}
 	devs := make([]*pluginapi.DeviceSpec, 0, len(chips)+1)
 	for _, c := range chips {
 		if !cfg.exists("vfio/" + c.Group) {
@@ -77,7 +86,7 @@ func ContainerResponse(cfg *Config, chips []Chip) (*pluginapi.ContainerAllocateR
 		return nil, errors.New("VFIO container device is missing")
 	}
 	devs = append(devs, cfg.spec("vfio/vfio"))
-	env, err := Env(cfg.Generation, len(chips), cfg.MetricsBase, chips)
+	env, err := Env(cfg.Generation, cfg.MetricsBase, chips, host)
 	if err != nil {
 		return nil, err
 	}
@@ -133,8 +142,12 @@ func (p *plugin) snapshot() ([]Chip, <-chan struct{}) {
 	return slices.Clone(p.current), p.changed
 }
 
+func options() *pluginapi.DevicePluginOptions {
+	return &pluginapi.DevicePluginOptions{GetPreferredAllocationAvailable: true}
+}
+
 func (*plugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
-	return &pluginapi.DevicePluginOptions{}, nil
+	return options(), nil
 }
 
 func (p *plugin) devices(chips []Chip) []*pluginapi.Device {
@@ -179,8 +192,8 @@ func same(a, b []*pluginapi.Device) bool {
 	})
 }
 
-// Allocate accepts any chip of the host: the kubelet chose from what it was told, and the
-// advertised set may have changed since.
+// Allocate accepts any chip of the host (the kubelet chose from what it was told, and the
+// advertised set may have changed since) but rejects a subset libtpu cannot run on.
 func (p *plugin) Allocate(_ context.Context, req *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	out := &pluginapi.AllocateResponse{}
 	for _, creq := range req.GetContainerRequests() {
@@ -192,7 +205,7 @@ func (p *plugin) Allocate(_ context.Context, req *pluginapi.AllocateRequest) (*p
 			}
 			chosen = append(chosen, p.chips[i])
 		}
-		cresp, err := ContainerResponse(p.cfg, chosen)
+		cresp, err := ContainerResponse(p.cfg, chosen, p.chips)
 		if err != nil {
 			return nil, err
 		}
@@ -206,8 +219,20 @@ func (*plugin) PreStartContainer(context.Context, *pluginapi.PreStartContainerRe
 	return &pluginapi.PreStartContainerResponse{}, nil
 }
 
-func (*plugin) GetPreferredAllocation(context.Context, *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
-	return &pluginapi.PreferredAllocationResponse{}, nil
+// GetPreferredAllocation steers the kubelet to a chip subset libtpu can run on (see
+// ValidSubset). With no valid subset it prefers nothing; Allocate then rejects an invalid
+// pick and the guest fails admission instead of starting on the wrong chips.
+func (p *plugin) GetPreferredAllocation(
+	_ context.Context, req *pluginapi.PreferredAllocationRequest,
+) (*pluginapi.PreferredAllocationResponse, error) {
+	out := &pluginapi.PreferredAllocationResponse{}
+	for _, creq := range req.GetContainerRequests() {
+		ids := Preferred(p.chips, creq.GetAvailableDeviceIDs(), creq.GetMustIncludeDeviceIDs(),
+			int(creq.GetAllocationSize()))
+		out.ContainerResponses = append(out.ContainerResponses,
+			&pluginapi.ContainerPreferredAllocationResponse{DeviceIDs: ids})
+	}
+	return out, nil
 }
 
 func (p *plugin) serve(ctx context.Context) error {
@@ -251,7 +276,7 @@ func (p *plugin) register(ctx context.Context) error {
 	defer cancel()
 	_, err = pluginapi.NewRegistrationClient(conn).Register(ctx, &pluginapi.RegisterRequest{
 		Version: pluginapi.Version, Endpoint: filepath.Base(p.socket),
-		ResourceName: string(PooledResource), Options: &pluginapi.DevicePluginOptions{},
+		ResourceName: string(PooledResource), Options: options(),
 	})
 	return err
 }
