@@ -38,8 +38,7 @@ func TestController_WaitForOperation_ForegroundOpTimeout(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("waitForOperation() = %v, want an error wrapping context.DeadlineExceeded", err)
 		}
-		// With no bound it polls until the caller's deadline, past the first
-		// 1 s poll.
+		// With no bound it polls until the caller's deadline.
 		if elapsed := time.Since(start); elapsed < time.Second {
 			t.Errorf("waitForOperation returned after %v, want it to run until the caller's deadline", elapsed)
 		}

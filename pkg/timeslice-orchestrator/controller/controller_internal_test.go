@@ -62,8 +62,8 @@ func TestController_WaitForOperation(t *testing.T) {
 				if mock.OperationIndex != 3 {
 					t.Errorf("Expected 3 calls, got %d", mock.OperationIndex)
 				}
-				if duration < 2*time.Second {
-					t.Errorf("Expected test to take at least 2 seconds, took %v", duration)
+				if duration < 250*time.Millisecond {
+					t.Errorf("Expected three 100ms polls (about 300ms), took %v", duration)
 				}
 			},
 		},

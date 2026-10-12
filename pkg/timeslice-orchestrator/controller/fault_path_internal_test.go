@@ -54,7 +54,8 @@ func startWedgedOnceAgent(t *testing.T) (string, *wedgedOnceAgent) {
 
 // TestWaitForOperation_WedgedPollIsBounded runs waitForOperation against a real
 // gRPC agent store. With a per-call timeout the wedged first poll gives up and
-// the next poll sees the finished operation: about 2 s, not a held worker.
+// the next poll sees the finished operation: well under the 3 s bound, not a
+// held worker.
 func TestWaitForOperation_WedgedPollIsBounded(t *testing.T) {
 	addr, agent := startWedgedOnceAgent(t)
 	agents := store.NewGRPCSnapshotAgentStore(0, 9001).WithRPCTimeout(500 * time.Millisecond)
@@ -69,7 +70,7 @@ func TestWaitForOperation_WedgedPollIsBounded(t *testing.T) {
 		t.Fatalf("waitForOperation: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("waitForOperation took %v, want about 2s (1s tick, 0.5s timed-out poll, next tick)", elapsed)
+		t.Errorf("waitForOperation took %v, want well under 3s (one tick, 0.5s timed-out poll, next tick)", elapsed)
 	}
 	if got := agent.calls.Load(); got != 2 {
 		t.Errorf("GetOperation calls = %d, want 2", got)
@@ -132,7 +133,7 @@ func operationDoneAfter(d time.Duration) func(context.Context, string, string) (
 }
 
 // TestWaitForKillOperation_PollsAtKillInterval: a kill that finishes at 250 ms
-// is seen within one 100 ms poll, where the 1 s snapshot poll would take 1 s.
+// is seen within one 100 ms poll.
 func TestWaitForKillOperation_PollsAtKillInterval(t *testing.T) {
 	ctrl := NewController(nil, nil, nil, nil, &MockSnapshotAgentStore{OperationFunc: operationDoneAfter(250 * time.Millisecond)})
 	if ctrl.KillPollInterval != 100*time.Millisecond {
@@ -148,14 +149,38 @@ func TestWaitForKillOperation_PollsAtKillInterval(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < 250*time.Millisecond || elapsed >= 600*time.Millisecond {
 		t.Errorf("WaitForKillOperation returned after %v, want within one 100ms poll of 250ms", elapsed)
 	}
+}
 
-	// Control: the snapshot/restore wait polls every second.
-	ctrl = NewController(nil, nil, nil, nil, &MockSnapshotAgentStore{OperationFunc: operationDoneAfter(250 * time.Millisecond)})
-	start = time.Now()
-	if err := ctrl.waitForOperation(ctx, "g", "guest", "node-1", "op-snap", "snapshot"); err != nil {
-		t.Fatalf("waitForOperation: %v", err)
+// TestWaitForOperation_PollsAtOperationInterval: a restore that finishes at
+// 250 ms is seen within one 100 ms poll. The foreground Acquire waits on the
+// restore; the former 1 s poll added up to a second to every reclaim.
+func TestWaitForOperation_PollsAtOperationInterval(t *testing.T) {
+	ctrl := NewController(nil, nil, nil, nil, &MockSnapshotAgentStore{OperationFunc: operationDoneAfter(250 * time.Millisecond)})
+	if ctrl.OperationPollInterval != 100*time.Millisecond {
+		t.Fatalf("default OperationPollInterval = %v, want 100ms", ctrl.OperationPollInterval)
 	}
-	if elapsed := time.Since(start); elapsed < time.Second {
-		t.Errorf("waitForOperation returned after %v, want at least the 1s poll", elapsed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, opType := range []string{"restore", "snapshot"} {
+		ctrl.agentStore = &MockSnapshotAgentStore{OperationFunc: operationDoneAfter(250 * time.Millisecond)}
+		start := time.Now()
+		if err := ctrl.waitForOperation(ctx, "g", "job-1", "node-1", "op-"+opType, opType); err != nil {
+			t.Fatalf("waitForOperation(%s): %v", opType, err)
+		}
+		if elapsed := time.Since(start); elapsed < 250*time.Millisecond || elapsed >= 600*time.Millisecond {
+			t.Errorf("waitForOperation(%s) returned after %v, want within one 100ms poll of 250ms", opType, elapsed)
+		}
+	}
+
+	// A zero interval (a Controller built without NewController) falls back
+	// to the default instead of panicking in time.NewTicker.
+	bare := &Controller{agentStore: &MockSnapshotAgentStore{OperationFunc: operationDoneAfter(150 * time.Millisecond)}}
+	start := time.Now()
+	if err := bare.waitForOperation(ctx, "g", "job-1", "node-1", "op-bare", "restore"); err != nil {
+		t.Fatalf("waitForOperation on a bare Controller: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 600*time.Millisecond {
+		t.Errorf("bare Controller waitForOperation returned after %v, want the 100ms default poll", elapsed)
 	}
 }

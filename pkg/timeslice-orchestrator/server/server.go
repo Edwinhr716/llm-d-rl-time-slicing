@@ -73,6 +73,12 @@ const (
 	DefaultKillBudget   = 3 * time.Second
 )
 
+// DefaultAcquirePollInterval is how often a waiting Acquire checks whether it
+// can be granted. A reclaim ends at no fixed point in the second, so a
+// whole-second poll added up to a second to every grant. A check reads the
+// in-memory stores only.
+const DefaultAcquirePollInterval = 100 * time.Millisecond
+
 // Option configures a Server.
 type Option func(*Server)
 
@@ -132,7 +138,7 @@ func NewServer(ctrl *controller.Controller, groupStore GroupStore, jobStore JobS
 		ctrl:                ctrl,
 		groupStore:          groupStore,
 		jobStore:            jobStore,
-		acquirePollInterval: 1 * time.Second,
+		acquirePollInterval: DefaultAcquirePollInterval,
 		noticeWindow:        DefaultNoticeWindow,
 		killBudget:          DefaultKillBudget,
 		lendPolicy:          defaultLendPolicy(),

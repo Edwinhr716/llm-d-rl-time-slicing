@@ -20,7 +20,11 @@ import (
 )
 
 const (
-	operationPollInterval = 1 * time.Second
+	// DefaultOperationPollInterval is how often waitForOperation polls a
+	// snapshot or restore operation. The foreground Acquire waits on the
+	// restore, so a whole-second poll added up to a second to every reclaim
+	// (an application restore takes about 0.6 s).
+	DefaultOperationPollInterval = 100 * time.Millisecond
 
 	// DefaultWorkers is the number of reconcile workers. With one worker, a
 	// single hung agent call stalls every group and the periodic resync.
@@ -164,6 +168,10 @@ type Controller struct {
 	// KillPollInterval is how often WaitForKillOperation polls.
 	KillPollInterval time.Duration
 
+	// OperationPollInterval is how often waitForOperation polls a snapshot
+	// or restore operation. Zero means DefaultOperationPollInterval.
+	OperationPollInterval time.Duration
+
 	// BackgroundLiveness is L: a host whose commands have failed for this long
 	// during a vacate barrier counts as unseen, and its guests are killed.
 	// Zero means DefaultBackgroundLiveness.
@@ -214,16 +222,17 @@ func NewController(
 	agentStore store.SnapshotAgentStore,
 ) *Controller {
 	return &Controller{
-		queue:               queue,
-		groupStore:          groupStore,
-		jobStore:            jobStore,
-		infraOrchestrator:   infraOrchestrator,
-		agentStore:          agentStore,
-		ResyncPeriod:        30 * time.Second,
-		SettleTimeout:       DefaultSettleTimeout,
-		KillPollInterval:    DefaultKillPollInterval,
-		MaxServingOffwindow: DefaultMaxServingOffwindow,
-		settleSince:         make(map[string]settleEntry),
+		queue:                 queue,
+		groupStore:            groupStore,
+		jobStore:              jobStore,
+		infraOrchestrator:     infraOrchestrator,
+		agentStore:            agentStore,
+		ResyncPeriod:          30 * time.Second,
+		SettleTimeout:         DefaultSettleTimeout,
+		KillPollInterval:      DefaultKillPollInterval,
+		OperationPollInterval: DefaultOperationPollInterval,
+		MaxServingOffwindow:   DefaultMaxServingOffwindow,
+		settleSince:           make(map[string]settleEntry),
 
 		ForegroundOpTimeoutAction:  ForegroundOpTimeoutActionRetry,
 		ForegroundOpTimeoutRetries: DefaultForegroundOpTimeoutRetries,
@@ -960,14 +969,19 @@ func translateJobState(s agentpb.JobState) pb.SnapshotAgentJobState_State {
 }
 
 // waitForOperation blocks until the given snapshot or restore operation on the
-// node completes or fails, or until ForegroundOpTimeout passes.
+// node completes or fails, or until ForegroundOpTimeout passes. It polls every
+// OperationPollInterval.
 func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeName, operationID, operationType string) error {
+	interval := c.OperationPollInterval
+	if interval <= 0 {
+		interval = DefaultOperationPollInterval
+	}
 	if c.ForegroundOpTimeout <= 0 {
-		return c.pollOperation(ctx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
+		return c.pollOperation(ctx, interval, groupID, jobID, nodeName, operationID, operationType)
 	}
 	opCtx, cancel := context.WithTimeout(ctx, c.ForegroundOpTimeout)
 	defer cancel()
-	err := c.pollOperation(opCtx, operationPollInterval, groupID, jobID, nodeName, operationID, operationType)
+	err := c.pollOperation(opCtx, interval, groupID, jobID, nodeName, operationID, operationType)
 	if err != nil && ctx.Err() == nil && errors.Is(opCtx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("%s operation %s did not finish within the foreground operation timeout %s (%w): %w",
 			operationType, operationID, c.ForegroundOpTimeout, ErrForegroundOpTimeout, err)
@@ -976,8 +990,8 @@ func (c *Controller) waitForOperation(ctx context.Context, groupID, jobID, nodeN
 }
 
 // WaitForKillOperation blocks until the given kill operation on the node
-// completes or fails. It polls every KillPollInterval rather than every second,
-// because the lock handoff waits on it. The caller bounds it with ctx.
+// completes or fails. It polls every KillPollInterval, because the lock
+// handoff waits on it. The caller bounds it with ctx.
 func (c *Controller) WaitForKillOperation(ctx context.Context, groupID, jobID, nodeName, operationID string) error {
 	interval := c.KillPollInterval
 	if interval <= 0 {
