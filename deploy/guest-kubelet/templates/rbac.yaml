@@ -1,0 +1,126 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+# {{- if .Values.rbac.create }}
+# The guest kubelet registers its virtual Node, runs guests as mirror pods,
+# watches the donor pods on its host and records events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: '{{ include "guest-kubelet.fullname" . }}-{{ include "guest-kubelet.namespace" . }}'
+  labels:
+    # {{- include "guest-kubelet.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "services"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # On SIGTERM the guest kubelet reads its own controller to tell a restart
+  # from an uninstall (a DaemonSet that no longer selects the host after the
+  # era ends). Without these reads it always assumes a restart and keeps the
+  # virtual Node, NotReady and finalized, with no one left to remove it.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "replicasets", "deployments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: '{{ include "guest-kubelet.fullname" . }}-{{ include "guest-kubelet.namespace" . }}'
+  labels:
+    # {{- include "guest-kubelet.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: '{{ include "guest-kubelet.fullname" . }}-{{ include "guest-kubelet.namespace" . }}'
+subjects:
+  - kind: ServiceAccount
+    name: '{{ include "guest-kubelet.serviceAccountName" . }}'
+    namespace: '{{ include "guest-kubelet.namespace" . }}'
+---
+# The virtual Node's Lease (node heartbeat).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: '{{ include "guest-kubelet.fullname" . }}-{{ include "guest-kubelet.namespace" . }}'
+  namespace: kube-node-lease
+  labels:
+    # {{- include "guest-kubelet.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: '{{ include "guest-kubelet.fullname" . }}-{{ include "guest-kubelet.namespace" . }}'
+  namespace: kube-node-lease
+  labels:
+    # {{- include "guest-kubelet.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: '{{ include "guest-kubelet.fullname" . }}-{{ include "guest-kubelet.namespace" . }}'
+subjects:
+  - kind: ServiceAccount
+    name: '{{ include "guest-kubelet.serviceAccountName" . }}'
+    namespace: '{{ include "guest-kubelet.namespace" . }}'
+---
+# Leader election between the old and new pod of a rolling update.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: '{{ include "guest-kubelet.fullname" . }}-leader'
+  namespace: '{{ include "guest-kubelet.namespace" . }}'
+  labels:
+    # {{- include "guest-kubelet.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: '{{ include "guest-kubelet.fullname" . }}-leader'
+  namespace: '{{ include "guest-kubelet.namespace" . }}'
+  labels:
+    # {{- include "guest-kubelet.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: '{{ include "guest-kubelet.fullname" . }}-leader'
+subjects:
+  - kind: ServiceAccount
+    name: '{{ include "guest-kubelet.serviceAccountName" . }}'
+    namespace: '{{ include "guest-kubelet.namespace" . }}'
+# {{- end }}
+# {{- if .Values.serviceAccount.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: '{{ include "guest-kubelet.serviceAccountName" . }}'
+  namespace: '{{ include "guest-kubelet.namespace" . }}'
+  labels:
+    # {{- include "guest-kubelet.labels" . | nindent 4 }}
+  annotations:
+    # {{- toYaml .Values.serviceAccount.annotations | nindent 4 }}
+# {{- end }}

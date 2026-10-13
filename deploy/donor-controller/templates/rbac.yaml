@@ -1,0 +1,49 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+# It reads donor pods, labels and unlabels real nodes and records Node events.
+# It never writes pods.
+# {{- $name := printf "%s-%s" (include "donor-controller.fullname" .) (include "donor-controller.namespace" .) }}
+# {{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: '{{ $name }}'
+  labels:
+    # {{- include "donor-controller.labels" . | nindent 4 }}
+rules:
+  - {apiGroups: [""], resources: [pods], verbs: [list, watch]}
+  - {apiGroups: [""], resources: [nodes], verbs: [get, list, watch, patch]}
+  - {apiGroups: [""], resources: [events], verbs: [create]}
+  # {{- if eq (toString (index .Values.flags "release-dead-hosts")) "true" }}
+  # --release-dead-hosts deletes a virtual Node whose host Node is gone.
+  - {apiGroups: [""], resources: [nodes], verbs: [delete]}
+  # {{- end }}
+  # {{- if eq (toString (index .Values.flags "clear-stale-fences")) "true" }}
+  # --clear-stale-fences removes a stale timeslice.io/gpu-fence taint (spec.taints).
+  - {apiGroups: [""], resources: [nodes], verbs: [update]}
+  # {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: '{{ $name }}'
+  labels:
+    # {{- include "donor-controller.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: '{{ $name }}'}
+subjects:
+  - kind: ServiceAccount
+    name: '{{ include "donor-controller.serviceAccountName" . }}'
+    namespace: '{{ include "donor-controller.namespace" . }}'
+# {{- end }}
+# {{- if .Values.serviceAccount.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: '{{ include "donor-controller.serviceAccountName" . }}'
+  namespace: '{{ include "donor-controller.namespace" . }}'
+  labels:
+    # {{- include "donor-controller.labels" . | nindent 4 }}
+  annotations:
+    # {{- toYaml .Values.serviceAccount.annotations | nindent 4 }}
+# {{- end }}

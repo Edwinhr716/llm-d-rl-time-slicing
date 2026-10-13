@@ -1,0 +1,71 @@
+# GPU utilization metrics: NVIDIA's DCGM exporter as a DaemonSet on GPU hosts,
+# with the profiling (DCP) counters that show how busy the SMs are, not only
+# whether a process holds the GPU:
+#   DCGM_FI_PROF_SM_ACTIVE       fraction of time at least one warp is on an SM
+#   DCGM_FI_PROF_SM_OCCUPANCY    resident warps / maximum warps
+#   DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, DCGM_FI_PROF_DRAM_ACTIVE
+#   DCGM_FI_DEV_GPU_UTIL, DCGM_FI_DEV_FB_USED (the classic nvidia-smi numbers)
+# Metrics are served in Prometheus format on port 9400 (/metrics). Off by
+# default in the parent chart. The exporter creates no CUDA context.
+
+namespace: timeslice-system
+
+image:
+  repository: nvcr.io/nvidia/k8s/dcgm-exporter
+  pullPolicy: IfNotPresent
+  tag: "4.4.1-4.6.0-ubuntu22.04"
+
+nameOverride: ""
+fullnameOverride: ""
+
+port: 9400
+
+# Sampling interval of the exporter, in milliseconds (its default is 30000,
+# too coarse for a 30 s notice window).
+collectIntervalMs: 1000
+
+# Counter list. The chart ships its own list (templates/counters.yaml, the
+# counters above) and mounts it at countersPath: the image's
+# dcp-metrics-included.csv comments out SM_ACTIVE and SM_OCCUPANCY. Set
+# collectors to a file inside the image (e.g.
+# /etc/dcgm-exporter/dcp-metrics-included.csv) to use that instead.
+collectors: /etc/timeslice-gpu-metrics/counters.csv
+countersPath: /etc/timeslice-gpu-metrics
+
+# Map GPUs to the pods using them through the kubelet pod-resources API.
+# Off: DRA-allocated GPUs are not listed there.
+kubernetesPodMapping: false
+
+# Host driver, mounted where the exporter looks for libnvidia-ml. The default
+# is GKE Container-Optimized OS.
+nvidia:
+  driver:
+    hostPath: /home/kubernetes/bin/nvidia
+    mountPath: /usr/local/nvidia
+  devices:
+    enabled: true
+    hostPath: /dev
+
+# The profiling counters need CAP_SYS_ADMIN on the GPU; privileged grants it.
+securityContext:
+  privileged: true
+
+resources:
+  requests: {cpu: 50m, memory: 256Mi}
+  limits: {memory: 1Gi}
+
+# GPU hosts only.
+nodeSelector: {}
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: cloud.google.com/gke-accelerator, operator: Exists}
+tolerations:
+  - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+
+# Google Cloud Managed Service for Prometheus scrape of port 9400.
+podMonitoring:
+  enabled: false
+  interval: 5s

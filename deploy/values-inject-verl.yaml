@@ -1,0 +1,15 @@
+# Overlay for RL jobs that keep a stock verl image (for example
+# verlai/verl:vllm020.dev2) instead of the prebuilt one
+# (ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/verl, the default):
+#
+#   helm install timeslice . -n timeslice-system --create-namespace -f values-inject-verl.yaml
+#
+# The webhook then adds an init container (rl-integration image) to every pod of
+# a Ray cluster that has a donor group. It copies the timeslice client, the verl
+# plugin and the verl fork with the fully-async lifecycle hooks (pinned to the
+# same commit as the prebuilt image, docker/verl/verl-pin.env) in front of
+# PYTHONPATH. Set timeslice-webhook.rlIntegration.injectVerl=false as well if
+# your image already has a verl with the hooks.
+timeslice-webhook:
+  rlIntegration:
+    enabled: true

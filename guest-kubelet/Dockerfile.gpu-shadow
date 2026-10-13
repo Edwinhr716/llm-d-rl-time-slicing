@@ -1,0 +1,20 @@
+# Build from the repository root (the guest-kubelet module needs the root go.mod):
+#   docker build -f guest-kubelet/Dockerfile.gpu-shadow .
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY guest-kubelet/go.mod guest-kubelet/go.sum ./guest-kubelet/
+WORKDIR /src/guest-kubelet
+RUN go mod download
+WORKDIR /src
+COPY pkg/timeslice-orchestrator/api/ ./pkg/timeslice-orchestrator/api/
+COPY pkg/snapshot-agent/api/ ./pkg/snapshot-agent/api/
+COPY guest-kubelet/ ./guest-kubelet/
+WORKDIR /src/guest-kubelet
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /gpu-shadow-plugin ./cmd/gpu-shadow-plugin
+
+# The image's default user (root) is kept: the kubelet's device-plugin and pod-resources
+# sockets are root-only. The deploy/gpu-shadow chart drops every capability.
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /gpu-shadow-plugin /gpu-shadow-plugin
+ENTRYPOINT ["/gpu-shadow-plugin"]

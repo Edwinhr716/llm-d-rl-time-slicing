@@ -1,0 +1,20 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+# {{- if .Values.monitoring.podMonitoring.enabled }}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: '{{ include "timesliceorchestrator.fullname" . }}'
+  namespace: '{{ include "timesliceorchestrator.namespace" . }}'
+  labels:
+    app.kubernetes.io/name: '{{ include "timesliceorchestrator.name" . }}'
+    app.kubernetes.io/instance: '{{ .Release.Name }}'
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: '{{ include "timesliceorchestrator.name" . }}'
+      app.kubernetes.io/instance: '{{ .Release.Name }}'
+  endpoints:
+    - port: metrics
+      interval: '{{ .Values.monitoring.podMonitoring.interval }}'
+# {{- end }}

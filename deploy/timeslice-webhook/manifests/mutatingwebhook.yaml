@@ -1,0 +1,68 @@
+# One webhook entry per label. Both mutate on CREATE only ("fires once, at creation") and never see
+# nodes. __CA_BUNDLE__ is the base64 CA that signed the __TLS_SECRET__ certificate.
+#   donor: failurePolicy Fail. A donor admitted without its job-id and group would be invisible to
+#          the orchestrator, so no donor is created while the webhook is down.
+#   guest: failurePolicy Ignore. While the webhook is down a guest is admitted as written (no
+#          toleration, no steering) instead of blocking the batch user.
+# Pods with neither label are not sent to the webhook at all.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: timeslice-webhook
+webhooks:
+  - name: donor.timeslice.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: timeslice-webhook
+        namespace: __NS__
+        path: /mutate
+        port: 443
+      caBundle: __CA_BUNDLE__
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
+    objectSelector:
+      matchLabels:
+        timeslice.io/donor: "true"
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system", "__NS__"]
+    matchPolicy: Equivalent
+    failurePolicy: Fail
+    sideEffects: None
+    timeoutSeconds: 3
+    reinvocationPolicy: IfNeeded
+  - name: guest.timeslice.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: timeslice-webhook
+        namespace: __NS__
+        path: /mutate
+        port: 443
+      caBundle: __CA_BUNDLE__
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
+    objectSelector:
+      matchLabels:
+        timeslice.io/guest: "true"
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system", "__NS__"]
+    matchPolicy: Equivalent
+    failurePolicy: Ignore
+    sideEffects: None
+    timeoutSeconds: 3
+    reinvocationPolicy: IfNeeded

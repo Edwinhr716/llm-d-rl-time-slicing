@@ -30,12 +30,12 @@ func BufDialer(context.Context, string) (net.Conn, error) {
 
 // InitGRPCServer is exported for external tests.
 // It sets the acquirePollInterval to 1ms for fast testing.
-func InitGRPCServer(groupStore GroupStore, jobStore JobStore) (*Server, *MockWorkQueue, func()) {
+func InitGRPCServer(groupStore GroupStore, jobStore JobStore, opts ...Option) (*Server, *MockWorkQueue, func()) {
 	lis = bufconn.Listen(bufSize)
 	s := grpc.NewServer()
 	mq := &MockWorkQueue{}
 	ctrl := controller.NewController(nil, nil, mq, nil, nil)
-	srv := NewServer(ctrl, groupStore, jobStore)
+	srv := NewServer(ctrl, groupStore, jobStore, opts...)
 	srv.acquirePollInterval = 1 * time.Millisecond // Set to 1ms for testing
 	pb.RegisterTimeSliceOrchestratorServiceServer(s, srv)
 	go func() {
@@ -71,11 +71,12 @@ func (m *MockWorkQueue) GetAdded() []string {
 	return cp
 }
 
-func (m *MockWorkQueue) AddRateLimited(groupID string) {}
-func (m *MockWorkQueue) Forget(groupID string)         {}
-func (m *MockWorkQueue) Done(groupID string)           {}
-func (m *MockWorkQueue) Get() (string, bool)           { return "", false }
-func (m *MockWorkQueue) ShutDown()                     {}
+func (m *MockWorkQueue) AddRateLimited(groupID string)                {}
+func (m *MockWorkQueue) AddAfter(groupID string, delay time.Duration) {}
+func (m *MockWorkQueue) Forget(groupID string)                        {}
+func (m *MockWorkQueue) Done(groupID string)                          {}
+func (m *MockWorkQueue) Get() (string, bool)                          { return "", false }
+func (m *MockWorkQueue) ShutDown()                                    {}
 
 // MockGroupStore is exported for external tests.
 type MockGroupStore struct {

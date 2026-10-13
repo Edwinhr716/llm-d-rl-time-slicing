@@ -60,3 +60,10 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Namespace every namespaced resource of this chart is created in.
+*/}}
+{{- define "snapshot-agent.namespace" -}}
+{{- .Values.namespace | default "timeslice-system" }}
+{{- end }}

@@ -1,0 +1,17 @@
+# The GPU shadow device plugin image (--gpu-mode=pooled), built remotely from the repository root:
+#   gcloud builds submit --project=YOUR_PROJECT --config guest-kubelet/cloudbuild-gpu-shadow.yaml \
+#     --substitutions=_REGISTRY=YOUR_REGISTRY,_TAG=$(git rev-parse --short HEAD) .
+# _REGISTRY is the image repository the guest-kubelet image goes to, without the image name.
+# cloudbuild.yaml already vets and tests this code (go test ./...).
+substitutions:
+  _REGISTRY: YOUR_REGISTRY
+  _TAG: dev
+options:
+  logging: GCS_ONLY
+  machineType: E2_HIGHCPU_8
+steps:
+  - id: image
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "guest-kubelet/Dockerfile.gpu-shadow", "-t", "${_REGISTRY}/gpu-shadow-plugin:${_TAG}", "."]
+images:
+  - ${_REGISTRY}/gpu-shadow-plugin:${_TAG}

@@ -1,0 +1,64 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: '{{ include "gpu-shadow.fullname" . }}'
+  namespace: '{{ include "gpu-shadow.namespace" . }}'
+  labels:
+    # {{- include "gpu-shadow.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      # {{- include "gpu-shadow.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        # {{- include "gpu-shadow.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        # {{- toYaml .Values.nodeSelector | nindent 8 }}
+      affinity:
+        # {{- toYaml .Values.affinity | nindent 8 }}
+      tolerations:
+        # {{- toYaml .Values.tolerations | nindent 8 }}
+      securityContext:
+        runAsUser: 0
+        runAsNonRoot: false
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: plugin
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default (.Values.global | default dict).imageTag | default "latest" }}'
+          imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+          args:
+            # {{- include "gpu-shadow.flags" .Values.flags | nindent 12 }}
+            # {{- with .Values.extraArgs }}{{ toYaml . | nindent 12 }}{{ end }}
+          resources:
+            # {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: device-plugins, mountPath: /var/lib/kubelet/device-plugins}
+            - {name: pod-resources, mountPath: /var/lib/kubelet/pod-resources, readOnly: true}
+            - {name: dev, mountPath: /host/dev, readOnly: true}
+            - {name: proc-driver, mountPath: /host/proc/driver/nvidia, readOnly: true}
+            - {name: sys, mountPath: /host/sys, readOnly: true}
+      volumes:
+        - name: device-plugins
+          hostPath: {path: /var/lib/kubelet/device-plugins, type: Directory}
+        - name: pod-resources
+          hostPath: {path: /var/lib/kubelet/pod-resources, type: Directory}
+        # Read only to check which /dev/nvidiaN exist; the kubelet hands the nodes to the mirror.
+        - name: dev
+          hostPath: {path: /dev, type: Directory}
+        # gpus/<pci>/information: each GPU's device minor and UUID.
+        - name: proc-driver
+          hostPath: {path: /proc/driver/nvidia, type: Directory}
+        # NUMA node of each GPU (bus/pci/devices/<pci>/numa_node).
+        - name: sys
+          hostPath: {path: /sys, type: Directory}

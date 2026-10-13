@@ -1,0 +1,41 @@
+{
+  "comment": "Shared fixture for the expected_idle estimator: timeslice_verl/estimator.py (tests/test_estimator.py) and its Go mirror (expectedidle/expectedidle_test.go) must both reproduce every step. EWMA alpha 0.5 per yield point; the first gap is taken as is; no hint before the first gap; negative gaps are ignored. want null = no hint.",
+  "alpha": 0.5,
+  "steps": [
+    {"op": "next", "point": "update_weights", "want": null},
+    {"op": "observe", "point": "update_weights", "gap": 10},
+    {"op": "next", "point": "update_weights", "want": 10},
+    {"op": "observe", "point": "update_weights", "gap": 20},
+    {"op": "next", "point": "update_weights", "want": 15},
+    {"op": "next", "point": "init_workers", "want": null},
+    {"op": "observe", "point": "init_workers", "gap": 60},
+    {"op": "next", "point": "init_workers", "want": 60},
+    {"op": "next", "point": "update_weights", "want": 15},
+    {"op": "observe", "point": "update_weights", "gap": 5},
+    {"op": "observe", "point": "update_weights", "gap": -1},
+    {"op": "next", "point": "update_weights", "want": 10},
+    {"op": "observe", "point": "update_weights", "gap": 120},
+    {"op": "next", "point": "update_weights", "want": 65},
+    {"op": "observe", "point": "update_weights", "gap": 0},
+    {"op": "next", "point": "update_weights", "want": 32.5},
+    {"op": "observe", "point": "update_weights", "gap": 30.25},
+    {"op": "next", "point": "update_weights", "want": 31.375},
+    {"op": "observe", "point": "init_workers", "gap": 45},
+    {"op": "next", "point": "init_workers", "want": 52.5},
+    {"op": "next", "point": "update_weights", "want": 31.375}
+  ],
+  "modes": [
+    {"raw": "", "mode": "off"},
+    {"raw": "off", "mode": "off"},
+    {"raw": " OFF ", "mode": "off"},
+    {"raw": "auto", "mode": "auto"},
+    {"raw": " Auto", "mode": "auto"},
+    {"raw": "30", "mode": "fixed", "seconds": 30},
+    {"raw": "12.5", "mode": "fixed", "seconds": 12.5},
+    {"raw": "0", "mode": "fixed", "seconds": 0},
+    {"raw": "-1", "mode": "invalid"},
+    {"raw": "soon", "mode": "invalid"},
+    {"raw": "nan", "mode": "invalid"},
+    {"raw": "inf", "mode": "invalid"}
+  ]
+}

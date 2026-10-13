@@ -1,0 +1,36 @@
+# Checks and builds the donor controller image remotely; nothing is built on a laptop. From the
+# repository root:
+#   gcloud builds submit --project=YOUR_PROJECT --config=deploy/donor-controller/cloudbuild.yaml \
+#     --substitutions=_REGISTRY=YOUR_REGISTRY_PATH,_TAG=$(git rev-parse --short HEAD) .
+# _REGISTRY is the image repository path without the image name (registry host/project/repo).
+substitutions:
+  _REGISTRY: YOUR_REGISTRY_PATH
+  _TAG: dev
+options:
+  machineType: E2_HIGHCPU_8
+  substitutionOption: ALLOW_LOOSE
+steps:
+  - id: tidy
+    name: golang:1.25
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        cp go.mod /tmp/go.mod; cp go.sum /tmp/go.sum
+        go mod tidy
+        diff -u /tmp/go.mod go.mod && diff -u /tmp/go.sum go.sum
+  - id: vet-test
+    name: golang:1.25
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        go vet ./pkg/donor-controller/... ./cmd/donor-controller/...
+        go test -race -count=1 ./pkg/donor-controller/... ./cmd/donor-controller/...
+  - id: image
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "deploy/donor-controller/Dockerfile", "-t", "${_REGISTRY}/donor-controller:${_TAG}", "."]
+images:
+  - ${_REGISTRY}/donor-controller:${_TAG}

@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os/exec"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
@@ -35,7 +34,9 @@ func (d *defaultNvmlClient) DeviceGetCount() (int, nvml.Return) {
 
 // CudaCheckpoint implements the Backend interface using cuda-checkpoint and optionally CRIU.
 type CudaCheckpoint struct {
-	mu          sync.Mutex
+	// lock is the node lock: one cuda-checkpoint action at a time per node.
+	// Waiting for it honours the caller's context.
+	lock        *NodeLock
 	execCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
 	nvml        nvmlClient
 	lookPath    func(string) (string, error)
@@ -44,6 +45,7 @@ type CudaCheckpoint struct {
 // NewCudaCheckpoint creates a new CudaCheckpoint backend.
 func NewCudaCheckpoint() *CudaCheckpoint {
 	return &CudaCheckpoint{
+		lock: NewNodeLock(),
 		execCommand: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
@@ -52,15 +54,37 @@ func NewCudaCheckpoint() *CudaCheckpoint {
 	}
 }
 
-// Snapshot triggers a snapshot of the accelerator context for a job.
+// Acquire takes the node lock, or returns an error when ctx ends first.
+// The caller must Release it. The guest pipeline holds it across its own
+// checks and SnapshotLocked or RestoreLocked.
+func (c *CudaCheckpoint) Acquire(ctx context.Context) error {
+	return c.lock.Acquire(ctx)
+}
+
+// Release frees the node lock taken with Acquire.
+func (c *CudaCheckpoint) Release() {
+	c.lock.Release()
+}
+
+// Snapshot triggers a snapshot of the accelerator context for a job. It
+// waits for the node lock only as long as ctx allows.
 func (c *CudaCheckpoint) Snapshot(ctx context.Context, req Request) error {
+	if len(ExtractPIDStrings(req.Config)) == 0 {
+		return fmt.Errorf("at least one PID is required for CUDA snapshot")
+	}
+	if err := c.lock.Acquire(ctx); err != nil {
+		return err
+	}
+	defer c.lock.Release()
+	return c.SnapshotLocked(ctx, req)
+}
+
+// SnapshotLocked is Snapshot for a caller that already holds the node lock.
+func (c *CudaCheckpoint) SnapshotLocked(ctx context.Context, req Request) error {
 	pids := ExtractPIDStrings(req.Config)
 	if len(pids) == 0 {
 		return fmt.Errorf("at least one PID is required for CUDA snapshot")
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	slog.InfoContext(ctx, "Snapshotting PIDs", "pids", pids)
 
@@ -72,15 +96,25 @@ func (c *CudaCheckpoint) Snapshot(ctx context.Context, req Request) error {
 	return nil
 }
 
-// Restore triggers a restoration of the accelerator context for a job.
+// Restore triggers a restoration of the accelerator context for a job. It
+// waits for the node lock only as long as ctx allows.
 func (c *CudaCheckpoint) Restore(ctx context.Context, req Request) error {
+	if len(ExtractPIDStrings(req.Config)) == 0 {
+		return fmt.Errorf("at least one PID is required for CUDA restore")
+	}
+	if err := c.lock.Acquire(ctx); err != nil {
+		return err
+	}
+	defer c.lock.Release()
+	return c.RestoreLocked(ctx, req)
+}
+
+// RestoreLocked is Restore for a caller that already holds the node lock.
+func (c *CudaCheckpoint) RestoreLocked(ctx context.Context, req Request) error {
 	pids := ExtractPIDStrings(req.Config)
 	if len(pids) == 0 {
 		return fmt.Errorf("at least one PID is required for CUDA restore")
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	slog.InfoContext(ctx, "Restoring PIDs", "pids", pids)
 	t0 := time.Now()

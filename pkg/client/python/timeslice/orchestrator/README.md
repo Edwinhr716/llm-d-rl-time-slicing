@@ -66,6 +66,27 @@ def run_gpu_kernel():
 run_gpu_kernel()
 ```
 
+### Yielding with an Expected Idle Time (`yield_`)
+
+`yield_()` is `release()` under the name of the underlying `Yield` RPC. Both
+take an optional `expected_idle` hint: how long the job expects to leave the
+accelerator idle before it calls `acquire()` again, in seconds or as a
+`datetime.timedelta`. When the orchestrator runs with a minimum bubble and the
+hint is at least that long, it may lend the accelerator to background guests
+until the job acquires again. Without the hint the accelerator is never lent.
+A negative value raises `ValueError`.
+
+```python
+# The trainer expects about 45 s of rollout before its next training step
+client.yield_(expected_idle=45)
+```
+
+`get_status()` reports `group.background_protocol` (1 when the server supports
+background guests) and, while guests are being asked to leave,
+`group.vacate_within` as a `timedelta`. `AcquireResult.vram_unconfirmed` is
+true when the accelerator was returned after a guest kill that could not be
+confirmed.
+
 ### Optional Initialization & Dynamic Overrides
 
 The `job_id` and `group_id` are optional on construction. If omitted, they **must** be provided dynamically during the method calls. You can also override the constructor-configured values on a per-call basis.

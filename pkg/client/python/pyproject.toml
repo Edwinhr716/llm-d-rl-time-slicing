@@ -9,14 +9,16 @@ description = "Timeslice library including Snapshot Agent client"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "grpcio>=1.81.0",
+    # The *_pb2_grpc.py version gates are lowered to 1.66.0 (no newer gRPC API is used), so the
+    # client imports in RL images that ship an older grpcio (verl images: 1.80).
+    "grpcio>=1.66.0",
     "protobuf>=6.33.5",
 ]
 
 [project.optional-dependencies]
 dev = [
-    # Pinned: gencode floor toolchain; regenerating with a newer
-    # grpcio-tools raises the runtime floors above.
+    # Pinned: gencode toolchain. After regenerating, lower GRPC_GENERATED_VERSION in the
+    # *_pb2_grpc.py files back to 1.66.0 (see the comment there).
     "grpcio-tools==1.81.0",
 ]
 

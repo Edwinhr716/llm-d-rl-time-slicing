@@ -1,0 +1,18 @@
+# Template directives sit in comments and quoted strings so the file stays
+# valid YAML for linters; Helm renders them all the same.
+# {{- if .Values.podMonitoring.enabled }}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: '{{ include "gpu-metrics.fullname" . }}'
+  namespace: '{{ include "gpu-metrics.namespace" . }}'
+  labels:
+    # {{- include "gpu-metrics.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      # {{- include "gpu-metrics.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: '{{ .Values.podMonitoring.interval }}'
+# {{- end }}

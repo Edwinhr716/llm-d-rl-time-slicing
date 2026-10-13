@@ -60,3 +60,17 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Namespace every namespaced resource of this chart is created in.
+*/}}
+{{- define "timesliceorchestrator.namespace" -}}
+{{- .Values.namespace | default "timeslice-system" }}
+{{- end }}
+
+{{/*
+Namespace of the lock ConfigMap: lock.namespace, else the chart namespace.
+*/}}
+{{- define "timesliceorchestrator.lockNamespace" -}}
+{{- .Values.lock.namespace | default (include "timesliceorchestrator.namespace" .) }}
+{{- end }}
