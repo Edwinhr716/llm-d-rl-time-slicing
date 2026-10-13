@@ -34,6 +34,10 @@ const (
 	// job's grant is unconsumed. See waitForGrantSettlement.
 	DefaultSettleTimeout = 30 * time.Second
 
+	// DefaultOrphanedLockGrace is the default --orphaned-lock-grace. See
+	// releaseOrphanedLock.
+	DefaultOrphanedLockGrace = 60 * time.Second
+
 	// rateLimiterQPS and rateLimiterBurst are the overall bucket that
 	// client-go's default controller rate limiter also applies.
 	rateLimiterQPS   = 10
@@ -142,6 +146,11 @@ type Controller struct {
 	// disables it.
 	HolderWaitRequeue time.Duration
 
+	// OrphanedLockGrace is how long the lock holder may be without pods, after
+	// it was seen with pods in the group, before the controller yields the lock
+	// on its behalf. Zero or negative disables it. See releaseOrphanedLock.
+	OrphanedLockGrace time.Duration
+
 	// ForegroundOpTimeout bounds how long a reconcile waits for one agent
 	// snapshot or restore operation. Zero leaves the wait bounded only by the
 	// context.
@@ -184,6 +193,10 @@ type Controller struct {
 	settleMu    sync.Mutex
 	settleSince map[string]settleEntry
 
+	// orphanMu guards holders (releaseOrphanedLock).
+	orphanMu sync.Mutex
+	holders  map[string]holderEntry
+
 	// killMu guards kills, agentSeen, agentFailed and holdLogged (kill path,
 	// kill.go; lend gate, hosts_push.go).
 	killMu     sync.Mutex
@@ -203,6 +216,14 @@ type Controller struct {
 type settleEntry struct {
 	jobID string
 	since time.Time
+}
+
+// holderEntry tracks a group's lock holder for releaseOrphanedLock: whether
+// it was ever seen with pods in the group, and since when its pods are gone.
+type holderEntry struct {
+	jobID     string
+	seen      bool
+	goneSince time.Time
 }
 
 // NewController creates a new Controller with the provided stores, queue, and infrastructure orchestrator.
@@ -352,6 +373,10 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		return fmt.Errorf("failed to get group %s from store: %w", groupID, err)
 	}
 
+	if err := c.releaseOrphanedLock(ctx, group); err != nil {
+		return fmt.Errorf("failed to release orphaned lock: %w", err)
+	}
+
 	if err := c.tryDeduceActiveJob(ctx, group); err != nil {
 		return fmt.Errorf("failed to try deducing active job: %w", err)
 	}
@@ -472,6 +497,67 @@ func (c *Controller) requeueWhileHolderWaits(ctx context.Context, groupID string
 	}
 	slog.DebugContext(ctx, "Lock holder is not loaded yet, requeuing", "holder", holder, "after", c.HolderWaitRequeue)
 	c.queue.AddAfter(groupID, c.HolderWaitRequeue)
+}
+
+// releaseOrphanedLock yields the group lock on behalf of a holder that was seen
+// with pods in the group and has had none for OrphanedLockGrace: its job was
+// deleted (for example after it FAULTED) without a Yield, and a held lock keeps
+// the group's nodes and blocks every waiter. The release is the same unlock as
+// a Yield, so the lock store is cleared and promotion runs later in the pass.
+// A holder never seen with pods is kept: a job may take the lock before its
+// pods are deployed. A FAULTED holder that still has pods is kept too (it
+// fails closed in reconcileNode).
+//
+// The seen-with-pods memory is in process only: after an orchestrator restart
+// a holder whose pods are already gone is never seen with pods, so its lock is
+// kept until it yields or is released by hand.
+func (c *Controller) releaseOrphanedLock(ctx context.Context, group *store.Group) error {
+	if c.OrphanedLockGrace <= 0 {
+		return nil
+	}
+	groupID := group.ID()
+	holder := group.Spec().LockingJob()
+	c.orphanMu.Lock()
+	defer c.orphanMu.Unlock()
+	if holder == "" {
+		delete(c.holders, groupID)
+		return nil
+	}
+	entry := c.holders[groupID]
+	if entry.jobID != holder {
+		entry = holderEntry{jobID: holder}
+	}
+	// The infrastructure observer keeps a job in the store only while it has pods.
+	_, err := c.jobStore.Get(ctx, groupID, holder)
+	switch {
+	case err == nil:
+		entry.seen, entry.goneSince = true, time.Time{}
+	case !errors.Is(err, store.ErrNotFound):
+		return fmt.Errorf("failed to get lock holder %s: %w", holder, err)
+	case entry.seen:
+		now := time.Now()
+		if entry.goneSince.IsZero() {
+			entry.goneSince = now
+		}
+		gone := now.Sub(entry.goneSince)
+		if gone < c.OrphanedLockGrace {
+			c.queue.AddAfter(groupID, c.OrphanedLockGrace-gone)
+			break
+		}
+		if err := group.Spec().Yield(ctx, holder); err != nil {
+			return fmt.Errorf("failed to yield for lock holder %s: %w", holder, err)
+		}
+		delete(c.holders, groupID)
+		metrics.OrphanedLockReleasesTotal.Inc()
+		slog.WarnContext(ctx, "Released the group lock of a holder whose pods are gone",
+			"job", holder, "group", groupID, "podsGoneFor", gone.Round(time.Second))
+		return nil
+	}
+	if c.holders == nil {
+		c.holders = make(map[string]holderEntry)
+	}
+	c.holders[groupID] = entry
+	return nil
 }
 
 // reconcileNode reconciles the state of a single node: early exits, then

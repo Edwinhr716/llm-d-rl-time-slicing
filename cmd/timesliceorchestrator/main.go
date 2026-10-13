@@ -102,6 +102,9 @@ func run() error {
 	holderWaitRequeue := flag.Duration("holder-wait-requeue", 1*time.Second,
 		"Re-reconcile a group this long after a pass that ends with the lock holder not yet loaded, so an "+
 			"agent state change reaches the waiting Acquire promptly. 0 disables it. PENDING LEAD DECISION.")
+	orphanedLockGrace := flag.Duration("orphaned-lock-grace", controller.DefaultOrphanedLockGrace,
+		"Yield a group lock on behalf of its holder once the holder, seen with pods in the group, has had "+
+			"none for this long (its job was deleted without a Yield). 0 disables it.")
 	settleTimeout := flag.Duration("settle-timeout", controller.DefaultSettleTimeout,
 		"Bound on how long promotion of the next waiter is held while another job's grant is unconsumed "+
 			"(granted, never seen on the accelerator). PENDING LEAD DECISION.")
@@ -242,6 +245,7 @@ func run() error {
 	)
 	ctrl.ResyncPeriod = *resyncPeriod
 	ctrl.HolderWaitRequeue = *holderWaitRequeue
+	ctrl.OrphanedLockGrace = *orphanedLockGrace
 	ctrl.SettleTimeout = *settleTimeout
 	ctrl.ForegroundOpTimeout = *foregroundOpTimeout
 	ctrl.ForegroundOpTimeoutAction = *foregroundOpTimeoutAction
@@ -295,6 +299,7 @@ func run() error {
 		"retryBaseDelay", *retryBaseDelay,
 		"retryMaxDelay", *retryMaxDelay,
 		"holderWaitRequeue", *holderWaitRequeue,
+		"orphanedLockGrace", *orphanedLockGrace,
 		"killPollInterval", *killPollInterval,
 		"maxServingOffwindow", *maxServingOffwindow,
 		"lockConfigMap", lockStore.ConfigMapRef(),

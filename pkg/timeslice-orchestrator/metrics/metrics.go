@@ -67,6 +67,15 @@ var (
 			Help: "Number of guest kills that were not confirmed when the unconfirmed-kill decision was taken.",
 		},
 	)
+
+	// OrphanedLockReleasesTotal counts group locks the controller released on
+	// behalf of a holder whose pods were gone for the orphaned-lock grace.
+	OrphanedLockReleasesTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "timeslice_orchestrator_orphaned_lock_releases_total",
+			Help: "Number of group locks released because the holder's pods were gone for the orphaned-lock grace.",
+		},
+	)
 )
 
 // noticeBuckets spans 100ms to 5min: the notice window N is tens of seconds
@@ -247,6 +256,7 @@ func Register() {
 		DeferredSnapshotsTotal,
 		QuantumSuppressedPollsTotal,
 		KillUnconfirmedTotal,
+		OrphanedLockReleasesTotal,
 		NoticeSeconds,
 		GuestKillsTotal,
 		AgentUnreachable,
