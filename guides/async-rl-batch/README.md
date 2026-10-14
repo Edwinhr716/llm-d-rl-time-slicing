@@ -20,13 +20,13 @@ inference pipeline. The whole setup is:
 
 | Who | What |
 |---|---|
-| Cluster admin | `helm install timeslice` |
+| Platform team | `helm install timeslice` |
 | RL team | the prebuilt verl image, one label and three settings in the RayJob |
 | Async inference team | one label on the model server pods |
 
-The RL team runs **the prebuilt verl image**
-(`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/verl`): a stock verl image
-plus the verl fork with the lifecycle hooks and the timeslice packages.
+Each team does its part on its own. Once the platform team has installed the
+platform, the RL team and the async inference team can do their parts in any
+order, or at the same time; neither waits for the other.
 
 Sections 1 to 4 are all you need to run. [Section 7](#7-optional-settings)
 lists optional settings.
@@ -34,11 +34,11 @@ lists optional settings.
 ## Contents
 
 1. [Requirements](#1-requirements)
-2. [Install the platform (cluster admin)](#2-install-the-platform-cluster-admin)
-3. [Change the RayJob (RL team)](#3-change-the-rayjob-rl-team)
-4. [Label the model server (async inference team)](#4-label-the-model-server-async-inference-team)
-5. [What the platform adds to your pods](#5-what-the-platform-adds-to-your-pods)
-6. [Verify and observe](#6-verify-and-observe)
+2. [Platform team: install the platform](#2-platform-team-install-the-platform)
+3. [RL team: change the RayJob](#3-rl-team-change-the-rayjob)
+4. [Async inference team: label the model server](#4-async-inference-team-label-the-model-server)
+5. [See the lending in action](#5-see-the-lending-in-action)
+6. [What the platform adds to your pods](#6-what-the-platform-adds-to-your-pods)
 7. [Optional settings](#7-optional-settings)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Limits](#9-limits)
@@ -66,7 +66,7 @@ the model server for async inference.
   [llm-d-async](https://github.com/llm-d/llm-d-async)) so requests wait instead
   of failing.
 
-## 2. Install the platform (cluster admin)
+## 2. Platform team: install the platform
 
 ```bash
 git clone --branch demo/batch https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git
@@ -78,7 +78,17 @@ helm install timeslice . -n timeslice-system --create-namespace
 That is all. Optional settings (pinning the image tag, limiting namespaces,
 keeping your own verl image) are in [section 7](#7-optional-settings).
 
-## 3. Change the RayJob (RL team)
+To check that the platform is up:
+
+```bash
+kubectl -n timeslice-system get pods -o wide
+```
+
+You should see the orchestrator, the webhook (2 replicas), the donor
+controller, and on GPU nodes the snapshot agent and the shadow device plugin.
+The guest kubelet starts on a trainer node once a trainer pod runs there.
+
+## 3. RL team: change the RayJob
 
 Start from your normal RayJob. The trainer worker group and the rollout worker
 group must be separate worker groups, with the trainer group on its own GPU
@@ -144,6 +154,20 @@ group names, resources and node pools will differ):
 Nothing else changes: same command, same data, same resources. Apply the
 RayJob as usual.
 
+To check that the job is wired:
+
+```bash
+kubectl get pod -l ray.io/group=trainer -o jsonpath='{.items[0].metadata.annotations}' | tr , '\n' | grep timeslice
+kubectl get nodes -l type=virtual-kubelet
+```
+
+The trainer pod carries `timeslice.io/donor-memory-raised`, and a virtual node
+appears for the trainer node. The job's log shows the time-slicing trainer:
+
+```bash
+kubectl logs <rayjob submitter pod> | grep -i timeslice | head
+```
+
 ### Keep your own verl image
 
 This is optional and off by default. If the RL team must keep its own verl
@@ -181,7 +205,11 @@ If your RL pods are not created by KubeRay, label every non-trainer pod of the
 job `timeslice.io/rl-integration: "true"` so they get the same packages (for
 KubeRay the webhook does this for you).
 
-## 4. Label the model server (async inference team)
+## 4. Async inference team: label the model server
+
+This step does not depend on the RL team. You can label the model server
+before, during or after RL jobs run: guests use trainer GPUs whenever one is
+lent.
 
 Add `timeslice.io/guest: "true"` to the model server's pod labels. Keep asking
 for `nvidia.com/gpu` as usual.
@@ -199,7 +227,8 @@ for `nvidia.com/gpu` as usual.
 ```
 
 Guests run only on lent GPUs. While no trainer GPU is lent, a guest pod stays
-`Pending` or frozen; that is expected.
+`Pending` or frozen; that is expected. To keep serving while nothing is lent,
+run regular (unlabeled) replicas of the same server behind the same queue.
 
 ### If you use llm-d-async and the llm-d router
 
@@ -225,7 +254,19 @@ both against your longest single generation instead:
 - **Async processor request timeout**: the default (5 minutes) is enough as
   long as it stays above your longest single generation.
 
-## 5. What the platform adds to your pods
+## 5. See the lending in action
+
+```bash
+kubectl get pods -l timeslice.io/guest=true -o wide -w
+kubectl -n timeslice-system logs ds/timeslice-guest-kubelet -f | grep 'host command'
+```
+
+Each trainer step shows one lend (the guest is resumed or starts, then becomes
+Ready) and one reclaim (the guest is suspended, the trainer is restored). To see
+the trainer GPU's utilization go up, use your cluster's usual GPU metrics (on
+GKE, the GPU metrics in Cloud Monitoring).
+
+## 6. What the platform adds to your pods
 
 The admission webhook changes only pods and Ray clusters that opted in with the
 labels above. It adds:
@@ -256,47 +297,6 @@ trainer node, so the first lend usually finds them there. A large image on a
 node that has never pulled it can still delay the first lend (100 s for the
 vLLM image in our H100 runs; 2 s once cached).
 
-## 6. Verify and observe
-
-**Platform up:**
-
-```bash
-kubectl -n timeslice-system get pods -o wide
-```
-
-You should see the orchestrator, the webhook (2 replicas), the donor
-controller, and on GPU nodes the snapshot agent, the shadow device plugin and
-the DCGM exporter. The guest kubelet starts on a trainer node once a trainer
-pod runs there.
-
-**RL job wired:**
-
-```bash
-kubectl get pod -l ray.io/group=trainer -o jsonpath='{.items[0].metadata.annotations}' | tr , '\n' | grep timeslice
-kubectl get nodes -l type=virtual-kubelet
-```
-
-The trainer pod carries `timeslice.io/donor-memory-raised`, and a virtual node
-appears for the trainer node. The job's log shows the time-slicing trainer:
-
-```bash
-kubectl logs <rayjob submitter pod> | grep -i timeslice | head
-```
-
-**Lending in action:**
-
-```bash
-kubectl get pods -l timeslice.io/guest=true -o wide -w
-kubectl -n timeslice-system logs ds/timeslice-guest-kubelet -f | grep 'host command'
-```
-
-Each trainer step shows one lend (the guest is resumed or starts, then becomes
-Ready) and one reclaim (the guest is suspended, the trainer is restored).
-
-**GPU utilization:** the `gpu-metrics` exporter serves DCGM metrics on port
-9400 of each GPU node (`DCGM_FI_PROF_SM_ACTIVE`, `DCGM_FI_DEV_GPU_UTIL`, memory
-and power, 1 s samples). Point your Prometheus at it, or scrape it directly.
-
 ## 7. Optional settings
 
 None of these is needed to run. Use them to pin versions, mirror images or
@@ -304,10 +304,10 @@ limit the platform's scope.
 
 | Setting | Who | Use it to |
 |---|---|---|
-| `global.imageTag` (Helm value) | Cluster admin | Pin the images to the commit you cloned (`demo-<short sha>`) or a version. The default is `demo-batch`, the newest release of the `demo/batch` branch. |
-| Image references (`<component>.image.repository`, and `timeslice-webhook.rlIntegration.image.repository`) | Cluster admin | Pull the images from your own registry or from images you built yourself. |
-| `timeslice-webhook.namespaceSelector` (Helm value) | Cluster admin | Limit the platform to some namespaces. By default it watches every namespace except `kube-system` and `timeslice-system`. |
-| `-f values-inject-verl.yaml` | Cluster admin | Keep the RL team's own verl image instead of the prebuilt one; see [Keep your own verl image](#keep-your-own-verl-image). |
+| `global.imageTag` (Helm value) | Platform team | Pin the images to the commit you cloned (`demo-<short sha>`) or a version. The default is `demo-batch`, the newest release of the `demo/batch` branch. |
+| Image references (`<component>.image.repository`, and `timeslice-webhook.rlIntegration.image.repository`) | Platform team | Pull the images from your own registry or from images you built yourself. |
+| `timeslice-webhook.namespaceSelector` (Helm value) | Platform team | Limit the platform to some namespaces. By default it watches every namespace except `kube-system` and `timeslice-system`. |
+| `-f values-inject-verl.yaml` | Platform team | Keep the RL team's own verl image instead of the prebuilt one; see [Keep your own verl image](#keep-your-own-verl-image). |
 | `timeslice.io/backend: app_channel` (trainer pod annotation) | RL team | Let the trainer park itself instead of being checkpointed; see [Application-aware suspend](#application-aware-suspend). |
 | `timeslice.io/backend: app_endpoint` (guest pod annotation) | Async inference team | Put a vLLM guest to sleep through its own API instead of checkpointing it; see [Application-aware suspend](#application-aware-suspend). |
 
