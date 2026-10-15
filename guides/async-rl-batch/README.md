@@ -95,7 +95,7 @@ group must be separate worker groups, with the trainer group on its own GPU
 nodes. Switch the image to the prebuilt verl image
 (`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/verl:demo-batch`, which has
 verl and its fully-async dependencies, so drop any `pip install` of verl at
-start), then make three changes:
+start), then make these changes:
 
 1. **Label the trainer worker group** `timeslice.io/donor: "true"`. This is the
    group whose GPUs are lent.
@@ -104,6 +104,10 @@ start), then make three changes:
 3. **Two verl settings**: `async_training.trainer_name=timeslice` (the
    time-slicing trainer, a subclass of verl's fully-async trainer) and
    `ray_pg_extra_resources=...` (the custom resources from change 2).
+4. **Only with the default `cuda-checkpoint` hand-over**: set
+   `NCCL_CUMEM_ENABLE=0` and `NCCL_NVLS_ENABLE=0` in every pod of the job, since
+   `cuda-checkpoint` cannot save NCCL's cuMem and NVLS buffers. An
+   [application-aware](#application-aware-suspend) trainer needs neither.
 
 The diff on a typical fully-async RayJob (1 trainer GPU + 1 rollout GPU; your
 group names, resources and node pools will differ):
@@ -226,9 +230,13 @@ for `nvidia.com/gpu` as usual.
            image: vllm/vllm-openai:v0.9.2
 ```
 
-Guests run only on lent GPUs. While no trainer GPU is lent, a guest pod stays
-`Pending` or frozen; that is expected. To keep serving while nothing is lent,
-run regular (unlabeled) replicas of the same server behind the same queue.
+Guests prefer lent GPUs. When no trainer GPU is lent, a new guest pod runs on a
+regular GPU node if one has room, and stays `Pending` otherwise. The node is
+picked once, when the pod is scheduled: a guest on a regular node stays there,
+and a guest on a lent GPU is frozen while the trainer has it back. If your
+cluster autoscales GPU nodes, a `Pending` guest can add a node. To keep guests
+on lent GPUs only, install with
+`--set timeslice-webhook.flags.guest-steering=required`.
 
 ### If you use llm-d-async and the llm-d router
 
@@ -274,12 +282,10 @@ labels above. It adds:
 - **Into every pod of a Ray cluster that has a donor group** (head, trainer and
   rollout workers): `TIMESLICE_FULLY_ASYNC=1` and the job's identity and
   orchestrator address (`TIMESLICE_JOB_ID`, `TIMESLICE_GROUP`,
-  `TIMESLICE_ORCH_ADDR`), and `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` (NCCL
-  then allocates no buffers that the GPU checkpoint cannot handle). Values you
-  set yourself are kept.
+  `TIMESLICE_ORCH_ADDR`). Values you set yourself are kept.
 - **Into the trainer pods**: a higher memory limit (one GPU's memory per GPU,
   for the checkpoint) and the annotation `timeslice.io/donor-memory-raised`.
-- **Into the guest pods**: scheduling onto the virtual nodes that represent
+- **Into the guest pods**: a preference for the virtual nodes that represent
   lent GPUs.
 - **Into every pod of a Ray cluster whose donor group opted into
   application-aware parking** (see
@@ -371,7 +377,7 @@ Only vLLM is supported for guests.
 | The RayJob's pods are not created; an admission error names the webhook | The webhook is not ready yet | Wait until both webhook replicas are Ready, then re-apply |
 | No virtual node appears | More than one pod holds `nvidia.com/gpu` on the trainer node, or the trainer pod lacks the donor label | Keep only the trainer pod on that node; check the label on the pod template |
 | The job fails at start with an import error for `timeslice_verl` | The pod was created before the platform was installed, or outside a labelled Ray cluster | Re-create the RayJob after installing the platform |
-| Guest stays `Pending` | No trainer GPU is lent yet (the trainer is busy or still starting) | Wait for the first trainer wait; check the virtual node exists |
+| Guest stays `Pending` | No trainer GPU is lent yet (the trainer is busy or still starting), and no regular GPU node has room | Wait for the first trainer wait; check the virtual node exists |
 | The trainer log shows a park failing with `VERIFY_FAILED`, and its GPU is not lent | An application-aware trainer kept more than 4 GiB of GPU memory after parking; the error lists each process's GPU memory | Report it with the trainer and snapshot agent logs; remove the `app_channel` annotation to fall back to `cuda-checkpoint` |
 | An `app_endpoint` guest fails to suspend | vLLM was started without `--enable-sleep-mode` or `VLLM_SERVER_DEV_MODE=1`, or the agent cannot reach it | Add both; check the snapshot agent log for the endpoint it called |
 | Trainer pod OOM-killed | The node lacks host memory for the checkpoint | Use nodes with more memory, or fewer GPUs per trainer pod |
@@ -397,9 +403,11 @@ Only vLLM is supported for guests.
 - Application-aware suspend supports verl trainers and vLLM guests, and only
   offloads to host memory (no discard). The backend is chosen per pod by
   annotation.
-- Guests run only on lent time. When no RL job is lending (between jobs, or
-  after the last one ends), guests have no GPU and queued requests wait until
-  their deadline and then fail. Keep a small dedicated pool for async inference
-  work that must always make progress, or pause the queue between RL jobs.
+- A guest on a lent GPU is not moved while the trainer has the GPU back: it
+  stays frozen, and requests routed only to it wait. When the RL job ends, a
+  guest that has not started yet is deleted, and its Deployment re-creates it on
+  a regular GPU node if one has room; a guest that has already started stays on
+  the virtual node until you delete it. Keep a few regular replicas behind the
+  same queue for work that must always progress.
 - A guest that is reclaimed before it has ever served is deleted and
   re-created, not frozen, so its next lend is a cold start.
