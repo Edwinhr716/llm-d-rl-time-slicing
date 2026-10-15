@@ -1,5 +1,21 @@
 # Async RL and async inference: lend an idle RL trainer GPU to async inference
 
+**Summary.** In our H100 runs, the trainer GPU was in use **92%** of the time
+with this platform (training, or lent to async inference), against **41%** on a
+dedicated trainer GPU: 2.28x the use of the same GPU. The RL job converged at the
+same step as on the dedicated GPU (step 140), and took 3.8% longer in
+wall-clock to get there.
+
+- **RL job:** verl fully-async GRPO, DeepSeek-R1-Distill-Qwen-1.5B on DAPO-Math,
+  16K-token responses, 8 samples per prompt. One H100 for the trainer and one
+  for rollout.
+- **Async inference:** Qwen2.5-7B-Instruct on vLLM, 3.5 requests/s of
+  1024-token answers through llm-d-async and the llm-d router, served only on
+  the lent trainer GPU.
+- **Platform:** GKE, nodes with one H100 each, with
+  [application-aware suspend](#application-aware-suspend) on both the trainer
+  and the guest.
+
 Asynchronous RL jobs (for example verl's fully-async mode) keep the rollout GPUs
 busy all the time, but the trainer GPU often sits idle while it waits for the
 next batch of samples. This is especially true for long chain-of-thought
@@ -316,6 +332,7 @@ limit the platform's scope.
 | `-f values-inject-verl.yaml` | Platform team | Keep the RL team's own verl image instead of the prebuilt one; see [Keep your own verl image](#keep-your-own-verl-image). |
 | `timeslice.io/backend: app_channel` (trainer pod annotation) | RL team | Let the trainer park itself instead of being checkpointed; see [Application-aware suspend](#application-aware-suspend). |
 | `timeslice.io/backend: app_endpoint` (guest pod annotation) | Async inference team | Put a vLLM guest to sleep through its own API instead of checkpointing it; see [Application-aware suspend](#application-aware-suspend). |
+| The `timeslice` Python client in your trainer | RL team | Use an RL framework other than verl; see [Bring your own RL framework](#bring-your-own-rl-framework). |
 
 ### Application-aware suspend
 
@@ -368,6 +385,142 @@ thaws the guest and calls `/wake_up`. The agent finds vLLM on the pod IP and
 its first serving port; to point it elsewhere, add the annotation
 `timeslice.io/backend-config: '{"app": "APP_VLLM", "endpoints": ["http://localhost:8000"]}'`.
 Only vLLM is supported for guests.
+
+### Bring your own RL framework
+
+The prebuilt image ships a verl plugin. Any other framework can use the platform
+through the `timeslice` Python client
+([`pkg/client/python`](../../pkg/client/python)), in two parts:
+
+1. **Hold the GPU lock while the trainer uses the GPU** (required). This tells
+   the platform when the GPU can be lent.
+2. **Park the trainer yourself** (optional). This replaces `cuda-checkpoint`
+   with [application-aware suspend](#application-aware-suspend).
+
+The verl plugin is a full example of both parts. These fork commits show the
+work:
+
+| Commit | What it adds |
+|---|---|
+| [`9a69ffa`](https://github.com/Edwinhr716/llm-d-rl-time-slicing/commit/9a69ffabbefd2b389240e23cffe4b1334a2ef58d) | The verl plugin with the GPU lock: [`locks.py`](../../pkg/integrations/verl/timeslice_verl/locks.py) wraps the client, [`hooks.py`](../../pkg/integrations/verl/timeslice_verl/hooks.py) maps verl's trainer hooks to acquire and release, and [`trainer.py`](../../pkg/integrations/verl/timeslice_verl/trainer.py) registers the trainer. |
+| [`cc29903`](https://github.com/Edwinhr716/llm-d-rl-time-slicing/commit/cc29903a4e99d1d8d8d2d63419dfa0b3dbba838e) | Application-aware parking of the verl trainer: [`app_aware.py`](../../pkg/integrations/verl/timeslice_verl/app_aware.py), and the webhook settings that point the trainer at the node's snapshot agent. |
+| [`dd3fc55`](https://github.com/Edwinhr716/llm-d-rl-time-slicing/commit/dd3fc554c77f4968c40e25e6b2d895839bfd2d74) | The same GPU lock for slime, in about 60 lines ([`callback.py`](../../pkg/integrations/slime/timeslice_slime/callback.py)). |
+
+**Install the client** in your trainer image:
+
+```bash
+pip install "git+https://github.com/llm-d-incubation/llm-d-rl-time-slicing@demo/batch#subdirectory=pkg/client/python"
+```
+
+**Label the trainer pods** `timeslice.io/donor: "true"`, as in
+[section 3](#3-rl-team-change-the-rayjob). Outside KubeRay, also give them a
+job identity: `timeslice.io/job-id` (unique per job) and `timeslice.io/group`
+(the name of the job's GPU lock, unique per job too). The webhook then sets
+`TIMESLICE_JOB_ID`, `TIMESLICE_GROUP` and `TIMESLICE_ORCH_ADDR` in the trainer
+pods (in a Ray cluster, in every pod of the cluster).
+
+**1. Hold the GPU lock.** Acquire before the trainer touches the GPU, and
+release while it waits for samples:
+
+```python
+import os
+from contextlib import contextmanager
+from timeslice import TimeSliceOrchestratorClient
+
+lock = TimeSliceOrchestratorClient(
+    target=os.environ["TIMESLICE_ORCH_ADDR"],
+    job_id=os.environ["TIMESLICE_JOB_ID"],
+    group_id=os.environ["TIMESLICE_GROUP"],
+)
+
+@contextmanager
+def gpu():
+    lock.acquire(timeout_sec=600)  # returns once the trainer is back on the GPU
+    try:
+        yield
+    finally:
+        lock.release()             # the GPU can be lent from here, also after an error
+
+with gpu():
+    init_workers_and_load_model()
+
+while training:
+    batch = wait_for_samples()     # CPU only: the GPU is lent meanwhile
+    with gpu():
+        train_step(batch)
+        sync_weights_to_rollout()
+        save_checkpoint_if_due()   # save while you still hold the lock
+```
+
+- **Every GPU use of the trainer goes between `acquire` and `release`**,
+  including weight syncs and checkpoint saves and loads. After `release` the
+  trainer's GPU state may be checkpointed off the GPU or parked.
+- **Wait for samples with the lock released.** That wait is the time the GPU is
+  lent.
+- **Let an `acquire` error stop the job.** A trainer must not train without the
+  lock.
+- **Release on every exit path,** errors included. A job that dies holding the
+  lock keeps its GPU from being lent.
+- **The default install lends on every `release`.** If the orchestrator runs
+  with `--lend-policy=hint`, pass `expected_idle=<seconds>` to `release`; the
+  GPU is lent only when that is at least `--min-bubble`.
+- **With the default `cuda-checkpoint` hand-over**, set `NCCL_CUMEM_ENABLE=0`
+  and `NCCL_NVLS_ENABLE=0` in every pod of the job (see
+  [section 3](#3-rl-team-change-the-rayjob)).
+
+[`locks.py`](../../pkg/integrations/verl/timeslice_verl/locks.py) wraps this in
+an idempotent helper that does nothing when the `TIMESLICE_*` settings are
+missing, so the same image runs with and without the platform.
+
+**2. Park the trainer yourself (optional).** Register a park and restore
+workload with the node's snapshot agent, and annotate the trainer pods
+`timeslice.io/backend: app_channel`. The agent calls `snapshot` before it lends
+the GPU and `restore` before it grants the trainer's next `acquire`:
+
+```python
+import os
+from timeslice.snapshot_agent.workload import register_workload
+
+class TrainerPark:
+    def snapshot(self, mode, tags):    # before the GPU is lent; mode is "offload"
+        if trainer_holds_lock():
+            raise RuntimeError("park refused: the trainer is mid-step")
+        move_model_and_optimizer_to("cpu")
+        torch.cuda.empty_cache()
+
+    def restore(self, tags):           # before the trainer's next acquire returns
+        move_model_and_optimizer_to("cuda")
+
+park = register_workload(
+    agent=f"{os.environ['TIMESLICE_NODE_IP']}:{os.environ.get('TIMESLICE_AGENT_PORT', '9001')}",
+    job_id=os.environ["TIMESLICE_JOB_ID"],
+    group=os.environ["TIMESLICE_GROUP"],
+    workload=TrainerPark(),
+    supported_modes=["offload"],
+)
+```
+
+- **Register once**, after the model is loaded and before the first `release`,
+  from a process that can move the trainer's state. If the trainer spans several
+  nodes, register with the agent of each of them. The client reconnects and
+  registers again on its own if the agent restarts.
+- **Keep at most 4 GiB of GPU memory after a park.** The agent checks it, and
+  does not lend the GPU if the trainer keeps more.
+- **Refuse a park while the trainer holds the lock.** The agent then does not
+  lend the GPU.
+- **After each `acquire`, make sure the state is back on the GPU,** and restore
+  it yourself if not: a restore can be lost if the agent restarts while the
+  trainer is parked.
+- **The agent address:** the agent runs on the host network of each GPU node.
+  In a Ray cluster, the webhook sets `TIMESLICE_NODE_IP` and
+  `TIMESLICE_AGENT_PORT` for you. Outside KubeRay, set `TIMESLICE_NODE_IP` from
+  the downward API (`status.hostIP`); the agent's port is 9001 unless the
+  platform team changed it.
+
+[`app_aware.py`](../../pkg/integrations/verl/timeslice_verl/app_aware.py) does
+all of this for verl: it parks the optimizer and then the model, frees the
+allocator caches, and checks that the trainer is resident after every
+`acquire`.
 
 ## 8. Troubleshooting
 
