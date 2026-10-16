@@ -9,6 +9,7 @@ import (
 	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/infrastructure"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
+	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -18,11 +19,15 @@ import (
 )
 
 type fakeSnapshotAgentStore struct {
-	statusFunc    func(ctx context.Context, nodeName string) (*agentpb.StatusResponse, error)
-	closeFunc     func(nodeName string) error
-	snapshotFunc  func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.SnapshotResponse, error)
+	statusFunc   func(ctx context.Context, nodeName string) (*agentpb.StatusResponse, error)
+	closeFunc    func(nodeName string) error
+	snapshotFunc func(
+		ctx context.Context, nodeName, jobID, groupID string, cfg *agentpb.BackendConfig,
+	) (*agentpb.SnapshotResponse, error)
 	operationFunc func(ctx context.Context, nodeName, operationID string) (*agentpb.GetOperationResponse, error)
-	restoreFunc   func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error)
+	restoreFunc   func(
+		ctx context.Context, nodeName, jobID, groupID string, cfg *agentpb.BackendConfig,
+	) (*agentpb.RestoreResponse, error)
 }
 
 func (f *fakeSnapshotAgentStore) GetStatus(ctx context.Context, nodeName string) (*agentpb.StatusResponse, error) {
@@ -40,10 +45,10 @@ func (f *fakeSnapshotAgentStore) CloseClient(nodeName string) error {
 }
 
 func (f *fakeSnapshotAgentStore) Snapshot(
-	ctx context.Context, nodeName, jobID, groupID string,
+	ctx context.Context, nodeName, jobID, groupID string, cfg *agentpb.BackendConfig,
 ) (*agentpb.SnapshotResponse, error) {
 	if f.snapshotFunc != nil {
-		return f.snapshotFunc(ctx, nodeName, jobID, groupID)
+		return f.snapshotFunc(ctx, nodeName, jobID, groupID, cfg)
 	}
 	return &agentpb.SnapshotResponse{}, nil
 }
@@ -58,10 +63,10 @@ func (f *fakeSnapshotAgentStore) GetOperation(
 }
 
 func (f *fakeSnapshotAgentStore) Restore(
-	ctx context.Context, nodeName, jobID, groupID string,
+	ctx context.Context, nodeName, jobID, groupID string, cfg *agentpb.BackendConfig,
 ) (*agentpb.RestoreResponse, error) {
 	if f.restoreFunc != nil {
-		return f.restoreFunc(ctx, nodeName, jobID, groupID)
+		return f.restoreFunc(ctx, nodeName, jobID, groupID, cfg)
 	}
 	return &agentpb.RestoreResponse{}, nil
 }
@@ -265,5 +270,69 @@ func TestObserveGroupState_UpdateJobsAndPods(t *testing.T) {
 	_, err = jobStore.Get(ctx, "group-1", "job-b")
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("Expected job-b to not exist in store, got: %v", err)
+	}
+}
+
+// TestObserveGroupState_KeepsBackendConfig verifies that a pod update reuses the stored Job object, so a
+// backend config recorded on Acquire/Yield survives pod churn while the job still has pods.
+func TestObserveGroupState_KeepsBackendConfig(t *testing.T) {
+	clientset := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
+	nodeInformer := informerFactory.Core().V1().Nodes()
+	podInformer := informerFactory.Core().V1().Pods()
+
+	groupStore := store.NewGroupStore(store.NewMemLockStore())
+	jobStore := store.NewJobStore()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	infraOrch := infrastructure.NewKubernetesOrchestrator(nodeInformer, podInformer, groupStore, jobStore, &fakeSnapshotAgentStore{})
+	informerFactory.Start(ctx.Done())
+	if err := infraOrch.Init(ctx); err != nil {
+		t.Fatalf("Failed to initialize infra orchestrator: %v", err)
+	}
+
+	cfg := &agentpb.BackendConfig{Backend: &agentpb.BackendConfig_AppChannel{AppChannel: &agentpb.AppChannelConfig{}}}
+	job := store.NewJob("group-1", "job-a")
+	job.SetBackendConfig(cfg)
+	if err := jobStore.Put(ctx, job); err != nil {
+		t.Fatalf("Failed to put job: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"timeslice.io/group":  "group-1",
+				"timeslice.io/job-id": "job-a",
+			},
+		},
+	}
+	if _, err := clientset.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create pod: %v", err)
+	}
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 3*time.Second, true, func(ctx context.Context) (bool, error) {
+		pods, err := podInformer.Lister().List(labels.Everything())
+		return len(pods) == 1, err
+	})
+	if err != nil {
+		t.Fatalf("Timed out waiting for caches to sync: %v", err)
+	}
+
+	if err := infraOrch.ObserveGroupState(ctx, "group-1"); err != nil {
+		t.Fatalf("ObserveGroupState failed: %v", err)
+	}
+
+	got, err := jobStore.Get(ctx, "group-1", "job-a")
+	if err != nil {
+		t.Fatalf("Expected job-a to exist in store: %v", err)
+	}
+	if len(got.Pods()) != 1 {
+		t.Errorf("Expected 1 pod on job-a, got %v", got.Pods())
+	}
+	if !proto.Equal(got.BackendConfig(), cfg) {
+		t.Errorf("Backend config lost across ObserveGroupState: got %v, want %v", got.BackendConfig(), cfg)
 	}
 }

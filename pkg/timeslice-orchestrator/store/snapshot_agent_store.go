@@ -17,9 +17,17 @@ import (
 type SnapshotAgentStore interface {
 	GetStatus(ctx context.Context, nodeName string) (*agentpb.StatusResponse, error)
 	CloseClient(nodeName string) error
-	Snapshot(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.SnapshotResponse, error)
+	// Snapshot triggers a snapshot of jobID's context on nodeName. backendConfig selects the agent
+	// backend; nil lets the agent use its default backend.
+	Snapshot(
+		ctx context.Context, nodeName, jobID, groupID string, backendConfig *agentpb.BackendConfig,
+	) (*agentpb.SnapshotResponse, error)
 	GetOperation(ctx context.Context, nodeName, operationID string) (*agentpb.GetOperationResponse, error)
-	Restore(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error)
+	// Restore triggers a restore of jobID's context on nodeName. backendConfig must select the same
+	// backend the context was snapshotted with; nil lets the agent use its default backend.
+	Restore(
+		ctx context.Context, nodeName, jobID, groupID string, backendConfig *agentpb.BackendConfig,
+	) (*agentpb.RestoreResponse, error)
 }
 
 type clientEntry struct {
@@ -114,7 +122,7 @@ func (s *GRPCSnapshotAgentStore) GetStatus(ctx context.Context, nodeName string)
 
 // Snapshot triggers a snapshot on the agent for the given node.
 func (s *GRPCSnapshotAgentStore) Snapshot(
-	ctx context.Context, nodeName, jobID, groupID string,
+	ctx context.Context, nodeName, jobID, groupID string, backendConfig *agentpb.BackendConfig,
 ) (*agentpb.SnapshotResponse, error) {
 	address := s.resolveNodeAddress(nodeName)
 	client, err := s.getClient(address)
@@ -123,8 +131,9 @@ func (s *GRPCSnapshotAgentStore) Snapshot(
 	}
 
 	resp, err := client.Snapshot(ctx, &agentpb.SnapshotRequest{
-		JobId: jobID,
-		Group: groupID,
+		JobId:         jobID,
+		Group:         groupID,
+		BackendConfig: backendConfig,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to trigger snapshot on agent at %s: %w", address, err)
@@ -155,7 +164,7 @@ func (s *GRPCSnapshotAgentStore) GetOperation(
 
 // Restore triggers an asynchronous restoration of the accelerator context for a job on the node.
 func (s *GRPCSnapshotAgentStore) Restore(
-	ctx context.Context, nodeName, jobID, groupID string,
+	ctx context.Context, nodeName, jobID, groupID string, backendConfig *agentpb.BackendConfig,
 ) (*agentpb.RestoreResponse, error) {
 	address := s.resolveNodeAddress(nodeName)
 	client, err := s.getClient(address)
@@ -164,8 +173,9 @@ func (s *GRPCSnapshotAgentStore) Restore(
 	}
 
 	resp, err := client.Restore(ctx, &agentpb.RestoreRequest{
-		JobId: jobID,
-		Group: groupID,
+		JobId:         jobID,
+		Group:         groupID,
+		BackendConfig: backendConfig,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to trigger restore for job %s on agent at %s: %w", jobID, address, err)

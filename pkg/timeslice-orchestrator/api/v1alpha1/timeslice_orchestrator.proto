@@ -63,6 +63,14 @@ message YieldRequest {
 
   // group_id is the unique identifier of the time-slice group being yielded.
   string group_id = 2;
+
+  // backend_config optionally selects the snapshot backend the orchestrator forwards to the
+  // node-local snapshot agents to park this job's context, and again to restore it on the job's
+  // next Acquire. If set, it replaces the backend stored for the job; if omitted, the previously
+  // stored backend is kept; if none was ever stored, the agent's default backend is used.
+  // The stored backend lives in orchestrator memory: after an orchestrator restart a job that
+  // yielded with a non-default backend is restored with the agent default (known issue).
+  JobBackendConfig backend_config = 3;
 }
 
 // YieldResponse is the response after yielding access.
@@ -76,6 +84,68 @@ message YieldResponse {
   // snapshot_deferred indicates whether the physical snapshot was skipped because
   // there were no waiting jobs in the queue.
   bool snapshot_deferred = 3;
+}
+
+// JobBackendConfig is the subset of the snapshot agent's BackendConfig that a client may choose per
+// job. Fields the agent derives from the job's pods (process targets) are intentionally absent, as
+// are experimental backends. The orchestrator converts this message to the agent's BackendConfig.
+message JobBackendConfig {
+  oneof backend {
+    // CUDA checkpoint/restore of the job's GPU processes; PIDs are discovered from the job's pods.
+    CudaBackend cuda = 1;
+    // TPU (libtpu) checkpoint/restore of the job's processes; PIDs are discovered from the job's pods.
+    TpuBackend tpu = 2;
+    // Application-aware suspend/resume through the application's HTTP API (vLLM, SGLang).
+    AppEndpointBackend app_endpoint = 3;
+    // Application-aware suspend/resume through the workload channel the job registered with the agent.
+    AppChannelBackend app_channel = 4;
+  }
+}
+
+// CudaBackend selects the CUDA backend. It carries no options.
+message CudaBackend {}
+
+// TpuBackend selects the TPU backend. It carries no options.
+message TpuBackend {}
+
+// App identifies the application behind an app_endpoint backend.
+// Values mirror snapshot_agent.v1alpha1.App.
+enum App {
+  APP_UNSPECIFIED = 0;
+  APP_VLLM = 1;
+  APP_SGLANG = 2;
+}
+
+// SuspendMode selects what happens to the application's accelerator memory on suspend.
+// Values mirror snapshot_agent.v1alpha1.SuspendMode.
+enum SuspendMode {
+  // Use the application's (or workload's) default mode.
+  SUSPEND_MODE_UNSPECIFIED = 0;
+  // Copy the selected regions to host memory and free device memory; resume copies them back.
+  SUSPEND_MODE_OFFLOAD = 1;
+  // Free the selected regions without copying; resume rebuilds them.
+  SUSPEND_MODE_DISCARD = 2;
+}
+
+// AppEndpointBackend configures the app_endpoint backend.
+message AppEndpointBackend {
+  // app is the application type. Required.
+  App app = 1;
+  // endpoints are the HTTP endpoint(s) of the application server(s), e.g. "http://localhost:8000".
+  // At least one is required.
+  repeated string endpoints = 2;
+  // mode is the suspend mode; unspecified means the application's default.
+  SuspendMode mode = 3;
+  // tags are region tags, e.g. "weights", "kv_cache". Empty means the application's default set.
+  repeated string tags = 4;
+}
+
+// AppChannelBackend configures the app_channel backend. The workload is addressed by the job id.
+message AppChannelBackend {
+  // mode is the suspend mode; unspecified means the workload's registered default.
+  SuspendMode mode = 1;
+  // tags are region tags; empty means the workload's default set.
+  repeated string tags = 2;
 }
 
 // ListGroupsRequest is the request to list active groups.

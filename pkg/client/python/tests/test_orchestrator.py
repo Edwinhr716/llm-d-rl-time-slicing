@@ -6,14 +6,19 @@ from unittest.mock import MagicMock, patch
 import grpc
 
 from timeslice import TimeSliceOrchestratorClient
+from timeslice.orchestrator._generated import pb2
 from timeslice.orchestrator.client import DEFAULT_CHANNEL_OPTIONS
+from timeslice.orchestrator.configs import (
+    app_channel_config,
+    cuda_config,
+    tpu_config,
+    vllm_config,
+)
 from timeslice.orchestrator.exceptions import (
     OrchestratorConnectionError,
     OrchestratorTimeoutError,
 )
 from timeslice.orchestrator.types import AgentJobState, GroupLockState
-
-from timeslice.orchestrator._generated import pb2
 
 
 class TestTimeSliceOrchestratorClient(unittest.TestCase):
@@ -197,7 +202,9 @@ class TestTimeSliceOrchestratorClient(unittest.TestCase):
             )
             self.client.release.assert_not_called()
 
-        self.client.release.assert_called_once_with(job_id=None, group_id=None)
+        self.client.release.assert_called_once_with(
+            job_id=None, group_id=None, backend_config=None
+        )
 
     def test_on_accelerators_context_manager_exception(self):
         # Verify release is called even if block raises error
@@ -213,7 +220,64 @@ class TestTimeSliceOrchestratorClient(unittest.TestCase):
         self.client.acquire.assert_called_once_with(
             job_id=None, group_id=None, timeout_sec=None
         )
-        self.client.release.assert_called_once_with(job_id=None, group_id=None)
+        self.client.release.assert_called_once_with(
+            job_id=None, group_id=None, backend_config=None
+        )
+
+    def test_on_accelerators_forwards_backend_config(self):
+        self.client.acquire = MagicMock()
+        self.client.release = MagicMock()
+        cfg = app_channel_config()
+
+        with self.client.on_accelerators(backend_config=cfg):
+            pass
+
+        self.client.acquire.assert_called_once_with(
+            job_id=None, group_id=None, timeout_sec=None
+        )
+        self.client.release.assert_called_once_with(
+            job_id=None, group_id=None, backend_config=cfg
+        )
+
+    def test_release_without_backend_config_leaves_field_unset(self):
+        self.mock_stub.Yield.return_value = pb2.YieldResponse(success=True)
+        self.client.release()
+        request = self.mock_stub.Yield.call_args[0][0]
+        self.assertFalse(request.HasField("backend_config"))
+
+    def test_backend_config_from_init_sent_on_release(self):
+        client = TimeSliceOrchestratorClient(
+            self.target, self.job_id, self.group_id, backend_config="app_channel"
+        )
+        self.mock_stub.Yield.return_value = pb2.YieldResponse(success=True)
+
+        client.release()
+
+        yield_req = self.mock_stub.Yield.call_args[0][0]
+        self.assertEqual(yield_req.backend_config, app_channel_config())
+        client.close()
+
+    def test_backend_config_per_call_overrides_init(self):
+        client = TimeSliceOrchestratorClient(
+            self.target, self.job_id, self.group_id, backend_config=cuda_config()
+        )
+        self.mock_stub.Yield.return_value = pb2.YieldResponse(success=True)
+        override = vllm_config(["http://localhost:8000"], mode="discard")
+
+        client.release(backend_config=override)
+        self.assertEqual(self.mock_stub.Yield.call_args[0][0].backend_config, override)
+
+        client.release(backend_config="tpu")
+        self.assertEqual(
+            self.mock_stub.Yield.call_args[0][0].backend_config, tpu_config()
+        )
+        client.close()
+
+    def test_init_invalid_backend_config_raises(self):
+        with self.assertRaises(TypeError):
+            TimeSliceOrchestratorClient(self.target, backend_config=42)
+        with self.assertRaises(ValueError):
+            TimeSliceOrchestratorClient(self.target, backend_config="direct_memory")
 
     def test_grpc_error_mapping_unavailable(self):
         # Mock gRPC error
@@ -324,7 +388,7 @@ class TestTimeSliceOrchestratorClient(unittest.TestCase):
             self.client.release.assert_not_called()
 
         self.client.release.assert_called_once_with(
-            job_id="override-job", group_id="override-group"
+            job_id="override-job", group_id="override-group", backend_config=None
         )
 
 

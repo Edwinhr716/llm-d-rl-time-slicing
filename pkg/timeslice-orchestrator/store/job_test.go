@@ -4,8 +4,10 @@ import (
 	"reflect"
 	"testing"
 
+	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestJob_GettersAndSetters(t *testing.T) {
@@ -155,5 +157,23 @@ func TestJob_UpdateContextState(t *testing.T) {
 				t.Errorf("ContextState() after UpdateContextState = %+v, want %+v", job.ContextState(), tc.expectedState)
 			}
 		})
+	}
+}
+
+func TestJob_BackendConfig(t *testing.T) {
+	job := store.NewJob("group-1", "job-1")
+	if job.BackendConfig() != nil {
+		t.Fatalf("new job must have no backend config, got %v", job.BackendConfig())
+	}
+
+	cfg := &agentpb.BackendConfig{Backend: &agentpb.BackendConfig_AppChannel{AppChannel: &agentpb.AppChannelConfig{}}}
+	job.SetBackendConfig(cfg)
+	if got := job.BackendConfig(); !proto.Equal(got, cfg) {
+		t.Errorf("BackendConfig() = %v, want %v", got, cfg)
+	}
+
+	job.SetBackendConfig(nil)
+	if job.BackendConfig() != nil {
+		t.Errorf("SetBackendConfig(nil) must clear the config, got %v", job.BackendConfig())
 	}
 }

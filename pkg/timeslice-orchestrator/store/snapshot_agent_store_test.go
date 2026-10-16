@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type fakeAgentServer struct {
@@ -20,6 +22,24 @@ type fakeAgentServer struct {
 	statusResponse *agentpb.StatusResponse
 	statusErr      error
 	callCount      int32
+
+	mu              sync.Mutex
+	lastSnapshotReq *agentpb.SnapshotRequest
+	lastRestoreReq  *agentpb.RestoreRequest
+}
+
+func (s *fakeAgentServer) Snapshot(ctx context.Context, req *agentpb.SnapshotRequest) (*agentpb.SnapshotResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastSnapshotReq = req
+	return &agentpb.SnapshotResponse{OperationId: "snap-op"}, nil
+}
+
+func (s *fakeAgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) (*agentpb.RestoreResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastRestoreReq = req
+	return &agentpb.RestoreResponse{OperationId: "restore-op"}, nil
 }
 
 func (s *fakeAgentServer) Status(ctx context.Context, req *agentpb.StatusRequest) (*agentpb.StatusResponse, error) {
@@ -253,5 +273,67 @@ func TestGRPCSnapshotAgentStore_CloseClient(t *testing.T) {
 	_, err = agentStore.GetStatus(context.Background(), addr)
 	if err == nil {
 		t.Error("Expected GetStatus to fail after CloseClient and server stop, but it succeeded")
+	}
+}
+
+// startFakeAgent serves fakeServer on a loopback listener and returns its address.
+func startFakeAgent(t *testing.T, fakeServer *fakeAgentServer) string {
+	t.Helper()
+	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	grpcServer := grpc.NewServer()
+	agentpb.RegisterSnapshotAgentServiceServer(grpcServer, fakeServer)
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			panic(err)
+		}
+	}()
+	t.Cleanup(grpcServer.Stop)
+	return lis.Addr().String()
+}
+
+func TestGRPCSnapshotAgentStore_ForwardsBackendConfig(t *testing.T) {
+	appChannel := &agentpb.BackendConfig{
+		Backend: &agentpb.BackendConfig_AppChannel{AppChannel: &agentpb.AppChannelConfig{Tags: []string{"weights"}}},
+	}
+	tests := []struct {
+		name string
+		cfg  *agentpb.BackendConfig
+	}{
+		{name: "nil config stays nil on the wire", cfg: nil},
+		{name: "app_channel config forwarded verbatim", cfg: appChannel},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeServer := &fakeAgentServer{}
+			addr := startFakeAgent(t, fakeServer)
+			agentStore := store.NewGRPCSnapshotAgentStore(0, 0)
+			t.Cleanup(func() {
+				if err := agentStore.CloseClient(addr); err != nil {
+					t.Errorf("CloseClient failed: %v", err)
+				}
+			})
+			ctx := context.Background()
+
+			if _, err := agentStore.Snapshot(ctx, addr, "job-1", "group-1", tc.cfg); err != nil {
+				t.Fatalf("Snapshot failed: %v", err)
+			}
+			if _, err := agentStore.Restore(ctx, addr, "job-1", "group-1", tc.cfg); err != nil {
+				t.Fatalf("Restore failed: %v", err)
+			}
+
+			fakeServer.mu.Lock()
+			defer fakeServer.mu.Unlock()
+			if got := fakeServer.lastSnapshotReq; got.GetJobId() != "job-1" || got.GetGroup() != "group-1" ||
+				!proto.Equal(got.GetBackendConfig(), tc.cfg) {
+				t.Errorf("snapshot request = %v, want backend config %v", got, tc.cfg)
+			}
+			if got := fakeServer.lastRestoreReq; got.GetJobId() != "job-1" || got.GetGroup() != "group-1" ||
+				!proto.Equal(got.GetBackendConfig(), tc.cfg) {
+				t.Errorf("restore request = %v, want backend config %v", got, tc.cfg)
+			}
+		})
 	}
 }

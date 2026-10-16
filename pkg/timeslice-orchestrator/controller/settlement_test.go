@@ -70,11 +70,15 @@ func TestController_Reconcile_SettlementHoldsPromotion(t *testing.T) {
 	defer cancel()
 
 	agentStore := &controller.MockSnapshotAgentStore{
-		SnapshotFunc: func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, nodeName, jobID, groupID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			t.Errorf("unexpected Snapshot(%s) while promotion is held", jobID)
 			return &agentpb.SnapshotResponse{}, nil
 		},
-		RestoreFunc: func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, nodeName, jobID, groupID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			t.Errorf("unexpected Restore(%s) while promotion is held", jobID)
 			return &agentpb.RestoreResponse{}, nil
 		},

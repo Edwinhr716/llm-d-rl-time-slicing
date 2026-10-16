@@ -73,6 +73,9 @@ type FakeSnapshotAgentStore struct {
 	// Optional hooks for tests to observe events
 	OnSnapshot func(node, jobID string)
 	OnRestore  func(node, jobID string)
+
+	// backendConfigs records the BackendConfig of the last snapshot/restore per "node/job".
+	backendConfigs map[string]*agentpb.BackendConfig
 }
 
 func NewFakeSnapshotAgentStore() *FakeSnapshotAgentStore {
@@ -123,15 +126,33 @@ func (f *FakeSnapshotAgentStore) CloseClient(nodeName string) error {
 	return nil
 }
 
+// recordBackendConfig remembers the config of the latest operation for node/job. Caller holds f.mu.
+func (f *FakeSnapshotAgentStore) recordBackendConfig(node, job string, cfg *agentpb.BackendConfig) {
+	if f.backendConfigs == nil {
+		f.backendConfigs = make(map[string]*agentpb.BackendConfig)
+	}
+	f.backendConfigs[node+"/"+job] = cfg
+}
+
+// LastBackendConfig returns the BackendConfig sent with the most recent snapshot or restore of job on
+// node, or nil if none was sent (or no operation happened).
+func (f *FakeSnapshotAgentStore) LastBackendConfig(node, job string) *agentpb.BackendConfig {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.backendConfigs[node+"/"+job]
+}
+
 func (f *FakeSnapshotAgentStore) Snapshot(
 	ctx context.Context,
 	nodeName,
 	jobID,
 	groupID string,
+	backendConfig *agentpb.BackendConfig,
 ) (*agentpb.SnapshotResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.recordBackendConfig(nodeName, jobID, backendConfig)
 	f.opCounter++
 	opID := fmt.Sprintf("op-snap-%d", f.opCounter)
 	f.pendingOperations[opID] = pendingOp{
@@ -154,10 +175,17 @@ func (f *FakeSnapshotAgentStore) Snapshot(
 	return &agentpb.SnapshotResponse{OperationId: opID}, nil
 }
 
-func (f *FakeSnapshotAgentStore) Restore(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error) {
+func (f *FakeSnapshotAgentStore) Restore(
+	ctx context.Context,
+	nodeName,
+	jobID,
+	groupID string,
+	backendConfig *agentpb.BackendConfig,
+) (*agentpb.RestoreResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.recordBackendConfig(nodeName, jobID, backendConfig)
 	f.opCounter++
 	opID := fmt.Sprintf("op-restore-%d", f.opCounter)
 	f.pendingOperations[opID] = pendingOp{

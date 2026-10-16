@@ -5,10 +5,11 @@ from typing import Any, List, Optional, Tuple
 import grpc
 
 from timeslice.orchestrator._generated import pb2, pb2_grpc
+from timeslice.orchestrator.configs import BackendConfigLike, coerce_backend_config
 from timeslice.orchestrator.exceptions import wrap_grpc_error
 from timeslice.orchestrator.types import (
-    AgentJobState,
     AcquireResult,
+    AgentJobState,
     GroupLockState,
     GroupStatus,
     OrchestratorGroupStatus,
@@ -54,6 +55,7 @@ class TimeSliceOrchestratorClient:
         job_id: Optional[str] = None,
         group_id: Optional[str] = None,
         channel_options: Optional[List[Tuple[str, Any]]] = None,
+        backend_config: BackendConfigLike = None,
     ):
         """Initializes the Orchestrator Client.
 
@@ -62,10 +64,18 @@ class TimeSliceOrchestratorClient:
             job_id: Optional unique identifier of the job.
             group_id: Optional unique identifier of the time-slice group.
             channel_options: Optional gRPC channel options.
+            backend_config: Optional snapshot backend for this job, sent on
+                every release unless overridden per call. A
+                ``JobBackendConfig`` (see ``timeslice.orchestrator.configs``)
+                or one of "cuda", "tpu", "app_channel". The orchestrator uses
+                it to park the job's context and to restore it on the next
+                acquire. None lets the orchestrator use whatever it has
+                stored for the job, or the agent's default backend.
         """
         self.target = target
         self.job_id = job_id
         self.group_id = group_id
+        self.backend_config = coerce_backend_config(backend_config)
 
         if channel_options is None:
             channel_options = DEFAULT_CHANNEL_OPTIONS
@@ -97,7 +107,9 @@ class TimeSliceOrchestratorClient:
     ) -> AcquireResult:
         """Acquires exclusive access to the time-slice group.
 
-        This call blocks until access is granted or timeout is reached.
+        This call blocks until access is granted or timeout is reached. If
+        the job's context is parked, it is restored with the backend the
+        job last passed on ``release``.
 
         Args:
             job_id: Optional job_id to override the constructor value.
@@ -131,6 +143,7 @@ class TimeSliceOrchestratorClient:
         job_id: Optional[str] = None,
         group_id: Optional[str] = None,
         timeout_sec: Optional[float] = None,
+        backend_config: BackendConfigLike = None,
     ) -> YieldResult:
         """Releases exclusive access to the time-slice group.
 
@@ -140,6 +153,10 @@ class TimeSliceOrchestratorClient:
             job_id: Optional job_id to override the constructor value.
             group_id: Optional group_id to override the constructor value.
             timeout_sec: Optional timeout in seconds for the RPC call.
+            backend_config: Optional snapshot backend to override the
+                constructor value for this call. If set, the orchestrator
+                stores it for the job and uses it to park the job's context
+                and to restore it on the next acquire.
 
         Returns:
             YieldResult containing success, pending_waiters, and snapshot_deferred.
@@ -152,6 +169,7 @@ class TimeSliceOrchestratorClient:
         resolved_group_id = self._resolve_group_id(group_id)
 
         request = pb2.YieldRequest(job_id=resolved_job_id, group_id=resolved_group_id)
+        self._set_backend_config(request, backend_config)
         try:
             response = self._stub.Yield(request, timeout=timeout_sec)
             return YieldResult(
@@ -248,8 +266,11 @@ class TimeSliceOrchestratorClient:
         job_id: Optional[str] = None,
         group_id: Optional[str] = None,
         timeout_sec: Optional[float] = None,
+        backend_config: BackendConfigLike = None,
     ):
         """Context manager/decorator for safe acquire/release flow on accelerators.
+
+        ``backend_config`` is forwarded to release.
 
         Usage as context manager:
             with client.on_accelerators() as result:
@@ -264,7 +285,20 @@ class TimeSliceOrchestratorClient:
         try:
             yield result
         finally:
-            self.release(job_id=job_id, group_id=group_id)
+            self.release(
+                job_id=job_id, group_id=group_id, backend_config=backend_config
+            )
+
+    def _set_backend_config(self, request, backend_config: BackendConfigLike) -> None:
+        """Fills request.backend_config from the per-call value, else the
+        constructor default; leaves the field unset when neither is given."""
+        cfg = (
+            coerce_backend_config(backend_config)
+            if backend_config is not None
+            else self.backend_config
+        )
+        if cfg is not None:
+            request.backend_config.CopyFrom(cfg)
 
     def _map_group_state(self, proto_state: int) -> GroupLockState:
         try:

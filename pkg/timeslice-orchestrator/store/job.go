@@ -4,6 +4,7 @@ import (
 	"maps"
 	"sync"
 
+	agentpb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1"
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
 )
 
@@ -14,6 +15,9 @@ type Job struct {
 	groupID      string
 	pods         []string // pod UUIDs
 	contextState map[string]pb.SnapshotAgentJobState_State
+	// backendConfig is the snapshot backend last supplied by the client on Yield. It is forwarded on
+	// every Snapshot/Restore for the job; nil means the agent default. In-memory only: lost on restart.
+	backendConfig *agentpb.BackendConfig
 }
 
 // NewJob creates a new Job with default values.
@@ -66,4 +70,19 @@ func (j *Job) UpdateContextState(nodeName string, state pb.SnapshotAgentJobState
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.contextState[nodeName] = state
+}
+
+// BackendConfig returns the snapshot backend config stored for the job, or nil when the client
+// never supplied one (the agent's default backend applies). The returned message must not be mutated.
+func (j *Job) BackendConfig() *agentpb.BackendConfig {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.backendConfig
+}
+
+// SetBackendConfig stores the snapshot backend config for the job. A nil cfg clears it.
+func (j *Job) SetBackendConfig(cfg *agentpb.BackendConfig) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.backendConfig = cfg
 }

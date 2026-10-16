@@ -382,9 +382,12 @@ func (c *Controller) reconcileNode(
 		}
 		switch agentJobStates[job.JobID()] {
 		case pb.SnapshotAgentJobState_STATE_RUNNING:
+			// The config the client stored on Yield (nil = agent default) is sent on both the snapshot
+			// and the later restore so the two always use the same backend.
+			backendCfg := job.BackendConfig()
 			if err := c.runAgentOperation(ctx, groupID, "snapshot", nodeName, job.JobID(), cancelPeers,
 				func(ctx context.Context) (string, error) {
-					resp, err := c.agentStore.Snapshot(ctx, nodeName, job.JobID(), groupID)
+					resp, err := c.agentStore.Snapshot(ctx, nodeName, job.JobID(), groupID, backendCfg)
 					if err != nil {
 						return "", err
 					}
@@ -424,9 +427,10 @@ func (c *Controller) reconcileNode(
 	if activeJob.ContextState()[nodeName] != pb.SnapshotAgentJobState_STATE_SAVED {
 		return nil
 	}
+	backendCfg := activeJob.BackendConfig()
 	return c.runAgentOperation(ctx, groupID, "restore", nodeName, activeJobID, cancelPeers,
 		func(ctx context.Context) (string, error) {
-			resp, err := c.agentStore.Restore(ctx, nodeName, activeJobID, groupID)
+			resp, err := c.agentStore.Restore(ctx, nodeName, activeJobID, groupID, backendCfg)
 			if err != nil {
 				return "", err
 			}

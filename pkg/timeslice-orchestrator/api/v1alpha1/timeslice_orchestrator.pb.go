@@ -22,6 +22,111 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// App identifies the application behind an app_endpoint backend.
+// Values mirror snapshot_agent.v1alpha1.App.
+type App int32
+
+const (
+	App_APP_UNSPECIFIED App = 0
+	App_APP_VLLM        App = 1
+	App_APP_SGLANG      App = 2
+)
+
+// Enum value maps for App.
+var (
+	App_name = map[int32]string{
+		0: "APP_UNSPECIFIED",
+		1: "APP_VLLM",
+		2: "APP_SGLANG",
+	}
+	App_value = map[string]int32{
+		"APP_UNSPECIFIED": 0,
+		"APP_VLLM":        1,
+		"APP_SGLANG":      2,
+	}
+)
+
+func (x App) Enum() *App {
+	p := new(App)
+	*p = x
+	return p
+}
+
+func (x App) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (App) Descriptor() protoreflect.EnumDescriptor {
+	return file_timeslice_orchestrator_proto_enumTypes[0].Descriptor()
+}
+
+func (App) Type() protoreflect.EnumType {
+	return &file_timeslice_orchestrator_proto_enumTypes[0]
+}
+
+func (x App) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use App.Descriptor instead.
+func (App) EnumDescriptor() ([]byte, []int) {
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{0}
+}
+
+// SuspendMode selects what happens to the application's accelerator memory on suspend.
+// Values mirror snapshot_agent.v1alpha1.SuspendMode.
+type SuspendMode int32
+
+const (
+	// Use the application's (or workload's) default mode.
+	SuspendMode_SUSPEND_MODE_UNSPECIFIED SuspendMode = 0
+	// Copy the selected regions to host memory and free device memory; resume copies them back.
+	SuspendMode_SUSPEND_MODE_OFFLOAD SuspendMode = 1
+	// Free the selected regions without copying; resume rebuilds them.
+	SuspendMode_SUSPEND_MODE_DISCARD SuspendMode = 2
+)
+
+// Enum value maps for SuspendMode.
+var (
+	SuspendMode_name = map[int32]string{
+		0: "SUSPEND_MODE_UNSPECIFIED",
+		1: "SUSPEND_MODE_OFFLOAD",
+		2: "SUSPEND_MODE_DISCARD",
+	}
+	SuspendMode_value = map[string]int32{
+		"SUSPEND_MODE_UNSPECIFIED": 0,
+		"SUSPEND_MODE_OFFLOAD":     1,
+		"SUSPEND_MODE_DISCARD":     2,
+	}
+)
+
+func (x SuspendMode) Enum() *SuspendMode {
+	p := new(SuspendMode)
+	*p = x
+	return p
+}
+
+func (x SuspendMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SuspendMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_timeslice_orchestrator_proto_enumTypes[1].Descriptor()
+}
+
+func (SuspendMode) Type() protoreflect.EnumType {
+	return &file_timeslice_orchestrator_proto_enumTypes[1]
+}
+
+func (x SuspendMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SuspendMode.Descriptor instead.
+func (SuspendMode) EnumDescriptor() ([]byte, []int) {
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{1}
+}
+
 // State defines the possible states of a group lock.
 type GroupStatus_State int32
 
@@ -71,11 +176,11 @@ func (x GroupStatus_State) String() string {
 }
 
 func (GroupStatus_State) Descriptor() protoreflect.EnumDescriptor {
-	return file_timeslice_orchestrator_proto_enumTypes[0].Descriptor()
+	return file_timeslice_orchestrator_proto_enumTypes[2].Descriptor()
 }
 
 func (GroupStatus_State) Type() protoreflect.EnumType {
-	return &file_timeslice_orchestrator_proto_enumTypes[0]
+	return &file_timeslice_orchestrator_proto_enumTypes[2]
 }
 
 func (x GroupStatus_State) Number() protoreflect.EnumNumber {
@@ -84,7 +189,7 @@ func (x GroupStatus_State) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use GroupStatus_State.Descriptor instead.
 func (GroupStatus_State) EnumDescriptor() ([]byte, []int) {
-	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{8, 0}
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{13, 0}
 }
 
 // State defines the possible states of a job's accelerator context.
@@ -136,11 +241,11 @@ func (x SnapshotAgentJobState_State) String() string {
 }
 
 func (SnapshotAgentJobState_State) Descriptor() protoreflect.EnumDescriptor {
-	return file_timeslice_orchestrator_proto_enumTypes[1].Descriptor()
+	return file_timeslice_orchestrator_proto_enumTypes[3].Descriptor()
 }
 
 func (SnapshotAgentJobState_State) Type() protoreflect.EnumType {
-	return &file_timeslice_orchestrator_proto_enumTypes[1]
+	return &file_timeslice_orchestrator_proto_enumTypes[3]
 }
 
 func (x SnapshotAgentJobState_State) Number() protoreflect.EnumNumber {
@@ -149,7 +254,7 @@ func (x SnapshotAgentJobState_State) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SnapshotAgentJobState_State.Descriptor instead.
 func (SnapshotAgentJobState_State) EnumDescriptor() ([]byte, []int) {
-	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{9, 0}
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{14, 0}
 }
 
 // AcquireRequest is the request to acquire exclusive access to a group.
@@ -280,7 +385,14 @@ type YieldRequest struct {
 	// job_id is the unique identifier of the job yielding access.
 	JobId string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	// group_id is the unique identifier of the time-slice group being yielded.
-	GroupId       string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	GroupId string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	// backend_config optionally selects the snapshot backend the orchestrator forwards to the
+	// node-local snapshot agents to park this job's context, and again to restore it on the job's
+	// next Acquire. If set, it replaces the backend stored for the job; if omitted, the previously
+	// stored backend is kept; if none was ever stored, the agent's default backend is used.
+	// The stored backend lives in orchestrator memory: after an orchestrator restart a job that
+	// yielded with a non-default backend is restored with the agent default (known issue).
+	BackendConfig *JobBackendConfig `protobuf:"bytes,3,opt,name=backend_config,json=backendConfig,proto3" json:"backend_config,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -327,6 +439,13 @@ func (x *YieldRequest) GetGroupId() string {
 		return x.GroupId
 	}
 	return ""
+}
+
+func (x *YieldRequest) GetBackendConfig() *JobBackendConfig {
+	if x != nil {
+		return x.BackendConfig
+	}
+	return nil
 }
 
 // YieldResponse is the response after yielding access.
@@ -394,6 +513,330 @@ func (x *YieldResponse) GetSnapshotDeferred() bool {
 	return false
 }
 
+// JobBackendConfig is the subset of the snapshot agent's BackendConfig that a client may choose per
+// job. Fields the agent derives from the job's pods (process targets) are intentionally absent, as
+// are experimental backends. The orchestrator converts this message to the agent's BackendConfig.
+type JobBackendConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Backend:
+	//
+	//	*JobBackendConfig_Cuda
+	//	*JobBackendConfig_Tpu
+	//	*JobBackendConfig_AppEndpoint
+	//	*JobBackendConfig_AppChannel
+	Backend       isJobBackendConfig_Backend `protobuf_oneof:"backend"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JobBackendConfig) Reset() {
+	*x = JobBackendConfig{}
+	mi := &file_timeslice_orchestrator_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JobBackendConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JobBackendConfig) ProtoMessage() {}
+
+func (x *JobBackendConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_timeslice_orchestrator_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JobBackendConfig.ProtoReflect.Descriptor instead.
+func (*JobBackendConfig) Descriptor() ([]byte, []int) {
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *JobBackendConfig) GetBackend() isJobBackendConfig_Backend {
+	if x != nil {
+		return x.Backend
+	}
+	return nil
+}
+
+func (x *JobBackendConfig) GetCuda() *CudaBackend {
+	if x != nil {
+		if x, ok := x.Backend.(*JobBackendConfig_Cuda); ok {
+			return x.Cuda
+		}
+	}
+	return nil
+}
+
+func (x *JobBackendConfig) GetTpu() *TpuBackend {
+	if x != nil {
+		if x, ok := x.Backend.(*JobBackendConfig_Tpu); ok {
+			return x.Tpu
+		}
+	}
+	return nil
+}
+
+func (x *JobBackendConfig) GetAppEndpoint() *AppEndpointBackend {
+	if x != nil {
+		if x, ok := x.Backend.(*JobBackendConfig_AppEndpoint); ok {
+			return x.AppEndpoint
+		}
+	}
+	return nil
+}
+
+func (x *JobBackendConfig) GetAppChannel() *AppChannelBackend {
+	if x != nil {
+		if x, ok := x.Backend.(*JobBackendConfig_AppChannel); ok {
+			return x.AppChannel
+		}
+	}
+	return nil
+}
+
+type isJobBackendConfig_Backend interface {
+	isJobBackendConfig_Backend()
+}
+
+type JobBackendConfig_Cuda struct {
+	// CUDA checkpoint/restore of the job's GPU processes; PIDs are discovered from the job's pods.
+	Cuda *CudaBackend `protobuf:"bytes,1,opt,name=cuda,proto3,oneof"`
+}
+
+type JobBackendConfig_Tpu struct {
+	// TPU (libtpu) checkpoint/restore of the job's processes; PIDs are discovered from the job's pods.
+	Tpu *TpuBackend `protobuf:"bytes,2,opt,name=tpu,proto3,oneof"`
+}
+
+type JobBackendConfig_AppEndpoint struct {
+	// Application-aware suspend/resume through the application's HTTP API (vLLM, SGLang).
+	AppEndpoint *AppEndpointBackend `protobuf:"bytes,3,opt,name=app_endpoint,json=appEndpoint,proto3,oneof"`
+}
+
+type JobBackendConfig_AppChannel struct {
+	// Application-aware suspend/resume through the workload channel the job registered with the agent.
+	AppChannel *AppChannelBackend `protobuf:"bytes,4,opt,name=app_channel,json=appChannel,proto3,oneof"`
+}
+
+func (*JobBackendConfig_Cuda) isJobBackendConfig_Backend() {}
+
+func (*JobBackendConfig_Tpu) isJobBackendConfig_Backend() {}
+
+func (*JobBackendConfig_AppEndpoint) isJobBackendConfig_Backend() {}
+
+func (*JobBackendConfig_AppChannel) isJobBackendConfig_Backend() {}
+
+// CudaBackend selects the CUDA backend. It carries no options.
+type CudaBackend struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CudaBackend) Reset() {
+	*x = CudaBackend{}
+	mi := &file_timeslice_orchestrator_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CudaBackend) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CudaBackend) ProtoMessage() {}
+
+func (x *CudaBackend) ProtoReflect() protoreflect.Message {
+	mi := &file_timeslice_orchestrator_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CudaBackend.ProtoReflect.Descriptor instead.
+func (*CudaBackend) Descriptor() ([]byte, []int) {
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{5}
+}
+
+// TpuBackend selects the TPU backend. It carries no options.
+type TpuBackend struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TpuBackend) Reset() {
+	*x = TpuBackend{}
+	mi := &file_timeslice_orchestrator_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TpuBackend) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TpuBackend) ProtoMessage() {}
+
+func (x *TpuBackend) ProtoReflect() protoreflect.Message {
+	mi := &file_timeslice_orchestrator_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TpuBackend.ProtoReflect.Descriptor instead.
+func (*TpuBackend) Descriptor() ([]byte, []int) {
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{6}
+}
+
+// AppEndpointBackend configures the app_endpoint backend.
+type AppEndpointBackend struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// app is the application type. Required.
+	App App `protobuf:"varint,1,opt,name=app,proto3,enum=timeslice_orchestrator.v1alpha1.App" json:"app,omitempty"`
+	// endpoints are the HTTP endpoint(s) of the application server(s), e.g. "http://localhost:8000".
+	// At least one is required.
+	Endpoints []string `protobuf:"bytes,2,rep,name=endpoints,proto3" json:"endpoints,omitempty"`
+	// mode is the suspend mode; unspecified means the application's default.
+	Mode SuspendMode `protobuf:"varint,3,opt,name=mode,proto3,enum=timeslice_orchestrator.v1alpha1.SuspendMode" json:"mode,omitempty"`
+	// tags are region tags, e.g. "weights", "kv_cache". Empty means the application's default set.
+	Tags          []string `protobuf:"bytes,4,rep,name=tags,proto3" json:"tags,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AppEndpointBackend) Reset() {
+	*x = AppEndpointBackend{}
+	mi := &file_timeslice_orchestrator_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AppEndpointBackend) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AppEndpointBackend) ProtoMessage() {}
+
+func (x *AppEndpointBackend) ProtoReflect() protoreflect.Message {
+	mi := &file_timeslice_orchestrator_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AppEndpointBackend.ProtoReflect.Descriptor instead.
+func (*AppEndpointBackend) Descriptor() ([]byte, []int) {
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *AppEndpointBackend) GetApp() App {
+	if x != nil {
+		return x.App
+	}
+	return App_APP_UNSPECIFIED
+}
+
+func (x *AppEndpointBackend) GetEndpoints() []string {
+	if x != nil {
+		return x.Endpoints
+	}
+	return nil
+}
+
+func (x *AppEndpointBackend) GetMode() SuspendMode {
+	if x != nil {
+		return x.Mode
+	}
+	return SuspendMode_SUSPEND_MODE_UNSPECIFIED
+}
+
+func (x *AppEndpointBackend) GetTags() []string {
+	if x != nil {
+		return x.Tags
+	}
+	return nil
+}
+
+// AppChannelBackend configures the app_channel backend. The workload is addressed by the job id.
+type AppChannelBackend struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// mode is the suspend mode; unspecified means the workload's registered default.
+	Mode SuspendMode `protobuf:"varint,1,opt,name=mode,proto3,enum=timeslice_orchestrator.v1alpha1.SuspendMode" json:"mode,omitempty"`
+	// tags are region tags; empty means the workload's default set.
+	Tags          []string `protobuf:"bytes,2,rep,name=tags,proto3" json:"tags,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AppChannelBackend) Reset() {
+	*x = AppChannelBackend{}
+	mi := &file_timeslice_orchestrator_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AppChannelBackend) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AppChannelBackend) ProtoMessage() {}
+
+func (x *AppChannelBackend) ProtoReflect() protoreflect.Message {
+	mi := &file_timeslice_orchestrator_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AppChannelBackend.ProtoReflect.Descriptor instead.
+func (*AppChannelBackend) Descriptor() ([]byte, []int) {
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *AppChannelBackend) GetMode() SuspendMode {
+	if x != nil {
+		return x.Mode
+	}
+	return SuspendMode_SUSPEND_MODE_UNSPECIFIED
+}
+
+func (x *AppChannelBackend) GetTags() []string {
+	if x != nil {
+		return x.Tags
+	}
+	return nil
+}
+
 // ListGroupsRequest is the request to list active groups.
 type ListGroupsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -403,7 +846,7 @@ type ListGroupsRequest struct {
 
 func (x *ListGroupsRequest) Reset() {
 	*x = ListGroupsRequest{}
-	mi := &file_timeslice_orchestrator_proto_msgTypes[4]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -415,7 +858,7 @@ func (x *ListGroupsRequest) String() string {
 func (*ListGroupsRequest) ProtoMessage() {}
 
 func (x *ListGroupsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_timeslice_orchestrator_proto_msgTypes[4]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -428,7 +871,7 @@ func (x *ListGroupsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListGroupsRequest.ProtoReflect.Descriptor instead.
 func (*ListGroupsRequest) Descriptor() ([]byte, []int) {
-	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{4}
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{9}
 }
 
 // ListGroupsResponse is the response containing active groups.
@@ -442,7 +885,7 @@ type ListGroupsResponse struct {
 
 func (x *ListGroupsResponse) Reset() {
 	*x = ListGroupsResponse{}
-	mi := &file_timeslice_orchestrator_proto_msgTypes[5]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -454,7 +897,7 @@ func (x *ListGroupsResponse) String() string {
 func (*ListGroupsResponse) ProtoMessage() {}
 
 func (x *ListGroupsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_timeslice_orchestrator_proto_msgTypes[5]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -467,7 +910,7 @@ func (x *ListGroupsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListGroupsResponse.ProtoReflect.Descriptor instead.
 func (*ListGroupsResponse) Descriptor() ([]byte, []int) {
-	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{5}
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ListGroupsResponse) GetGroupIds() []string {
@@ -488,7 +931,7 @@ type GetGroupStatusRequest struct {
 
 func (x *GetGroupStatusRequest) Reset() {
 	*x = GetGroupStatusRequest{}
-	mi := &file_timeslice_orchestrator_proto_msgTypes[6]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -500,7 +943,7 @@ func (x *GetGroupStatusRequest) String() string {
 func (*GetGroupStatusRequest) ProtoMessage() {}
 
 func (x *GetGroupStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_timeslice_orchestrator_proto_msgTypes[6]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -513,7 +956,7 @@ func (x *GetGroupStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetGroupStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetGroupStatusRequest) Descriptor() ([]byte, []int) {
-	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{6}
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *GetGroupStatusRequest) GetGroupId() string {
@@ -537,7 +980,7 @@ type GetGroupStatusResponse struct {
 
 func (x *GetGroupStatusResponse) Reset() {
 	*x = GetGroupStatusResponse{}
-	mi := &file_timeslice_orchestrator_proto_msgTypes[7]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -549,7 +992,7 @@ func (x *GetGroupStatusResponse) String() string {
 func (*GetGroupStatusResponse) ProtoMessage() {}
 
 func (x *GetGroupStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_timeslice_orchestrator_proto_msgTypes[7]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -562,7 +1005,7 @@ func (x *GetGroupStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetGroupStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetGroupStatusResponse) Descriptor() ([]byte, []int) {
-	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{7}
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *GetGroupStatusResponse) GetGroup() *GroupStatus {
@@ -608,7 +1051,7 @@ type GroupStatus struct {
 
 func (x *GroupStatus) Reset() {
 	*x = GroupStatus{}
-	mi := &file_timeslice_orchestrator_proto_msgTypes[8]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -620,7 +1063,7 @@ func (x *GroupStatus) String() string {
 func (*GroupStatus) ProtoMessage() {}
 
 func (x *GroupStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_timeslice_orchestrator_proto_msgTypes[8]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -633,7 +1076,7 @@ func (x *GroupStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GroupStatus.ProtoReflect.Descriptor instead.
 func (*GroupStatus) Descriptor() ([]byte, []int) {
-	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{8}
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *GroupStatus) GetGroupId() string {
@@ -701,7 +1144,7 @@ type SnapshotAgentJobState struct {
 
 func (x *SnapshotAgentJobState) Reset() {
 	*x = SnapshotAgentJobState{}
-	mi := &file_timeslice_orchestrator_proto_msgTypes[9]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -713,7 +1156,7 @@ func (x *SnapshotAgentJobState) String() string {
 func (*SnapshotAgentJobState) ProtoMessage() {}
 
 func (x *SnapshotAgentJobState) ProtoReflect() protoreflect.Message {
-	mi := &file_timeslice_orchestrator_proto_msgTypes[9]
+	mi := &file_timeslice_orchestrator_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -726,7 +1169,7 @@ func (x *SnapshotAgentJobState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotAgentJobState.ProtoReflect.Descriptor instead.
 func (*SnapshotAgentJobState) Descriptor() ([]byte, []int) {
-	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{9}
+	return file_timeslice_orchestrator_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *SnapshotAgentJobState) GetAgent() string {
@@ -761,14 +1204,33 @@ const file_timeslice_orchestrator_proto_rawDesc = "" +
 	"\x0fAcquireResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1b\n" +
 	"\twaited_ms\x18\x02 \x01(\x03R\bwaitedMs\x12)\n" +
-	"\x10context_restored\x18\x03 \x01(\bR\x0fcontextRestored\"@\n" +
+	"\x10context_restored\x18\x03 \x01(\bR\x0fcontextRestored\"\x9a\x01\n" +
 	"\fYieldRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x19\n" +
-	"\bgroup_id\x18\x02 \x01(\tR\agroupId\"\x7f\n" +
+	"\bgroup_id\x18\x02 \x01(\tR\agroupId\x12X\n" +
+	"\x0ebackend_config\x18\x03 \x01(\v21.timeslice_orchestrator.v1alpha1.JobBackendConfigR\rbackendConfig\"\x7f\n" +
 	"\rYieldResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12'\n" +
 	"\x0fpending_waiters\x18\x02 \x01(\x03R\x0ependingWaiters\x12+\n" +
-	"\x11snapshot_deferred\x18\x03 \x01(\bR\x10snapshotDeferred\"\x13\n" +
+	"\x11snapshot_deferred\x18\x03 \x01(\bR\x10snapshotDeferred\"\xd3\x02\n" +
+	"\x10JobBackendConfig\x12B\n" +
+	"\x04cuda\x18\x01 \x01(\v2,.timeslice_orchestrator.v1alpha1.CudaBackendH\x00R\x04cuda\x12?\n" +
+	"\x03tpu\x18\x02 \x01(\v2+.timeslice_orchestrator.v1alpha1.TpuBackendH\x00R\x03tpu\x12X\n" +
+	"\fapp_endpoint\x18\x03 \x01(\v23.timeslice_orchestrator.v1alpha1.AppEndpointBackendH\x00R\vappEndpoint\x12U\n" +
+	"\vapp_channel\x18\x04 \x01(\v22.timeslice_orchestrator.v1alpha1.AppChannelBackendH\x00R\n" +
+	"appChannelB\t\n" +
+	"\abackend\"\r\n" +
+	"\vCudaBackend\"\f\n" +
+	"\n" +
+	"TpuBackend\"\xc0\x01\n" +
+	"\x12AppEndpointBackend\x126\n" +
+	"\x03app\x18\x01 \x01(\x0e2$.timeslice_orchestrator.v1alpha1.AppR\x03app\x12\x1c\n" +
+	"\tendpoints\x18\x02 \x03(\tR\tendpoints\x12@\n" +
+	"\x04mode\x18\x03 \x01(\x0e2,.timeslice_orchestrator.v1alpha1.SuspendModeR\x04mode\x12\x12\n" +
+	"\x04tags\x18\x04 \x03(\tR\x04tags\"i\n" +
+	"\x11AppChannelBackend\x12@\n" +
+	"\x04mode\x18\x01 \x01(\x0e2,.timeslice_orchestrator.v1alpha1.SuspendModeR\x04mode\x12\x12\n" +
+	"\x04tags\x18\x02 \x03(\tR\x04tags\"\x13\n" +
 	"\x11ListGroupsRequest\"1\n" +
 	"\x12ListGroupsResponse\x12\x1b\n" +
 	"\tgroup_ids\x18\x01 \x03(\tR\bgroupIds\"2\n" +
@@ -808,7 +1270,16 @@ const file_timeslice_orchestrator_proto_rawDesc = "" +
 	"\rSTATE_RUNNING\x10\x02\x12\x17\n" +
 	"\x13STATE_TRANSITIONING\x10\x03\x12\x0f\n" +
 	"\vSTATE_SAVED\x10\x04\x12\x11\n" +
-	"\rSTATE_FAULTED\x10\x052\xef\x03\n" +
+	"\rSTATE_FAULTED\x10\x05*8\n" +
+	"\x03App\x12\x13\n" +
+	"\x0fAPP_UNSPECIFIED\x10\x00\x12\f\n" +
+	"\bAPP_VLLM\x10\x01\x12\x0e\n" +
+	"\n" +
+	"APP_SGLANG\x10\x02*_\n" +
+	"\vSuspendMode\x12\x1c\n" +
+	"\x18SUSPEND_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14SUSPEND_MODE_OFFLOAD\x10\x01\x12\x18\n" +
+	"\x14SUSPEND_MODE_DISCARD\x10\x022\xef\x03\n" +
 	"\x1cTimeSliceOrchestratorService\x12l\n" +
 	"\aAcquire\x12/.timeslice_orchestrator.v1alpha1.AcquireRequest\x1a0.timeslice_orchestrator.v1alpha1.AcquireResponse\x12f\n" +
 	"\x05Yield\x12-.timeslice_orchestrator.v1alpha1.YieldRequest\x1a..timeslice_orchestrator.v1alpha1.YieldResponse\x12u\n" +
@@ -828,42 +1299,57 @@ func file_timeslice_orchestrator_proto_rawDescGZIP() []byte {
 	return file_timeslice_orchestrator_proto_rawDescData
 }
 
-var file_timeslice_orchestrator_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_timeslice_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_timeslice_orchestrator_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_timeslice_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_timeslice_orchestrator_proto_goTypes = []any{
-	(GroupStatus_State)(0),           // 0: timeslice_orchestrator.v1alpha1.GroupStatus.State
-	(SnapshotAgentJobState_State)(0), // 1: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State
-	(*AcquireRequest)(nil),           // 2: timeslice_orchestrator.v1alpha1.AcquireRequest
-	(*AcquireResponse)(nil),          // 3: timeslice_orchestrator.v1alpha1.AcquireResponse
-	(*YieldRequest)(nil),             // 4: timeslice_orchestrator.v1alpha1.YieldRequest
-	(*YieldResponse)(nil),            // 5: timeslice_orchestrator.v1alpha1.YieldResponse
-	(*ListGroupsRequest)(nil),        // 6: timeslice_orchestrator.v1alpha1.ListGroupsRequest
-	(*ListGroupsResponse)(nil),       // 7: timeslice_orchestrator.v1alpha1.ListGroupsResponse
-	(*GetGroupStatusRequest)(nil),    // 8: timeslice_orchestrator.v1alpha1.GetGroupStatusRequest
-	(*GetGroupStatusResponse)(nil),   // 9: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse
-	(*GroupStatus)(nil),              // 10: timeslice_orchestrator.v1alpha1.GroupStatus
-	(*SnapshotAgentJobState)(nil),    // 11: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState
-	(*timestamppb.Timestamp)(nil),    // 12: google.protobuf.Timestamp
+	(App)(0),                         // 0: timeslice_orchestrator.v1alpha1.App
+	(SuspendMode)(0),                 // 1: timeslice_orchestrator.v1alpha1.SuspendMode
+	(GroupStatus_State)(0),           // 2: timeslice_orchestrator.v1alpha1.GroupStatus.State
+	(SnapshotAgentJobState_State)(0), // 3: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State
+	(*AcquireRequest)(nil),           // 4: timeslice_orchestrator.v1alpha1.AcquireRequest
+	(*AcquireResponse)(nil),          // 5: timeslice_orchestrator.v1alpha1.AcquireResponse
+	(*YieldRequest)(nil),             // 6: timeslice_orchestrator.v1alpha1.YieldRequest
+	(*YieldResponse)(nil),            // 7: timeslice_orchestrator.v1alpha1.YieldResponse
+	(*JobBackendConfig)(nil),         // 8: timeslice_orchestrator.v1alpha1.JobBackendConfig
+	(*CudaBackend)(nil),              // 9: timeslice_orchestrator.v1alpha1.CudaBackend
+	(*TpuBackend)(nil),               // 10: timeslice_orchestrator.v1alpha1.TpuBackend
+	(*AppEndpointBackend)(nil),       // 11: timeslice_orchestrator.v1alpha1.AppEndpointBackend
+	(*AppChannelBackend)(nil),        // 12: timeslice_orchestrator.v1alpha1.AppChannelBackend
+	(*ListGroupsRequest)(nil),        // 13: timeslice_orchestrator.v1alpha1.ListGroupsRequest
+	(*ListGroupsResponse)(nil),       // 14: timeslice_orchestrator.v1alpha1.ListGroupsResponse
+	(*GetGroupStatusRequest)(nil),    // 15: timeslice_orchestrator.v1alpha1.GetGroupStatusRequest
+	(*GetGroupStatusResponse)(nil),   // 16: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse
+	(*GroupStatus)(nil),              // 17: timeslice_orchestrator.v1alpha1.GroupStatus
+	(*SnapshotAgentJobState)(nil),    // 18: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState
+	(*timestamppb.Timestamp)(nil),    // 19: google.protobuf.Timestamp
 }
 var file_timeslice_orchestrator_proto_depIdxs = []int32{
-	10, // 0: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse.group:type_name -> timeslice_orchestrator.v1alpha1.GroupStatus
-	11, // 1: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse.agent_job_states:type_name -> timeslice_orchestrator.v1alpha1.SnapshotAgentJobState
-	0,  // 2: timeslice_orchestrator.v1alpha1.GroupStatus.group_state:type_name -> timeslice_orchestrator.v1alpha1.GroupStatus.State
-	12, // 3: timeslice_orchestrator.v1alpha1.GroupStatus.state_timestamp:type_name -> google.protobuf.Timestamp
-	1,  // 4: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.job_state:type_name -> timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State
-	2,  // 5: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Acquire:input_type -> timeslice_orchestrator.v1alpha1.AcquireRequest
-	4,  // 6: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Yield:input_type -> timeslice_orchestrator.v1alpha1.YieldRequest
-	6,  // 7: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.ListGroups:input_type -> timeslice_orchestrator.v1alpha1.ListGroupsRequest
-	8,  // 8: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.GetGroupStatus:input_type -> timeslice_orchestrator.v1alpha1.GetGroupStatusRequest
-	3,  // 9: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Acquire:output_type -> timeslice_orchestrator.v1alpha1.AcquireResponse
-	5,  // 10: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Yield:output_type -> timeslice_orchestrator.v1alpha1.YieldResponse
-	7,  // 11: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.ListGroups:output_type -> timeslice_orchestrator.v1alpha1.ListGroupsResponse
-	9,  // 12: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.GetGroupStatus:output_type -> timeslice_orchestrator.v1alpha1.GetGroupStatusResponse
-	9,  // [9:13] is the sub-list for method output_type
-	5,  // [5:9] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	8,  // 0: timeslice_orchestrator.v1alpha1.YieldRequest.backend_config:type_name -> timeslice_orchestrator.v1alpha1.JobBackendConfig
+	9,  // 1: timeslice_orchestrator.v1alpha1.JobBackendConfig.cuda:type_name -> timeslice_orchestrator.v1alpha1.CudaBackend
+	10, // 2: timeslice_orchestrator.v1alpha1.JobBackendConfig.tpu:type_name -> timeslice_orchestrator.v1alpha1.TpuBackend
+	11, // 3: timeslice_orchestrator.v1alpha1.JobBackendConfig.app_endpoint:type_name -> timeslice_orchestrator.v1alpha1.AppEndpointBackend
+	12, // 4: timeslice_orchestrator.v1alpha1.JobBackendConfig.app_channel:type_name -> timeslice_orchestrator.v1alpha1.AppChannelBackend
+	0,  // 5: timeslice_orchestrator.v1alpha1.AppEndpointBackend.app:type_name -> timeslice_orchestrator.v1alpha1.App
+	1,  // 6: timeslice_orchestrator.v1alpha1.AppEndpointBackend.mode:type_name -> timeslice_orchestrator.v1alpha1.SuspendMode
+	1,  // 7: timeslice_orchestrator.v1alpha1.AppChannelBackend.mode:type_name -> timeslice_orchestrator.v1alpha1.SuspendMode
+	17, // 8: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse.group:type_name -> timeslice_orchestrator.v1alpha1.GroupStatus
+	18, // 9: timeslice_orchestrator.v1alpha1.GetGroupStatusResponse.agent_job_states:type_name -> timeslice_orchestrator.v1alpha1.SnapshotAgentJobState
+	2,  // 10: timeslice_orchestrator.v1alpha1.GroupStatus.group_state:type_name -> timeslice_orchestrator.v1alpha1.GroupStatus.State
+	19, // 11: timeslice_orchestrator.v1alpha1.GroupStatus.state_timestamp:type_name -> google.protobuf.Timestamp
+	3,  // 12: timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.job_state:type_name -> timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State
+	4,  // 13: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Acquire:input_type -> timeslice_orchestrator.v1alpha1.AcquireRequest
+	6,  // 14: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Yield:input_type -> timeslice_orchestrator.v1alpha1.YieldRequest
+	13, // 15: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.ListGroups:input_type -> timeslice_orchestrator.v1alpha1.ListGroupsRequest
+	15, // 16: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.GetGroupStatus:input_type -> timeslice_orchestrator.v1alpha1.GetGroupStatusRequest
+	5,  // 17: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Acquire:output_type -> timeslice_orchestrator.v1alpha1.AcquireResponse
+	7,  // 18: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.Yield:output_type -> timeslice_orchestrator.v1alpha1.YieldResponse
+	14, // 19: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.ListGroups:output_type -> timeslice_orchestrator.v1alpha1.ListGroupsResponse
+	16, // 20: timeslice_orchestrator.v1alpha1.TimeSliceOrchestratorService.GetGroupStatus:output_type -> timeslice_orchestrator.v1alpha1.GetGroupStatusResponse
+	17, // [17:21] is the sub-list for method output_type
+	13, // [13:17] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_timeslice_orchestrator_proto_init() }
@@ -871,13 +1357,19 @@ func file_timeslice_orchestrator_proto_init() {
 	if File_timeslice_orchestrator_proto != nil {
 		return
 	}
+	file_timeslice_orchestrator_proto_msgTypes[4].OneofWrappers = []any{
+		(*JobBackendConfig_Cuda)(nil),
+		(*JobBackendConfig_Tpu)(nil),
+		(*JobBackendConfig_AppEndpoint)(nil),
+		(*JobBackendConfig_AppChannel)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_timeslice_orchestrator_proto_rawDesc), len(file_timeslice_orchestrator_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   10,
+			NumEnums:      4,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

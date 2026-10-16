@@ -1,14 +1,23 @@
 from timeslice.orchestrator.client import TimeSliceOrchestratorClient
+from timeslice.orchestrator.configs import (
+    app_channel_config,
+    app_endpoint_config,
+    coerce_backend_config,
+    cuda_config,
+    sglang_config,
+    tpu_config,
+    vllm_config,
+)
 from timeslice.orchestrator.exceptions import (
-    OrchestratorError,
     OrchestratorConnectionError,
-    OrchestratorTimeoutError,
-    OrchestratorInvalidArgumentError,
+    OrchestratorError,
     OrchestratorInternalError,
+    OrchestratorInvalidArgumentError,
+    OrchestratorTimeoutError,
 )
 from timeslice.orchestrator.types import (
-    AgentJobState,
     AcquireResult,
+    AgentJobState,
     GroupLockState,
     GroupStatus,
     OrchestratorGroupStatus,
@@ -18,6 +27,13 @@ from timeslice.orchestrator.types import (
 
 __all__ = [
     "TimeSliceOrchestratorClient",
+    "app_channel_config",
+    "app_endpoint_config",
+    "coerce_backend_config",
+    "cuda_config",
+    "sglang_config",
+    "tpu_config",
+    "vllm_config",
     "OrchestratorError",
     "OrchestratorConnectionError",
     "OrchestratorTimeoutError",

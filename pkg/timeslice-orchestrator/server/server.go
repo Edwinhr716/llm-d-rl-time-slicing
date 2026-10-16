@@ -157,7 +157,11 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 	ctx = logging.WithServerMethod(ctx, "Yield")
 	ctx = logging.WithJobID(ctx, req.GetJobId())
 	ctx = logging.WithGroupID(ctx, req.GetGroupId())
-	slog.InfoContext(ctx, "Yield called")
+	slog.InfoContext(ctx, "Yield called", "backend", AgentBackendName(ToAgentBackendConfig(req.GetBackendConfig())))
+
+	if err := ValidateJobBackendConfig(req.GetBackendConfig()); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid backend_config: %v", err)
+	}
 
 	groupID := req.GetGroupId()
 	jobID := req.GetJobId()
@@ -174,9 +178,19 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 	// 2. Take Snapshot BEFORE Yield
 	snap := group.Snapshot()
 
-	// 3. Call Yield
+	// 3. Record the backend config before releasing the lock: a reconcile already in flight may
+	// promote the next waiter and snapshot this job immediately, and it must use the new config.
+	applied, err := s.applyBackendConfig(ctx, groupID, jobID, req.GetBackendConfig())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to record backend config: %v", err)
+	}
+
+	// 4. Call Yield
 	err = group.Spec().Yield(ctx, jobID)
 	if err != nil {
+		// A rejected yield (e.g. from a job that is parked, not locking) must not change the config
+		// its saved context will be restored with.
+		applied.rollback()
 		if errors.Is(err, store.ErrNotLockHolder) {
 			return nil, status.Errorf(codes.PermissionDenied, "job %s does not hold lock for group %s", jobID, groupID)
 		}
@@ -187,7 +201,7 @@ func (s *Server) Yield(ctx context.Context, req *pb.YieldRequest) (*pb.YieldResp
 		s.ctrl.EnqueueWork(groupID)
 	}
 
-	// 4. Construct Response from Snapshot
+	// 5. Construct Response from Snapshot
 	numWaiters := snap.WaiterQueueDepth
 	if numWaiters == 0 {
 		metrics.DeferredSnapshotsTotal.WithLabelValues(groupID).Inc()

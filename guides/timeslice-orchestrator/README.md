@@ -186,6 +186,33 @@ spec:
 
 For a complete reference of the Python SDK (including explicit acquire/release, inline context managers, and dynamic overrides), see the [Orchestrator Python Client README](../../pkg/client/python/timeslice/orchestrator/README.md).
 
+#### Choosing the snapshot backend per job
+
+By default the node-local snapshot agents park and restore a job's context with their configured default backend (`cuda` unless the agent was started otherwise). A job can choose its own backend by passing `backend_config` on `release` (Yield). The supported subset is `cuda`, `tpu`, `app_endpoint` (vLLM/SGLang HTTP API) and `app_channel` (workload channel registered with the agent); process targets are never specified here because the agent discovers PIDs from the job's pods.
+
+```python
+from timeslice import TimeSliceOrchestratorClient
+from timeslice.orchestrator import app_channel_config, vllm_config
+
+# Set once: sent on every release.
+orchestrator = TimeSliceOrchestratorClient(
+    target="timeslice-timesliceorchestrator.timeslice-system.svc.cluster.local:50051",
+    job_id="job-a",
+    group_id="group-ab-sampler",
+    backend_config=app_channel_config(),          # or "cuda", "tpu", vllm_config([...])
+)
+
+# Or per call, e.g. a vLLM server that should discard its KV cache while parked.
+orchestrator.release(backend_config=vllm_config(["http://localhost:8000"], mode="discard"))
+```
+
+Rules:
+
+- The orchestrator keeps **one** backend config per job. A `release` that carries one replaces it; a `release` without one leaves it unchanged. The stored config is sent on the job's snapshot (when it is parked after yielding) **and** on its restore (when it next acquires), so both always use the same backend. `acquire` takes no backend config.
+- If a `release` config differs from the stored one, the orchestrator logs a warning and uses the new one. If a job never passed a config, the agent's default backend is used.
+- The stored config lives with the job's pods: it is dropped when the job has no pods left.
+- **Known issue:** the stored config is in orchestrator memory only. If the orchestrator restarts while a job is parked with a non-default backend, the job is restored with the agent's default backend, which will fail for application-aware backends. Persisting the per-job backend alongside the group lock is tracked separately.
+
 #### Pattern A: Accelerator Work Pod Deployment (Startup)
 When running time-sliced jobs, work pods must only be deployed and scheduled onto the accelerator nodes while their job holds the lock for their respective Group. 
 

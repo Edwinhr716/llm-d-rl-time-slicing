@@ -14,6 +14,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/metrics"
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/store"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -472,7 +473,9 @@ func TestController_Reconcile_TriggersSnapshot(t *testing.T) {
 			}
 			return &agentpb.StatusResponse{}, nil
 		},
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			if node == nodeName && jobID == "job-2" && gID == groupID {
 				snapshotCalled <- jobID
 			}
@@ -710,7 +713,9 @@ func TestController_Reconcile_TriggersRestore(t *testing.T) {
 			}
 			return &agentpb.StatusResponse{}, nil
 		},
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			if node == nodeName && jobID == "job-1" && gID == groupID {
 				restoreCalled <- jobID
 			}
@@ -806,11 +811,15 @@ func TestController_Reconcile_ActiveJobAlreadyRunningExitsEarly(t *testing.T) {
 
 	// 3. Mock SnapshotAgentStore to fail if any disruptive action is taken.
 	mockAgentStore := &controller.MockSnapshotAgentStore{
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			t.Errorf("Unexpected call to Snapshot")
 			return nil, fmt.Errorf("unexpected call")
 		},
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			t.Errorf("Unexpected call to Restore")
 			return nil, fmt.Errorf("unexpected call")
 		},
@@ -974,7 +983,9 @@ func TestController_Reconcile_DeduceLoadedJob_PartiallyLoaded(t *testing.T) {
 			}
 			return &agentpb.StatusResponse{}, nil
 		},
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			if node == "node-2" && jobID == "job-1" && gID == groupID {
 				restoreCalled <- jobID
 			}
@@ -1153,7 +1164,9 @@ func TestController_Reconcile_DeduceLoadedJob_RunningAndUnspecifiedButOtherRunni
 			}
 			return &agentpb.StatusResponse{}, nil
 		},
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			if node == "node-2" && jobID == "job-2" && gID == groupID {
 				snapshotCalled <- jobID
 			}
@@ -1456,7 +1469,9 @@ func TestController_Reconcile_DeduceLoadedJob_NonExistentButOtherRunning(t *test
 			}
 			return &agentpb.StatusResponse{}, nil
 		},
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			if node == "node-1" && jobID == "job-2" && gID == groupID {
 				snapshotCalled <- jobID
 			}
@@ -1628,11 +1643,15 @@ func TestController_Reconcile_ColdStartTwoIdleJobs(t *testing.T) {
 
 	// Neither job has an accelerator context: no snapshot/restore may happen.
 	mockAgentStore := &controller.MockSnapshotAgentStore{
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			t.Errorf("Unexpected call to Snapshot for job %s", jobID)
 			return nil, fmt.Errorf("unexpected call")
 		},
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			t.Errorf("Unexpected call to Restore for job %s", jobID)
 			return nil, fmt.Errorf("unexpected call")
 		},
@@ -1732,7 +1751,9 @@ func TestController_Reconcile_DeduceLoadedJob_IdleButOtherRunning(t *testing.T) 
 			}
 			return &agentpb.StatusResponse{}, nil
 		},
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			if node == "node-1" && jobID == "job-2" && gID == groupID {
 				snapshotCalled <- jobID
 			}
@@ -1965,11 +1986,15 @@ func TestController_Reconcile_IdleJobDoesNotBlockRestore(t *testing.T) {
 			}
 			return &agentpb.StatusResponse{}, nil
 		},
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			t.Errorf("Unexpected call to Snapshot for job %s (IDLE jobs have nothing to snapshot)", jobID)
 			return nil, fmt.Errorf("unexpected call")
 		},
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			if node == nodeName && jobID == "job-1" && gID == groupID {
 				restoreCalled <- jobID
 			}
@@ -2055,11 +2080,15 @@ func TestController_Reconcile_PreemptionSafetyGates_TransitioningJob(t *testing.
 
 	// 3. Mock SnapshotAgentStore to fail if Snapshot/Restore is called
 	mockAgentStore := &controller.MockSnapshotAgentStore{
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			t.Errorf("Unexpected call to Snapshot")
 			return nil, fmt.Errorf("unexpected call")
 		},
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			t.Errorf("Unexpected call to Restore")
 			return nil, fmt.Errorf("unexpected call")
 		},
@@ -2258,7 +2287,9 @@ func TestController_Reconcile_MultiNodeRestore_Rendezvous(t *testing.T) {
 				JobStatuses: []*agentpb.JobStatus{{JobId: "job-1", State: state}},
 			}, nil
 		},
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			restoredNodes[node] = true
@@ -2374,7 +2405,9 @@ func TestController_Reconcile_MultiNodeSnapshot_Concurrent(t *testing.T) {
 				JobStatuses: []*agentpb.JobStatus{{JobId: "job-2", State: state}},
 			}, nil
 		},
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			snapshottedNodes[node] = true
@@ -2469,7 +2502,9 @@ func TestController_Reconcile_MultiNodeRestore_FailurePropagates(t *testing.T) {
 	var mu sync.Mutex
 	restoredNodes := make(map[string]bool)
 	mockAgentStore := &controller.MockSnapshotAgentStore{
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			restoredNodes[node] = true
@@ -2555,7 +2590,9 @@ func TestController_Reconcile_MultiNodeRestore_TriggerFailureCancelsPeers(t *tes
 	}
 
 	mockAgentStore := &controller.MockSnapshotAgentStore{
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			// node-2's trigger fails outright; node-1's succeeds.
 			if node == "node-2" {
 				return nil, fmt.Errorf("agent unreachable on node-2")
@@ -2627,11 +2664,15 @@ func TestController_Reconcile_PreemptionSafetyGates_ActiveJobTransitioning(t *te
 
 	// 3. Mock SnapshotAgentStore to fail if Snapshot/Restore is called
 	mockAgentStore := &controller.MockSnapshotAgentStore{
-		SnapshotFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.SnapshotResponse, error) {
+		SnapshotFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.SnapshotResponse, error) {
 			t.Errorf("Unexpected call to Snapshot")
 			return nil, fmt.Errorf("unexpected call")
 		},
-		RestoreFunc: func(ctx context.Context, node, jobID, gID string) (*agentpb.RestoreResponse, error) {
+		RestoreFunc: func(
+			ctx context.Context, node, jobID, gID string, _ *agentpb.BackendConfig,
+		) (*agentpb.RestoreResponse, error) {
 			t.Errorf("Unexpected call to Restore")
 			return nil, fmt.Errorf("unexpected call")
 		},
@@ -2665,5 +2706,120 @@ func TestController_Reconcile_PreemptionSafetyGates_ActiveJobTransitioning(t *te
 
 	if testQueue.getAddRateLimitedCount() < 1 {
 		t.Errorf("Expected AddRateLimited to be called at least once, got %d", testQueue.getAddRateLimitedCount())
+	}
+}
+
+// TestController_Reconcile_ForwardsBackendConfig verifies that the config a job stored on Acquire/Yield
+// is sent on both its snapshot (as a non-active RUNNING job) and its restore (as the active SAVED job),
+// and that a job without a stored config is sent nil (agent default).
+func TestController_Reconcile_ForwardsBackendConfig(t *testing.T) {
+	appChannel := &agentpb.BackendConfig{
+		Backend: &agentpb.BackendConfig_AppChannel{AppChannel: &agentpb.AppChannelConfig{Tags: []string{"weights"}}},
+	}
+	tpu := &agentpb.BackendConfig{Backend: &agentpb.BackendConfig_Tpu{Tpu: &agentpb.TpuBackendConfig{}}}
+
+	tests := []struct {
+		name        string
+		snapshotCfg *agentpb.BackendConfig // stored on job-2 (RUNNING, to be parked)
+		restoreCfg  *agentpb.BackendConfig // stored on job-1 (SAVED, active, to be restored)
+	}{
+		{name: "stored configs forwarded", snapshotCfg: appChannel, restoreCfg: tpu},
+		{name: "no stored config sends nil", snapshotCfg: nil, restoreCfg: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			groupStore := store.NewGroupStore(store.NewMemLockStore())
+			jobStore := store.NewJobStore()
+			queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+				workqueue.DefaultTypedControllerRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "test"},
+			)
+			groupID, nodeName := "group-1", "node-1"
+
+			testGroup, _, err := groupStore.GetOrCreate(ctx, groupID)
+			if err != nil {
+				t.Fatalf("failed to create group: %v", err)
+			}
+			testGroup.Status().SetNodes([]string{nodeName})
+			testGroup.Spec().SetActiveJob("job-1")
+
+			job1 := store.NewJob(groupID, "job-1")
+			job1.UpdateContextState(nodeName, pb.SnapshotAgentJobState_STATE_SAVED)
+			job1.SetBackendConfig(tc.restoreCfg)
+			job2 := store.NewJob(groupID, "job-2")
+			job2.UpdateContextState(nodeName, pb.SnapshotAgentJobState_STATE_RUNNING)
+			job2.SetBackendConfig(tc.snapshotCfg)
+			for _, job := range []*store.Job{job1, job2} {
+				if err := jobStore.Put(ctx, job); err != nil {
+					t.Fatalf("failed to put %s: %v", job.JobID(), err)
+				}
+			}
+
+			// Agent state: job-2 RUNNING until snapshotted, job-1 SAVED until restored.
+			var mu sync.Mutex
+			job1State, job2State := agentpb.JobState_JOB_STATE_SAVED, agentpb.JobState_JOB_STATE_RUNNING
+			gotSnapshotCfg := make(chan *agentpb.BackendConfig, 1)
+			gotRestoreCfg := make(chan *agentpb.BackendConfig, 1)
+			mockAgentStore := &controller.MockSnapshotAgentStore{
+				GetStatusFunc: func(ctx context.Context, node string) (*agentpb.StatusResponse, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					return &agentpb.StatusResponse{JobStatuses: []*agentpb.JobStatus{
+						{JobId: "job-1", State: job1State},
+						{JobId: "job-2", State: job2State},
+					}}, nil
+				},
+				SnapshotFunc: func(
+					ctx context.Context, node, jobID, gID string, cfg *agentpb.BackendConfig,
+				) (*agentpb.SnapshotResponse, error) {
+					mu.Lock()
+					job2State = agentpb.JobState_JOB_STATE_SAVED
+					mu.Unlock()
+					gotSnapshotCfg <- cfg
+					return &agentpb.SnapshotResponse{OperationId: "op-snap"}, nil
+				},
+				RestoreFunc: func(
+					ctx context.Context, node, jobID, gID string, cfg *agentpb.BackendConfig,
+				) (*agentpb.RestoreResponse, error) {
+					mu.Lock()
+					job1State = agentpb.JobState_JOB_STATE_RUNNING
+					mu.Unlock()
+					gotRestoreCfg <- cfg
+					return &agentpb.RestoreResponse{OperationId: "op-restore"}, nil
+				},
+				OperationFunc: func(ctx context.Context, node, operationID string) (*agentpb.GetOperationResponse, error) {
+					return &agentpb.GetOperationResponse{Status: agentpb.OperationStatus_OPERATION_STATUS_COMPLETE}, nil
+				},
+			}
+			mockOrch := &mockInfrastructureOrchestrator{}
+
+			c := controller.NewController(groupStore, jobStore, queue, mockOrch, mockAgentStore)
+			go func() {
+				if err := c.Run(ctx, 1); err != nil {
+					t.Errorf("Controller Run failed: %v", err)
+				}
+			}()
+			queue.Add(groupID)
+
+			select {
+			case got := <-gotSnapshotCfg:
+				if !proto.Equal(got, tc.snapshotCfg) {
+					t.Errorf("snapshot backend config = %v, want %v", got, tc.snapshotCfg)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Timed out waiting for Snapshot")
+			}
+			select {
+			case got := <-gotRestoreCfg:
+				if !proto.Equal(got, tc.restoreCfg) {
+					t.Errorf("restore backend config = %v, want %v", got, tc.restoreCfg)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Timed out waiting for Restore")
+			}
+		})
 	}
 }

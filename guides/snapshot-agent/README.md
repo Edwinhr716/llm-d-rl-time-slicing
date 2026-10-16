@@ -145,7 +145,7 @@ result = client.snapshot_and_wait(job_id="my-k8s-job-id")
 
 ## 3. Backends
 
-The Snapshot Agent supports multiple backends for different GPU memory management strategies. Each backend is selected per-request via the `backend_config` field.
+The Snapshot Agent supports multiple backends for different GPU memory management strategies. Each backend is selected per-request via the `backend_config` field. When the TimeSlice Orchestrator drives the agent, it forwards the `backend_config` the job passed on `Yield` (see the [orchestrator guide](../timeslice-orchestrator/README.md#choosing-the-snapshot-backend-per-job)); jobs that pass none are served by the agent's default backend (`-default-backend`).
 
 | Backend | Config | How it works | VRAM Freed | Resume Time |
 |---------|--------|-------------|------------|-------------|

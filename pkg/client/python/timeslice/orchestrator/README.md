@@ -88,6 +88,39 @@ with client.on_accelerators(job_id="job-B", group_id="group-B") as result:
 
 ---
 
+### Backend Configuration
+
+A job may choose which snapshot-agent backend parks and restores its context by passing `backend_config` to the constructor (sent on every `release`) or to an individual `release` call (overrides the constructor value for that call). `acquire` takes no backend config: a parked job is restored with the backend it was parked with. Builders live in `timeslice.orchestrator.configs` and are re-exported from `timeslice.orchestrator`:
+
+| Builder | Backend | Notes |
+| --- | --- | --- |
+| `cuda_config()` or `"cuda"` | `cuda` | PIDs discovered by the agent from the job's pods |
+| `tpu_config()` or `"tpu"` | `tpu` | PIDs discovered by the agent from the job's pods |
+| `vllm_config(endpoints, mode=None, tags=None)` | `app_endpoint` | vLLM sleep/wake API |
+| `sglang_config(endpoints, mode=None, tags=None)` | `app_endpoint` | SGLang memory-occupation API |
+| `app_endpoint_config(app, endpoints, mode=None, tags=None)` | `app_endpoint` | Generic form of the two above |
+| `app_channel_config(mode=None, tags=None)` or `"app_channel"` | `app_channel` | Workload registered a channel with the agent |
+
+`mode` is `"offload"`, `"discard"` or `None` (application/workload default); `tags` selects memory regions such as `["weights", "kv_cache"]`.
+
+```python
+from timeslice import TimeSliceOrchestratorClient
+from timeslice.orchestrator import app_channel_config, vllm_config
+
+client = TimeSliceOrchestratorClient(
+    "orchestrator-service:50051", "my-job", "shared-gpu",
+    backend_config=app_channel_config(),
+)
+
+with client.on_accelerators():          # the release on exit carries app_channel
+    ...
+
+# Per-call override; the orchestrator stores the latest value it was given.
+client.release(backend_config=vllm_config(["http://localhost:8000"], mode="discard"))
+```
+
+The orchestrator stores one config per job and forwards it on the job's snapshot and restore; a release without `backend_config` keeps the stored value, and a job that never passes one is served by the agent's default backend. Known issue: the stored config is not persisted across orchestrator restarts, so a job parked with a non-default backend when the orchestrator restarts is restored with the agent default. Invalid configs (unknown app, no endpoints, empty tags) are rejected client-side with `ValueError`, or by the orchestrator with `INVALID_ARGUMENT`.
+
 ## Comprehensive Example: Reinforcement Learning (RL) Job (Decorator Pattern)
 
 In a typical Reinforcement Learning setup, a single training job might need to coordinate access across two different GPU resource pools: one dedicated to **Sampling** (generating experience rollouts) and another dedicated to **Training** (updating model weights).

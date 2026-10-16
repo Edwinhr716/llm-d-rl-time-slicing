@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n>timeslice/orchestrator/_generated/timeslice_orchestrator.proto\x12\x1ftimeslice_orchestrator.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"2\n\x0e\x41\x63quireRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\t\x12\x10\n\x08group_id\x18\x02 \x01(\t\"O\n\x0f\x41\x63quireResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x11\n\twaited_ms\x18\x02 \x01(\x03\x12\x18\n\x10\x63ontext_restored\x18\x03 \x01(\x08\"0\n\x0cYieldRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\t\x12\x10\n\x08group_id\x18\x02 \x01(\t\"T\n\rYieldResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x17\n\x0fpending_waiters\x18\x02 \x01(\x03\x12\x19\n\x11snapshot_deferred\x18\x03 \x01(\x08\"\x13\n\x11ListGroupsRequest\"\'\n\x12ListGroupsResponse\x12\x11\n\tgroup_ids\x18\x01 \x03(\t\")\n\x15GetGroupStatusRequest\x12\x10\n\x08group_id\x18\x01 \x01(\t\"\xa7\x01\n\x16GetGroupStatusResponse\x12;\n\x05group\x18\x01 \x01(\x0b\x32,.timeslice_orchestrator.v1alpha1.GroupStatus\x12P\n\x10\x61gent_job_states\x18\x02 \x03(\x0b\x32\x36.timeslice_orchestrator.v1alpha1.SnapshotAgentJobState\"\xf9\x02\n\x0bGroupStatus\x12\x10\n\x08group_id\x18\x01 \x01(\t\x12G\n\x0bgroup_state\x18\x02 \x01(\x0e\x32\x32.timeslice_orchestrator.v1alpha1.GroupStatus.State\x12\x33\n\x0fstate_timestamp\x18\x03 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12\x13\n\x0blocking_job\x18\x04 \x01(\t\x12\x12\n\nactive_job\x18\x05 \x01(\t\x12\x1a\n\x12waiter_queue_depth\x18\x06 \x01(\x03\x12\x12\n\nloaded_job\x18\x07 \x01(\t\"\x80\x01\n\x05State\x12\x15\n\x11STATE_UNSPECIFIED\x10\x00\x12\x11\n\rSTATE_UNKNOWN\x10\x01\x12\x0e\n\nSTATE_IDLE\x10\x02\x12\x16\n\x12STATE_IDLE_YIELDED\x10\x03\x12\x10\n\x0cSTATE_LOCKED\x10\x04\x12\x13\n\x0fSTATE_SWITCHING\x10\x05\"\x87\x02\n\x15SnapshotAgentJobState\x12\r\n\x05\x61gent\x18\x01 \x01(\t\x12O\n\tjob_state\x18\x02 \x01(\x0e\x32<.timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State\x12\x0e\n\x06job_id\x18\x03 \x01(\t\"~\n\x05State\x12\x15\n\x11STATE_UNSPECIFIED\x10\x00\x12\x0e\n\nSTATE_IDLE\x10\x01\x12\x11\n\rSTATE_RUNNING\x10\x02\x12\x17\n\x13STATE_TRANSITIONING\x10\x03\x12\x0f\n\x0bSTATE_SAVED\x10\x04\x12\x11\n\rSTATE_FAULTED\x10\x05\x32\xef\x03\n\x1cTimeSliceOrchestratorService\x12l\n\x07\x41\x63quire\x12/.timeslice_orchestrator.v1alpha1.AcquireRequest\x1a\x30.timeslice_orchestrator.v1alpha1.AcquireResponse\x12\x66\n\x05Yield\x12-.timeslice_orchestrator.v1alpha1.YieldRequest\x1a..timeslice_orchestrator.v1alpha1.YieldResponse\x12u\n\nListGroups\x12\x32.timeslice_orchestrator.v1alpha1.ListGroupsRequest\x1a\x33.timeslice_orchestrator.v1alpha1.ListGroupsResponse\x12\x81\x01\n\x0eGetGroupStatus\x12\x36.timeslice_orchestrator.v1alpha1.GetGroupStatusRequest\x1a\x37.timeslice_orchestrator.v1alpha1.GetGroupStatusResponseBdZbgithub.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1;v1alpha1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n>timeslice/orchestrator/_generated/timeslice_orchestrator.proto\x12\x1ftimeslice_orchestrator.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"2\n\x0e\x41\x63quireRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\t\x12\x10\n\x08group_id\x18\x02 \x01(\t\"O\n\x0f\x41\x63quireResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x11\n\twaited_ms\x18\x02 \x01(\x03\x12\x18\n\x10\x63ontext_restored\x18\x03 \x01(\x08\"{\n\x0cYieldRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\t\x12\x10\n\x08group_id\x18\x02 \x01(\t\x12I\n\x0e\x62\x61\x63kend_config\x18\x03 \x01(\x0b\x32\x31.timeslice_orchestrator.v1alpha1.JobBackendConfig\"T\n\rYieldResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x17\n\x0fpending_waiters\x18\x02 \x01(\x03\x12\x19\n\x11snapshot_deferred\x18\x03 \x01(\x08\"\xaf\x02\n\x10JobBackendConfig\x12<\n\x04\x63uda\x18\x01 \x01(\x0b\x32,.timeslice_orchestrator.v1alpha1.CudaBackendH\x00\x12:\n\x03tpu\x18\x02 \x01(\x0b\x32+.timeslice_orchestrator.v1alpha1.TpuBackendH\x00\x12K\n\x0c\x61pp_endpoint\x18\x03 \x01(\x0b\x32\x33.timeslice_orchestrator.v1alpha1.AppEndpointBackendH\x00\x12I\n\x0b\x61pp_channel\x18\x04 \x01(\x0b\x32\x32.timeslice_orchestrator.v1alpha1.AppChannelBackendH\x00\x42\t\n\x07\x62\x61\x63kend\"\r\n\x0b\x43udaBackend\"\x0c\n\nTpuBackend\"\xa4\x01\n\x12\x41ppEndpointBackend\x12\x31\n\x03\x61pp\x18\x01 \x01(\x0e\x32$.timeslice_orchestrator.v1alpha1.App\x12\x11\n\tendpoints\x18\x02 \x03(\t\x12:\n\x04mode\x18\x03 \x01(\x0e\x32,.timeslice_orchestrator.v1alpha1.SuspendMode\x12\x0c\n\x04tags\x18\x04 \x03(\t\"]\n\x11\x41ppChannelBackend\x12:\n\x04mode\x18\x01 \x01(\x0e\x32,.timeslice_orchestrator.v1alpha1.SuspendMode\x12\x0c\n\x04tags\x18\x02 \x03(\t\"\x13\n\x11ListGroupsRequest\"\'\n\x12ListGroupsResponse\x12\x11\n\tgroup_ids\x18\x01 \x03(\t\")\n\x15GetGroupStatusRequest\x12\x10\n\x08group_id\x18\x01 \x01(\t\"\xa7\x01\n\x16GetGroupStatusResponse\x12;\n\x05group\x18\x01 \x01(\x0b\x32,.timeslice_orchestrator.v1alpha1.GroupStatus\x12P\n\x10\x61gent_job_states\x18\x02 \x03(\x0b\x32\x36.timeslice_orchestrator.v1alpha1.SnapshotAgentJobState\"\xf9\x02\n\x0bGroupStatus\x12\x10\n\x08group_id\x18\x01 \x01(\t\x12G\n\x0bgroup_state\x18\x02 \x01(\x0e\x32\x32.timeslice_orchestrator.v1alpha1.GroupStatus.State\x12\x33\n\x0fstate_timestamp\x18\x03 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12\x13\n\x0blocking_job\x18\x04 \x01(\t\x12\x12\n\nactive_job\x18\x05 \x01(\t\x12\x1a\n\x12waiter_queue_depth\x18\x06 \x01(\x03\x12\x12\n\nloaded_job\x18\x07 \x01(\t\"\x80\x01\n\x05State\x12\x15\n\x11STATE_UNSPECIFIED\x10\x00\x12\x11\n\rSTATE_UNKNOWN\x10\x01\x12\x0e\n\nSTATE_IDLE\x10\x02\x12\x16\n\x12STATE_IDLE_YIELDED\x10\x03\x12\x10\n\x0cSTATE_LOCKED\x10\x04\x12\x13\n\x0fSTATE_SWITCHING\x10\x05\"\x87\x02\n\x15SnapshotAgentJobState\x12\r\n\x05\x61gent\x18\x01 \x01(\t\x12O\n\tjob_state\x18\x02 \x01(\x0e\x32<.timeslice_orchestrator.v1alpha1.SnapshotAgentJobState.State\x12\x0e\n\x06job_id\x18\x03 \x01(\t\"~\n\x05State\x12\x15\n\x11STATE_UNSPECIFIED\x10\x00\x12\x0e\n\nSTATE_IDLE\x10\x01\x12\x11\n\rSTATE_RUNNING\x10\x02\x12\x17\n\x13STATE_TRANSITIONING\x10\x03\x12\x0f\n\x0bSTATE_SAVED\x10\x04\x12\x11\n\rSTATE_FAULTED\x10\x05*8\n\x03\x41pp\x12\x13\n\x0f\x41PP_UNSPECIFIED\x10\x00\x12\x0c\n\x08\x41PP_VLLM\x10\x01\x12\x0e\n\nAPP_SGLANG\x10\x02*_\n\x0bSuspendMode\x12\x1c\n\x18SUSPEND_MODE_UNSPECIFIED\x10\x00\x12\x18\n\x14SUSPEND_MODE_OFFLOAD\x10\x01\x12\x18\n\x14SUSPEND_MODE_DISCARD\x10\x02\x32\xef\x03\n\x1cTimeSliceOrchestratorService\x12l\n\x07\x41\x63quire\x12/.timeslice_orchestrator.v1alpha1.AcquireRequest\x1a\x30.timeslice_orchestrator.v1alpha1.AcquireResponse\x12\x66\n\x05Yield\x12-.timeslice_orchestrator.v1alpha1.YieldRequest\x1a..timeslice_orchestrator.v1alpha1.YieldResponse\x12u\n\nListGroups\x12\x32.timeslice_orchestrator.v1alpha1.ListGroupsRequest\x1a\x33.timeslice_orchestrator.v1alpha1.ListGroupsResponse\x12\x81\x01\n\x0eGetGroupStatus\x12\x36.timeslice_orchestrator.v1alpha1.GetGroupStatusRequest\x1a\x37.timeslice_orchestrator.v1alpha1.GetGroupStatusResponseBdZbgithub.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1;v1alpha1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,30 +33,44 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'timeslice.orchestrator._gen
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Zbgithub.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1;v1alpha1'
+  _globals['_APP']._serialized_start=1994
+  _globals['_APP']._serialized_end=2050
+  _globals['_SUSPENDMODE']._serialized_start=2052
+  _globals['_SUSPENDMODE']._serialized_end=2147
   _globals['_ACQUIREREQUEST']._serialized_start=132
   _globals['_ACQUIREREQUEST']._serialized_end=182
   _globals['_ACQUIRERESPONSE']._serialized_start=184
   _globals['_ACQUIRERESPONSE']._serialized_end=263
   _globals['_YIELDREQUEST']._serialized_start=265
-  _globals['_YIELDREQUEST']._serialized_end=313
-  _globals['_YIELDRESPONSE']._serialized_start=315
-  _globals['_YIELDRESPONSE']._serialized_end=399
-  _globals['_LISTGROUPSREQUEST']._serialized_start=401
-  _globals['_LISTGROUPSREQUEST']._serialized_end=420
-  _globals['_LISTGROUPSRESPONSE']._serialized_start=422
-  _globals['_LISTGROUPSRESPONSE']._serialized_end=461
-  _globals['_GETGROUPSTATUSREQUEST']._serialized_start=463
-  _globals['_GETGROUPSTATUSREQUEST']._serialized_end=504
-  _globals['_GETGROUPSTATUSRESPONSE']._serialized_start=507
-  _globals['_GETGROUPSTATUSRESPONSE']._serialized_end=674
-  _globals['_GROUPSTATUS']._serialized_start=677
-  _globals['_GROUPSTATUS']._serialized_end=1054
-  _globals['_GROUPSTATUS_STATE']._serialized_start=926
-  _globals['_GROUPSTATUS_STATE']._serialized_end=1054
-  _globals['_SNAPSHOTAGENTJOBSTATE']._serialized_start=1057
-  _globals['_SNAPSHOTAGENTJOBSTATE']._serialized_end=1320
-  _globals['_SNAPSHOTAGENTJOBSTATE_STATE']._serialized_start=1194
-  _globals['_SNAPSHOTAGENTJOBSTATE_STATE']._serialized_end=1320
-  _globals['_TIMESLICEORCHESTRATORSERVICE']._serialized_start=1323
-  _globals['_TIMESLICEORCHESTRATORSERVICE']._serialized_end=1818
+  _globals['_YIELDREQUEST']._serialized_end=388
+  _globals['_YIELDRESPONSE']._serialized_start=390
+  _globals['_YIELDRESPONSE']._serialized_end=474
+  _globals['_JOBBACKENDCONFIG']._serialized_start=477
+  _globals['_JOBBACKENDCONFIG']._serialized_end=780
+  _globals['_CUDABACKEND']._serialized_start=782
+  _globals['_CUDABACKEND']._serialized_end=795
+  _globals['_TPUBACKEND']._serialized_start=797
+  _globals['_TPUBACKEND']._serialized_end=809
+  _globals['_APPENDPOINTBACKEND']._serialized_start=812
+  _globals['_APPENDPOINTBACKEND']._serialized_end=976
+  _globals['_APPCHANNELBACKEND']._serialized_start=978
+  _globals['_APPCHANNELBACKEND']._serialized_end=1071
+  _globals['_LISTGROUPSREQUEST']._serialized_start=1073
+  _globals['_LISTGROUPSREQUEST']._serialized_end=1092
+  _globals['_LISTGROUPSRESPONSE']._serialized_start=1094
+  _globals['_LISTGROUPSRESPONSE']._serialized_end=1133
+  _globals['_GETGROUPSTATUSREQUEST']._serialized_start=1135
+  _globals['_GETGROUPSTATUSREQUEST']._serialized_end=1176
+  _globals['_GETGROUPSTATUSRESPONSE']._serialized_start=1179
+  _globals['_GETGROUPSTATUSRESPONSE']._serialized_end=1346
+  _globals['_GROUPSTATUS']._serialized_start=1349
+  _globals['_GROUPSTATUS']._serialized_end=1726
+  _globals['_GROUPSTATUS_STATE']._serialized_start=1598
+  _globals['_GROUPSTATUS_STATE']._serialized_end=1726
+  _globals['_SNAPSHOTAGENTJOBSTATE']._serialized_start=1729
+  _globals['_SNAPSHOTAGENTJOBSTATE']._serialized_end=1992
+  _globals['_SNAPSHOTAGENTJOBSTATE_STATE']._serialized_start=1866
+  _globals['_SNAPSHOTAGENTJOBSTATE_STATE']._serialized_end=1992
+  _globals['_TIMESLICEORCHESTRATORSERVICE']._serialized_start=2150
+  _globals['_TIMESLICEORCHESTRATORSERVICE']._serialized_end=2645
 # @@protoc_insertion_point(module_scope)

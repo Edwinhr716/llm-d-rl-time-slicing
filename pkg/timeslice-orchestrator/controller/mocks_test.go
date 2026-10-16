@@ -13,9 +13,13 @@ import (
 type MockSnapshotAgentStore struct {
 	store.SnapshotAgentStore
 	GetStatusFunc func(ctx context.Context, nodeName string) (*agentpb.StatusResponse, error)
-	SnapshotFunc  func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.SnapshotResponse, error)
+	SnapshotFunc  func(
+		ctx context.Context, nodeName, jobID, groupID string, backendConfig *agentpb.BackendConfig,
+	) (*agentpb.SnapshotResponse, error)
 	OperationFunc func(ctx context.Context, nodeName, operationID string) (*agentpb.GetOperationResponse, error)
-	RestoreFunc   func(ctx context.Context, nodeName, jobID, groupID string) (*agentpb.RestoreResponse, error)
+	RestoreFunc   func(
+		ctx context.Context, nodeName, jobID, groupID string, backendConfig *agentpb.BackendConfig,
+	) (*agentpb.RestoreResponse, error)
 
 	// Queued responses for GetOperation
 	OperationResponses []*agentpb.GetOperationResponse
@@ -34,10 +38,10 @@ func (m *MockSnapshotAgentStore) CloseClient(nodeName string) error {
 }
 
 func (m *MockSnapshotAgentStore) Snapshot(
-	ctx context.Context, nodeName, jobID, groupID string,
+	ctx context.Context, nodeName, jobID, groupID string, backendConfig *agentpb.BackendConfig,
 ) (*agentpb.SnapshotResponse, error) {
 	if m.SnapshotFunc != nil {
-		return m.SnapshotFunc(ctx, nodeName, jobID, groupID)
+		return m.SnapshotFunc(ctx, nodeName, jobID, groupID, backendConfig)
 	}
 	return &agentpb.SnapshotResponse{}, nil
 }
@@ -60,10 +64,10 @@ func (m *MockSnapshotAgentStore) GetOperation(
 }
 
 func (m *MockSnapshotAgentStore) Restore(
-	ctx context.Context, nodeName, jobID, groupID string,
+	ctx context.Context, nodeName, jobID, groupID string, backendConfig *agentpb.BackendConfig,
 ) (*agentpb.RestoreResponse, error) {
 	if m.RestoreFunc != nil {
-		return m.RestoreFunc(ctx, nodeName, jobID, groupID)
+		return m.RestoreFunc(ctx, nodeName, jobID, groupID, backendConfig)
 	}
 	return &agentpb.RestoreResponse{}, nil
 }
