@@ -1,0 +1,33 @@
+# Rollout-stall test: a harmless DaemonSet that tolerates everything (like GKE's system
+# DaemonSets) and targets default-pool plus the virtual node. Bump the annotation to roll it.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vk-m1-rollout-probe
+  namespace: guest-kubelet-proto
+spec:
+  selector:
+    matchLabels: {app: vk-m1-rollout-probe}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels: {app: vk-m1-rollout-probe}
+      annotations: {rev: "1"}
+    spec:
+      tolerations:
+        - operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: cloud.google.com/gke-nodepool, operator: In, values: [default-pool]}
+              - matchExpressions:
+                  - {key: timeslice.io/virtual-node, operator: In, values: ["true"]}
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: {cpu: 1m, memory: 4Mi}

@@ -1,0 +1,15 @@
+# curl client on a different node, for "curl <podIP>:<port> works from another node".
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: guest-kubelet-proto
+spec:
+  nodeSelector:
+    cloud.google.com/gke-nodepool: default-pool
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      command: ["sleep", "infinity"]
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}

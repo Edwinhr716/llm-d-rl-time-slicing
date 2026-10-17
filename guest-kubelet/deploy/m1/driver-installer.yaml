@@ -1,0 +1,145 @@
+# GPU driver for the M1 node pool YOUR_GPU_POOL (created with gpu-driver-version=disabled, like
+# YOUR_TRAINER_POOL). A copy of kube-system/nvidia-driver-installer pinned to YOUR_GPU_POOL, so the
+# shared installer DaemonSet is not edited (editing it would roll it on other tests' nodes).
+# Same approach as the driver installer used by the earlier fault tests.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vk-m1-nvidia-driver-installer
+  namespace: guest-kubelet-proto
+spec:
+  selector:
+    matchLabels:
+      app: vk-m1-nvidia-driver-installer
+  template:
+    metadata:
+      labels:
+        app: vk-m1-nvidia-driver-installer
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-accelerator
+                operator: Exists
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - YOUR_GPU_POOL
+              - key: cloud.google.com/gke-gpu-driver-version
+                operator: DoesNotExist
+              - key: cloud.google.com/gke-confidential-nodes-instance-type
+                operator: DoesNotExist
+      containers:
+      - image: gke.gcr.io/pause:3.8@sha256:880e63f94b145e46f1b1082bb71b85e21f16b99b180b9996407d61240ceb9830
+        imagePullPolicy: IfNotPresent
+        name: pause
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      hostNetwork: true
+      hostPID: true
+      initContainers:
+      - command:
+        - bash
+        - -c
+        - "echo \"Checking for existing GPU driver modules\"\nif lsmod | grep nvidia;\
+          \ then\n  echo \"GPU driver is already installed, the installed version\
+          \ may or may not be the driver version being tried to install, skipping\
+          \ installation\"\n  exit 0\nelse\n  echo \"No GPU driver module detected,\
+          \ installing now\"\n  /cos-gpu-installer install --version=latest || exit\
+          \ 1\n  chmod 755 /root/home/kubernetes/bin/nvidia\nfi\n"
+        env:
+        - name: NVIDIA_INSTALL_DIR_HOST
+          value: /home/kubernetes/bin/nvidia
+        - name: NVIDIA_INSTALL_DIR_CONTAINER
+          value: /usr/local/nvidia
+        - name: VULKAN_ICD_DIR_HOST
+          value: /home/kubernetes/bin/nvidia/vulkan/icd.d
+        - name: VULKAN_ICD_DIR_CONTAINER
+          value: /etc/vulkan/icd.d
+        - name: ROOT_MOUNT_DIR
+          value: /root
+        - name: COS_TOOLS_DIR_HOST
+          value: /var/lib/cos-tools
+        - name: COS_TOOLS_DIR_CONTAINER
+          value: /build/cos-tools
+        image: cos-nvidia-installer:fixed
+        imagePullPolicy: Never
+        name: nvidia-driver-installer
+        resources:
+          requests:
+            cpu: 150m
+        securityContext:
+          privileged: true
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/local/nvidia
+          name: nvidia-install-dir-host
+        - mountPath: /etc/vulkan/icd.d
+          name: vulkan-icd-mount
+        - mountPath: /dev
+          name: dev
+        - mountPath: /root
+          name: root-mount
+        - mountPath: /build/cos-tools
+          name: cos-tools
+      - env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+        image: gcr.io/gke-release/nvidia-partition-gpu@sha256:de12f85ebfb4fb6c1893cd30c23aab662a72fa0448f97ef74fccb82d7522ef17
+        imagePullPolicy: IfNotPresent
+        name: partition-gpus
+        resources:
+          requests:
+            cpu: 150m
+        securityContext:
+          privileged: true
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/local/nvidia
+          name: nvidia-install-dir-host
+        - mountPath: /dev
+          name: dev
+        - mountPath: /etc/nvidia
+          name: nvidia-config
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - operator: Exists
+      volumes:
+      - hostPath:
+          path: /dev
+          type: ''
+        name: dev
+      - hostPath:
+          path: /home/kubernetes/bin/nvidia/vulkan/icd.d
+          type: ''
+        name: vulkan-icd-mount
+      - hostPath:
+          path: /home/kubernetes/bin/nvidia
+          type: ''
+        name: nvidia-install-dir-host
+      - hostPath:
+          path: /
+          type: ''
+        name: root-mount
+      - hostPath:
+          path: /var/lib/cos-tools
+          type: ''
+        name: cos-tools
+      - hostPath:
+          path: /etc/nvidia
+          type: ''
+        name: nvidia-config
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate

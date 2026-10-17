@@ -1,0 +1,37 @@
+# Step two: the approach-7 tenant (the approach-7 shadow vLLM manifest) as a
+# guest. Changes from the tenant, each a candidate webhook job:
+#   nodeSelector group.timeslice.io/trainers -> kubernetes.io/hostname of the virtual node
+#   resourceClaims (shared-trainers-gpu-claim) -> nvidia.com/gpu: 1 (the VK puts the claim back)
+#   toleration timeslice.io/shared -> timeslice.io/guest
+#   readinessGates timeslice.io/serving dropped (nothing sets it in this test)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-guest
+  namespace: guest-kubelet-proto
+  labels: {app: vllm-guest}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: __VNODE__
+  tolerations:
+    - {key: timeslice.io/guest, operator: Exists, effect: NoSchedule}
+  containers:
+    - name: vllm
+      image: vllm/vllm-openai:v0.9.2
+      command: ["vllm", "serve"]
+      args: ["Qwen/Qwen2.5-0.5B-Instruct", "--port", "8000", "--enable-sleep-mode",
+             "--gpu-memory-utilization", "0.7", "--max-model-len", "4096", "--enforce-eager"]
+      env:
+        - {name: VLLM_SERVER_DEV_MODE, value: "1"}
+      ports: [{containerPort: 8000}]
+      readinessProbe:
+        httpGet: {path: /health, port: 8000}
+        periodSeconds: 5
+      resources:
+        requests: {cpu: "6", memory: 24Gi, nvidia.com/gpu: 1}
+        limits: {memory: 30Gi, nvidia.com/gpu: 1}
+      volumeMounts:
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 4Gi}
