@@ -24,6 +24,9 @@ const (
 	SnapshotAgentService_GetOperation_FullMethodName    = "/snapshot_agent.v1alpha1.SnapshotAgentService/GetOperation"
 	SnapshotAgentService_Status_FullMethodName          = "/snapshot_agent.v1alpha1.SnapshotAgentService/Status"
 	SnapshotAgentService_WorkloadChannel_FullMethodName = "/snapshot_agent.v1alpha1.SnapshotAgentService/WorkloadChannel"
+	SnapshotAgentService_Suspend_FullMethodName         = "/snapshot_agent.v1alpha1.SnapshotAgentService/Suspend"
+	SnapshotAgentService_Resume_FullMethodName          = "/snapshot_agent.v1alpha1.SnapshotAgentService/Resume"
+	SnapshotAgentService_Kill_FullMethodName            = "/snapshot_agent.v1alpha1.SnapshotAgentService/Kill"
 )
 
 // SnapshotAgentServiceClient is the client API for SnapshotAgentService service.
@@ -51,6 +54,17 @@ type SnapshotAgentServiceClient interface {
 	// its own node, and Snapshot/Restore requests carrying an AppChannelConfig
 	// must be sent to that same agent.
 	WorkloadChannel(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[WorkloadMessage, AgentCommand], error)
+	// Suspend checkpoints and freezes a background (guest) job so that it holds
+	// no device memory. Asynchronous: returns an operation ID to poll with
+	// GetOperation. Fenced by epoch (see SuspendRequest).
+	Suspend(ctx context.Context, in *SuspendRequest, opts ...grpc.CallOption) (*SuspendResponse, error)
+	// Resume thaws and restores a suspended background (guest) job.
+	// Asynchronous and epoch-fenced like Suspend.
+	Resume(ctx context.Context, in *ResumeRequest, opts ...grpc.CallOption) (*ResumeResponse, error)
+	// Kill terminates every process of a job and confirms the device memory is
+	// free, from any job state. It carries no epoch and supersedes any running
+	// operation of the job. Asynchronous: returns an operation ID.
+	Kill(ctx context.Context, in *KillRequest, opts ...grpc.CallOption) (*KillResponse, error)
 }
 
 type snapshotAgentServiceClient struct {
@@ -114,6 +128,36 @@ func (c *snapshotAgentServiceClient) WorkloadChannel(ctx context.Context, opts .
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type SnapshotAgentService_WorkloadChannelClient = grpc.BidiStreamingClient[WorkloadMessage, AgentCommand]
 
+func (c *snapshotAgentServiceClient) Suspend(ctx context.Context, in *SuspendRequest, opts ...grpc.CallOption) (*SuspendResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SuspendResponse)
+	err := c.cc.Invoke(ctx, SnapshotAgentService_Suspend_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotAgentServiceClient) Resume(ctx context.Context, in *ResumeRequest, opts ...grpc.CallOption) (*ResumeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResumeResponse)
+	err := c.cc.Invoke(ctx, SnapshotAgentService_Resume_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotAgentServiceClient) Kill(ctx context.Context, in *KillRequest, opts ...grpc.CallOption) (*KillResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(KillResponse)
+	err := c.cc.Invoke(ctx, SnapshotAgentService_Kill_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SnapshotAgentServiceServer is the server API for SnapshotAgentService service.
 // All implementations must embed UnimplementedSnapshotAgentServiceServer
 // for forward compatibility.
@@ -139,6 +183,17 @@ type SnapshotAgentServiceServer interface {
 	// its own node, and Snapshot/Restore requests carrying an AppChannelConfig
 	// must be sent to that same agent.
 	WorkloadChannel(grpc.BidiStreamingServer[WorkloadMessage, AgentCommand]) error
+	// Suspend checkpoints and freezes a background (guest) job so that it holds
+	// no device memory. Asynchronous: returns an operation ID to poll with
+	// GetOperation. Fenced by epoch (see SuspendRequest).
+	Suspend(context.Context, *SuspendRequest) (*SuspendResponse, error)
+	// Resume thaws and restores a suspended background (guest) job.
+	// Asynchronous and epoch-fenced like Suspend.
+	Resume(context.Context, *ResumeRequest) (*ResumeResponse, error)
+	// Kill terminates every process of a job and confirms the device memory is
+	// free, from any job state. It carries no epoch and supersedes any running
+	// operation of the job. Asynchronous: returns an operation ID.
+	Kill(context.Context, *KillRequest) (*KillResponse, error)
 	mustEmbedUnimplementedSnapshotAgentServiceServer()
 }
 
@@ -163,6 +218,15 @@ func (UnimplementedSnapshotAgentServiceServer) Status(context.Context, *StatusRe
 }
 func (UnimplementedSnapshotAgentServiceServer) WorkloadChannel(grpc.BidiStreamingServer[WorkloadMessage, AgentCommand]) error {
 	return status.Error(codes.Unimplemented, "method WorkloadChannel not implemented")
+}
+func (UnimplementedSnapshotAgentServiceServer) Suspend(context.Context, *SuspendRequest) (*SuspendResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Suspend not implemented")
+}
+func (UnimplementedSnapshotAgentServiceServer) Resume(context.Context, *ResumeRequest) (*ResumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Resume not implemented")
+}
+func (UnimplementedSnapshotAgentServiceServer) Kill(context.Context, *KillRequest) (*KillResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Kill not implemented")
 }
 func (UnimplementedSnapshotAgentServiceServer) mustEmbedUnimplementedSnapshotAgentServiceServer() {}
 func (UnimplementedSnapshotAgentServiceServer) testEmbeddedByValue()                              {}
@@ -264,6 +328,60 @@ func _SnapshotAgentService_WorkloadChannel_Handler(srv interface{}, stream grpc.
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type SnapshotAgentService_WorkloadChannelServer = grpc.BidiStreamingServer[WorkloadMessage, AgentCommand]
 
+func _SnapshotAgentService_Suspend_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SuspendRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotAgentServiceServer).Suspend(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotAgentService_Suspend_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotAgentServiceServer).Suspend(ctx, req.(*SuspendRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotAgentService_Resume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotAgentServiceServer).Resume(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotAgentService_Resume_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotAgentServiceServer).Resume(ctx, req.(*ResumeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotAgentService_Kill_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(KillRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotAgentServiceServer).Kill(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotAgentService_Kill_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotAgentServiceServer).Kill(ctx, req.(*KillRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SnapshotAgentService_ServiceDesc is the grpc.ServiceDesc for SnapshotAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -286,6 +404,18 @@ var SnapshotAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Status",
 			Handler:    _SnapshotAgentService_Status_Handler,
+		},
+		{
+			MethodName: "Suspend",
+			Handler:    _SnapshotAgentService_Suspend_Handler,
+		},
+		{
+			MethodName: "Resume",
+			Handler:    _SnapshotAgentService_Resume_Handler,
+		},
+		{
+			MethodName: "Kill",
+			Handler:    _SnapshotAgentService_Kill_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
