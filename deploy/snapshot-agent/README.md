@@ -201,7 +201,10 @@ Enabling it adds:
     `mountPropagation: HostToContainer` so the init containers' mounts are
     visible. The agent's `EXPORT_FILE_PATH` and per-operation deadline
     (`DIRECT_MEMORY_OP_TIMEOUT_SEC`, `opTimeoutSec`, default 120 s) are set
-    from this block.
+    from this block. `cr_client` also has its own internal wait, set by
+    `GPU_CR_OP_TIMEOUT_SEC` (default 120 s); `opTimeoutSec` above 120 takes
+    effect only when `memoryRegions.opTimeoutSec` is raised to match (see
+    [Memory Regions](#gpu-cr-memory-regions-backend-memoryregions)).
 *   The `DirectMemoryBackend` feature gate, implied by
     `directMemory.enabled=true` (an explicit `featureGates` entry overrides
     the implied value).
@@ -224,14 +227,19 @@ Enabling it adds:
     *   `mount-ctl-tmpfs` — mounts a small tmpfs (`ctlTmpfsSizeMi`, default
         64) nested at `<hostCtlPath>/ctl` for the control files through
         which the agent's `cr_client` and the workload's preloader
-        coordinate. Both sides discover it through the store mount they
-        already share — no configuration on either side — and keeping
+        coordinate. Workloads discover it through the store mount they
+        already share, with no configuration. The chart also sets the
+        agent's `GPU_CR_CTL_PATH` to it, because the agent reads workload
+        pid maps there and garbage-collects control files left by exited
+        processes, and does not discover the dir on its own. Keeping
         control files off hugetlbfs is what lets the agent run with no
         hugepage request.
 
 The agent requests **no `hugepages-2Mi` at all**: dump bytes are written by
 the workload's own process, and the agent's control traffic stays on the
-tmpfs. That zero request is what lets the DaemonSet schedule on fresh nodes
+tmpfs. Its memory request and limit default to `directMemory.agentMemory`
+(576Mi: 512Mi base plus the control tmpfs cap, since tmpfs pages are charged
+to whichever cgroup first touches them) unless `resources` sets memory. That zero request is what lets the DaemonSet schedule on fresh nodes
 *before* hugepage capacity exists and absorb the hugepage bootstrap as an
 init container. (`directMemory.hugepagesResource` exists only for older
 GPU-CR builds that keep control files on the store, on nodes whose pool is
@@ -263,3 +271,54 @@ the agent, `cr_client`, and the preloader source always roll together.
 > non-Helm `timeslice-snapshot-agent` PriorityClass; `helm install` refuses
 > to adopt it. Delete it once before installing:
 > `kubectl delete priorityclass timeslice-snapshot-agent`.
+
+## GPU-CR Memory-Regions Backend (`memoryRegions.*`)
+
+The `memory_regions` backend checkpoints and restores **explicit ranges** of
+a workload's device memory into named snapshot slots, while the workload
+keeps running — the use case is swapping one set of weights for another
+(for example alternating LoRA adapters through a single vLLM slot) without
+parking the whole process. `direct_memory` (above) parks everything;
+`memory_regions` touches only the ranges the caller names.
+
+It is gated behind the `memoryRegions` values block and **disabled by
+default** — with `memoryRegions.enabled=false` the rendered chart is
+identical to a plain CUDA/app-backend deployment.
+
+```bash
+helm install snapshot-agent ./snapshot-agent \
+  --namespace timeslice-system \
+  --create-namespace \
+  --set memoryRegions.enabled=true
+```
+
+Both GPU-CR backends run on the same node plumbing, so **this block adds
+almost nothing of its own**. Everything described under
+[Direct Memory](#gpu-cr-direct-memory-backend-directmemory) — the shared
+checkpoint store, the hugetlbfs mount, the control tmpfs, the hugepage
+bootstrap, the PriorityClass, and the agent's zero hugepage request —
+renders identically when `memoryRegions.enabled=true`, configured by the
+same `directMemory.ctlDir` / `hostCtlPath` / `hugetlbfs.*` knobs. Enabling
+this backend does **not** require `directMemory.enabled=true`; enabling
+both renders one copy of the shared machinery, not two.
+
+What is specific to this block:
+
+*   The `MemoryRegionsBackend` feature gate, implied by
+    `memoryRegions.enabled=true` (an explicit `featureGates` entry
+    overrides the implied value).
+*   `GPU_CR_OP_TIMEOUT_SEC` (`memoryRegions.opTimeoutSec`, default 120 s) —
+    the per-`cr_client`-invocation deadline for this backend. It is not
+    independent of `direct_memory`'s: `cr_client` reads the same variable as
+    its own internal wait on every call from either backend, so with both
+    backends enabled it also caps `direct_memory`'s `cr_client` calls. Keep
+    it at least as large as `directMemory.opTimeoutSec`.
+
+Workload requirements are the same as for `direct_memory` (preloader,
+`hostPID`, the shared checkpoint dir, hugepages sized for its buffers),
+plus one addition: the caller must know the device addresses and sizes it
+wants checkpointed, because this backend does no discovery. See the
+backend section and the region/slot API in
+[guides/snapshot-agent](../../guides/snapshot-agent/README.md).
+`grpc.health.v1.Health/Check` with `service: "memory-regions"` reports
+whether `cr_client` is available.
