@@ -63,11 +63,6 @@ file(GLOB_RECURSE VGPU_SOURCE_FILES CONFIGURE_DEPENDS
 # Drop scratch sources.
 list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "-pre\\.cpp$")
 
-# vGPU.cpp still carries its own memcpy_multi definition; the standalone
-# TU exists so the GPU-free unit suite can exercise it, and joins this
-# library when the preloader refactor drops the in-file copy.
-list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "/memcpy_multi\\.cpp$")
-
 # Per-vendor backend exclusions.
 if(GPU_VENDOR STREQUAL "NVIDIA")
     list(FILTER VGPU_SOURCE_FILES EXCLUDE REGEX "/AMD/")
@@ -112,6 +107,9 @@ target_link_options(vGPU PRIVATE -shared -fPIC)
 # ---------------------------------------------------------------------------
 set(_COORD_COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
+    # multi_cr_client maps worker buffers at SHM_SIZE, a runtime value
+    # read from gpu_cr::Config().
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
 )
 
 add_executable(cr_client
@@ -139,11 +137,12 @@ target_link_libraries(multi_cr_client PRIVATE ${GPU_LIBS} dl stdc++ pthread)
 target_compile_options(multi_cr_client PRIVATE -O3 -g)
 
 # ---------------------------------------------------------------------------
-# Tests (GPU-free; run in Dockerfile.build and cloudbuild-test.yaml)
-#   gpu_cr_unit_tests        — GoogleTest unit suite for the config, ctl-path,
-#                              dump-format, granule-clamp and region-spec code,
-#                              plus the upstream-baseline control channel,
-#                              buffer mapping, fd exchange and memcpy_multi
+# Tests (GPU-free; run in Dockerfile.build)
+#   gpu_cr_unit_tests        — GoogleTest unit suite for the ctl-path,
+#                              dump-format, granule-clamp, region-spec and
+#                              runtime-config code, plus the
+#                              upstream-baseline control channel, buffer
+#                              mapping, fd exchange and memcpy_multi
 #   gpu_cr_deferred_tests    — deferred dump-buffer mode (GPU_CR_SHM_MB=0);
 #                              its own process because Config() is cached
 #   fake_workload            — GPU-free stand-in for the vGPU.so side of the

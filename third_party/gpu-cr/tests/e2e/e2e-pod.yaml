@@ -35,7 +35,7 @@ spec:
   initContainers:
   - name: fetch-baseline
     # Artifact-carrier image produced by tests/e2e/build_baseline_so.sh
-    image: asia-southeast1-docker.pkg.dev/PROJECT_ID/time-slicing/gpucr-so:baseline-e9bbb52
+    image: asia-southeast1-docker.pkg.dev/PROJECT_ID/time-slicing/gpucr-so:baseline-e9bbb52-shm5
     imagePullPolicy: Always
     command: [sh, -c, "cp /vGPU-NVIDIA.so /baseline/ && cp /cr_client /baseline/"]
     securityContext:

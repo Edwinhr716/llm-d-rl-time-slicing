@@ -103,9 +103,9 @@ void ShareMem::setup() {
         fprintf(stderr, "[ShareMem] dump buffer DEFERRED (GPU_CR_SHM=0): created on first buffer-path op at %zu MiB\n",
                 static_cast<size_t>(SHM_SIZE >> 20));
     } else {
-        fs_mutex.lock();
+        buf_mutex.lock();
         tmp_buf = map_dump_buffer(/*fatal=*/true);
-        fs_mutex.unlock();
+        buf_mutex.unlock();
     }
 
     // host_buf — follow same backend selection as the main staging buffer.
@@ -142,12 +142,21 @@ void* ShareMem::get_tmp_buf() {
     // creates the buffer at the floor size. Non-fatal: callers must
     // null-check and fail the op cleanly (op_status) — this runs in
     // signal-handler context and must not kill the workload on ENOMEM.
-    // Every deferred-mode access to tmp_buf goes through fs_mutex
+    // Every deferred-mode access to tmp_buf goes through buf_mutex
     // (setup() never touches it in this mode); the non-deferred read
     // stays lock-free — setup() wrote the pointer once, before any op
-    // path or handler existed.
+    // path or handler existed. try_lock, not lock: if the CR signal
+    // lands on a thread that is itself mid-materialization (an IPC verb
+    // holding buf_mutex), a blocking lock would deadlock the handler —
+    // contention instead fails THIS op cleanly, same contract as the
+    // gpu_mem_mutex EBUSY path.
     if (gpu_cr::Config().shm_deferred) {
-        std::lock_guard<std::mutex> lock(fs_mutex);
+        std::unique_lock<std::mutex> lock(buf_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            fprintf(stderr, "[ShareMem] dump buffer busy (materialization in flight "
+                            "on the signaled thread?); failing this op\n");
+            return nullptr;
+        }
         if (tmp_buf == nullptr)
             tmp_buf = map_dump_buffer(/*fatal=*/false);
         return tmp_buf;

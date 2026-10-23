@@ -68,7 +68,11 @@ const ctlMinAge = time.Minute
 // the backends and this sweeper so a rename happens in one place.
 const (
 	// EnvDataDir overrides the GPU-CR data dir (dump/staging buffers and
-	// the parent of the destination store).
+	// the parent of the destination store). The name lacks the GPU_CR_
+	// prefix because it is GPU-CR's own contract, read by the preloader
+	// inside the workload (vGPU.so) — both ends must agree on it
+	// byte-for-byte, so renaming it is an upstream GPU-CR change, not an
+	// agent-side choice.
 	EnvDataDir = "EXPORT_FILE_PATH"
 	// EnvGroupStore overrides the destination store location.
 	EnvGroupStore = "GPU_CR_GROUP_STORE"

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/logging"
@@ -95,6 +97,21 @@ type Controller struct {
 	infraOrchestrator InfrastructureOrchestrator
 	agentStore        store.SnapshotAgentStore
 	ResyncPeriod      time.Duration
+
+	// SettleTimeout bounds how long promotion of the next waiter is held
+	// while the current active job's grant is unconsumed (granted but never
+	// observed RUNNING). See waitForGrantSettlement.
+	SettleTimeout time.Duration
+
+	settleMu    sync.Mutex
+	settleSince map[string]settleEntry
+}
+
+// settleEntry remembers when a group's active job was first seen holding an
+// unconsumed grant, so the promotion hold is bounded per (group, job).
+type settleEntry struct {
+	jobID string
+	since time.Time
 }
 
 // NewController creates a new Controller with the provided stores, queue, and infrastructure orchestrator.
@@ -112,6 +129,8 @@ func NewController(
 		infraOrchestrator: infraOrchestrator,
 		agentStore:        agentStore,
 		ResyncPeriod:      30 * time.Second,
+		SettleTimeout:     30 * time.Second,
+		settleSince:       make(map[string]settleEntry),
 	}
 }
 
@@ -231,18 +250,64 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 		return fmt.Errorf("failed to try deducing active job: %w", err)
 	}
 
+	if err := c.waitForGrantSettlement(ctx, group); err != nil {
+		return err
+	}
+
 	if _, err := group.Spec().TryPromote(ctx); err != nil {
 		return fmt.Errorf("failed to promote next job: %w", err)
 	}
 
 	activeJob := group.Spec().ActiveJob()
 
-	// 3. Act
-	// TODO: add optional fan out parallelism for node reconciliation
-	for _, node := range group.Status().Nodes() {
-		if err := c.reconcileNode(ctx, group.ID(), node, activeJob); err != nil {
-			return fmt.Errorf("failed to reconcile node %s: %w", node, err)
-		}
+	// 3. Act: reconcile every node of the group CONCURRENTLY. On one node the
+	// work is sequential — early exits, then park (snapshot) any non-active job
+	// still holding context there, then restore the active job — but no node
+	// waits on a peer's pass. Multi-host checkpoint AND restore are slice-wide
+	// rendezvous (libtpu): the operation only completes once every host has the
+	// same operation in flight, so the concurrent per-node passes are what let
+	// the cohorts form (a serial issue-then-block loop parks the first host in
+	// the rendezvous forever). The snapshot rendezvous doubles as a natural
+	// barrier: no node reaches its restore before every node's snapshot is done.
+	//
+	// A failed trigger on one node cancels the peers' passes via cancelPeers:
+	// once a cohort member is missing, a rendezvoused operation can never
+	// complete, so waiting on the peers only burns into the agent-side
+	// operation timeout and escalates a retryable trigger error into a FAULTED
+	// job. Abort the whole pass instead and let the requeue retry it;
+	// already-triggered operations resolve agent-side and are re-observed at
+	// the start of the next pass.
+	//
+	// CAVEAT (asymmetric states): a node whose snapshot cannot run this pass
+	// (non-active job TRANSITIONING there) no longer blocks the peers'
+	// restores; a peer's restore then parks in the rendezvous until the next
+	// pass catches the node up. On the symmetric path (job loaded on every
+	// node of the slice) this does not occur.
+	nodes := group.Status().Nodes()
+	opCtx, cancelPeers := context.WithCancel(ctx)
+	defer cancelPeers()
+	nodeErrs := make([]error, len(nodes))
+	var wg sync.WaitGroup
+	for idx, node := range nodes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.ErrorContext(ctx, "Observed a panic", "panic", r, "stack", string(debug.Stack()))
+					nodeErrs[idx] = fmt.Errorf("panic while reconciling node %s: %v", node, r)
+					cancelPeers()
+				}
+			}()
+			if err := c.reconcileNode(opCtx, group.ID(), node, activeJob, cancelPeers); err != nil {
+				nodeErrs[idx] = fmt.Errorf("failed to reconcile node %s: %w", node, err)
+				cancelPeers()
+			}
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(nodeErrs...); err != nil {
+		return err
 	}
 
 	// 4. Update Status
@@ -255,8 +320,16 @@ func (c *Controller) reconcileGroup(ctx context.Context, groupID string) error {
 	return nil
 }
 
-// reconcileNode reconciles the state of a single node for the active job.
-func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activeJobID string) error {
+// reconcileNode reconciles the state of a single node: early exits, then
+// parks (snapshots) every non-active job still holding context on the node,
+// then restores the active job if its context is SAVED here. Snapshot-then-
+// restore is sequential ON the node; reconcileGroup runs one reconcileNode
+// per node concurrently so the slice-wide rendezvous cohorts can form.
+// cancelPeers aborts the peers' node passes when this node's trigger fails
+// (see reconcileGroup step 3).
+func (c *Controller) reconcileNode(
+	ctx context.Context, groupID, nodeName, activeJobID string, cancelPeers context.CancelFunc,
+) error {
 	ctx = logging.WithNodeName(ctx, nodeName)
 	jobs, err := c.jobStore.ListByGroup(ctx, groupID)
 	if err != nil {
@@ -295,61 +368,168 @@ func (c *Controller) reconcileNode(ctx context.Context, groupID, nodeName, activ
 		}
 	}
 
-	// 3. Ensure no other jobs have their context loaded
-	for jobID, state := range agentJobStates {
-		if jobID == activeJobID {
+	// 2. Park (snapshot) every non-active job still holding context on this
+	// node. Deterministic job order across nodes so multi-job rendezvous
+	// cohorts cannot interleave into a cross-node deadlock. A TRANSITIONING
+	// job cannot be snapshotted this pass, but must not block another job's
+	// snapshot: record it as a pending error so the group requeues (and this
+	// node's restore below stays blocked) while the node still makes progress.
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].JobID() < jobs[j].JobID() })
+	var pendingErrs []error
+	for _, job := range jobs {
+		if job.JobID() == activeJobID {
 			continue
 		}
-
-		switch state {
+		switch agentJobStates[job.JobID()] {
 		case pb.SnapshotAgentJobState_STATE_RUNNING:
-			slog.InfoContext(ctx, "Triggering snapshot for job", "jobID", jobID, "state", state)
-			resp, err := c.agentStore.Snapshot(ctx, nodeName, jobID, groupID)
-			if err != nil {
-				return fmt.Errorf("failed to trigger snapshot for job %s on node %s: %w", jobID, nodeName, err)
-			}
-			if err := c.waitForOperation(ctx, groupID, jobID, nodeName, resp.OperationId, "snapshot"); err != nil {
-				return fmt.Errorf("failed while waiting for snapshot operation %s for job %s on node %s: %w",
-					resp.OperationId, jobID, nodeName, err)
-			}
-			if err := c.observeNodeJobContext(ctx, groupID, nodeName); err != nil {
-				return fmt.Errorf("failed to refresh agent state after snapshot: %w", err)
+			if err := c.runAgentOperation(ctx, groupID, "snapshot", nodeName, job.JobID(), cancelPeers,
+				func(ctx context.Context) (string, error) {
+					resp, err := c.agentStore.Snapshot(ctx, nodeName, job.JobID(), groupID)
+					if err != nil {
+						return "", err
+					}
+					return resp.OperationId, nil
+				}); err != nil {
+				pendingErrs = append(pendingErrs, err)
 			}
 		case pb.SnapshotAgentJobState_STATE_IDLE:
 			// Pods exist but have no accelerator context — nothing resident
 			// to preempt. A job only touches the GPU while holding the lock,
 			// so a parked pre-provisioned job must not stall the active one.
-			slog.DebugContext(ctx, "Other job is IDLE (nothing resident), skipping", "jobID", jobID)
+			slog.DebugContext(ctx, "Other job is IDLE (nothing resident), skipping",
+				"jobID", job.JobID(), "node", nodeName)
 		case pb.SnapshotAgentJobState_STATE_TRANSITIONING:
-			slog.InfoContext(ctx, "Other job is TRANSITIONING, waiting for it to finish", "jobID", jobID)
-			return fmt.Errorf("preemption pending: job %s is currently transitioning", jobID)
+			slog.InfoContext(ctx, "Other job is TRANSITIONING, waiting for it to finish",
+				"jobID", job.JobID(), "node", nodeName)
+			pendingErrs = append(pendingErrs,
+				fmt.Errorf("preemption pending: job %s is currently transitioning on node %s", job.JobID(), nodeName))
 		}
 	}
+	if err := errors.Join(pendingErrs...); err != nil {
+		return err
+	}
 
+	// 3. Restore the active job if its context on this node is SAVED.
 	if activeJobID == "" {
 		return nil
 	}
+	activeJob, err := c.jobStore.Get(ctx, groupID, activeJobID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// No pods for this job yet (e.g. lock acquired before deploy); nothing to restore.
+			return nil
+		}
+		return fmt.Errorf("failed to get active job %s: %w", activeJobID, err)
+	}
+	if activeJob.ContextState()[nodeName] != pb.SnapshotAgentJobState_STATE_SAVED {
+		return nil
+	}
+	return c.runAgentOperation(ctx, groupID, "restore", nodeName, activeJobID, cancelPeers,
+		func(ctx context.Context) (string, error) {
+			resp, err := c.agentStore.Restore(ctx, nodeName, activeJobID, groupID)
+			if err != nil {
+				return "", err
+			}
+			return resp.OperationId, nil
+		})
+}
 
-	// 4. Ensure active job is loaded where there is available context
-	state, ok := agentJobStates[activeJobID]
-	if !ok || state != pb.SnapshotAgentJobState_STATE_SAVED {
+// waitForGrantSettlement holds promotion of the next waiter while the current
+// active job's grant is unconsumed: it was granted the group lock but has
+// never been observed RUNNING (its context state is still IDLE on a group
+// node). Such a job's engine may be seconds from touching the accelerator —
+// it registers IDLE when its pods appear and the watcher only reports PIDs on
+// its next poll — so promoting now would let the handoff restore another
+// job's context onto a device that is about to be occupied.
+//
+// This cannot reintroduce the cold-start deadlock (#137): parked
+// pre-provisioned jobs are never the ACTIVE job, so only the one job whose
+// grant is genuinely in flight is ever waited on, and the wait is bounded by
+// SettleTimeout for grants that never produce device activity (crashed
+// engine, a job that exited right after its grant).
+func (c *Controller) waitForGrantSettlement(ctx context.Context, group *store.Group) error {
+	groupID := group.ID()
+	active := group.Spec().ActiveJob()
+	// No hold unless a promotion is actually pending behind an active job.
+	if active == "" || group.Spec().LockingJob() != "" || group.Spec().GetWaitingJobQueue().Len() == 0 {
+		c.clearSettle(groupID)
 		return nil
 	}
 
-	slog.InfoContext(ctx, "Triggering restore for active job", "jobID", activeJobID, "state", state)
-	resp, err := c.agentStore.Restore(ctx, nodeName, activeJobID, groupID)
+	job, err := c.jobStore.Get(ctx, groupID, active)
 	if err != nil {
-		return fmt.Errorf("failed to trigger restore for active job %s on node %s: %w",
-			activeJobID, nodeName, err)
-	}
-	if err := c.waitForOperation(ctx, groupID, activeJobID, nodeName, resp.OperationId, "restore"); err != nil {
-		return fmt.Errorf("failed waiting for restore op %s for job %s on %s: %w",
-			resp.OperationId, activeJobID, nodeName, err)
-	}
-	if err := c.observeNodeJobContext(ctx, groupID, nodeName); err != nil {
-		return fmt.Errorf("failed to refresh agent state after restore: %w", err)
+		if errors.Is(err, store.ErrNotFound) {
+			// No pods -> nothing observable to wait on.
+			c.clearSettle(groupID)
+			return nil
+		}
+		return fmt.Errorf("failed to get active job %s: %w", active, err)
 	}
 
+	idleNode := ""
+	contextState := job.ContextState()
+	for _, node := range group.Status().Nodes() {
+		if contextState[node] == pb.SnapshotAgentJobState_STATE_IDLE {
+			idleNode = node
+			break
+		}
+	}
+	if idleNode == "" {
+		c.clearSettle(groupID)
+		return nil
+	}
+
+	c.settleMu.Lock()
+	entry, ok := c.settleSince[groupID]
+	if !ok || entry.jobID != active {
+		entry = settleEntry{jobID: active, since: time.Now()}
+		c.settleSince[groupID] = entry
+	}
+	c.settleMu.Unlock()
+
+	if waited := time.Since(entry.since); waited > c.SettleTimeout {
+		slog.WarnContext(ctx, "Active job's grant never produced device activity; proceeding with promotion",
+			"activeJob", active, "node", idleNode, "waited", waited)
+		c.clearSettle(groupID)
+		return nil
+	}
+
+	return fmt.Errorf("promotion pending: active job %s holds an unconsumed grant (IDLE on node %s); "+
+		"waiting for it to start or settle", active, idleNode)
+}
+
+func (c *Controller) clearSettle(groupID string) {
+	c.settleMu.Lock()
+	delete(c.settleSince, groupID)
+	c.settleMu.Unlock()
+}
+
+// runAgentOperation triggers one async agent operation on a node, polls it to
+// completion, and refreshes the node's agent state. A trigger failure cancels
+// the peer nodes' passes via cancelPeers: once a cohort member is missing, a
+// rendezvoused operation can never complete, so waiting on the peers only
+// burns into the agent-side operation timeout and escalates a retryable
+// trigger error into a FAULTED job (or, against an agent with no timeout,
+// parks this worker forever). Already-triggered operations resolve agent-side
+// and are re-observed at the start of the next pass.
+func (c *Controller) runAgentOperation(
+	ctx context.Context, groupID, opType, node, jobID string,
+	cancelPeers context.CancelFunc, trigger func(ctx context.Context) (string, error),
+) error {
+	slog.InfoContext(ctx, "Triggering agent operation for job",
+		"opType", opType, "jobID", jobID, "node", node)
+	opID, err := trigger(ctx)
+	if err != nil {
+		cancelPeers()
+		return fmt.Errorf("failed to trigger %s for job %s on node %s: %w", opType, jobID, node, err)
+	}
+	if err := c.waitForOperation(ctx, groupID, jobID, node, opID, opType); err != nil {
+		return fmt.Errorf("failed while waiting for %s operation %s for job %s on node %s: %w",
+			opType, opID, jobID, node, err)
+	}
+	if err := c.observeNodeJobContext(ctx, groupID, node); err != nil {
+		return fmt.Errorf("failed to refresh agent state after %s on %s: %w", opType, node, err)
+	}
 	return nil
 }
 

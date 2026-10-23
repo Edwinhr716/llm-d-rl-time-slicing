@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "common.h"
+#include "cr_signal_guard.h"
 #include "ctl_path.h"
 #include "dump_format.h"
 #include "comm/comm.h"
@@ -121,7 +122,7 @@ double ckpt() {
             required += ROUND_UP_2MB(entry.second);
         if (required > SHM_SIZE) {
             fprintf(stderr, "[vGPU-CKPT] Error: checkpoint needs %zu MiB but the dump buffer is "
-                            "%zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
+                            "%zu MiB (raise GPU_CR_SHM_MB / GPU_CR_SHM_GB); failing cleanly\n",
                     required >> 20, static_cast<size_t>(SHM_SIZE) >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
@@ -459,7 +460,17 @@ double ckpt_selective(const SelectiveCrRequest* req) {
         if (FindContainingAllocation(d, &base_ptr, &alloc_size)) {
             blocks_to_snapshot.insert(base_ptr);
         } else {
-            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] WARNING: ptr %p not in any allocated memory block, skipping\n", d);
+            // Reject, as the restore path does for the same condition: the
+            // region list is caller input, so an unresolvable pointer means
+            // the caller's view of the process is stale. Skipping it would
+            // release less than the caller asked for -- or nothing at all --
+            // and still report success, which reads at the scheduler as VRAM
+            // that is free when it is not. Nothing is open or released yet.
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: region ptr %p not in any live "
+                            "allocation; rejecting\n", d);
+            g_op_status = EINVAL;
+            fs_mutex.unlock();
+            return -1;
         }
     }
 
@@ -492,7 +503,7 @@ double ckpt_selective(const SelectiveCrRequest* req) {
         // mid-loop exit(-1).
         if (dump_total > fs_capacity) {
             fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: selective checkpoint needs %zu MiB but the "
-                            "dump buffer is %zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
+                            "dump buffer is %zu MiB (raise GPU_CR_SHM_MB / GPU_CR_SHM_GB); failing cleanly\n",
                     dump_total >> 20, fs_capacity >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
@@ -840,6 +851,81 @@ double restore_ptr_and_content() {
     return tot_size;
 }
 
+// Validates a selective dump's whole extent table before anything touches GPU
+// state or reads a byte of payload.
+//
+// ckpt_selective lays the extents out back to back from the end of the header,
+// one per live allocation, so a dump it wrote satisfies every check here by
+// construction; one that does not is torn or forged. That matters because the
+// offsets below are what index the mapping and the staging buffer later:
+// `fs->current_offset - start_offset` is unsigned, so a first extent claiming
+// to start past the end of the dump underflows to a huge length and the staged
+// copy reads far outside the mapping.
+//
+// Validating up front, rather than per entry inside the remap loop, also keeps
+// a bad entry from being caught only after earlier entries were already
+// remapped — which would leave the allocation set half-restored with no way
+// back. DumpHeaderPlausible covers only file_num and current_offset.
+static bool SelectiveDumpExtentsValid(const shared_mem_fs* fs, uint64_t file_num) {
+    // Inductive bound: expected <= fs->current_offset holds on entry and is
+    // re-established by the size check below, so every comparison is a
+    // subtraction against a known-larger value and no addition can overflow.
+    uint64_t expected = ROUND_UP_2MB(sizeof(shared_mem_fs));
+    if (fs->current_offset < expected) {
+        fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] dump ends at %lu, before its own header; rejecting\n",
+                (unsigned long)fs->current_offset);
+        return false;
+    }
+    for (uint64_t i = 0; i < file_num; i++) {
+        void* const ptr = fs->files[i].ptr;
+        const uint64_t size = fs->files[i].size;
+        if (fs->files[i].start_offset != expected) {
+            fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] dump entry %lu starts at %lu, expected %lu; "
+                            "extents must be contiguous\n",
+                    (unsigned long)i, (unsigned long)fs->files[i].start_offset,
+                    (unsigned long)expected);
+            return false;
+        }
+        if (size == 0 || size > fs->current_offset - expected) {
+            fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] dump entry %lu (%p) claims %lu bytes, which do "
+                            "not fit before the dump's end offset %lu; rejecting\n",
+                    (unsigned long)i, ptr, (unsigned long)size,
+                    (unsigned long)fs->current_offset);
+            return false;
+        }
+        // Exactly the live allocation, not merely inside one: ckpt_selective
+        // resolves every requested pointer to its whole containing allocation,
+        // so a partial extent means this dump did not come from that path.
+        auto it = allocated_memory.find(ptr);
+        if (it == allocated_memory.end() || it->second != size) {
+            fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] dump entry %lu (%p, size %lu) is not a live "
+                            "allocation of exactly that size; rejecting\n",
+                    (unsigned long)i, ptr, (unsigned long)size);
+            return false;
+        }
+        // Duplicate pointers would remap and overwrite the same allocation
+        // twice. Quadratic, but file_num is capped at MAX_FILE_NUM and this
+        // runs on the signal-handler path, where a hash set's allocation is
+        // the worse trade.
+        for (uint64_t j = 0; j < i; j++) {
+            if (fs->files[j].ptr == ptr) {
+                fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] dump entry %lu repeats pointer %p from "
+                                "entry %lu; rejecting\n", (unsigned long)i, ptr, (unsigned long)j);
+                return false;
+            }
+        }
+        expected += size;
+    }
+    // The staged copy runs from the first extent to current_offset, so a table
+    // that stops short would drag in bytes no entry claims.
+    if (expected != fs->current_offset) {
+        fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] extents end at %lu but the dump declares %lu; "
+                        "rejecting\n", (unsigned long)expected, (unsigned long)fs->current_offset);
+        return false;
+    }
+    return true;
+}
+
 double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
     // Same untrusted-request handling as ckpt_selective: NUL-termination
     // first, then a non-empty dest_path selects destination-file routing.
@@ -906,11 +992,30 @@ double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
             g_op_status = ENOMEM;
             return -1;
         }
+        // DestOpenForRestore bounds the header on the dest path; the per-PID
+        // buffer needs the same before anything indexes files[], which the
+        // extent walk below does using the header's own file_num. SHM_SIZE is
+        // the runtime buffer size, so this also catches an offset past a
+        // buffer shrunk by GPU_CR_SHM_MB.
+        if (!gpu_cr::DumpHeaderPlausible(fs->file_num, fs->current_offset,
+                                         static_cast<uint64_t>(SHM_SIZE))) {
+            fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: implausible dump header in the per-PID "
+                            "buffer (file_num=%lu current_offset=%lu); rejecting\n",
+                    (unsigned long)fs->file_num, (unsigned long)fs->current_offset);
+            g_op_status = EINVAL;
+            return -1;
+        }
     }
 
     uint64_t file_num = fs->file_num;
     fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] restore %lu selective regions from %s\n",
             file_num, dest_path ? dest_path : "(per-PID buffer)");
+
+    if (!SelectiveDumpExtentsValid(fs, file_num)) {
+        g_op_status = EINVAL;
+        if (dest_path) DestClose(&dm);
+        return -1;
+    }
 
     fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Remapping physical GPU memory...\n");
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -1049,11 +1154,16 @@ int get_id() {
     bool ctl_mode = false;
     const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
     snprintf(id_name, sizeof(id_name), "%s/control", ctl_dir);
-    int fd_id = open(id_name, O_CREAT | O_RDWR, 0755);
+    // Same cross-UID policy as the per-PID control files: the counter is
+    // shared by every workload on this ctl dir, and a 0755 first-creator
+    // mode would refuse O_RDWR to a later workload under a different uid.
+    // fchmod bypasses the umask; best-effort (non-owners cannot chmod).
+    int fd_id = open(id_name, O_CREAT | O_RDWR, 0777);
     if (fd_id < 0) {
         perror("open()");
         exit(EXIT_FAILURE);
     }
+    fchmod(fd_id, 0777);
     // The counter is a single atomic int: on the ctl tmpfs one 4KiB page
     // suffices (and frees the hugepage the legacy layout pinned); on
     // hugetlbfs the historical 2MiB sizing is kept.
@@ -1190,7 +1300,20 @@ void cr_signal_handler(int signum) {
     }
 
     uint32_t msg = comm->recv_msg();
-    gpu->pushContext();
+    // Mask every CR signal for the rest of the operation. A handler auto-blocks
+    // only its own signum, so a *different* CR signal could otherwise land on
+    // this thread while the op below holds gpu_mem_mutex; the nested handler's
+    // pushContext would then block forever on a non-recursive mutex its own
+    // thread already owns. pushContext masks only around its snapshot, which is
+    // too narrow — the mutex is held for the whole ckpt/restore. Holding the
+    // mask through popContext and FINISH_MSG means no nesting is possible until
+    // the op has been reported; a signal sent meanwhile stays pending and is
+    // delivered on return.
+    gpu_cr::ScopedBlockCrSignals op_signal_block;
+    // Pair the pop below with this handler's own push: pushContext leaves the
+    // stack untouched when it fails, and an unconditional pop would then
+    // consume a context an earlier handler pushed and failed to pop.
+    const bool context_pushed = gpu->pushContext() == 0;
     if(msg == SELECTIVE_CKPT_MSG) {
         ShareMemComm* scomm = static_cast<ShareMemComm*>(comm);
         const SelectiveCrRequest* req = &scomm->control->selective_req;
@@ -1279,7 +1402,7 @@ void cr_signal_handler(int signum) {
         }
         FinishOp(static_cast<ShareMemComm*>(comm));
     }
-    gpu->popContext();
+    if (context_pushed) gpu->popContext();
     comm->send_msg(FINISH_MSG);
 }
 

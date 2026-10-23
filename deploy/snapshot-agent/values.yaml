@@ -10,20 +10,15 @@ fullnameOverride: ""
 
 podAnnotations: {}
 
-# NO hugepages request since GPU-CR GEP-0001 + GEP-0006: the agent moves no
-# dump bytes (destination-path checkpoints run inside the workload's
-# preloader) and the cr_client control channel lives on the ctl tmpfs, so
-# no hugetlb page is ever faulted from this pod's cgroup. That zero request
-# is also what lets this DaemonSet schedule on fresh vanilla nodes BEFORE
-# hugepage capacity exists — which is why the hugepage bootstrap can run as
-# an initContainer here instead of a separate DaemonSet.
-# Memory = 512Mi base + the ctl tmpfs cap (worst case, tmpfs pages charge
-# the first-toucher cgroup, which can be this pod via cr_client).
-resources:
-  requests:
-    memory: "576Mi"
-  limits:
-    memory: "576Mi"
+# With either GPU-CR backend enabled, an unset memory request/limit here
+# defaults to directMemory.agentMemory; see there.
+resources: {}
+#  limits:
+#    cpu: 500m
+#    memory: 1Gi
+#  requests:
+#    cpu: 100m
+#    memory: 256Mi
 
 nodeSelector: {}
 
@@ -57,71 +52,24 @@ nvidia:
     hostPath: /dev
     mountPath: /dev
 
-# GPU-CR memory-regions backend machinery. Default disabled: the chart is
-# identical to a CUDA/app-backend deployment unless this is turned on.
-# All gpuCr.* and priorityClass.* settings below take effect only when
-# memoryRegions.enabled=true.
+# GPU-CR memory-regions backend: selective checkpoint/restore of explicit
+# device-memory ranges into named snapshot slots, while the workload keeps
+# running. Default disabled — the chart is identical to a CUDA/app-backend
+# deployment unless this is turned on.
+#
+# It runs on the SAME node plumbing as directMemory (shared checkpoint
+# store, control tmpfs, hugepage pool), so enabling either block renders
+# that machinery once and the directMemory.* knobs below configure it for
+# both. Turning this on does not require directMemory.enabled.
 memoryRegions:
   enabled: false
-  # LEGACY pre-GEP-0001 snapshot COPY store (tmpfs). Since GEP-0001 the
-  # agent copies no dump bytes — parked state lives in the destination
-  # group store under gpuCr.dataDir — so this is wired ONLY as a GC input:
-  # the agent TTL-reaps leftover copies from older agent versions here.
-  # Set legacySnapshots.enabled=false once no pre-GEP leftovers remain.
-  legacySnapshots:
-    enabled: true
-    snapshotDir: /var/snapshots # SNAPSHOT_DIR inside the agent
-    snapshotsHostPath: /dev/shm/gcr-snapshots
-
-gpuCr:
-  # hugetlbfs data mount: dump/staging buffers and the per-group destination
-  # store (groups/). Mounted at the SAME in-container path as in workload
-  # pods so -o path strings resolve to the same files in both namespaces.
-  dataDir:
-    hostPath: /var/tmp/huge-ckpt
-    mountPath: /mnt/huge-ckpt
-  # GEP-0006 control-plane tmpfs: control-<pid>, pid_map, ctl-ready
-  # advertisements. Mounted on the HOST at <dataDir.hostPath>/ctl — nested
-  # INSIDE the dump store — so workloads inherit it through the store
-  # volume they already mount and both binaries zero-config-discover it
-  # (no ctl env var, no extra volume on the workload side). hostPath and
-  # mountPath MUST stay <dataDir>/ctl for that discovery to hold, and NO
-  # TRAILING SLASH on any of these paths: the init container's idempotence
-  # check greps /proc/mounts for the exact string, so a trailing slash
-  # would stack a fresh tmpfs (and reset the id counter) on every agent
-  # restart.
-  ctl:
-    hostPath: /var/tmp/huge-ckpt/ctl
-    mountPath: /mnt/huge-ckpt/ctl
-    sizeMi: 64
-    # Where a pre-nesting deployment mounted the ctl tmpfs. On an in-place
-    # layout switch the init container bind-mounts THAT filesystem at the
-    # nested path, preserving the node-global id counter and live control
-    # files; a fresh tmpfs is created only when none exists.
-    legacyHostPath: /var/tmp/gpu-cr-ctl
-    # Also expose the nested tmpfs at legacyHostPath (matters on FRESH
-    # nodes), for not-yet-updated workload manifests that still set
-    # GPU_CR_CTL_PATH and mount the old path. Disable once every workload
-    # manifest is stripped of ctl config.
-    legacyBind: false
-  # Runtime hugepage provisioning (absorbs the former hugepages-bootstrap
-  # DaemonSet): writes nr_hugepages and restarts the kubelet once per node
-  # boot so the node publishes hugepages-2Mi capacity for WORKLOAD pods.
-  # Validated blast radius of the restart: zero (see
-  # docs/proposals/hugepages-runtime-bootstrap.md).
-  bootstrap:
-    enabled: true
-    # 12288 x 2Mi = 24Gi, sized for two GPU-CR processes built with
-    # SHM_SIZE_GB=8; use 30720 (60Gi) for two stock 25GiB builds.
-    pages2Mi: 12288
-  opTimeoutSec: 120 # GPU_CR_OP_TIMEOUT_SEC
-
-priorityClass:
-  # The bootstrap initContainer must win node placement over GPU workloads.
-  # Created (and referenced) only when memoryRegions.enabled=true.
-  create: true
-  name: timeslice-snapshot-agent
-  value: 900000000
+  # Per-cr_client-invocation timeout (GPU_CR_OP_TIMEOUT_SEC), the agent's
+  # deadline for this backend's cr_client calls. cr_client itself also
+  # reads GPU_CR_OP_TIMEOUT_SEC (default 120) as its own internal wait, on
+  # EVERY call from either backend: with both backends enabled this value
+  # also caps direct_memory's cr_client calls, so keep it at least as large
+  # as directMemory.opTimeoutSec.
+  opTimeoutSec: 120
 
 # Kubernetes-style feature gates (map of Name: bool), rendered into the
 # agent's FEATURE_GATES env var. Experimental capabilities are off by
@@ -142,10 +90,15 @@ featureGates: {}
 
 # GPU-CR direct_memory (full-process) backend machinery. Default disabled:
 # the chart is identical to a CUDA/app-backend deployment unless this is
-# turned on. Enabling it deploys the shared checkpoint-dir mount, hostIPC,
-# and implies the DirectMemoryBackend feature gate. The target workloads
-# must run under the GPU-CR vGPU preloader, with shm/hugepage capacity
-# sized for whole-VRAM dumps (the GPU-CR SHM_SIZE_GB build knob).
+# turned on. Enabling it deploys the checkpoint-dir mount shared with
+# workloads and implies the DirectMemoryBackend feature gate. The target
+# workloads must run under the GPU-CR vGPU preloader, with hugepage
+# capacity sized for whole-VRAM dumps.
+#
+# NOTE: the knobs in this block (ctlDir, hostCtlPath, hugetlbfs.*) configure
+# the node plumbing for BOTH GPU-CR backends — memoryRegions.enabled renders
+# the same mounts and init containers from these values, whether or not
+# directMemory itself is enabled.
 directMemory:
   enabled: false
   # Shared checkpoint/control dir (EXPORT_FILE_PATH inside the agent). Any
@@ -156,18 +109,75 @@ directMemory:
   # hugetlbfs.mount is on.
   hostCtlPath: /var/tmp/huge-ckpt
   hugetlbfs:
-    # Run the privileged nsenter init container that mounts hugetlbfs at
-    # hostCtlPath. Off by default: stock GPU-CR dumps into plain shm.
-    mount: false
+    # Mount hugetlbfs at hostCtlPath (privileged nsenter init container).
+    # On by default: GPU-CR pins its dump and staging files for DMA, which
+    # requires hugepage-backed files — this is where its checkpoint speed
+    # comes from. With this off, dumps land through this chart's hostPath
+    # in ordinary boot-disk page cache: unpinned, slow, and a disk-pressure
+    # risk at whole-VRAM sizes. Turn it off only if hostCtlPath already IS
+    # a hugetlbfs (the mount here is idempotent, so leaving it on is safe
+    # too) or you accept the degraded mode.
+    mount: true
     pagesize: 2M
-  # Optional hugetlb cgroup headroom for the agent itself, rendered as
+    # Control-plane tmpfs, mounted (with the hugetlbfs mount) nested at
+    # <hostCtlPath>/ctl. The agent's cr_client and the workload's preloader
+    # coordinate through small control files here; both discover the dir
+    # through the dump-store mount they already share, so workloads need no
+    # env var. The chart also points the agent at it with GPU_CR_CTL_PATH:
+    # the agent itself reads workload pid maps there and garbage-collects
+    # control files left by exited processes, and it does not discover the
+    # dir on its own. Keeping control files on tmpfs instead of the
+    # hugetlbfs store is what lets this pod run with no hugepage request.
+    ctlTmpfsSizeMi: 64
+    # Runtime hugepage provisioning (initContainer, takes effect only when
+    # mount is on): writes nr_hugepages and restarts the kubelet once per
+    # node boot so the node publishes hugepages-2Mi capacity for WORKLOAD
+    # pods. Validated: the restart does not disturb running pods, and the
+    # agent's zero-hugepage request is what lets this DaemonSet schedule on
+    # a fresh vanilla node BEFORE capacity exists. 2Mi pages only.
+    bootstrap:
+      enabled: true
+      # 12288 x 2Mi = 24Gi, sized for two GPU-CR processes built with
+      # SHM_SIZE_GB=8; use 30720 (60Gi) for two stock 25GiB builds.
+      pages2Mi: 12288
+  # Optional hugepage headroom for the agent pod itself, rendered as
   # hugepages-<pagesize>i requests/limits (plus a minimal memory request,
-  # which k8s requires alongside hugepages). Empty = none: for full-process
-  # checkpoints the dump is written by the workload's preloader, not the
-  # agent, so the agent normally needs no hugepage allowance.
+  # which Kubernetes requires alongside hugepages). Normally leave this
+  # empty: the agent never touches hugepage memory — dump bytes are written
+  # by the workload's own process, and the agent's helper keeps its control
+  # files on the tmpfs above — and the empty (zero-request) form is what
+  # lets this DaemonSet schedule on nodes before hugepage capacity exists.
+  # Set it only when running an older GPU-CR build that predates the
+  # control-file tmpfs, on nodes whose hugepage pool is already
+  # provisioned. Mutually exclusive with hugetlbfs.bootstrap (a pod that
+  # requests hugepages cannot schedule before its own bootstrap publishes
+  # capacity — the combination fails at render time).
   hugepagesResource: ""
-  # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC).
+  # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC), the
+  # agent's deadline for direct_memory's cr_client calls. cr_client has its
+  # own internal wait, set by GPU_CR_OP_TIMEOUT_SEC (default 120): values
+  # above 120 here take effect only when memoryRegions is also enabled with
+  # memoryRegions.opTimeoutSec raised to match.
   opTimeoutSec: 120
+  # Agent memory request and limit with either GPU-CR backend enabled,
+  # applied when resources sets no memory of its own: 512Mi base + the
+  # control tmpfs cap (tmpfs pages are charged to whichever cgroup first
+  # touches them, which can be this pod). Deliberately NO hugepages
+  # request: the agent moves no dump bytes (the workload's own process
+  # writes them) and its control files live on the control tmpfs, so no
+  # hugepage is ever charged to this pod. That zero request is what lets
+  # the DaemonSet schedule on a fresh node BEFORE hugepage capacity exists,
+  # which in turn lets the hugepage bootstrap run as one of its init
+  # containers.
+  agentMemory: 576Mi
+
+priorityClass:
+  # The bootstrap initContainer must win node placement over GPU workloads.
+  # Created (and referenced) only when the hugetlbfs bootstrap is active
+  # (directMemory.enabled + hugetlbfs.mount + hugetlbfs.bootstrap.enabled).
+  create: true
+  name: timeslice-snapshot-agent
+  value: 900000000
 
 rbac:
   create: true

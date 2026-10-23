@@ -191,6 +191,21 @@ ADV="$CTL/ctl-ready-$FAKE_PID"
 sed -i 's/starttime=[0-9]*/starttime=1/' "$ADV"
 check "gate: starttime mismatch (PID reuse) -> refused" 3 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
 
+# --- forged advertisement: owner uid mismatch -> refused ----------------------
+# A co-tenant on a shared ctl dir cannot vouch for a victim PID: the advert
+# must be owned by the same uid the target process runs as. chown needs
+# root, so skip (never fail) elsewhere — the Docker gate runs as root.
+if [ "$(id -u)" = 0 ]; then
+    start_fake $CTL_ENV
+    # forge: right content, wrong owner (recompute the path — start_fake
+    # gave us a fresh FAKE_PID and a fresh advert)
+    chown 65534:65534 "$CTL/ctl-ready-$FAKE_PID"
+    check "gate: advert owner mismatch (forged) -> refused" 3 \
+        env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS"
+else
+    echo "SKIP: forged-advert scenario (needs root for chown)"
+fi
+
 # --- broken ctl path is refused loudly ---------------------------------------
 start_fake "EXPORT_FILE_PATH=$WORK"      # fake in legacy mode
 check "gate: non-tmpfs GPU_CR_CTL_PATH -> refused" 3 \

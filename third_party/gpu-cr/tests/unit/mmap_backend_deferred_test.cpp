@@ -94,6 +94,21 @@ TEST_F(MmapBackendDeferredTest, FirstGetTmpBufMaterializesAtFloor) {
   EXPECT_EQ(backend.get_tmp_buf(), buf);
 }
 
+// The try_lock contract: if buf_mutex is already held (a materialization
+// in flight on another thread — or, in the real library, on the very
+// thread a CR signal interrupted), the op fails cleanly with nullptr
+// instead of blocking; once the lock is free the next op succeeds.
+TEST_F(MmapBackendDeferredTest, ContendedMaterializationFailsCleanly) {
+  ShareMem backend(kId);
+  backend.setup();
+
+  backend.buf_mutex.lock();
+  EXPECT_EQ(backend.get_tmp_buf(), nullptr);
+  backend.buf_mutex.unlock();
+
+  EXPECT_NE(backend.get_tmp_buf(), nullptr);
+}
+
 // The non-fatal contract: a failed materialization reports nullptr and
 // leaves the process alive; once the data dir is usable again the next
 // buffer-path op retries and succeeds.

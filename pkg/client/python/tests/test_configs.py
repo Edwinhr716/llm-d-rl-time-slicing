@@ -3,11 +3,14 @@
 import unittest
 
 from timeslice.snapshot_agent import (
+    MemoryRegion,
     app_channel_config,
     app_endpoint_config,
     cuda_config,
     direct_memory_config,
+    memory_regions_config,
     sglang_config,
+    tpu_config,
     vllm_config,
 )
 from timeslice.snapshot_agent import snapshot_agent_pb2
@@ -25,6 +28,18 @@ class TestBackendConfigBuilders(unittest.TestCase):
         cfg = direct_memory_config([101, 102])
         self.assertEqual(cfg.WhichOneof("backend"), "direct_memory")
         self.assertEqual(list(cfg.direct_memory.explicit_target.pids), [101, 102])
+
+    def test_tpu_config_builds_explicit_target(self):
+        """Explicit PIDs land in tpu.explicit_target."""
+        cfg = tpu_config([101, 102])
+        self.assertEqual(cfg.WhichOneof("backend"), "tpu")
+        self.assertEqual(list(cfg.tpu.explicit_target.pids), [101, 102])
+
+    def test_tpu_config_omits_target_when_pids_not_given(self):
+        """Omitting pids leaves tpu.explicit_target unset (k8s discovery)."""
+        cfg = tpu_config()
+        self.assertEqual(cfg.WhichOneof("backend"), "tpu")
+        self.assertFalse(cfg.tpu.HasField("explicit_target"))
 
     def test_cuda_config_omits_target_when_pids_not_given(self):
         """Omitting pids leaves cuda.explicit_target unset (k8s discovery)."""
@@ -44,6 +59,8 @@ class TestBackendConfigBuilders(unittest.TestCase):
             cuda_config([])
         with self.assertRaises(ValueError):
             direct_memory_config([])
+        with self.assertRaises(ValueError):
+            tpu_config([])
 
     def test_rejects_non_positive_pids(self):
         """Zero and negative PIDs are rejected."""
@@ -60,6 +77,19 @@ class TestBackendConfigBuilders(unittest.TestCase):
                 cuda_config(pids)
             with self.assertRaises((ValueError, TypeError)):
                 direct_memory_config(pids)
+
+    def test_memory_regions_config_builds_regions(self):
+        """Regions and snapshot_name land in the memory_regions oneof."""
+        cfg = memory_regions_config(
+            [MemoryRegion(pid=123, address=0x7F00, size_bytes=1024)],
+            snapshot_name="slot-a",
+        )
+        self.assertEqual(cfg.WhichOneof("backend"), "memory_regions")
+        self.assertEqual(cfg.memory_regions.snapshot_name, "slot-a")
+        region = cfg.memory_regions.regions[0]
+        self.assertEqual(region.pid, 123)
+        self.assertEqual(region.address, 0x7F00)
+        self.assertEqual(region.size_bytes, 1024)
 
     def test_app_endpoint_config_builds_full_config(self):
         cfg = app_endpoint_config(

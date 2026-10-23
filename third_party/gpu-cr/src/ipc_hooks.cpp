@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 #undef cudaGetDriverEntryPoint
 #include <dlfcn.h>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,7 +41,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-extern CUcontext g_application_context;
+extern std::atomic<CUcontext> g_application_context;
 
 // ---------------------------------------------------------------------------
 // Internal data structures
@@ -671,8 +672,13 @@ struct HookEntry {
 
 using cudaLaunchKernel_fn = cudaError_t (*)(const void*, dim3, dim3, void**, size_t, cudaStream_t);
 using cuLaunchKernel_fn = CUresult (*)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, CUstream, void**, void**);
+// The extended-launch entry points and their config structs arrived in CUDA
+// 12; the rest of this file still compiles against CUDA 11 headers, so every
+// site that names them is guarded the same way.
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
 using cuLaunchKernelEx_fn = CUresult (*)(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
 using cudaLaunchKernelExC_fn = cudaError_t (*)(const cudaLaunchConfig_t* config, const void* func, void** args);
+#endif
 using cudaGetLastError_fn = cudaError_t (*)();
 using cudaPeekAtLastError_fn = cudaError_t (*)();
 using cudaStreamSynchronize_fn = cudaError_t (*)(cudaStream_t);
@@ -685,9 +691,11 @@ static cudaLaunchKernel_fn real_cudaLaunchKernel = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel = nullptr;
 static cudaLaunchKernel_fn real_cudaLaunchKernel_ptsz = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel_ptsz = nullptr;
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
 static cuLaunchKernelEx_fn real_cuLaunchKernelEx = nullptr;
 static cudaLaunchKernelExC_fn real_cudaLaunchKernelExC = nullptr;
 static cudaLaunchKernelExC_fn real_cudaLaunchKernelExC_ptsz = nullptr;
+#endif
 static cudaLaunchKernel_fn real___cudaLaunchKernel = nullptr;
 static cudaLaunchKernel_fn real___cudaLaunchKernel_ptsz = nullptr;
 static cudaGetLastError_fn real_cudaGetLastError = nullptr;
@@ -703,9 +711,11 @@ extern "C" cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blo
 extern "C" CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
 extern "C" cudaError_t cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
 extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
 extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args);
 extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args);
+#endif
 extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" cudaError_t cudaGetLastError();
@@ -729,9 +739,11 @@ static HookEntry g_hook_table[] = {
     {"cuLaunchKernel",                 (void*)(cuLaunchKernel_fn)cuLaunchKernel,     (void**)&real_cuLaunchKernel},
     {"cudaLaunchKernel_ptsz",          (void*)(cudaLaunchKernel_fn)cudaLaunchKernel_ptsz, (void**)&real_cudaLaunchKernel_ptsz},
     {"cuLaunchKernel_ptsz",            (void*)(cuLaunchKernel_fn)cuLaunchKernel_ptsz,     (void**)&real_cuLaunchKernel_ptsz},
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
     {"cuLaunchKernelEx",               (void*)(cuLaunchKernelEx_fn)cuLaunchKernelEx, (void**)&real_cuLaunchKernelEx},
     {"cudaLaunchKernelExC",            (void*)(cudaLaunchKernelExC_fn)cudaLaunchKernelExC, (void**)&real_cudaLaunchKernelExC},
     {"cudaLaunchKernelExC_ptsz",       (void*)(cudaLaunchKernelExC_fn)cudaLaunchKernelExC_ptsz, (void**)&real_cudaLaunchKernelExC_ptsz},
+#endif
     {"__cudaLaunchKernel",             (void*)(cudaLaunchKernel_fn)__cudaLaunchKernel, (void**)&real___cudaLaunchKernel},
     {"__cudaLaunchKernel_ptsz",        (void*)(cudaLaunchKernel_fn)__cudaLaunchKernel_ptsz, (void**)&real___cudaLaunchKernel_ptsz},
     {"cudaGetLastError",               (void*)cudaGetLastError,                    (void**)&real_cudaGetLastError},
@@ -745,12 +757,22 @@ static HookEntry g_hook_table[] = {
     {nullptr, nullptr, nullptr}
 };
 
+// The table holds symbols this library defines itself, so a resolver that
+// searched the global scope can hand back our own interposer. Caching that as
+// the "real" function makes the hook call itself; keep the previously cached
+// pointer instead.
+static bool IsSelf(const HookEntry& entry, void* resolved) {
+    return resolved == entry.hook_fn;
+}
+
 static void try_intercept(const char* symbol, void** funcPtr) {
     if (!symbol || !funcPtr || !*funcPtr) return;
     for (int i = 0; g_hook_table[i].symbol != nullptr; i++) {
         if (strcmp(symbol, g_hook_table[i].symbol) == 0) {
-            *(g_hook_table[i].real_fn_storage) = *funcPtr;
-            fprintf(stderr, "[IPC-HOOK] Intercepted %s (real=%p)\n", symbol, *funcPtr);
+            if (!IsSelf(g_hook_table[i], *funcPtr)) {
+                *(g_hook_table[i].real_fn_storage) = *funcPtr;
+                fprintf(stderr, "[IPC-HOOK] Intercepted %s (real=%p)\n", symbol, *funcPtr);
+            }
             *funcPtr = g_hook_table[i].hook_fn;
             return;
         }
@@ -818,7 +840,10 @@ extern "C" void* dlsym(void* handle, const char* symbol) {
                 g_inside_dlsym_hook = true;
                 void* real_symbol = real_dlsym(handle, symbol);
                 g_inside_dlsym_hook = false;
-                if (real_symbol) {
+                // RTLD_DEFAULT searches the global scope, which this
+                // LD_PRELOADed library heads: the lookup can resolve back to
+                // our own interposer. Only cache a pointer that is not us.
+                if (real_symbol && !IsSelf(g_hook_table[i], real_symbol)) {
                     *(g_hook_table[i].real_fn_storage) = real_symbol;
                     fprintf(stderr, "[IPC-HOOK] dlsym intercepted %s (real=%p handle=%p)\n",
                             symbol, real_symbol, handle);
@@ -940,26 +965,35 @@ bool TraceLaunches() {
     return enabled;
 }
 
-// Shared body for the kernel-launch hooks: The application issues launches from a
-// context captured at cudaMalloc time (g_application_context); when the calling
-// thread's current context differs, the launch is bracketed by a push/pop
-// of the captured context so the kernel lands where the allocations live.
+// Shared body for the kernel-launch hooks: a thread with no current CUDA
+// context borrows the application's context (captured at first allocation) for
+// the duration of the launch, so the kernel lands where the allocations live.
+//
+// A thread that already has a context current keeps it. g_application_context
+// is process-global and records only the first allocation's context, so it is
+// no evidence that some other live context is the wrong one — the launch's
+// function and stream handles belong to the caller's context, and overriding
+// it is what would break the launch. Filling in an absent context is safe
+// because there is nothing to contradict.
 template <typename Fn>
 auto LaunchInCapturedContext(const char* name, Fn&& call) -> decltype(call()) {
     CUcontext ctx = nullptr;
-    cuCtxGetCurrent(&ctx);  // feeds the mismatch check below, not just tracing
+    cuCtxGetCurrent(&ctx);  // feeds the check below, not just tracing
     if (TraceLaunches()) {
         fprintf(stderr, "[HOOK] %s: current ctx=%p\n", name, ctx);
         fflush(stderr);
     }
 
+    // One snapshot drives the decision, the log line and the push: an
+    // allocation on another thread may publish a context between them.
+    const CUcontext captured = g_application_context.load(std::memory_order_acquire);
     bool pushed = false;
-    if (g_application_context != nullptr && ctx != g_application_context) {
+    if (ctx == nullptr && captured != nullptr) {
         if (TraceLaunches()) {
-            fprintf(stderr, "[HOOK] %s: context mismatch (current=%p, captured=%p), pushing captured\n",
-                    name, ctx, g_application_context);
+            fprintf(stderr, "[HOOK] %s: no current context, pushing captured %p\n",
+                    name, captured);
         }
-        if (cuCtxPushCurrent(g_application_context) == CUDA_SUCCESS) {
+        if (cuCtxPushCurrent(captured) == CUDA_SUCCESS) {
             pushed = true;
         }
     }
@@ -1028,6 +1062,7 @@ extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(CUfunction f, unsigned int gridD
     });
 }
 
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
 extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
     ResolveReal(&real_cuLaunchKernelEx, "cuLaunchKernelEx");
     return LaunchInCapturedContext("cuLaunchKernelEx", [&]() -> CUresult {
@@ -1051,6 +1086,7 @@ extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config
                                              : cudaErrorUnknown;
     });
 }
+#endif  // CUDA_VERSION >= 12000
 
 extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream) {
     ResolveReal(&real___cudaLaunchKernel, "__cudaLaunchKernel");
@@ -2673,6 +2709,10 @@ int ipc_validate_all_mappings(const char* label) {
 }
 
 extern "C" CUresult CUDAAPI hook_cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
+    // cuda.h maps cuCtxCreate onto the versioned entry point, so that is what
+    // libcuda is expected to carry; the unversioned name is the fallback.
+    // ResolveReal is a no-op once the pointer is cached.
+    ResolveReal(&real_cuCtxCreate, "cuCtxCreate_v2");
     ResolveReal(&real_cuCtxCreate, "cuCtxCreate");
     if (!real_cuCtxCreate) return CUDA_ERROR_UNKNOWN;
     CUresult res = real_cuCtxCreate(pctx, flags, dev);
@@ -2689,9 +2729,22 @@ extern "C" CUresult CUDAAPI hook_cuCtxCreate(CUcontext* pctx, unsigned int flags
 extern "C" CUresult CUDAAPI hook_cuCtxDestroy(CUcontext ctx) {
     fprintf(stderr, "[HOOK] cuCtxDestroy destroying ctx=%p\n", ctx);
     fflush(stderr);
+    ResolveReal(&real_cuCtxDestroy, "cuCtxDestroy_v2");
     ResolveReal(&real_cuCtxDestroy, "cuCtxDestroy");
     if (!real_cuCtxDestroy) return CUDA_ERROR_UNKNOWN;
-    return real_cuCtxDestroy(ctx);
+    CUresult res = real_cuCtxDestroy(ctx);
+    if (res == CUDA_SUCCESS) {
+        // Drop the capture if this was it. The allocation path only fills
+        // g_application_context in when it is null, so a destroyed context
+        // would otherwise stay there for the rest of the process and get
+        // pushed by the launch bracket. The driver is free to hand the same
+        // handle back for a later context, so this is not merely a push that
+        // fails -- it can silently name the wrong context.
+        CUcontext expected = ctx;
+        g_application_context.compare_exchange_strong(
+            expected, nullptr, std::memory_order_acq_rel, std::memory_order_relaxed);
+    }
+    return res;
 }
 
 extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
@@ -2713,5 +2766,23 @@ extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRelease(CUdevice dev) {
     fflush(stderr);
     ResolveReal(&real_cuDevicePrimaryCtxRelease, "cuDevicePrimaryCtxRelease");
     if (!real_cuDevicePrimaryCtxRelease) return CUDA_ERROR_UNKNOWN;
-    return real_cuDevicePrimaryCtxRelease(dev);
+    CUresult res = real_cuDevicePrimaryCtxRelease(dev);
+    // Same stale-capture hazard as cuCtxDestroy, and the likelier one: the
+    // runtime API hands out the primary context, so that is usually what got
+    // captured, and it is torn down by the last release rather than by
+    // cuCtxDestroy. Release only destroys it once the refcount reaches zero,
+    // so ask. There is no dev->context map to consult, but the library is
+    // documented single-process/single-GPU, and clearing a capture that is
+    // still live is harmless -- a context-less thread just loses the bracket
+    // and behaves as it did before anything was captured.
+    if (res == CUDA_SUCCESS && g_application_context.load(std::memory_order_acquire) != nullptr) {
+        unsigned int flags = 0;
+        int active = 0;
+        if (cuDevicePrimaryCtxGetState(dev, &flags, &active) == CUDA_SUCCESS && !active) {
+            g_application_context.store(nullptr, std::memory_order_release);
+            fprintf(stderr, "[HOOK] primary context for dev=%d destroyed; dropped capture\n", dev);
+            fflush(stderr);
+        }
+    }
+    return res;
 }
