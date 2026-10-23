@@ -203,7 +203,8 @@ Enabling it adds:
     (`DIRECT_MEMORY_OP_TIMEOUT_SEC`, `opTimeoutSec`, default 120 s) are set
     from this block. `cr_client` also has its own internal wait, set by
     `GPU_CR_OP_TIMEOUT_SEC` (default 120 s); `opTimeoutSec` above 120 takes
-    effect only when `memoryRegions.opTimeoutSec` is raised to match (see
+    effect only when `memoryRegions.enabled=true` and
+    `memoryRegions.opTimeoutSec` is raised to match (see
     [Memory Regions](#gpu-cr-memory-regions-backend-memoryregions)).
 *   The `DirectMemoryBackend` feature gate, implied by
     `directMemory.enabled=true` (an explicit `featureGates` entry overrides
@@ -223,7 +224,10 @@ Enabling it adds:
         (`pagesize=2M,mode=0777`). GPU-CR pins its dump and staging files
         for DMA, which requires hugepage-backed files; without this mount
         every dump silently degrades to boot-disk page cache. Turn
-        `hugetlbfs.mount` off only if the path already is a hugetlbfs.
+        `hugetlbfs.mount` off only if the path already is a hugetlbfs. If
+        the host also already has the ctl tmpfs at `<hostCtlPath>/ctl`,
+        set `hugetlbfs.ctlPreMounted=true` so the agent still gets
+        `GPU_CR_CTL_PATH`.
     *   `mount-ctl-tmpfs` — mounts a small tmpfs (`ctlTmpfsSizeMi`, default
         64) nested at `<hostCtlPath>/ctl` for the control files through
         which the agent's `cr_client` and the workload's preloader
@@ -239,7 +243,8 @@ The agent requests **no `hugepages-2Mi` at all**: dump bytes are written by
 the workload's own process, and the agent's control traffic stays on the
 tmpfs. Its memory request and limit default to `directMemory.agentMemory`
 (576Mi: 512Mi base plus the control tmpfs cap, since tmpfs pages are charged
-to whichever cgroup first touches them) unless `resources` sets memory. That zero request is what lets the DaemonSet schedule on fresh nodes
+to whichever cgroup first touches them) unless `resources` sets memory; set
+it to `""` for no default. That zero request is what lets the DaemonSet schedule on fresh nodes
 *before* hugepage capacity exists and absorb the hugepage bootstrap as an
 init container. (`directMemory.hugepagesResource` exists only for older
 GPU-CR builds that keep control files on the store, on nodes whose pool is
