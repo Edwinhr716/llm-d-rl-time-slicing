@@ -16,6 +16,7 @@ package server_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -35,9 +36,11 @@ func TestWatcher(t *testing.T) {
 	// Save original functions and restore after tests
 	origGetK8sClient := podutils.GetK8sClient
 	origGetPodPIDs := podutils.GetPodPIDs
+	origGetPodGPUInfo := podutils.GetPodGPUInfo
 	defer func() {
 		podutils.GetK8sClient = origGetK8sClient
 		podutils.GetPodPIDs = origGetPodPIDs
+		podutils.GetPodGPUInfo = origGetPodGPUInfo
 	}()
 
 	os.Setenv("NODE_NAME", "test-node")
@@ -45,8 +48,11 @@ func TestWatcher(t *testing.T) {
 
 	tests := []struct {
 		name          string
+		accelType     string
+		residueMB     int
 		pods          []*corev1.Pod
 		mockPIDs      func(ctx context.Context, podName, namespace string) ([]int, error)
+		mockGPUInfo   func(ctx context.Context, podName, namespace string) (*podutils.PodGPUInfo, error)
 		expectedState map[string]pb.JobState // jobID -> expected state
 		expectedPIDs  map[string][]int       // jobID -> expected PIDs
 		timeout       time.Duration
@@ -137,25 +143,145 @@ func TestWatcher(t *testing.T) {
 			expectedState: map[string]pb.JobState{}, // No jobs expected
 			timeout:       1 * time.Second,
 		},
+		{
+			name:      "Transition to SAVED when VRAM is below residue threshold",
+			residueMB: 4096,
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod-offloaded",
+						Namespace: "default",
+						Labels: map[string]string{
+							podutils.JobIDLabel: "job-offloaded",
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "test-node",
+					},
+				},
+			},
+			mockGPUInfo: func(ctx context.Context, podName, namespace string) (*podutils.PodGPUInfo, error) {
+				return &podutils.PodGPUInfo{PIDs: []int{789}, TotalVRAMBytes: 2000 * 1024 * 1024}, nil
+			},
+			expectedState: map[string]pb.JobState{
+				"job-offloaded": pb.JobState_JOB_STATE_SAVED,
+			},
+			expectedPIDs: map[string][]int{
+				"job-offloaded": {789},
+			},
+			timeout: 3 * time.Second,
+		},
+		{
+			name:      "TPU discovery transitions to RUNNING on detected PIDs",
+			accelType: "tpu",
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod-tpu",
+						Namespace: "default",
+						Labels: map[string]string{
+							podutils.JobIDLabel: "job-tpu",
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "test-node",
+					},
+				},
+			},
+			mockGPUInfo: func(ctx context.Context, podName, namespace string) (*podutils.PodGPUInfo, error) {
+				t.Fatal("GetPodGPUInfo should not be called on TPU nodes")
+				return nil, errors.New("should not be called")
+			},
+			mockPIDs: func(ctx context.Context, podName, namespace string) ([]int, error) {
+				return []int{555}, nil
+			},
+			expectedState: map[string]pb.JobState{
+				"job-tpu": pb.JobState_JOB_STATE_RUNNING,
+			},
+			expectedPIDs: map[string][]int{
+				"job-tpu": {555},
+			},
+			timeout: 3 * time.Second,
+		},
+		{
+			name:      "Multi-pod job transitions to RUNNING if any pod exceeds threshold",
+			residueMB: 1024,
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod-multi-1",
+						Namespace: "default",
+						Labels: map[string]string{
+							podutils.JobIDLabel: "job-multi",
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "test-node",
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod-multi-2",
+						Namespace: "default",
+						Labels: map[string]string{
+							podutils.JobIDLabel: "job-multi",
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "test-node",
+					},
+				},
+			},
+			mockGPUInfo: func(ctx context.Context, podName, namespace string) (*podutils.PodGPUInfo, error) {
+				if podName == "pod-multi-1" {
+					return &podutils.PodGPUInfo{PIDs: []int{101}, TotalVRAMBytes: 200 * 1024 * 1024}, nil
+				}
+				return &podutils.PodGPUInfo{PIDs: []int{102}, TotalVRAMBytes: 2000 * 1024 * 1024}, nil
+			},
+			expectedState: map[string]pb.JobState{
+				"job-multi": pb.JobState_JOB_STATE_RUNNING,
+			},
+			expectedPIDs: map[string][]int{
+				"job-multi": {101, 102},
+			},
+			timeout: 3 * time.Second,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ACCELERATOR_TYPE", tc.accelType)
 			fakeClient := fakek8s.NewSimpleClientset()
 			podutils.GetK8sClient = func() (kubernetes.Interface, error) {
 				return fakeClient, nil
 			}
 
-			if tc.mockPIDs != nil {
+			switch {
+			case tc.mockGPUInfo != nil && tc.mockPIDs != nil:
+				podutils.GetPodGPUInfo = tc.mockGPUInfo
 				podutils.GetPodPIDs = tc.mockPIDs
-			} else {
+			case tc.mockGPUInfo != nil:
+				podutils.GetPodGPUInfo = tc.mockGPUInfo
+			case tc.mockPIDs != nil:
+				podutils.GetPodPIDs = tc.mockPIDs
+				podutils.GetPodGPUInfo = func(ctx context.Context, podName, namespace string) (*podutils.PodGPUInfo, error) {
+					pids, err := tc.mockPIDs(ctx, podName, namespace)
+					if err != nil {
+						return nil, err
+					}
+					return &podutils.PodGPUInfo{PIDs: pids, TotalVRAMBytes: 0}, nil
+				}
+			default:
 				podutils.GetPodPIDs = func(ctx context.Context, podName, namespace string) ([]int, error) {
 					return nil, nil
+				}
+				podutils.GetPodGPUInfo = func(ctx context.Context, podName, namespace string) (*podutils.PodGPUInfo, error) {
+					return &podutils.PodGPUInfo{PIDs: nil, TotalVRAMBytes: 0}, nil
 				}
 			}
 
 			state := sm.NewStateManager()
-			watcher, err := server.NewWatcher(fakeClient, state)
+			watcher, err := server.NewWatcher(fakeClient, state, tc.residueMB)
 			if err != nil {
 				t.Fatalf("Failed to create watcher: %v", err)
 			}

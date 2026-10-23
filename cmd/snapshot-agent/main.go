@@ -44,6 +44,9 @@ func main() {
 	defaultBackend := flag.String("default-backend", string(backends.BackendCuda),
 		"Backend used when a request carries no backend_config (the orchestrator never sends one, "+
 			"so this selects the backend for orchestrator-driven snapshots/restores)")
+	vramResidueThresholdMB := flag.Int("vram-residue-threshold-mb", 0,
+		"Maximum residual GPU memory (in MB) tolerated for an idle/parked job before considering it RUNNING. "+
+			"Default 0 (no residue tolerated, strict for cuda-checkpoint).")
 	flag.Parse()
 
 	depMode := *deploymentMode
@@ -155,11 +158,24 @@ func main() {
 		gpucr.StartSweeper(ctx, ctlDir, 10*time.Minute)
 	}
 
+	residueMB := *vramResidueThresholdMB
+	if envResidue := os.Getenv("VRAM_RESIDUE_THRESHOLD_MB"); envResidue != "" {
+		if v, err := strconv.Atoi(envResidue); err == nil {
+			residueMB = v
+		} else {
+			slog.WarnContext(ctx, "Invalid VRAM_RESIDUE_THRESHOLD_MB, ignoring", "val", envResidue, "error", err)
+		}
+	}
+	if residueMB < 0 {
+		slog.WarnContext(ctx, "Negative VRAM residue threshold specified, defaulting to 0", "specified", residueMB)
+		residueMB = 0
+	}
+
 	slog.InfoContext(ctx, "Starting Snapshot Agent",
 		"port", listenPort, "deploymentMode", depMode, "defaultBackend", defBackend,
-		"featureGates", featureGates.String())
+		"featureGates", featureGates.String(), "vramResidueThresholdMB", residueMB)
 	err = server.StartServer(
-		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates)
+		ctx, listenPort, registeredBackends, defBackend, depMode, channelRegistry, featureGates, residueMB)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to start server", "error", err)
 		os.Exit(1)

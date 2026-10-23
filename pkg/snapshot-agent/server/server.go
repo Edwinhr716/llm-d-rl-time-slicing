@@ -543,6 +543,7 @@ func StartServer(
 	deploymentMode string,
 	channelRegistry *backends.ChannelRegistry,
 	featureGates features.Gates,
+	vramResidueThresholdMB int,
 ) error {
 	lc := net.ListenConfig{}
 	lis, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
@@ -560,7 +561,7 @@ func StartServer(
 	srv := NewServer(backendMap, defaultBackend, deploymentMode, channelRegistry, featureGates)
 
 	// 3. Start the Watcher internally
-	watcher, err := NewWatcher(k8sClient, srv.state)
+	watcher, err := NewWatcher(k8sClient, srv.state, vramResidueThresholdMB)
 	if err != nil {
 		return fmt.Errorf("failed to create watcher: %w", err)
 	}

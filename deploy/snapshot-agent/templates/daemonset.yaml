@@ -144,6 +144,10 @@ spec:
                   fieldPath: spec.nodeName
             - name: AGENT_PORT
               value: {{ .Values.port | quote }}
+            {{- if .Values.vramResidueThresholdMB }}
+            - name: VRAM_RESIDUE_THRESHOLD_MB
+              value: {{ .Values.vramResidueThresholdMB | quote }}
+            {{- end }}
             {{- /* Feature gates: explicit values from .Values.featureGates,
                  with each backend block implying its own gate (deploying
                  the machinery is the opt-in). */}}

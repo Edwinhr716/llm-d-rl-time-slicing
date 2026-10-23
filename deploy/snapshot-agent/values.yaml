@@ -35,6 +35,13 @@ affinity: {}
 
 port: 9001
 
+# Maximum residual GPU memory (in MB) tolerated for an idle/parked job.
+# When 0 (default), any job with GPU activity is considered RUNNING (strict
+# default for cuda-checkpoint). When deploying for app-aware checkpointing
+# (e.g. app_channel), set this to the expected CUDA context residue (e.g. 4096)
+# so the agent distinguishes the active job from offloaded/parked jobs.
+vramResidueThresholdMB: 0
+
 securityContext:
   privileged: true
 

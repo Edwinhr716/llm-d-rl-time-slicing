@@ -342,3 +342,24 @@ func (sm *StateManager) TransitionToRunning(jobID string, pids []int) error {
 	job.PIDs = pids
 	return nil
 }
+
+// TransitionToSaved transitions a job from IDLE to SAVED and associates PIDs.
+func (sm *StateManager) TransitionToSaved(jobID string, pids []int) error {
+	sm.mu.Lock()
+	job, ok := sm.jobs[jobID]
+	sm.mu.Unlock()
+	if !ok {
+		return status.Errorf(codes.NotFound, "job %s not found", jobID)
+	}
+
+	job.mu.Lock()
+	defer job.mu.Unlock()
+
+	if job.State != pb.JobState_JOB_STATE_IDLE {
+		return status.Errorf(codes.FailedPrecondition, "job %s is not in IDLE state (current: %s)", jobID, job.State)
+	}
+
+	job.State = pb.JobState_JOB_STATE_SAVED
+	job.PIDs = pids
+	return nil
+}
