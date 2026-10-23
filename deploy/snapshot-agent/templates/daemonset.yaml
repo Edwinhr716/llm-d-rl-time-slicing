@@ -173,10 +173,11 @@ spec:
             # agent and the workloads see at the same path.
             - name: EXPORT_FILE_PATH
               value: {{ .Values.directMemory.ctlDir | quote }}
-            {{- if .Values.directMemory.hugetlbfs.mount }}
-            # The control tmpfs mounted by mount-ctl-tmpfs. GPU-CR's C++
-            # side finds it on its own; the agent's Go side (pid map
-            # lookup, control-file GC) only looks where this points.
+            {{- if or .Values.directMemory.hugetlbfs.mount .Values.directMemory.hugetlbfs.ctlPreMounted }}
+            # The control tmpfs (mounted by mount-ctl-tmpfs, or already on
+            # the host). GPU-CR's C++ side finds it on its own; the agent's
+            # Go side (pid map lookup, control-file GC) only looks where
+            # this points.
             - name: GPU_CR_CTL_PATH
               value: "{{ .Values.directMemory.ctlDir }}/ctl"
             {{- end }}
@@ -209,7 +210,7 @@ spec:
                    hugepages). */}}
             {{- $req := deepCopy (default (dict) .Values.resources.requests) }}
             {{- $lim := deepCopy (default (dict) .Values.resources.limits) }}
-            {{- if not (or (hasKey $req "memory") (hasKey $lim "memory")) }}
+            {{- if and .Values.directMemory.agentMemory (not (or (hasKey $req "memory") (hasKey $lim "memory"))) }}
             {{- $_ := set $req "memory" .Values.directMemory.agentMemory }}
             {{- $_ := set $lim "memory" .Values.directMemory.agentMemory }}
             {{- end }}
@@ -217,6 +218,7 @@ spec:
             {{- $hpKey := printf "hugepages-%si" .Values.directMemory.hugetlbfs.pagesize }}
             {{- $_ := set $req $hpKey .Values.directMemory.hugepagesResource }}
             {{- $_ := set $lim $hpKey .Values.directMemory.hugepagesResource }}
+            {{- if not (hasKey $req "memory") }}{{- $_ := set $req "memory" "256Mi" }}{{- end }}
             {{- end }}
             {{- toYaml (dict "requests" $req "limits" $lim) | nindent 12 }}
             {{- else }}

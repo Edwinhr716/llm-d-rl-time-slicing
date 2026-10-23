@@ -129,6 +129,10 @@ directMemory:
     # dir on its own. Keeping control files on tmpfs instead of the
     # hugetlbfs store is what lets this pod run with no hugepage request.
     ctlTmpfsSizeMi: 64
+    # Set true when mount is off and the host already has a tmpfs mounted
+    # at <hostCtlPath>/ctl, so the agent still gets GPU_CR_CTL_PATH. Leave
+    # false otherwise: GPU_CR_CTL_PATH must name a tmpfs.
+    ctlPreMounted: false
     # Runtime hugepage provisioning (initContainer, takes effect only when
     # mount is on): writes nr_hugepages and restarts the kubelet once per
     # node boot so the node publishes hugepages-2Mi capacity for WORKLOAD
@@ -168,7 +172,7 @@ directMemory:
   # hugepage is ever charged to this pod. That zero request is what lets
   # the DaemonSet schedule on a fresh node BEFORE hugepage capacity exists,
   # which in turn lets the hugepage bootstrap run as one of its init
-  # containers.
+  # containers. Set "" to apply no default.
   agentMemory: 576Mi
 
 priorityClass:
