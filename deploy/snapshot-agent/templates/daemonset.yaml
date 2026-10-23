@@ -173,6 +173,13 @@ spec:
             # agent and the workloads see at the same path.
             - name: EXPORT_FILE_PATH
               value: {{ .Values.directMemory.ctlDir | quote }}
+            {{- if .Values.directMemory.hugetlbfs.mount }}
+            # The control tmpfs mounted by mount-ctl-tmpfs. GPU-CR's C++
+            # side finds it on its own; the agent's Go side (pid map
+            # lookup, control-file GC) only looks where this points.
+            - name: GPU_CR_CTL_PATH
+              value: "{{ .Values.directMemory.ctlDir }}/ctl"
+            {{- end }}
             {{- end }}
             {{- if .Values.directMemory.enabled }}
             - name: DIRECT_MEMORY_OP_TIMEOUT_SEC
@@ -195,15 +202,22 @@ spec:
               containerPort: {{ .Values.port }}
               protocol: TCP
           resources:
-            {{- if and $gpucr .Values.directMemory.hugepagesResource }}
-            {{- /* Merge hugepages headroom into the configured resources
-                   (k8s requires a memory request alongside hugepages). */}}
-            {{- $hpKey := printf "hugepages-%si" .Values.directMemory.hugetlbfs.pagesize }}
+            {{- if $gpucr }}
+            {{- /* Default the memory request/limit to agentMemory unless
+                   resources sets either, and merge optional hugepages
+                   headroom (k8s requires a memory request alongside
+                   hugepages). */}}
             {{- $req := deepCopy (default (dict) .Values.resources.requests) }}
             {{- $lim := deepCopy (default (dict) .Values.resources.limits) }}
+            {{- if not (or (hasKey $req "memory") (hasKey $lim "memory")) }}
+            {{- $_ := set $req "memory" .Values.directMemory.agentMemory }}
+            {{- $_ := set $lim "memory" .Values.directMemory.agentMemory }}
+            {{- end }}
+            {{- if .Values.directMemory.hugepagesResource }}
+            {{- $hpKey := printf "hugepages-%si" .Values.directMemory.hugetlbfs.pagesize }}
             {{- $_ := set $req $hpKey .Values.directMemory.hugepagesResource }}
             {{- $_ := set $lim $hpKey .Values.directMemory.hugepagesResource }}
-            {{- if not (hasKey $req "memory") }}{{- $_ := set $req "memory" "256Mi" }}{{- end }}
+            {{- end }}
             {{- toYaml (dict "requests" $req "limits" $lim) | nindent 12 }}
             {{- else }}
             {{- toYaml .Values.resources | nindent 12 }}

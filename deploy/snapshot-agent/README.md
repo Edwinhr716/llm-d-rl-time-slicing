@@ -201,7 +201,10 @@ Enabling it adds:
     `mountPropagation: HostToContainer` so the init containers' mounts are
     visible. The agent's `EXPORT_FILE_PATH` and per-operation deadline
     (`DIRECT_MEMORY_OP_TIMEOUT_SEC`, `opTimeoutSec`, default 120 s) are set
-    from this block.
+    from this block. `cr_client` also has its own internal wait, set by
+    `GPU_CR_OP_TIMEOUT_SEC` (default 120 s); `opTimeoutSec` above 120 takes
+    effect only when `memoryRegions.opTimeoutSec` is raised to match (see
+    [Memory Regions](#gpu-cr-memory-regions-backend-memoryregions)).
 *   The `DirectMemoryBackend` feature gate, implied by
     `directMemory.enabled=true` (an explicit `featureGates` entry overrides
     the implied value).
@@ -224,14 +227,19 @@ Enabling it adds:
     *   `mount-ctl-tmpfs` — mounts a small tmpfs (`ctlTmpfsSizeMi`, default
         64) nested at `<hostCtlPath>/ctl` for the control files through
         which the agent's `cr_client` and the workload's preloader
-        coordinate. Both sides discover it through the store mount they
-        already share — no configuration on either side — and keeping
+        coordinate. Workloads discover it through the store mount they
+        already share, with no configuration. The chart also sets the
+        agent's `GPU_CR_CTL_PATH` to it, because the agent reads workload
+        pid maps there and garbage-collects control files left by exited
+        processes, and does not discover the dir on its own. Keeping
         control files off hugetlbfs is what lets the agent run with no
         hugepage request.
 
 The agent requests **no `hugepages-2Mi` at all**: dump bytes are written by
 the workload's own process, and the agent's control traffic stays on the
-tmpfs. That zero request is what lets the DaemonSet schedule on fresh nodes
+tmpfs. Its memory request and limit default to `directMemory.agentMemory`
+(576Mi: 512Mi base plus the control tmpfs cap, since tmpfs pages are charged
+to whichever cgroup first touches them) unless `resources` sets memory. That zero request is what lets the DaemonSet schedule on fresh nodes
 *before* hugepage capacity exists and absorb the hugepage bootstrap as an
 init container. (`directMemory.hugepagesResource` exists only for older
 GPU-CR builds that keep control files on the store, on nodes whose pool is
@@ -300,8 +308,11 @@ What is specific to this block:
     `memoryRegions.enabled=true` (an explicit `featureGates` entry
     overrides the implied value).
 *   `GPU_CR_OP_TIMEOUT_SEC` (`memoryRegions.opTimeoutSec`, default 120 s) —
-    the per-`cr_client`-invocation deadline for this backend, separate from
-    `direct_memory`'s so the two can be tuned independently.
+    the per-`cr_client`-invocation deadline for this backend. It is not
+    independent of `direct_memory`'s: `cr_client` reads the same variable as
+    its own internal wait on every call from either backend, so with both
+    backends enabled it also caps `direct_memory`'s `cr_client` calls. Keep
+    it at least as large as `directMemory.opTimeoutSec`.
 
 Workload requirements are the same as for `direct_memory` (preloader,
 `hostPID`, the shared checkpoint dir, hugepages sized for its buffers),

@@ -10,19 +10,15 @@ fullnameOverride: ""
 
 podAnnotations: {}
 
-# Deliberately NO hugepages request: with either GPU-CR backend the agent
-# moves no dump bytes (the workload's own process writes them) and its
-# control files live on the control tmpfs, so no hugepage is ever charged
-# to this pod. That zero request is what lets the DaemonSet schedule on a
-# fresh node BEFORE hugepage capacity exists, which in turn lets the
-# hugepage bootstrap run as one of its init containers.
-# Memory = 512Mi base + the control tmpfs cap (worst case: tmpfs pages are
-# charged to whichever cgroup first touches them, which can be this pod).
-resources:
-  requests:
-    memory: "576Mi"
-  limits:
-    memory: "576Mi"
+# With either GPU-CR backend enabled, an unset memory request/limit here
+# defaults to directMemory.agentMemory; see there.
+resources: {}
+#  limits:
+#    cpu: 500m
+#    memory: 1Gi
+#  requests:
+#    cpu: 100m
+#    memory: 256Mi
 
 nodeSelector: {}
 
@@ -67,9 +63,12 @@ nvidia:
 # both. Turning this on does not require directMemory.enabled.
 memoryRegions:
   enabled: false
-  # Per-cr_client-invocation timeout (GPU_CR_OP_TIMEOUT_SEC). Separate from
-  # directMemory.opTimeoutSec: the two backends are configured independently
-  # and the agent reads one env var per backend.
+  # Per-cr_client-invocation timeout (GPU_CR_OP_TIMEOUT_SEC), the agent's
+  # deadline for this backend's cr_client calls. cr_client itself also
+  # reads GPU_CR_OP_TIMEOUT_SEC (default 120) as its own internal wait, on
+  # EVERY call from either backend: with both backends enabled this value
+  # also caps direct_memory's cr_client calls, so keep it at least as large
+  # as directMemory.opTimeoutSec.
   opTimeoutSec: 120
 
 # Kubernetes-style feature gates (map of Name: bool), rendered into the
@@ -123,9 +122,12 @@ directMemory:
     # Control-plane tmpfs, mounted (with the hugetlbfs mount) nested at
     # <hostCtlPath>/ctl. The agent's cr_client and the workload's preloader
     # coordinate through small control files here; both discover the dir
-    # through the dump-store mount they already share — no env var on
-    # either side. Keeping control files on tmpfs instead of the hugetlbfs
-    # store is what lets this pod run with no hugepage request at all.
+    # through the dump-store mount they already share, so workloads need no
+    # env var. The chart also points the agent at it with GPU_CR_CTL_PATH:
+    # the agent itself reads workload pid maps there and garbage-collects
+    # control files left by exited processes, and it does not discover the
+    # dir on its own. Keeping control files on tmpfs instead of the
+    # hugetlbfs store is what lets this pod run with no hugepage request.
     ctlTmpfsSizeMi: 64
     # Runtime hugepage provisioning (initContainer, takes effect only when
     # mount is on): writes nr_hugepages and restarts the kubelet once per
@@ -151,8 +153,23 @@ directMemory:
   # requests hugepages cannot schedule before its own bootstrap publishes
   # capacity — the combination fails at render time).
   hugepagesResource: ""
-  # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC).
+  # Per-cr_client-invocation timeout (DIRECT_MEMORY_OP_TIMEOUT_SEC), the
+  # agent's deadline for direct_memory's cr_client calls. cr_client has its
+  # own internal wait, set by GPU_CR_OP_TIMEOUT_SEC (default 120): values
+  # above 120 here take effect only when memoryRegions is also enabled with
+  # memoryRegions.opTimeoutSec raised to match.
   opTimeoutSec: 120
+  # Agent memory request and limit with either GPU-CR backend enabled,
+  # applied when resources sets no memory of its own: 512Mi base + the
+  # control tmpfs cap (tmpfs pages are charged to whichever cgroup first
+  # touches them, which can be this pod). Deliberately NO hugepages
+  # request: the agent moves no dump bytes (the workload's own process
+  # writes them) and its control files live on the control tmpfs, so no
+  # hugepage is ever charged to this pod. That zero request is what lets
+  # the DaemonSet schedule on a fresh node BEFORE hugepage capacity exists,
+  # which in turn lets the hugepage bootstrap run as one of its init
+  # containers.
+  agentMemory: 576Mi
 
 priorityClass:
   # The bootstrap initContainer must win node placement over GPU workloads.
