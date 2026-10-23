@@ -22,16 +22,27 @@ external projects: see `third_party/forked/` in kubernetes/kubernetes,
 
 ## Local changes
 
-This copy carries test coverage for the imported upstream `e9bbb52` sources
-(the sources themselves are unchanged):
+This copy carries upstream `e9bbb52` plus the changes GPU time-slicing
+required, cleaned up and tested:
 
-- unit tests under `tests/unit/` for the GPU-free upstream-baseline pieces
-  (wire structs, control channel, buffer mapping, fd exchange)
-- e2e and perf-regression suites under `tests/` (see `tests/README.md`);
-  `Dockerfile.build` runs the GPU-free suite on every image build
+- memory-address (selective) checkpoint backend, unrounded allocation-size
+  dumps, and granule-chunked copies
+- destination-path selective checkpoints,
+  control channel off hugetlbfs (readiness advertisements),
+  runtime-sizable checkpoint buffers (`GPU_CR_SHM_GB`/`_MB`,
+  `GPU_CR_STAGING_MB`) — destination-path-only deployments should set
+  `GPU_CR_SHM_MB=0`: dest-path ops never touch the dump buffer, so
+  deferred mode drops the reservation entirely (pool sizing rule in
+  `src/gpu_cr_config.h`)
+- Google C++ Style Guide cleanup of the added code, and cr_client
+  hardening (`GPU_CR_CUDA_CHECKPOINT` override; restore fails on a failed
+  cuda-checkpoint toggle)
+- unit, integration, e2e and perf-regression suites under `tests/`
+  (see `tests/README.md`); `Dockerfile.build` runs the GPU-free suites on
+  every image build
 
 Like the original import, the prebuilt `cuda-checkpoint` binary is not
-vendored; deployments provide it.
+vendored; deployments provide it (or set `GPU_CR_CUDA_CHECKPOINT`).
 
 ## Licensing
 

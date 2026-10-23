@@ -9,6 +9,9 @@
 # freeze/thaw half is NVIDIA's binary — identical for both builds — and is
 # stubbed out so only GPU-CR code is measured.
 #
+# The candidate's selective-path timings are also recorded (informational:
+# no baseline exists for them in e9bbb52).
+#
 # Usage:
 #   perf_regression.sh --baseline-so SO --candidate-so SO \
 #       [--baseline-client BIN] [--candidate-client BIN] \
@@ -80,8 +83,12 @@ echo "perf regression: ${NUM_BUFFERS}x${BUFFER_MB}MiB buffers, $ITERS iters, thr
 
 # Perf tests run in the legacy (no-ctl) layout: the e9bbb52 baseline
 # predates the ctl-path control plane and both variants must see identical
-# plumbing.
+# plumbing. Unsetting the env is not enough on the nested-ctl pod layout —
+# the candidate would zero-config-discover $STORE/ctl — so dumps move to a
+# ctl-free subdirectory of the store (same hugetlbfs, no ctl/ inside).
 unset GPU_CR_CTL_PATH
+STORE="$STORE/perf-legacy"
+mkdir -p "$STORE"
 
 BASE=$(measure baseline "$BASELINE_SO" "$BASELINE_CLIENT") || exit 1
 CAND=$(measure candidate "$CANDIDATE_SO" "$CANDIDATE_CLIENT") || exit 1
@@ -91,6 +98,28 @@ EOF
 read -r _ CAND_CKPT CAND_RESTORE <<EOF
 $CAND
 EOF
+
+# Informational: candidate selective path (no e9bbb52 baseline exists).
+# Forward hook: needs a cr_client with selective support (-s); with a
+# baseline-only client the ops fail fast and both medians report -1.
+: > "$RUN/workload.stderr"
+if start_workload "$CANDIDATE_SO" \
+        E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" \
+        GPU_CR_SHM_MB="$SHM_MB"; then
+    env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" \
+        "$CANDIDATE_CLIENT" -i -p "$WL_PID" > /dev/null 2>&1
+    for i in $(seq 1 "$ITERS"); do
+        env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" \
+            "$CANDIDATE_CLIENT" -c -p "$WL_PID" -s "$WL_REGIONS" > /dev/null 2>&1
+        env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" \
+            "$CANDIDATE_CLIENT" -r -p "$WL_PID" -s "$WL_REGIONS" > /dev/null 2>&1
+    done
+    SEL_CKPT=$(extract_ms "$RUN/workload.stderr" "selective ckpt" | median)
+    SEL_RESTORE=$(extract_ms "$RUN/workload.stderr" "selective restore" | median)
+    stop_workload
+else
+    SEL_CKPT=-1; SEL_RESTORE=-1
+fi
 
 fail=0
 judge() { # <name> <base_ms> <cand_ms>
@@ -106,6 +135,7 @@ judge() { # <name> <base_ms> <cand_ms>
 echo
 judge "full ckpt data plane"    "$BASE_CKPT"    "$CAND_CKPT"
 judge "full restore data plane" "$BASE_RESTORE" "$CAND_RESTORE"
+echo "INFO: candidate selective ckpt median ${SEL_CKPT}ms, selective restore median ${SEL_RESTORE}ms"
 
 cat > "$RUN/perf-results.json" <<EOF
 {
@@ -114,6 +144,7 @@ cat > "$RUN/perf-results.json" <<EOF
   "threshold_pct": $THRESHOLD_PCT,
   "full_ckpt_ms":    {"baseline": $BASE_CKPT,    "candidate": $CAND_CKPT},
   "full_restore_ms": {"baseline": $BASE_RESTORE, "candidate": $CAND_RESTORE},
+  "selective_ms":    {"ckpt": $SEL_CKPT, "restore": $SEL_RESTORE},
   "pass": $((1 - fail))
 }
 EOF

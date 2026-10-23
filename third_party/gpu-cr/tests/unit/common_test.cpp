@@ -1,5 +1,6 @@
-// Shared-protocol helpers from common.h: the consume-once FINISH
-// bookkeeping and the wire-layout guards for the selective request.
+// Shared-protocol helpers from common.h: granule clamping, the
+// consume-once FINISH bookkeeping and the wire-layout guards for the
+// selective request.
 
 #include "common.h"
 
@@ -11,6 +12,53 @@
 
 namespace gpu_cr {
 namespace {
+
+TEST(GranuleClampLenTest, ZeroLengthStaysZero) {
+  // A clamp must never turn an empty copy into a 2MB one.
+  EXPECT_EQ(GranuleClampLen(0, 0), 0u);
+  EXPECT_EQ(GranuleClampLen(kVmmGranuleSize - 4, 0), 0u);
+}
+
+TEST(GranuleClampLenTest, ShortCopyFromAlignedStartUnclamped) {
+  EXPECT_EQ(GranuleClampLen(0, 4096), 4096u);
+}
+
+TEST(GranuleClampLenTest, FullGranuleFromAlignedStartUnclamped) {
+  EXPECT_EQ(GranuleClampLen(0, kVmmGranuleSize), kVmmGranuleSize);
+}
+
+TEST(GranuleClampLenTest, LongCopyClampedToGranule) {
+  EXPECT_EQ(GranuleClampLen(0, kVmmGranuleSize + 1), kVmmGranuleSize);
+}
+
+TEST(GranuleClampLenTest, UnalignedStartClampsToBoundary) {
+  // 4 bytes shy of a boundary: at most 4 bytes may be issued.
+  uintptr_t addr = kVmmGranuleSize - 4;
+  EXPECT_EQ(GranuleClampLen(addr, 4096), 4u);
+  EXPECT_EQ(GranuleClampLen(addr, 2), 2u);
+}
+
+TEST(GranuleClampLenTest, EveryClampEndsAlignedOrAtRegionEnd) {
+  // Walk a simulated 5MiB+3 region from an unaligned base the way the
+  // selective copy loops do, asserting the clamp invariant for each
+  // issued copy: <=2MB, and granule-aligned at its start or its end
+  // (or it is the final copy of the region).
+  uintptr_t addr = 12345;
+  size_t remaining = 5 * (1UL << 20) + 3;
+  int copies = 0;
+  while (remaining > 0) {
+    size_t len = GranuleClampLen(addr, remaining);
+    ASSERT_GT(len, 0u);
+    ASSERT_LE(len, kVmmGranuleSize);
+    bool start_aligned = (addr % kVmmGranuleSize) == 0;
+    bool end_aligned = ((addr + len) % kVmmGranuleSize) == 0;
+    bool is_final = (len == remaining);
+    ASSERT_TRUE(start_aligned || end_aligned || is_final);
+    addr += len;
+    remaining -= len;
+    ASSERT_LT(++copies, 100);
+  }
+}
 
 // FinishOpControls is the only writer of op_status: op sites hand it a
 // positive errno (or 0), and it stores kOpStatusOk or the negated errno,

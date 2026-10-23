@@ -11,6 +11,7 @@ SPEC="$RUN/spec"
 CMD="$RUN/cmd"
 RESP="$RUN/resp"
 WL_PID=""
+WL_REGIONS=""
 SEQ=0
 
 # start_workload <vgpu_so> [ENV=VAL ...]
@@ -37,6 +38,7 @@ start_workload() {
     done
     [ -s "$SPEC" ] || { echo "FATAL: workload spec never appeared" >&2; return 1; }
     WL_PID=$(sed -n 1p "$SPEC")
+    WL_REGIONS=$(sed -n 2p "$SPEC")
     return 0
 }
 
@@ -65,8 +67,11 @@ stop_workload() {
     # hugetlbfs pages are freed only when the backing files go away: purge
     # the per-run buffers or back-to-back runs exhaust the pool. NOTE:
     # clears every ckpt-*/control*/pid_map_* under $STORE — point STORE
-    # at a dedicated volume, not a shared store.
-    rm -f "$STORE"/ckpt-* "$STORE"/control* "$STORE"/pid_map_* 2>/dev/null
+    # at a dedicated volume, not a shared store. $STORE/ctl is the
+    # zero-config discovery dir (harmless no-op when absent).
+    rm -f "$STORE"/ckpt-* "$STORE"/control* "$STORE"/pid_map_* \
+          "$STORE"/ctl/control* "$STORE"/ctl/pid_map_* \
+          "$STORE"/ctl/ctl-ready-* 2>/dev/null
     WL_PID=""
     return 0
 }
@@ -85,7 +90,8 @@ stub_cuda_checkpoint() {
 }
 
 # extract_ms <stderr-file> <prefix> — prints one time-in-ms per matching
-# ".. size: X GB, time: Y ms, .." line (prefix: "ckpt" | "restore").
+# ".. size: X GB, time: Y ms, .." line (prefix: "ckpt" | "restore" |
+# "selective ckpt" | "selective restore").
 extract_ms() {
     sed -n "s/^$2 size: .* time: \([0-9][0-9]*\) ms.*/\1/p" "$1"
 }

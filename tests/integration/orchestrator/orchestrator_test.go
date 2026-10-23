@@ -31,6 +31,31 @@ func TestOrchestrator(t *testing.T) {
 
 	h := NewComposedHarness(t)
 
+	t.Run("TeardownRace", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+
+		conn, err := grpc.NewClient(
+			h.OrchAddr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			t.Fatalf("dialing orchestrator at %s: %v", h.OrchAddr, err)
+		}
+		defer conn.Close()
+
+		client := pb.NewTimeSliceOrchestratorServiceClient(conn)
+
+		execFn := func(ctx context.Context, podName, container string, command ...string) (string, error) {
+			return h.ExecPod(podName, container, 2*time.Minute, command...)
+		}
+
+		err = scenarios.RunTeardownRaceScenario(ctx, h.Client, client, t, execFn)
+		if err != nil {
+			t.Fatalf("TeardownRace scenario failed: %v", err)
+		}
+	})
+
 	t.Run("SingleRLJob", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
@@ -51,8 +76,8 @@ func TestOrchestrator(t *testing.T) {
 			h.Client,
 			client,
 			t,
-			"",  // sampler template key (default: PyTorch GPU burner)
-			"",  // trainer template key (default: PyTorch GPU burner)
+			"", // sampler template key (default: PyTorch GPU burner)
+			"", // trainer template key (default: PyTorch GPU burner)
 		)
 		if err != nil {
 			t.Fatalf("SingleRLJob scenario failed: %v", err)
@@ -79,11 +104,48 @@ func TestOrchestrator(t *testing.T) {
 			h.Client,
 			client,
 			t,
+			"", // sampler template key (default: PyTorch GPU burner)
+			"", // trainer template key (default: PyTorch GPU burner)
+		)
+		if err != nil {
+			t.Fatalf("QueuedRLJobs scenario failed: %v", err)
+		}
+	})
+
+	t.Run("MultiNodeGroups", func(t *testing.T) {
+		nodeB := os.Getenv("TEST_NODE_SAMPLERS_B")
+		if nodeB == "" {
+			t.Skip("TEST_NODE_SAMPLERS_B not set; multi-node samplers topology not provisioned")
+		}
+		// Label nodeB here, not in harness setup, so the samplers group is
+		// multi-node only for this scenario (the earlier scenarios assume a
+		// single-node group); the subtest's cleanup removes the label.
+		h.labelNode(t, nodeB, integSamplers)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+		defer cancel()
+
+		conn, err := grpc.NewClient(
+			h.OrchAddr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			t.Fatalf("dialing orchestrator at %s: %v", h.OrchAddr, err)
+		}
+		defer conn.Close()
+
+		client := pb.NewTimeSliceOrchestratorServiceClient(conn)
+
+		err = scenarios.RunMultiNodeGroupsScenario(
+			ctx,
+			h.Client,
+			client,
+			t,
 			"",  // sampler template key (default: PyTorch GPU burner)
 			"",  // trainer template key (default: PyTorch GPU burner)
 		)
 		if err != nil {
-			t.Fatalf("QueuedRLJobs scenario failed: %v", err)
+			t.Fatalf("MultiNodeGroups scenario failed: %v", err)
 		}
 	})
 }

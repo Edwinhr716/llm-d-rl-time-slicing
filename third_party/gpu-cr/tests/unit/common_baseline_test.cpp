@@ -9,6 +9,7 @@
 #include <set>
 
 #include "gtest/gtest.h"
+#include "ipc_hooks.h"
 
 namespace gpu_cr {
 namespace {
@@ -41,6 +42,13 @@ TEST(RoundUp2MBTest, LargeValuesKeepFullWidth) {
   EXPECT_EQ(ROUND_UP_2MB((25UL << 30) + 1), (25UL << 30) + (2UL << 20));
 }
 
+// The VMM mapping granule and the hugepage size are the same 2MB constant;
+// ROUND_UP_2MB and GranuleClampLen must agree on where boundaries are.
+TEST(HugePageGeometryTest, GranuleMatchesHugePageSize) {
+  EXPECT_EQ(static_cast<size_t>(HUGE_PAGE_SIZE), kVmmGranuleSize);
+  EXPECT_EQ(ROUND_UP_2MB(1UL), kVmmGranuleSize);
+}
+
 // The upstream control word must stay at offset 0: an upstream cr_client
 // and a current .so share the same zero-initialized mapping.
 TEST(SignalControlsLayoutTest, SignalWordIsFirst) {
@@ -54,6 +62,17 @@ TEST(SignalControlsLayoutTest, SignalWordIsFirst) {
 TEST(SharedMemFsTest, HeaderFitsWithinOneHugepageExtent) {
   EXPECT_EQ(ROUND_UP_2MB(sizeof(shared_mem_fs)),
             static_cast<size_t>(HUGE_PAGE_SIZE));
+}
+
+// multi_cr_client maps only ROUND_UP_2MB(sizeof(shared_mem_fs)) of each
+// worker buffer and places the two IPC scratch blocks at the tail of that
+// window (get_my_block/get_peer_block; the .so uses the same formula).
+// The blocks must fit in the round-up slack above the header, or an
+// IPC_MAX_EXPORTS_PER_PROC bump would silently overlap the header or
+// read past the coordinator's mapping.
+TEST(SharedMemFsTest, IpcScratchBlocksFitInHeaderWindowSlack) {
+  EXPECT_LE(sizeof(shared_mem_fs) + 2 * sizeof(IpcRebuildShmBlock),
+            ROUND_UP_2MB(sizeof(shared_mem_fs)));
 }
 
 // shared_mem_file / shared_mem_fs are the persisted dump-header layout,

@@ -17,10 +17,12 @@ package scenarios
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
 	pb "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/timeslice-orchestrator/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -265,6 +267,176 @@ func RunQueuedRLJobsScenario(
 	return nil
 }
 
+// RunMultiNodeGroupsScenario validates concurrent multi-node checkpoint/
+// restore on a samplers group spanning two or more nodes. Each job deploys
+// one GPU pod pinned to EVERY sampler node (per-node shared claims), so each
+// samplers handoff must snapshot the outgoing job and restore the incoming
+// job on ALL nodes of the group — exercising the concurrent per-node
+// reconcile fan-out (parallel reconcileNode) on real GPUs.
+func RunMultiNodeGroupsScenario(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	client pb.TimeSliceOrchestratorServiceClient,
+	logger Logger,
+	samplerTemplateKey string,
+	trainerTemplateKey string,
+) error {
+	logger.Log("Starting Multi-Node Groups Scenario")
+
+	samplerNodes, err := listGroupNodes(ctx, clientset, "samplers")
+	if err != nil {
+		return err
+	}
+	if len(samplerNodes) < 2 {
+		return fmt.Errorf("multi-node groups scenario needs >=2 sampler nodes, found %d", len(samplerNodes))
+	}
+	trainerNodes, err := listGroupNodes(ctx, clientset, "trainers")
+	if err != nil {
+		return err
+	}
+	if len(trainerNodes) == 0 {
+		return fmt.Errorf("no trainer nodes labeled")
+	}
+
+	// One shared claim per node per group; both jobs reference the same claim
+	// on a given node, so their pods co-reside on that node's GPU.
+	samplerClaims := make(map[string]string, len(samplerNodes))
+	trainerClaims := make(map[string]string, len(trainerNodes))
+	var allClaims []string
+	for i, node := range samplerNodes {
+		name := fmt.Sprintf("claim-mn-samplers-%d", i)
+		samplerClaims[node] = name
+		allClaims = append(allClaims, name)
+	}
+	for i, node := range trainerNodes {
+		name := fmt.Sprintf("claim-mn-trainers-%d", i)
+		trainerClaims[node] = name
+		allClaims = append(allClaims, name)
+	}
+	var createdClaims []string
+	defer func() {
+		// Survive scenario-deadline expiry: a leaked still-allocated claim
+		// poisons the next run (createSharedClaim tolerates AlreadyExists).
+		cleanupCtx := context.WithoutCancel(ctx)
+		for _, name := range createdClaims {
+			if err := deleteSharedClaim(cleanupCtx, clientset, name); err != nil {
+				logger.Errorf("Failed to delete shared claim %s: %v", name, err)
+			}
+		}
+	}()
+	for _, name := range allClaims {
+		if err := createSharedClaim(ctx, clientset, name); err != nil {
+			return err
+		}
+		createdClaims = append(createdClaims, name)
+	}
+
+	newJob := func(name string) *FakeRLJob {
+		j := NewFakeRLJob(
+			name, client, clientset, 2, logger,
+			samplerTemplateKey, trainerTemplateKey,
+			"", "", // shared claim names unused: per-node claims below
+		)
+		j.SetPerNodeClaims("samplers", samplerClaims)
+		j.SetPerNodeClaims("trainers", trainerClaims)
+		return j
+	}
+	jobA := newJob("job-mn-a")
+	jobB := newJob("job-mn-b")
+
+	// Coordination mirrors RunQueuedRLJobsScenario: A blocks in its first
+	// sampling phase (holding the multi-node samplers lock) until the test
+	// has confirmed B is queued behind it.
+	jobASampling := make(chan struct{})
+	unblockJobA := make(chan struct{})
+	var coordOnce sync.Once
+	jobA.OnSampling = func(ctx context.Context) {
+		coordOnce.Do(func() {
+			logger.Log("[Test] Job A is sampling on the multi-node group, blocking...")
+			close(jobASampling)
+			select {
+			case <-unblockJobA:
+			case <-ctx.Done():
+			}
+		})
+	}
+	quick := func(ctx context.Context) { time.Sleep(10 * time.Millisecond) }
+	jobA.OnTraining = quick
+	jobB.OnSampling = quick
+	jobB.OnTraining = quick
+
+	jobAErr := make(chan error, 1)
+	go func() { jobAErr <- jobA.Run(ctx) }()
+
+	select {
+	case <-jobASampling:
+		logger.Log("[Test] Confirmed Job A holds the multi-node samplers lock")
+	case <-time.After(10 * time.Minute):
+		return fmt.Errorf("timed out waiting for Job A to start sampling")
+	}
+
+	jobBErr := make(chan error, 1)
+	go func() { jobBErr <- jobB.Run(ctx) }()
+	time.Sleep(1 * time.Second)
+
+	resp, err := client.GetGroupStatus(ctx, &pb.GetGroupStatusRequest{GroupId: "samplers"})
+	if err != nil {
+		return fmt.Errorf("failed to get samplers group status: %w", err)
+	}
+	if resp.Group.LockingJob != "job-mn-a" {
+		return fmt.Errorf("expected lockingJob job-mn-a, got %q", resp.Group.LockingJob)
+	}
+	logger.Log("[Test] Job B queued; unblocking Job A...")
+	close(unblockJobA)
+
+	for _, j := range []struct {
+		name string
+		ch   chan error
+	}{{"job-mn-a", jobAErr}, {"job-mn-b", jobBErr}} {
+		select {
+		case err := <-j.ch:
+			if err != nil {
+				return fmt.Errorf("%s failed: %w", j.name, err)
+			}
+		case <-time.After(15 * time.Minute):
+			return fmt.Errorf("timed out waiting for %s to complete", j.name)
+		}
+	}
+
+	// Post-cleanup: no pods left for either job.
+	err = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		pods, err := clientset.CoreV1().Pods("default").List(ctx, metav1.ListOptions{
+			LabelSelector: "timeslice.io/job-id in (job-mn-a, job-mn-b)",
+		})
+		if err != nil {
+			return false, err
+		}
+		return len(pods.Items) == 0, nil
+	})
+	if err != nil {
+		return fmt.Errorf("timed out waiting for pods cleanup: %w", err)
+	}
+
+	logger.Log("Multi-Node Groups Scenario completed successfully")
+	return nil
+}
+
+// listGroupNodes returns the sorted names of nodes labeled for the group.
+func listGroupNodes(ctx context.Context, clientset kubernetes.Interface, groupID string) ([]string, error) {
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("group.timeslice.io/%s=true", groupID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list nodes for group %s: %w", groupID, err)
+	}
+	names := make([]string, 0, len(nodes.Items))
+	for i := range nodes.Items {
+		names = append(names, nodes.Items[i].Name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 //nolint:gocritic
 func createSharedClaim(ctx context.Context, clientset kubernetes.Interface, name string) error {
 	claim := &resourcev1.ResourceClaim{
@@ -300,5 +472,201 @@ func deleteSharedClaim(ctx context.Context, clientset kubernetes.Interface, name
 	if err != nil && !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete shared claim %s: %w", name, err)
 	}
+	return nil
+}
+
+// ExecInPod runs a command inside a scenario pod's container; wired to the
+// harness's SPDY exec helper by the test that drives the scenario.
+type ExecInPod func(ctx context.Context, podName, container string, command ...string) (string, error)
+
+// killableBurnerPod is the default GPU burner restructured so the GPU
+// process can be killed WITHOUT the pod dying: a shell stays as PID 1,
+// records the python PID, and keeps the pod alive after it exits. This
+// reproduces a real workload teardown (Ray drivers exit, worker pods
+// linger) where the accelerator processes are gone but the pod - and with
+// it the platform's job bookkeeping - remains.
+func killableBurnerPod() *corev1.Pod {
+	gracePeriodSec := int64(2)
+	script := `cat > /tmp/burn.py <<'PYEOF'
+import torch, time
+total = torch.cuda.get_device_properties(0).total_memory
+alloc = int(total * 0.5)
+print(f"Allocating 50% VRAM: {alloc / 1e9:.2f} GB")
+t = torch.zeros(alloc // 4, dtype=torch.float32, device='cuda')
+torch.cuda.synchronize()
+print("holding VRAM")
+while True:
+    time.sleep(1)
+PYEOF
+python3 /tmp/burn.py &
+echo $! > /tmp/gpu.pid
+wait $(cat /tmp/gpu.pid)
+echo "GPU process exited; keeping pod alive"
+sleep infinity`
+	return &corev1.Pod{
+		Spec: corev1.PodSpec{
+			TerminationGracePeriodSeconds: &gracePeriodSec,
+			Containers: []corev1.Container{
+				{
+					Name:            "pytorch-container",
+					Image:           "pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime",
+					Command:         []string{"sh", "-c"},
+					Args:            []string{script},
+					ImagePullPolicy: corev1.PullIfNotPresent,
+				},
+			},
+		},
+	}
+}
+
+// waitAgentJobState polls GetGroupStatus until the given job reports the
+// wanted state on at least one agent of the group.
+func waitAgentJobState(
+	ctx context.Context,
+	client pb.TimeSliceOrchestratorServiceClient,
+	groupID, jobID string,
+	want pb.SnapshotAgentJobState_State,
+	timeout time.Duration,
+) error {
+	return wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		resp, err := client.GetGroupStatus(ctx, &pb.GetGroupStatusRequest{GroupId: groupID})
+		if err != nil {
+			//nolint:nilerr // the group may not exist yet (NotFound); keep polling until timeout
+			return false, nil
+		}
+		for _, s := range resp.AgentJobStates {
+			if s.JobId == jobID && s.JobState == want {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+}
+
+// RunTeardownRaceScenario reproduces the end-of-run teardown race
+// (issue #164): a job releases its group lock with no waiters (the snapshot
+// is deferred, so the agent keeps reporting it RUNNING), then its
+// accelerator processes exit while its pods linger. The next job's Acquire
+// triggers lazy eviction of this ghost - a checkpoint of processes that no
+// longer exist. Without the fix, PID discovery fails the snapshot, the dead
+// job is marked FAULTED, and the survivor's Acquire fails with
+// "group samplers is faulted"; with the fix, the eviction completes, the
+// ghost settles to IDLE, and the survivor is granted the lock.
+func RunTeardownRaceScenario(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	client pb.TimeSliceOrchestratorServiceClient,
+	logger Logger,
+	execInPod ExecInPod,
+) error {
+	logger.Log("Starting Teardown Race Scenario")
+
+	const ghostJob = "ghost-job"
+	const survivorJob = "survivor-job"
+	samplerClaim := "claim-shared-teardown-samplers"
+
+	if err := createSharedClaim(ctx, clientset, samplerClaim); err != nil {
+		return err
+	}
+	defer func() {
+		if err := deleteSharedClaim(ctx, clientset, samplerClaim); err != nil {
+			logger.Errorf("Failed to delete shared claim %s: %v", samplerClaim, err)
+		}
+	}()
+
+	jobA := NewFakeRLJob(
+		ghostJob, client, clientset, 0, logger,
+		"killable", "", samplerClaim, "",
+	)
+	jobA.RegisterPodTemplate("killable", killableBurnerPod())
+	defer func() {
+		if err := jobA.cleanupPods(context.WithoutCancel(ctx)); err != nil {
+			logger.Errorf("Failed to clean up ghost job pods: %v", err)
+		}
+	}()
+
+	// 1. The ghost job acquires samplers and deploys its GPU workload.
+	logger.Logf("[Test] %s acquiring samplers...", ghostJob)
+	resp, err := jobA.acquireWithRetry(ctx, "samplers")
+	if err != nil {
+		return fmt.Errorf("ghost job failed to acquire samplers: %w", err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("ghost job samplers acquire was not successful")
+	}
+	if err := jobA.deployPods(ctx, "samplers"); err != nil {
+		return fmt.Errorf("ghost job failed to deploy sampler pod: %w", err)
+	}
+
+	// 2. Wait until the agent observes the workload on the accelerator.
+	logger.Logf("[Test] Waiting for %s to be observed RUNNING by the agent...", ghostJob)
+	if err := waitAgentJobState(ctx, client, "samplers", ghostJob,
+		pb.SnapshotAgentJobState_STATE_RUNNING, 6*time.Minute); err != nil {
+		return fmt.Errorf("ghost job never observed RUNNING: %w", err)
+	}
+
+	// 3. Final release with NO waiters: the snapshot is deferred, so the
+	// agent keeps reporting the job RUNNING.
+	logger.Logf("[Test] %s releasing samplers (no waiters - snapshot deferred)...", ghostJob)
+	if err := jobA.yieldWithRetry(ctx, "samplers"); err != nil {
+		return fmt.Errorf("ghost job failed to yield samplers: %w", err)
+	}
+
+	// 4. The workload exits (killed) while the pod - and the platform's job
+	// bookkeeping - lingers. This is the moment a real job's driver exits.
+	jobA.mu.Lock()
+	podName := jobA.createdPods[0]
+	jobA.mu.Unlock()
+	logger.Logf("[Test] Killing the GPU process in pod %s (pod stays alive)...", podName)
+	out, err := execInPod(ctx, podName, "pytorch-container",
+		"sh", "-c", "kill -9 $(cat /tmp/gpu.pid) && echo killed")
+	if err != nil {
+		return fmt.Errorf("failed to kill GPU process in %s: %w (output: %s)", podName, err, out)
+	}
+
+	// 5. Confirm the ghost: the agent still reports the dead job RUNNING.
+	time.Sleep(5 * time.Second)
+	statusResp, err := client.GetGroupStatus(ctx, &pb.GetGroupStatusRequest{GroupId: "samplers"})
+	if err != nil {
+		return fmt.Errorf("failed to get samplers status after kill: %w", err)
+	}
+	ghostSeen := false
+	for _, s := range statusResp.AgentJobStates {
+		if s.JobId == ghostJob && s.JobState == pb.SnapshotAgentJobState_STATE_RUNNING {
+			ghostSeen = true
+		}
+	}
+	if !ghostSeen {
+		return fmt.Errorf("expected stale RUNNING record for %s after its processes exited (ghost precondition)", ghostJob)
+	}
+	logger.Logf("[Test] Confirmed ghost: %s processes are dead but the agent still reports RUNNING", ghostJob)
+
+	// 6. The survivor acquires: this triggers lazy eviction of the ghost.
+	// Without the fix this fails with "group samplers is faulted".
+	logger.Logf("[Test] %s acquiring samplers (triggers lazy eviction of the ghost)...", survivorJob)
+	acquireCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	if _, err := client.Acquire(acquireCtx, &pb.AcquireRequest{
+		GroupId: "samplers",
+		JobId:   survivorJob,
+	}); err != nil {
+		return fmt.Errorf(
+			"teardown race: survivor's Acquire failed after the ghost job's processes exited "+
+				"(lazy eviction of the dead job likely FAULTED the group): %w", err)
+	}
+	logger.Logf("[Test] %s acquired samplers - ghost eviction handled", survivorJob)
+
+	// 7. The ghost must have settled to IDLE (evicted with nothing to save).
+	if err := waitAgentJobState(ctx, client, "samplers", ghostJob,
+		pb.SnapshotAgentJobState_STATE_IDLE, time.Minute); err != nil {
+		return fmt.Errorf("ghost job did not settle to IDLE after eviction: %w", err)
+	}
+
+	// 8. Release the survivor's lock so later scenarios start clean.
+	if _, err := client.Yield(ctx, &pb.YieldRequest{GroupId: "samplers", JobId: survivorJob}); err != nil {
+		logger.Errorf("Failed to yield survivor lock: %v", err)
+	}
+
+	logger.Log("Teardown Race Scenario completed successfully")
 	return nil
 }

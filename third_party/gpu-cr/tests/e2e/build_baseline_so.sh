@@ -14,9 +14,12 @@
 # shm-size-gb defaults to 5: the baseline has no env-based sizing, so its
 # compile-time dump buffer must fit the perf pod's hugepage request while
 # still covering the perf workload (PERF_NUM_BUFFERS x PERF_BUFFER_MB).
+# The default tag carries that size for the same reason — a baseline image
+# is only usable with a pod whose hugepage request covers it, so the tag
+# has to say which build it is rather than leaving it to be guessed.
 set -eu
 REF=${1:-e9bbb52e1f52986587fc631217c0f2b50b46245a}
-TAG=${2:-baseline-e9bbb52}
+TAG=${2:-baseline-e9bbb52-shm5}
 SHM_SIZE_GB=${3:-5}
 
 SRC=$(mktemp -d /tmp/gpu-cr-baseline.XXXXXX)
