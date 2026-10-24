@@ -44,6 +44,16 @@ required, cleaned up and tested:
 Like the original import, the prebuilt `cuda-checkpoint` binary is not
 vendored; deployments provide it (or set `GPU_CR_CUDA_CHECKPOINT`).
 
+## Released binaries
+
+CI publishes the built artifacts as the `gpu-cr` container package
+(`ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/gpu-cr`) via
+`docker/gpu-cr/Dockerfile`: `latest` on every merge to main, versioned tags
+via a manual release run — the same scheme as the snapshot-agent and
+timesliceorchestrator images. The image carries `/opt/gpu-cr/cr_client` and
+`/opt/gpu-cr/vGPU-NVIDIA.so`, built as a version-locked pair; consumers must
+take both from the same tag.
+
 ## Licensing
 
 Upstream's Apache-2.0 [LICENSE](./LICENSE) applies to this directory and is
